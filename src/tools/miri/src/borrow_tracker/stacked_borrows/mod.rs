@@ -39,6 +39,7 @@ pub struct Stacks {
     exposed_tags: FxHashSet<BorTag>,
     /// Whether this memory has been modified since the last time the tag GC ran
     modified_since_last_gc: bool,
+    _kind: MemoryKind<MiriMemoryKind>,
 }
 
 /// Indicates which permissions to grant to the retagged pointer.
@@ -478,6 +479,7 @@ impl<'tcx> Stacks {
         perm: Permission,
         tag: BorTag,
         id: AllocId,
+        kind: MemoryKind<MiriMemoryKind>,
         machine: &MiriMachine<'_, '_>,
     ) -> Self {
         let item = Item::new(tag, perm, false);
@@ -488,6 +490,7 @@ impl<'tcx> Stacks {
             history: AllocHistory::new(id, item, machine),
             exposed_tags: FxHashSet::default(),
             modified_since_last_gc: false,
+            _kind: kind,
         }
     }
 
@@ -531,7 +534,7 @@ impl Stacks {
             // Everything else is shared by default.
             _ => (state.base_ptr_tag(id, machine), Permission::SharedReadWrite),
         };
-        Stacks::new(size, perm, base_tag, id, machine)
+        Stacks::new(size, perm, base_tag, id, kind, machine)
     }
 
     #[inline(always)]
@@ -740,6 +743,7 @@ trait EvalContextPrivExt<'mir: 'ecx, 'tcx: 'mir, 'ecx>: crate::MiriInterpCxExt<'
                 let item = Item::new(new_tag, perm, protector.is_some());
                 let range = alloc_range(base_offset, size);
                 let global = machine.borrow_tracker.as_ref().unwrap().borrow();
+
                 let dcx = DiagnosticCxBuilder::retag(
                     machine,
                     retag_info,
@@ -747,6 +751,7 @@ trait EvalContextPrivExt<'mir: 'ecx, 'tcx: 'mir, 'ecx>: crate::MiriInterpCxExt<'
                     orig_tag,
                     alloc_range(base_offset, size),
                 );
+
                 stacked_borrows.for_each(range, dcx, |stack, dcx, exposed_tags| {
                     stack.grant(orig_tag, item, access, &global, dcx, exposed_tags)
                 })?;
@@ -772,6 +777,7 @@ trait EvalContextPrivExt<'mir: 'ecx, 'tcx: 'mir, 'ecx>: crate::MiriInterpCxExt<'
                 // `visit_freeze_sensitive` needs to access the global state.
                 let alloc_extra = this.get_alloc_extra(alloc_id)?;
                 let mut stacked_borrows = alloc_extra.borrow_tracker_sb().borrow_mut();
+
                 this.visit_freeze_sensitive(place, size, |mut range, frozen| {
                     // Adjust range.
                     range.start += base_offset;
@@ -783,6 +789,7 @@ trait EvalContextPrivExt<'mir: 'ecx, 'tcx: 'mir, 'ecx>: crate::MiriInterpCxExt<'
                     };
                     let item = Item::new(new_tag, perm, protector.is_some());
                     let global = this.machine.borrow_tracker.as_ref().unwrap().borrow();
+
                     let dcx = DiagnosticCxBuilder::retag(
                         &this.machine,
                         retag_info,
@@ -790,6 +797,7 @@ trait EvalContextPrivExt<'mir: 'ecx, 'tcx: 'mir, 'ecx>: crate::MiriInterpCxExt<'
                         orig_tag,
                         alloc_range(base_offset, size),
                     );
+
                     stacked_borrows.for_each(range, dcx, |stack, dcx, exposed_tags| {
                         stack.grant(orig_tag, item, access, &global, dcx, exposed_tags)
                     })?;

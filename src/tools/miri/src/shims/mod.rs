@@ -3,19 +3,25 @@
 mod backtrace;
 #[cfg(target_os = "linux")]
 pub mod ffi_support;
+
+pub mod llvm_ffi_support;
+
 pub mod foreign_items;
 pub mod intrinsics;
 pub mod unix;
 pub mod windows;
 mod x86;
 
+#[macro_use]
+pub mod llvm;
+
 pub mod dlsym;
 pub mod env;
+
 pub mod os_str;
 pub mod panic;
 pub mod time;
 pub mod tls;
-
 // End module management, begin local code
 
 use log::trace;

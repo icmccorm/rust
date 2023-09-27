@@ -1,0 +1,92 @@
+extern crate rustc_abi;
+use crate::shims::llvm::helpers::EvalContextExt;
+use crate::MiriInterpCx;
+use inkwell::values::GenericValue;
+use rustc_abi::{Align, Size};
+use rustc_const_eval::interpret::InterpResult;
+use rustc_const_eval::interpret::OpTy;
+use std::ffi::CStr;
+
+pub enum MemcpyMode {
+    Disjoint,
+    Overlapping,
+    DisjointOrEqual,
+}
+
+#[allow(clippy::arithmetic_side_effects)]
+pub fn eval_memcpy<'tcx>(
+    ctx: &mut MiriInterpCx<'_, 'tcx>,
+    function: &str,
+    dest: &OpTy<'tcx, crate::Provenance>,
+    source: &OpTy<'tcx, crate::Provenance>,
+    source_length: Option<&OpTy<'tcx, crate::Provenance>>,
+    mode: MemcpyMode,
+) -> InterpResult<'tcx, GenericValue<'tcx>> {
+    let dest = ctx.opty_as_scalar(dest)?;
+    let dest_as_pointer = dest.to_pointer(ctx)?;
+
+    let src = ctx.opty_as_scalar(source)?;
+    let src_as_pointer = src.to_pointer(ctx)?;
+
+    let length_value = if let Some(len) = source_length {
+        let len_as_scalar = ctx.opty_as_scalar(len)?;
+        len_as_scalar.to_target_usize(ctx)?
+    } else {
+        let source_as_slice = ctx.pointer_to_slice(src_as_pointer)?;
+        let source_as_cstring = CStr::from_bytes_until_nul(source_as_slice);
+        if let Ok(cstr) = source_as_cstring {
+            // add 1 to cover null-terminator
+            (cstr.to_bytes().len() + 1) as u64
+        } else {
+            throw_interop_format!(
+                "invalid memory copy with {}: expected a null-terminated string, but couldn't locate a null-terminator.",
+                function
+            )
+        }
+    };
+    let (src_prov, src_addr) = src_as_pointer.into_parts();
+    let (dest_prov, dest_addr) = dest_as_pointer.into_parts();
+    let addr_equal = src_addr == dest_addr;
+    let provenance_equal = if let (Some(src_prov), Some(dest_prov)) = (src_prov, dest_prov) {
+        match src_prov {
+            crate::Provenance::Concrete { alloc_id, tag } => {
+                if let crate::Provenance::Concrete { alloc_id: dest_alloc_id, tag: dest_tag } =
+                    dest_prov
+                {
+                    alloc_id == dest_alloc_id && tag == dest_tag
+                } else {
+                    false
+                }
+            }
+            crate::Provenance::Wildcard => {
+                matches!(dest_prov, crate::Provenance::Wildcard)
+            }
+        }
+    } else {
+        dest_prov.is_none() && src_prov.is_none()
+    };
+
+    let nonoverlapping = matches!(mode, MemcpyMode::Disjoint | MemcpyMode::DisjointOrEqual);
+    if !(addr_equal && provenance_equal && matches!(mode, MemcpyMode::DisjointOrEqual)) {
+        if matches!(mode, MemcpyMode::DisjointOrEqual) && addr_equal && !provenance_equal {
+            throw_interop_format!(
+                "invalid memory copy with {}: cannot copy equal pointers with different provenance.",
+                function
+            )
+        }
+        let error = ctx.mem_copy(
+            src_as_pointer,
+            Align::ONE,
+            dest_as_pointer,
+            Align::ONE,
+            Size::from_bytes(length_value),
+            nonoverlapping,
+        );
+        if error.is_err() {
+            throw_interop_format!("invalid memory copy with {}", function)
+        }
+    }
+    let as_miri_ptr = ctx.pointer_to_lli_wrapped_pointer(dest_as_pointer);
+    let as_gv = unsafe { GenericValue::create_generic_value_of_miri_pointer(as_miri_ptr) };
+    Ok(as_gv)
+}

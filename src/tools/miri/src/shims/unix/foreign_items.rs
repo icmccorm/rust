@@ -57,7 +57,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             }
 
             // File related shims
-            "open" | "open64" => {
+            "_open" | "open" | "open64" => {
                 // `open` is variadic, the third argument is only present when the second argument has O_CREAT (or on linux O_TMPFILE, but miri doesn't support that) set
                 this.check_abi_and_shim_symbol_clash(abi, Abi::C { unwind: false }, link_name)?;
                 let result = this.open(args)?;
@@ -433,10 +433,15 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let result = this.pthread_cond_destroy(cond)?;
                 this.write_scalar(Scalar::from_i32(result), dest)?;
             }
-
             // Threading
             "pthread_create" => {
                 let [thread, attr, start, arg] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                if this.active_thread_stack().is_empty() {
+                    this.handle_unsupported(format!(
+                        "can't call foreign function `{link_name}` on OS `{os}`",
+                        os = this.tcx.sess.target.os,
+                    ))?;
+                }
                 let result = this.pthread_create(thread, attr, start, arg)?;
                 this.write_scalar(Scalar::from_i32(result), dest)?;
             }

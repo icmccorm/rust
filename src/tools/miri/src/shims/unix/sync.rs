@@ -410,7 +410,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             Ok(0)
         }
     }
-
     fn pthread_mutex_trylock(
         &mut self,
         mutex_op: &OpTy<'tcx, Provenance>,

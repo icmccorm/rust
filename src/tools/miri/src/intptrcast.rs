@@ -65,7 +65,7 @@ impl GlobalStateInner {
 impl<'mir, 'tcx> GlobalStateInner {
     // Returns the exposed `AllocId` that corresponds to the specified addr,
     // or `None` if the addr is out of bounds
-    fn alloc_id_from_addr(ecx: &MiriInterpCx<'mir, 'tcx>, addr: u64) -> Option<AllocId> {
+    pub fn alloc_id_from_addr(ecx: &MiriInterpCx<'mir, 'tcx>, addr: u64) -> Option<AllocId> {
         let global_state = ecx.machine.intptrcast.borrow();
         assert!(global_state.provenance_mode != ProvenanceMode::Strict);
 
@@ -162,7 +162,7 @@ impl<'mir, 'tcx> GlobalStateInner {
         Ok(Pointer::new(Some(Provenance::Wildcard), Size::from_bytes(addr)))
     }
 
-    fn alloc_base_addr(
+    pub fn alloc_base_addr(
         ecx: &MiriInterpCx<'mir, 'tcx>,
         alloc_id: AllocId,
     ) -> InterpResult<'tcx, u64> {

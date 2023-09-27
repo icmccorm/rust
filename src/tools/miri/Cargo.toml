@@ -18,6 +18,10 @@ test = false # we have no unit tests
 doctest = false # and no doc tests
 
 [dependencies]
+inkwell = { path = "../../inkwell", features=["llvm17-0"] }
+llvm-sys = { path = "../../llvm-sys", version = "170.0.0" }
+ouroboros = "0.15.6"
+
 getrandom = { version = "0.2", features = ["std"] }
 env_logger = "0.10"
 log = "0.4"
@@ -26,6 +30,12 @@ smallvec = "1.7"
 
 measureme = "10.0.0"
 ctrlc = "3.2.5"
+which = "4.4.0"
+walkdir = "2.3.2"
+infer = "0.13.0"
+once_cell = "1.17.1"
+libc = "0.2"
+parking_lot = "0.12.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

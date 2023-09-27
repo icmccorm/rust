@@ -1,4 +1,9 @@
-use std::{collections::hash_map::Entry, io::Write, iter, path::Path};
+use std::{
+    collections::hash_map::Entry,
+    io::Write,
+    iter::{self, repeat},
+    path::Path,
+};
 
 use log::trace;
 
@@ -82,6 +87,35 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         } else {
             let align = this.min_align(size, kind);
             let ptr = this.allocate_ptr(Size::from_bytes(size), align, kind.into())?;
+            if zero_init {
+                // We just allocated this, the access is definitely in-bounds and fits into our address space.
+                this.write_bytes_ptr(
+                    ptr.into(),
+                    iter::repeat(0u8).take(usize::try_from(size).unwrap()),
+                )
+                .unwrap();
+            }
+            Ok(ptr.into())
+        }
+    }
+
+    fn malloc_align(
+        &mut self,
+        size: u64,
+        alignment: u64,
+        zero_init: bool,
+        kind: MiriMemoryKind,
+    ) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
+        let this = self.eval_context_mut();
+        if alignment == 0 {
+            throw_unsup_format!("malloc_align: alignment must be non-zero");
+        } else {
+            let ptr = match Align::from_bytes(alignment) {
+                Ok(align) => this.allocate_ptr(Size::from_bytes(size), align, kind.into())?,
+                Err(s) => {
+                    throw_unsup_format!("{}", s);
+                }
+            };
             if zero_init {
                 // We just allocated this, the access is definitely in-bounds and fits into our address space.
                 this.write_bytes_ptr(
@@ -705,7 +739,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                         Greater => 1,
                     }
                 };
-
                 this.write_scalar(Scalar::from_i32(result), dest)?;
             }
             "memrchr" => {
@@ -758,6 +791,17 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 } else {
                     this.write_null(dest)?;
                 }
+            }
+            "memset" => {
+                let [ptr, val, num] =
+                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let ptr = this.read_pointer(ptr)?;
+                let val = this.read_scalar(val)?.to_i32()?;
+                let num = this.read_target_usize(num)?;
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let val = val as u8;
+                this.write_bytes_ptr(ptr, repeat(val).take(usize::try_from(num).unwrap()))?;
+                this.write_pointer(ptr, dest)?;
             }
             "strlen" => {
                 let [ptr] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
@@ -1044,8 +1088,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             }
 
             // Platform-specific shims
-            _ =>
-                return match this.tcx.sess.target.os.as_ref() {
+            _ => {
+                let shim_result = match this.tcx.sess.target.os.as_ref() {
                     target_os if target_os_is_unix(target_os) =>
                         shims::unix::foreign_items::EvalContextExt::emulate_foreign_item_by_name(
                             this, link_name, abi, args, dest,
@@ -1055,7 +1099,30 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                             this, link_name, abi, args, dest,
                         ),
                     _ => Ok(EmulateByNameResult::NotSupported),
-                },
+                };
+                if let Ok(EmulateByNameResult::NotSupported) = shim_result {
+                    if !this.machine.external_bc_files.is_empty() {
+                        use crate::shims::llvm_ffi_support::EvalContextExt as _;
+                        // An Ok(false) here means that the function being called was not exported
+                        // by the specified `.bc` file; we should continue and check if it corresponds to
+                        // a provided shim.
+                        //
+                        // We only do this if we're not already executing LLVM code, because otherwise
+                        // we would end up with endless stack overflows in cases where a system call is
+                        // exposed as an LLVM function, but implemented in terms of itself.
+
+                        // TODO: When multithreading is added, check the thread ID
+                        if this.has_llvm_interpreter()
+                            && !this.thread_is_lli_thread(this.get_active_thread())?
+                        {
+                            if this.call_external_llvm_fct(link_name, dest, args)? {
+                                return Ok(EmulateByNameResult::NeedsJumping);
+                            }
+                        }
+                    }
+                }
+                return shim_result;
+            }
         };
         // We only fall through to here if we did *not* hit the `_` arm above,
         // i.e., if we actually emulated the function with one of the shims.

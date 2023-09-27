@@ -1,7 +1,10 @@
 //! Global machine state as well as implementation of the interpreter engine
 //! `Machine` trait.
+use inkwell::miri::StackTrace;
+use inkwell::values::GenericValueRef;
 
-use std::borrow::Cow;
+use std::fs::OpenOptions;
+use std::{borrow::Cow, fs::File};
 use std::cell::RefCell;
 use std::fmt;
 use std::path::Path;
@@ -10,6 +13,10 @@ use std::process;
 use either::Either;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rustc_span::Span;
+use std::cell::Cell;
+
+use std::path::PathBuf;
 
 use rustc_ast::ast::Mutability;
 use rustc_const_eval::const_eval::CheckAlignment;
@@ -25,7 +32,7 @@ use rustc_middle::{
     },
 };
 use rustc_span::def_id::{CrateNum, DefId};
-use rustc_span::{Span, SpanData, Symbol};
+use rustc_span::{SpanData, Symbol};
 use rustc_target::abi::{Align, Size};
 use rustc_target::spec::abi::Abi;
 
@@ -113,6 +120,12 @@ pub enum MiriMemoryKind {
     /// Memory for thread-local statics.
     /// This memory may leak.
     Tls,
+    /// Memory allocated by malloc in LLI
+    /// This memory may not leak.
+    LLVMStatic,
+    LLVMStack,
+    LLVMHeap,
+    LLVMInterop,
     /// Memory mapped directly by the program
     Mmap,
 }
@@ -129,8 +142,8 @@ impl MayLeak for MiriMemoryKind {
     fn may_leak(self) -> bool {
         use self::MiriMemoryKind::*;
         match self {
-            Rust | Miri | C | WinHeap | Runtime => false,
-            Machine | Global | ExternStatic | Tls | Mmap => true,
+            Rust | Miri | C | WinHeap | Runtime | LLVMInterop | LLVMStack | LLVMHeap => false,
+            Machine | Global | ExternStatic | Tls | LLVMStatic | Mmap => true,
         }
     }
 }
@@ -141,9 +154,9 @@ impl MiriMemoryKind {
         use self::MiriMemoryKind::*;
         match self {
             // Heap allocations are fine since the `Allocation` is created immediately.
-            Rust | Miri | C | WinHeap | Mmap => true,
+            Rust | Miri | C | WinHeap | Mmap | LLVMInterop => true,
             // Everything else is unclear, let's not show potentially confusing spans.
-            Machine | Global | ExternStatic | Tls | Runtime => false,
+            Machine | Global | ExternStatic | Tls | Runtime | LLVMStatic | LLVMStack | LLVMHeap => false,
         }
     }
 }
@@ -152,6 +165,10 @@ impl fmt::Display for MiriMemoryKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use self::MiriMemoryKind::*;
         match self {
+            LLVMInterop => write!(f, "Allocated for interop between LLI and Miri"),
+            LLVMStatic => write!(f, "Allocated by LLVM for global variable"),
+            LLVMHeap => write!(f, "Allocated in heap by LLVM"),
+            LLVMStack => write!(f, "Allocated as local by LLVM"),
             Rust => write!(f, "Rust heap"),
             Miri => write!(f, "Miri bare-metal heap"),
             C => write!(f, "C heap"),
@@ -318,6 +335,8 @@ pub struct PrimitiveLayouts<'tcx> {
     pub u32: TyAndLayout<'tcx>,
     pub u64: TyAndLayout<'tcx>,
     pub u128: TyAndLayout<'tcx>,
+    pub f32: TyAndLayout<'tcx>,
+    pub f64: TyAndLayout<'tcx>,
     pub usize: TyAndLayout<'tcx>,
     pub bool: TyAndLayout<'tcx>,
     pub mut_raw_ptr: TyAndLayout<'tcx>,   // *mut ()
@@ -344,6 +363,8 @@ impl<'mir, 'tcx: 'mir> PrimitiveLayouts<'tcx> {
             u32: layout_cx.layout_of(tcx.types.u32)?,
             u64: layout_cx.layout_of(tcx.types.u64)?,
             u128: layout_cx.layout_of(tcx.types.u128)?,
+            f32: layout_cx.layout_of(tcx.types.f32)?,
+            f64: layout_cx.layout_of(tcx.types.f64)?,
             usize: layout_cx.layout_of(tcx.types.usize)?,
             bool: layout_cx.layout_of(tcx.types.bool)?,
             mut_raw_ptr: layout_cx.layout_of(mut_raw_ptr)?,
@@ -381,6 +402,8 @@ impl<'mir, 'tcx: 'mir> PrimitiveLayouts<'tcx> {
 pub struct MiriMachine<'mir, 'tcx> {
     // We carry a copy of the global `TyCtxt` for convenience, so methods taking just `&Evaluator` have `tcx` access.
     pub tcx: TyCtxt<'tcx>,
+
+    pub layout_cx: LayoutCx<'tcx, TyCtxt<'tcx>>,
 
     /// Global data for borrow tracking.
     pub borrow_tracker: Option<borrow_tracker::GlobalState>,
@@ -421,6 +444,7 @@ pub struct MiriMachine<'mir, 'tcx> {
 
     /// The table of file descriptors.
     pub(crate) file_handler: shims::unix::FileHandler,
+
     /// The table of directory descriptors.
     pub(crate) dir_handler: shims::unix::DirHandler,
 
@@ -459,7 +483,7 @@ pub struct MiriMachine<'mir, 'tcx> {
     pub(crate) local_crates: Vec<CrateNum>,
 
     /// Mapping extern static names to their base pointer.
-    extern_statics: FxHashMap<Symbol, Pointer<Provenance>>,
+    pub extern_statics: FxHashMap<Symbol, Pointer<Provenance>>,
 
     /// The random number generator used for resolving non-determinism.
     /// Needs to be queried by ptr_to_int, hence needs interior mutability.
@@ -495,6 +519,14 @@ pub struct MiriMachine<'mir, 'tcx> {
     #[cfg(not(target_os = "linux"))]
     pub external_so_lib: Option<!>,
 
+    pub external_bc_files: FxHashSet<PathBuf>,
+    pub extern_instance_map: FxHashMap<String, Instance<'tcx>>,
+    pub(crate) foreign_error: Cell<Option<InterpErrorInfo<'tcx>>>,
+    pub(crate) foreign_error_trace: Cell<Option<StackTrace>>,
+    pub(crate) foreign_error_rust_call_location: Cell<Option<Span>>,
+    pub(crate) _exposed_foreign_allocations: FxHashSet<AllocId>,
+    pub(crate) pending_return_values: FxHashMap<ThreadId, GenericValueRef>,
+
     /// Run a garbage collector for BorTags every N basic blocks.
     pub(crate) gc_interval: u32,
     /// The number of blocks that passed since the last BorTag GC pass.
@@ -510,6 +542,8 @@ pub struct MiriMachine<'mir, 'tcx> {
 
     /// Whether to collect a backtrace when each allocation is created, just in case it leaks.
     pub(crate) collect_leak_backtraces: bool,
+    pub(crate) llvm_bc_log_path: Option<PathBuf>,
+    pub(crate) llvm_call_logs_path: Option<File>,
 
     /// The spans we will use to report where an allocation was created and deallocated in
     /// diagnostics.
@@ -519,6 +553,7 @@ pub struct MiriMachine<'mir, 'tcx> {
 impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
     pub(crate) fn new(config: &MiriConfig, layout_cx: LayoutCx<'tcx, TyCtxt<'tcx>>) -> Self {
         let tcx = layout_cx.tcx;
+        let extern_instance_map = helpers::get_extern_functions(tcx);
         let local_crates = helpers::get_local_crates(tcx);
         let layouts =
             PrimitiveLayouts::new(layout_cx).expect("Couldn't get layouts of primitive types");
@@ -568,8 +603,38 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
         let stack_addr = if tcx.pointer_size().bits() < 32 { page_size } else { page_size * 32 };
         let stack_size =
             if tcx.pointer_size().bits() < 32 { page_size * 4 } else { page_size * 16 };
+
+            
+        let llvm_bc_log_path = if config.llvm_log && !config.disable_bc {
+            let mut cwd = std::env::current_dir().unwrap();
+            if cwd.exists() && cwd.is_dir() {
+                cwd.push("llvm_bc.csv");
+                Some(cwd)
+            }else{
+                tcx.sess.fatal("Unable to resolve current directory for LLVM logging outputxc.");
+            }
+        }else {
+            None
+        };
+        let llvm_call_logs_path = if config.llvm_log && !config.disable_bc {
+            let mut cwd = std::env::current_dir().unwrap();
+            if cwd.exists() && cwd.is_dir() {
+                cwd.push("llvm_calls.csv");
+                // delete the file if it exists
+                if cwd.exists() {
+                    std::fs::remove_file(&cwd).unwrap();
+                }
+                Some(OpenOptions::new().create(true).append(true).open(cwd).unwrap())
+            }else{
+                tcx.sess.fatal("Unable to resolve current directory for LLVM logging outputxc.");
+            }
+        } else {
+            None
+        };
+
         MiriMachine {
             tcx,
+            layout_cx,
             borrow_tracker,
             data_race,
             intptrcast: RefCell::new(intptrcast::GlobalStateInner::new(config, stack_addr)),
@@ -631,6 +696,17 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
             external_so_lib: config.external_so_file.as_ref().map(|_| {
                 panic!("loading external .so files is only supported on Linux")
             }),
+            external_bc_files: if !config.disable_bc {
+                config.external_bc_files.clone()
+            } else {
+                FxHashSet::default()
+            },
+            extern_instance_map,
+            foreign_error: Cell::new(None),
+            foreign_error_trace: Cell::new(None),
+            foreign_error_rust_call_location: Cell::new(None),
+            _exposed_foreign_allocations: FxHashSet::default(),
+            pending_return_values: FxHashMap::default(),
             gc_interval: config.gc_interval,
             since_gc: 0,
             num_cpus: config.num_cpus,
@@ -638,6 +714,8 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
             stack_addr,
             stack_size,
             collect_leak_backtraces: config.collect_leak_backtraces,
+            llvm_bc_log_path,
+            llvm_call_logs_path,
             allocation_spans: RefCell::new(FxHashMap::default()),
         }
     }
@@ -653,7 +731,7 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
         Ok(())
     }
 
-    fn add_extern_static(
+    pub(crate) fn add_extern_static(
         this: &mut MiriInterpCx<'mir, 'tcx>,
         name: &str,
         ptr: Pointer<Option<Provenance>>,
@@ -795,6 +873,7 @@ impl VisitTags for MiriMachine<'_, '_> {
             intptrcast,
             file_handler,
             tcx: _,
+            layout_cx: _,
             isolated_op: _,
             validate: _,
             enforce_abi: _,
@@ -816,13 +895,22 @@ impl VisitTags for MiriMachine<'_, '_> {
             preemption_rate: _,
             report_progress: _,
             basic_block_count: _,
+            foreign_error: _,
+            foreign_error_trace: _,
+            foreign_error_rust_call_location: _,
+            _exposed_foreign_allocations: _,
+            pending_return_values: _,
             external_so_lib: _,
+            external_bc_files: _,
+            extern_instance_map: _,
             gc_interval: _,
             since_gc: _,
             num_cpus: _,
             page_size: _,
             stack_addr: _,
             stack_size: _,
+            llvm_bc_log_path: _,
+            llvm_call_logs_path: _,
             collect_leak_backtraces: _,
             allocation_spans: _,
         } = self;
@@ -998,7 +1086,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
         bin_op: mir::BinOp,
         left: &ImmTy<'tcx, Provenance>,
         right: &ImmTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, (ImmTy<'tcx, Provenance>, bool)> {
+    ) -> InterpResult<'tcx, (Scalar<Provenance>, bool, Ty<'tcx>)> {
         ecx.binary_ptr_op(bin_op, left, right)
     }
 

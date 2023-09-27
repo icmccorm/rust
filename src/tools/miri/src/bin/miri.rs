@@ -12,11 +12,12 @@ extern crate rustc_interface;
 extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
-
-use std::env;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::{env, fs};
+
+use walkdir::WalkDir;
 
 use log::debug;
 
@@ -28,8 +29,7 @@ use rustc_middle::{
     middle::exported_symbols::{
         ExportedSymbol, SymbolExportInfo, SymbolExportKind, SymbolExportLevel,
     },
-    query::{LocalCrate},
-    util::Providers,
+    query::{ExternProviders, LocalCrate},
     ty::TyCtxt,
 };
 use rustc_session::config::{CrateType, ErrorOutputType, OptLevel};
@@ -44,11 +44,11 @@ struct MiriCompilerCalls {
 
 impl rustc_driver::Callbacks for MiriCompilerCalls {
     fn config(&mut self, config: &mut Config) {
-        config.override_queries = Some(|_, providers| {
-            providers.extern_queries.used_crate_source = |tcx, cnum| {
-                let mut providers = Providers::default();
-                rustc_metadata::provide(&mut providers);
-                let mut crate_source = (providers.extern_queries.used_crate_source)(tcx, cnum);
+        config.override_queries = Some(|_, _, external_providers| {
+            external_providers.used_crate_source = |tcx, cnum| {
+                let mut providers = ExternProviders::default();
+                rustc_metadata::provide_extern(&mut providers);
+                let mut crate_source = (providers.used_crate_source)(tcx, cnum);
                 // HACK: rustc will emit "crate ... required to be available in rlib format, but
                 // was not found in this form" errors once we use `tcx.dependency_formats()` if
                 // there's no rlib provided, so setting a dummy path here to workaround those errors.
@@ -80,13 +80,25 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
                 tcx.sess.fatal("miri can only run programs that have a main function");
             };
             let mut config = self.miri_config.clone();
-
             // Add filename to `miri` arguments.
             config.args.insert(0, tcx.sess.io.input.filestem().to_string());
 
             // Adjust working directory for interpretation.
             if let Some(cwd) = env::var_os("MIRI_CWD") {
                 env::set_current_dir(cwd).unwrap();
+            }
+            
+            if !config.disable_bc {
+                let cwd = env::current_dir().unwrap();
+                if cwd.exists() && cwd.is_dir() {
+                    config.external_bc_files.extend(collect_llvm_bytecode(cwd));
+                }else{
+                    tcx.sess.fatal("Unable to resolve CARGO_TARGET_DIR.");
+                }
+    
+                if !config.external_bc_files.is_empty() {
+                    config.provenance_mode = ProvenanceMode::Permissive;
+                }
             }
 
             if tcx.sess.opts.optimize != OptLevel::No {
@@ -126,7 +138,7 @@ impl rustc_driver::Callbacks for MiriBeRustCompilerCalls {
         if config.opts.prints.is_empty() && self.target_crate {
             // Queries overridden here affect the data stored in `rmeta` files of dependencies,
             // which will be used later in non-`MIRI_BE_RUSTC` mode.
-            config.override_queries = Some(|_, local_providers| {
+            config.override_queries = Some(|_, local_providers, _| {
                 // `exported_symbols` and `reachable_non_generics` provided by rustc always returns
                 // an empty result if `tcx.sess.opts.output_types.should_codegen()` is false.
                 local_providers.exported_symbols = |tcx, LocalCrate| {
@@ -353,6 +365,8 @@ fn main() {
             miri_config.check_alignment = miri::AlignmentCheck::None;
         } else if arg == "-Zmiri-symbolic-alignment-check" {
             miri_config.check_alignment = miri::AlignmentCheck::Symbolic;
+        } else if arg == "-Zmiri-llvm-log" {
+            miri_config.llvm_log = true
         } else if arg == "-Zmiri-check-number-validity" {
             eprintln!(
                 "WARNING: the flag `-Zmiri-check-number-validity` no longer has any effect \
@@ -526,6 +540,24 @@ fn main() {
                 "full" => BacktraceStyle::Full,
                 _ => show_error!("-Zmiri-backtrace may only be 0, 1, or full"),
             };
+        } else if arg == "-Zmiri-disable-bc" {
+            miri_config.disable_bc = true
+        } else if let Some(param) = arg.strip_prefix("-Zmiri-extern-bc=") {
+            let csv_filenames = param.to_string();
+            for filename in csv_filenames.split(',') {
+                let path = std::path::Path::new(&filename);
+                if path.exists() {
+                    if path.is_dir() {
+                        let llvm_files = collect_llvm_bytecode(path.to_path_buf());
+                        miri_config.external_bc_files.extend(llvm_files);
+                    } else {
+                        let canon_path = fs::canonicalize(path);
+                        miri_config.external_bc_files.insert(canon_path.unwrap());
+                    }
+                } else {
+                    show_error!("-Zmiri-extern-bc `{}` does not exist", filename);
+                }
+            }
         } else if let Some(param) = arg.strip_prefix("-Zmiri-extern-so-file=") {
             let filename = param.to_string();
             if std::path::Path::new(&filename).exists() {
@@ -575,4 +607,18 @@ fn main() {
     debug!("rustc arguments: {:?}", rustc_args);
     debug!("crate arguments: {:?}", miri_config.args);
     run_compiler(rustc_args, /* target_crate: */ true, &mut MiriCompilerCalls { miri_config })
+}
+
+fn collect_llvm_bytecode(pb: PathBuf) -> Vec<PathBuf> {
+    let mut llvm_bitcode_paths = Vec::new();
+    for entry in WalkDir::new(pb).follow_links(true).into_iter().filter_map(|e| e.ok()) {
+        if entry.path().is_file() {
+            if let Some(p) = entry.path().extension() {
+                if p == "bc" {
+                    llvm_bitcode_paths.push(fs::canonicalize(entry.path()).unwrap());
+                }
+            }
+        }
+    }
+    llvm_bitcode_paths
 }

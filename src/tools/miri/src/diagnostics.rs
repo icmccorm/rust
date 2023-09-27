@@ -17,6 +17,13 @@ pub enum TerminationInfo {
         code: i64,
         leak_check: bool,
     },
+    ForeignError {
+        stack_trace: Option<String>,
+        base_error: Option<String>,
+    },
+    InteroperationError {
+        msg: String
+    },
     Abort(String),
     UnsupportedInIsolation(String),
     StackedBorrowsUb {
@@ -49,6 +56,8 @@ pub enum TerminationInfo {
     },
 }
 
+unsafe impl Send for TerminationInfo {}
+
 pub struct RacingOp {
     pub action: String,
     pub thread_info: String,
@@ -59,6 +68,16 @@ impl fmt::Display for TerminationInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use TerminationInfo::*;
         match self {
+            ForeignError { stack_trace, base_error } => {
+                //write both stack and base if Some, else write either, or write unknown foreign error
+                match (stack_trace, base_error) {
+                    (Some(stack), Some(base)) => write!(f, "{base}\n---\n{stack}"),
+                    (Some(stack), None) => write!(f, "---{stack}"),
+                    (None, Some(base)) => write!(f, "\n{base}"),
+                    (None, None) => write!(f, "unknown"),
+                }
+            }
+            InteroperationError { msg } => write!(f, "{msg}"),
             Exit { code, .. } => write!(f, "the evaluated program completed with exit code {code}"),
             Abort(msg) => write!(f, "{msg}"),
             UnsupportedInIsolation(msg) => write!(f, "{msg}"),
@@ -215,6 +234,8 @@ pub fn report_error<'tcx, 'mir>(
                 Some("Undefined Behavior"),
             Deadlock => Some("deadlock"),
             MultipleSymbolDefinitions { .. } | SymbolShimClashing { .. } => None,
+            ForeignError { .. } => Some("foreign error"),
+            InteroperationError { .. } => Some("LLI interoperation error"),
         };
         #[rustfmt::skip]
         let helps = match info {

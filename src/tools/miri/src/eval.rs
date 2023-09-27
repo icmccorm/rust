@@ -12,6 +12,7 @@ use rustc_middle::ty::Ty;
 
 use crate::borrow_tracker::RetagFields;
 use crate::diagnostics::report_leaks;
+use crate::shims::llvm::lli::{LLI, LLVM_INTERPRETER};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def::Namespace;
 use rustc_hir::def_id::DefId;
@@ -20,9 +21,8 @@ use rustc_middle::ty::{
     layout::{LayoutCx, LayoutOf},
     TyCtxt,
 };
-use rustc_target::spec::abi::Abi;
-
 use rustc_session::config::EntryFnType;
+use rustc_target::spec::abi::Abi;
 
 use crate::shims::tls;
 use crate::*;
@@ -142,6 +142,13 @@ pub struct MiriConfig {
     pub report_progress: Option<u32>,
     /// Whether Stacked Borrows and Tree Borrows retagging should recurse into fields of datatypes.
     pub retag_fields: RetagFields,
+    /// The location of an LLVM bytecode file to load when calling external functions
+    pub external_bc_files: FxHashSet<PathBuf>,
+    /// The location of an additional directory, aside from target, to search through for
+    /// LLVM bytecode files
+    pub external_bc_dir: Option<PathBuf>,
+
+    pub disable_bc: bool,
     /// The location of a shared object file to load when calling external functions
     /// FIXME! consider allowing users to specify paths to multiple SO files, or to a directory
     pub external_so_file: Option<PathBuf>,
@@ -153,6 +160,8 @@ pub struct MiriConfig {
     pub page_size: Option<u64>,
     /// Whether to collect a backtrace when each allocation is created, just in case it leaks.
     pub collect_leak_backtraces: bool,
+    /// Whether to log LLVM bytecode and function calls to files
+    pub llvm_log: bool
 }
 
 impl Default for MiriConfig {
@@ -183,12 +192,16 @@ impl Default for MiriConfig {
             mute_stdout_stderr: false,
             preemption_rate: 0.01, // 1%
             report_progress: None,
+            external_bc_files: FxHashSet::default(),
+            external_bc_dir: None,
+            disable_bc: false,
             retag_fields: RetagFields::Yes,
             external_so_file: None,
             gc_interval: 10_000,
             num_cpus: 1,
             page_size: None,
             collect_leak_backtraces: true,
+            llvm_log: false
         }
     }
 }
@@ -428,7 +441,6 @@ pub fn eval_entry<'tcx>(
 ) -> Option<i64> {
     // Copy setting before we move `config`.
     let ignore_leaks = config.ignore_leaks;
-
     let mut ecx = match create_ecx(tcx, entry_id, entry_type, &config) {
         Ok(v) => v,
         Err(err) => {
@@ -437,6 +449,11 @@ pub fn eval_entry<'tcx>(
             panic!("Miri initialization error: {kind:?}")
         }
     };
+
+    if !config.disable_bc && !config.external_bc_files.is_empty() {
+        let mg = LLVM_INTERPRETER.lock();
+        mg.replace(Some(LLI::create(&mut ecx, &config.external_bc_files)));
+    }
 
     // Perform the main execution.
     let res: thread::Result<InterpResult<'_, !>> =

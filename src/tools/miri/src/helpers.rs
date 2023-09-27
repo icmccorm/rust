@@ -1,20 +1,22 @@
 pub mod convert;
-
 use std::cmp;
 use std::iter;
 use std::num::NonZeroUsize;
+
 use std::time::Duration;
-
+use crate::helpers::rustc_data_structures::fx::FxHashMap;
+use log::debug;
 use log::trace;
-
 use rustc_hir::def::{DefKind, Namespace};
 use rustc_hir::def_id::{DefId, CRATE_DEF_INDEX};
 use rustc_index::IndexVec;
 use rustc_middle::mir;
+use rustc_middle::ty::Instance;
+use crate::helpers::ty::List;
 use rustc_middle::ty::{
     self,
     layout::{IntegerExt as _, LayoutOf, TyAndLayout},
-    IntTy, Ty, TyCtxt, UintTy,
+    Ty, TyCtxt,
 };
 use rustc_span::{def_id::CrateNum, sym, Span, Symbol};
 use rustc_target::abi::{Align, FieldIdx, FieldsShape, Integer, Size, Variants};
@@ -22,6 +24,7 @@ use rustc_target::spec::abi::Abi;
 
 use rand::RngCore;
 
+use crate::Provenance;
 use crate::*;
 
 // This mapping should match `decode_error_kind` in
@@ -350,13 +353,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             let callee_arg = this.local_to_place(this.frame_idx(), local)?;
             this.write_immediate(*arg, &callee_arg)?;
         }
+        // Initialize remaining locals.
+        this.storage_live_for_always_live_locals()?;
         if callee_args.next().is_some() {
             throw_ub_format!("callee has more arguments than expected");
         }
-
-        // Initialize remaining locals.
-        this.storage_live_for_always_live_locals()?;
-
         Ok(())
     }
 
@@ -588,7 +589,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             Ok(errno_place)
         }
     }
-
+    
     /// Sets the last error variable.
     fn set_last_error(&mut self, scalar: Scalar<Provenance>) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
@@ -732,12 +733,48 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     ) -> InterpResult<'tcx, MPlaceTy<'tcx, Provenance>> {
         let this = self.eval_context_ref();
         let op_place = this.deref_pointer_as(op, base_layout)?;
-        let offset = Size::from_bytes(offset);
+        debug!(
+            "Deref operand, have {:?}, trying to access {:?} at offset {}",
+            op_place.layout.ty, value_layout.ty, offset
+        );
+        let (underlying_size, place) = if let Some(Provenance::Concrete { alloc_id, .. }) =
+            op_place.ptr().provenance
+        {
+            let alloc_base_addr = intptrcast::GlobalStateInner::alloc_base_addr(this, alloc_id)?;
+            debug!("Base address: {}", alloc_base_addr);
 
+            let (size, _, _) = self.eval_context_ref().get_alloc_info(alloc_id);
+            debug!("Alloc size: {}", size.bytes());
+
+            debug!("Current ptr: {}", op_place.ptr().addr().bytes());
+
+            let remaining_size = size.bytes() - (op_place.ptr().addr().bytes() - alloc_base_addr);
+            debug!("Remaining size: {}", remaining_size);
+
+            let offset_pointer = op_place.ptr().offset(Size::from_bytes(offset), this)?;
+
+            (remaining_size, MPlaceTy::from_aligned_ptr(offset_pointer, value_layout))
+        } else {
+            (
+                op_place.layout.size.bytes(),
+                op_place.offset(Size::from_bytes(offset), value_layout, this)?,
+            )
+        };
+        debug!(
+            "Available underlying size: {}, required size: {}",
+            underlying_size,
+            offset + value_layout.size.bytes()
+        );
         // Ensure that the access is within bounds.
-        assert!(base_layout.size >= offset + value_layout.size);
-        let value_place = op_place.offset(offset, value_layout, this)?;
-        Ok(value_place)
+        if underlying_size < offset + value_layout.size.bytes() {
+            throw_unsup_format!(
+                "Required access to {} bytes with offset {} but place is only {} bytes long",
+                value_layout.size.bytes(),
+                offset,
+                op_place.layout.size.bytes()
+            );
+        }
+        Ok(place)
     }
 
     fn deref_pointer_and_read(
@@ -917,6 +954,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             // no_std situations
             return false;
         };
+        if this.active_thread_stack().is_empty() {
+            return false
+        }
         let frame = this.frame();
         // Make an attempt to get at the instance of the function this is inlined from.
         let instance: Option<_> = try {
@@ -1013,15 +1053,15 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn float_to_int_checked<F>(
         &self,
         f: F,
-        cast_to: TyAndLayout<'tcx>,
+        dest_ty: Ty<'tcx>,
         round: rustc_apfloat::Round,
-    ) -> Option<ImmTy<'tcx, Provenance>>
+    ) -> Option<Scalar<Provenance>>
     where
         F: rustc_apfloat::Float + Into<Scalar<Provenance>>,
     {
         let this = self.eval_context_ref();
 
-        let val = match cast_to.ty.kind() {
+        match dest_ty.kind() {
             // Unsigned
             ty::Uint(t) => {
                 let size = Integer::from_uint_ty(this, *t).size();
@@ -1033,11 +1073,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 ) {
                     // Floating point value is NaN (flagged with INVALID_OP) or outside the range
                     // of values of the integer type (flagged with OVERFLOW or UNDERFLOW).
-                    return None
+                    None
                 } else {
                     // Floating point value can be represented by the integer type after rounding.
                     // The INEXACT flag is ignored on purpose to allow rounding.
-                    Scalar::from_uint(res.value, size)
+                    Some(Scalar::from_uint(res.value, size))
                 }
             }
             // Signed
@@ -1051,39 +1091,19 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 ) {
                     // Floating point value is NaN (flagged with INVALID_OP) or outside the range
                     // of values of the integer type (flagged with OVERFLOW or UNDERFLOW).
-                    return None
+                    None
                 } else {
                     // Floating point value can be represented by the integer type after rounding.
                     // The INEXACT flag is ignored on purpose to allow rounding.
-                    Scalar::from_int(res.value, size)
+                    Some(Scalar::from_int(res.value, size))
                 }
             }
             // Nothing else
             _ =>
                 span_bug!(
                     this.cur_span(),
-                    "attempted float-to-int conversion with non-int output type {}",
-                    cast_to.ty,
+                    "attempted float-to-int conversion with non-int output type {dest_ty:?}"
                 ),
-        };
-        Some(ImmTy::from_scalar(val, cast_to))
-    }
-
-    /// Returns an integer type that is twice wide as `ty`
-    fn get_twice_wide_int_ty(&self, ty: Ty<'tcx>) -> Ty<'tcx> {
-        let this = self.eval_context_ref();
-        match ty.kind() {
-            // Unsigned
-            ty::Uint(UintTy::U8) => this.tcx.types.u16,
-            ty::Uint(UintTy::U16) => this.tcx.types.u32,
-            ty::Uint(UintTy::U32) => this.tcx.types.u64,
-            ty::Uint(UintTy::U64) => this.tcx.types.u128,
-            // Signed
-            ty::Int(IntTy::I8) => this.tcx.types.i16,
-            ty::Int(IntTy::I16) => this.tcx.types.i32,
-            ty::Int(IntTy::I32) => this.tcx.types.i64,
-            ty::Int(IntTy::I64) => this.tcx.types.i128,
-            _ => span_bug!(this.cur_span(), "unexpected type: {ty:?}"),
         }
     }
 }
@@ -1149,6 +1169,73 @@ pub fn isolation_abort_error<'tcx>(name: &str) -> InterpResult<'tcx> {
 
 /// Retrieve the list of local crates that should have been passed by cargo-miri in
 /// MIRI_LOCAL_CRATES and turn them into `CrateNum`s.
+pub fn get_extern_functions(tcx: TyCtxt<'_>) -> FxHashMap<String, Instance<'_>> {
+    let mut cxx_map = FxHashMap::default();
+
+    tcx.hir().items().for_each(|id| {
+        let node = tcx.hir().get(id.hir_id());
+        if let rustc_hir::Node::Item(it) = node {
+            if let rustc_hir::ItemKind::Fn(..) = it.kind {
+                if let Some(cxx_name) = resolve_cxx_name(tcx, it.owner_id.to_def_id()) {
+                    let rust_name = it.ident.to_string();
+                    let type_of_it = tcx.type_of(it.owner_id.to_def_id()).skip_binder();
+                    if let ty::FnDef(did, sr) = type_of_it.kind() {
+                        if let Ok(Some(inst)) = tcx.resolve_instance(tcx.param_env(did).and((*did, sr))) {
+                            debug!("Resolved Rust instance for: {}", cxx_name);
+                            cxx_map.insert(cxx_name, inst);
+                        } else {
+                            bug!("Unable to resolve instance for {:?}", rust_name)
+                        }
+                    }else{
+                        bug!("Expected an item of kind ItemKind::Fn to have a function type, but found {:?}", type_of_it)
+                    }                   
+                }
+            }
+        }
+    });
+    tcx.crates(()).iter().map(|cn| tcx.exported_symbols(*cn)).for_each(|sl| {
+        sl.iter().for_each(|(exs, _sei)| {
+            let did_sr_opt = {
+                match exs {
+                    rustc_middle::middle::exported_symbols::ExportedSymbol::NonGeneric(did) =>
+                        Some((*did, List::empty())),
+                    rustc_middle::middle::exported_symbols::ExportedSymbol::Generic(did, sr) =>
+                        Some((*did, *sr)),
+                    _ => None,
+                }
+            };
+            if let Some((did, sr)) = did_sr_opt {
+                if let Some(cxx_name) = resolve_cxx_name(tcx, did) {
+                    if let Ok(Some(inst)) = tcx.resolve_instance(tcx.param_env(did).and((did, sr)))
+                    {
+                        debug!("Resolved Rust instance for: {}", cxx_name);
+                        cxx_map.insert(cxx_name, inst);
+                    } else {
+                        bug!(
+                            "Unable to resolve instance for {:?}",
+                            exs.symbol_name_for_local_instance(tcx)
+                        )
+                    }
+                }
+            }
+        })
+    });
+    cxx_map
+}
+
+fn resolve_cxx_name(tcx: TyCtxt<'_>, did: DefId) -> Option<String> {
+    if let Some(a) = tcx.get_attr(did, Symbol::intern("export_name")) {
+        if let rustc_ast::AttrKind::Normal(n) = &a.kind {
+            if let rustc_ast::AttrArgs::Eq(_, rustc_ast::AttrArgsEq::Hir(mil)) = &n.item.args {
+                return Some(mil.symbol.as_str().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Retrieve the list of local crates that should have been passed by cargo-miri in
+/// MIRI_LOCAL_CRATES and turn them into `CrateNum`s.
 pub fn get_local_crates(tcx: TyCtxt<'_>) -> Vec<CrateNum> {
     // Convert the local crate names from the passed-in config into CrateNums so that they can
     // be looked up quickly during execution
@@ -1170,21 +1257,4 @@ pub fn get_local_crates(tcx: TyCtxt<'_>) -> Vec<CrateNum> {
 /// `target_os` is a supported UNIX OS.
 pub fn target_os_is_unix(target_os: &str) -> bool {
     matches!(target_os, "linux" | "macos" | "freebsd" | "android")
-}
-
-pub(crate) fn bool_to_simd_element(b: bool, size: Size) -> Scalar<Provenance> {
-    // SIMD uses all-1 as pattern for "true". In two's complement,
-    // -1 has all its bits set to one and `from_int` will truncate or
-    // sign-extend it to `size` as required.
-    let val = if b { -1 } else { 0 };
-    Scalar::from_int(val, size)
-}
-
-pub(crate) fn simd_element_to_bool(elem: ImmTy<'_, Provenance>) -> InterpResult<'_, bool> {
-    let val = elem.to_scalar().to_int(elem.layout.size)?;
-    Ok(match val {
-        0 => false,
-        -1 => true,
-        _ => throw_ub_format!("each element of a SIMD mask must be all-0-bits or all-1-bits"),
-    })
 }
