@@ -155,7 +155,12 @@ fn miri_call_by_name_result<'tcx>(
         let (mut function_args, return_type_opt) =
             ctx.resolve_llvm_interface_unchecked(tref, args_ref);
         debug!("LLVM to Shim: {:?}, TID: {:?}", name_rust_str, ctx.get_active_thread());
-        ctx.log_llvm_call(name_rust_str, ctx.get_active_thread(), ctx.get_active_thread(), None);
+
+        let group_id = ctx.eval_context_ref().machine.threads.get_thread_group(ctx.get_active_thread());
+        if let Some(logger) = & mut ctx.eval_context_mut().machine.llvm_logger {
+            logger.log_llvm_call(name_rust_str, group_id, None);
+        }
+
         let mut op_ty_args = vec![];
         let mut places_to_deallocate = vec![];
         let mut callback_places = vec![];

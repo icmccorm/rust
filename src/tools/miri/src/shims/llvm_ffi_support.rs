@@ -1,5 +1,4 @@
 extern crate either;
-extern crate itertools;
 use super::llvm::lli::LLVM_INTERPRETER;
 use crate::concurrency::thread::EvalContextExt as ThreadEvalContextExt;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMHelperEvalExt;
@@ -10,9 +9,8 @@ use either::Either;
 use inkwell::{
     attributes::{Attribute, AttributeLoc},
     types::BasicTypeEnum,
-    values::{FunctionValue, GenericValue, GenericValueRef},
+    values::{FunctionValue, GenericValueRef},
 };
-use itertools::Itertools;
 use log::debug;
 use rustc_const_eval::interpret::{InterpResult, MemoryKind, OpTy, PlaceTy};
 use rustc_span::Symbol;
@@ -25,7 +23,7 @@ macro_rules! throw_llvm_argument_mismatch {
             $function.get_type().print_to_string().to_string(),
             (if $function.get_type().is_var_arg() { "at least " } else { "" }),
             $function.get_params().len(),
-            $args.len()
+            $args
         )
     };
 }
@@ -111,61 +109,51 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         } else {
             (llvm_parameter_types.as_slice(), ThreadLinkDestination::ToMiriDefault(dest.clone()))
         };
+
+        if args.len() > llvm_parameter_types.len() {
+            throw_llvm_argument_mismatch!(function, args.len());
+        }
+
         let mut llvm_parameter_types = llvm_parameter_types.to_vec();
+        llvm_parameter_types.reverse();
+
+        let mut args = args.to_vec();
+        args.reverse();
+
+        let scalar_pair_expansion = args.len() < llvm_parameter_types.len();
 
         debug!("link={}, sret={:?}", thread_link_destination, has_sret);
 
-        let last_type = llvm_parameter_types.last().copied();
-        for arg in args.iter() {
+        let last_type = llvm_parameter_types.first().copied();
+        let original_arg_length = args.len();
+        while let Some(current_arg) = args.pop() {
             if llvm_parameter_types.is_empty() {
                 if function.get_type().is_var_arg() {
                     llvm_parameter_types.push(last_type.unwrap());
                 } else {
-                    throw_llvm_argument_mismatch!(function, args);
+                    throw_llvm_argument_mismatch!(function, original_arg_length);
                 }
             }
-            let arg_size = arg.layout.size;
-            let mut curr_types: Vec<BasicTypeEnum<'_>> = vec![];
-            let mut llvm_total_size: u64 = 0;
-            while llvm_total_size < arg_size.bytes() && !llvm_parameter_types.is_empty() {
-                let llvm_type = llvm_parameter_types.remove(0);
-                let llvm_type_size = this.resolve_llvm_type_size(llvm_type)?;
-                llvm_total_size += llvm_type_size;
-                curr_types.push(llvm_type);
-            }
-            if llvm_total_size > arg_size.bytes() && curr_types.len() > 1 {
-                throw_llvm_argument_mismatch!(function, args);
-            }
-            if curr_types.len() == 1 {
-                generic_args.push(this.op_to_generic_value(arg, *curr_types.first().unwrap())?)
-            } else {
-                let mut curr_arg = arg.clone();
-
-                if arg.layout.fields.count() != curr_types.len() {
-                    while this.can_dereference_into_singular_field(&arg.layout) {
-                        curr_arg = this.project_field(arg, 0)?;
-                    }
-                    if curr_arg.layout.fields.count() != curr_types.len() {
-                        throw_llvm_argument_mismatch!(function, args);
-                    }
+            let num_types_remaining = llvm_parameter_types.len() - 1;
+            let num_args_remaining = args.len();
+            if scalar_pair_expansion
+                && num_types_remaining >= 2
+                && num_types_remaining > num_args_remaining
+                && (*llvm_parameter_types.last().unwrap()
+                    == llvm_parameter_types[llvm_parameter_types.len() - 1])
+            {
+                if let Some((first, second)) =
+                    this.resolve_scalar_pair(&current_arg, llvm_parameter_types.last().unwrap())?
+                {
+                    args.push(second);
+                    args.push(first);
+                    continue;
                 }
-                
-                let field_values = arg
-                    .layout
-                    .fields
-                    .index_by_increasing_offset()
-                    .map(|idx| this.project_field(arg, idx))
-                    .collect::<InterpResult<'tcx, Vec<OpTy<'tcx, Provenance>>>>()?;
-
-                let as_generic = field_values
-                    .iter()
-                    .zip_eq(curr_types)
-                    .map(|(opty, bte)| this.op_to_generic_value(opty, bte))
-                    .collect::<InterpResult<'tcx, Vec<GenericValue<'_>>>>()?;
-
-                generic_args.extend(as_generic);
             }
+            let first_type = llvm_parameter_types.pop().unwrap();
+            generic_args.push(this.op_to_generic_value(&current_arg, first_type)?);
         }
+
         let exposed = generic_args
             .drain(0..)
             .map(|gv| GenericValueRef::new(unsafe { gv.into_raw() }))

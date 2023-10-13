@@ -363,6 +363,57 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
+    fn is_fieldless(&self, layout: &TyAndLayout<'tcx>) -> bool {
+        matches!(
+            &layout.fields,
+            rustc_abi::FieldsShape::Union(_) | rustc_abi::FieldsShape::Primitive
+        )
+    }
+
+    fn resolve_scalar_pair(
+        &mut self,
+        arg: &OpTy<'tcx, crate::Provenance>,
+        llvm_type: &BasicTypeEnum<'_>,
+    ) -> InterpResult<'tcx, Option<(OpTy<'tcx, crate::Provenance>, OpTy<'tcx, crate::Provenance>)>>
+    {
+        let this = self.eval_context_mut();
+        if !this.is_fieldless(&arg.layout) {
+            let mut curr_arg = arg.clone();
+            let single_field_dereferenced =
+                this.can_dereference_into_singular_field(&curr_arg.layout);
+            while this.can_dereference_into_singular_field(&curr_arg.layout) {
+                curr_arg = this.project_field(&curr_arg, 0)?;
+            }
+            if matches!(curr_arg.layout.abi, rustc_target::abi::Abi::ScalarPair(_, _)) {
+                let field_values = arg
+                    .layout
+                    .fields
+                    .index_by_increasing_offset()
+                    .map(|idx| this.project_field(arg, idx))
+                    .collect::<InterpResult<'tcx, Vec<OpTy<'_, Provenance>>>>()?;
+                let llvm_size = this.resolve_llvm_type_size(*llvm_type)?;
+                for rust_field in field_values.iter() {
+                    let rust_field_size = rust_field.layout.size.bytes();
+                    if rust_field_size != llvm_size {
+                        return Ok(None);
+                    }
+                }
+                if let Some(logger) = &mut this.machine.llvm_logger {
+                    logger.log_llvm_conversion(
+                        curr_arg.layout,
+                        single_field_dereferenced,
+                        llvm_type,
+                    )
+                }
+                return Ok(Some((
+                    field_values.first().unwrap().clone(),
+                    field_values.last().unwrap().clone(),
+                )));
+            }
+        }
+        Ok(None)
+    }
+
     fn maybe_alloc_id(&self, mp: Pointer<Option<crate::Provenance>>) -> Option<AllocId> {
         let this = self.eval_context_ref();
         match mp.provenance {

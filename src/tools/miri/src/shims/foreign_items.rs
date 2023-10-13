@@ -858,7 +858,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 )?;
                 this.write_pointer(ptr_dest, dest)?;
             }
-
+            | "abs" => {
+                let [n] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let n = this.read_scalar(n)?.to_i32()?;
+                this.write_scalar(Scalar::from_i32(n.abs()), dest)?;
+            }
             // math functions (note that there are also intrinsics for some other functions)
             #[rustfmt::skip]
             | "cbrtf"
@@ -925,6 +929,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             | "log1p"
             | "expm1"
             | "tgamma"
+            | "sin"
+            | "cos"
+            | "log10"
+            | "log2"
+            | "sqrt"
+            | "ceil"
+            | "floor"
             => {
                 let [f] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 // FIXME: Using host floats.
@@ -941,6 +952,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     "log1p" => f.ln_1p(),
                     "expm1" => f.exp_m1(),
                     "tgamma" => f.gamma(),
+                    "sin" => f.sin(),
+                    "cos" => f.cos(),
+                    "log10" => f.log10(),
+                    "log2" => f.log2(),
+                    "sqrt" => f.sqrt(),
+                    "ceil" => f.ceil(),
+                    "floor" => f.floor(),
                     _ => bug!(),
                 };
                 this.write_scalar(Scalar::from_u64(res.to_bits()), dest)?;
@@ -950,6 +968,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             | "hypot"
             | "atan2"
             | "fdim"
+            | "pow"
+            | "fmod"
             => {
                 let [f1, f2] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 // FIXME: Using host floats.
@@ -958,6 +978,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let res = match link_name.as_str() {
                     "_hypot" | "hypot" => f1.hypot(f2),
                     "atan2" => f1.atan2(f2),
+                    "pow" => f1.powf(f2),
+                    "fmod" => f1 % f2,
                     #[allow(deprecated)]
                     "fdim" => f1.abs_sub(f2),
                     _ => bug!(),

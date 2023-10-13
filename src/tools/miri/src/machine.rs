@@ -2,9 +2,7 @@
 //! `Machine` trait.
 use inkwell::miri::StackTrace;
 use inkwell::values::GenericValueRef;
-
-use std::fs::OpenOptions;
-use std::{borrow::Cow, fs::File};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt;
 use std::path::Path;
@@ -36,6 +34,7 @@ use rustc_span::{SpanData, Symbol};
 use rustc_target::abi::{Align, Size};
 use rustc_target::spec::abi::Abi;
 
+use crate::shims::llvm::logging::LLVMLogger;
 use crate::{
     concurrency::{data_race, weak_memory},
     shims::unix::FileHandler,
@@ -542,9 +541,7 @@ pub struct MiriMachine<'mir, 'tcx> {
 
     /// Whether to collect a backtrace when each allocation is created, just in case it leaks.
     pub(crate) collect_leak_backtraces: bool,
-    pub(crate) llvm_bc_log_path: Option<PathBuf>,
-    pub(crate) llvm_call_logs_path: Option<File>,
-
+    pub(crate) llvm_logger: Option<LLVMLogger>,
     /// The spans we will use to report where an allocation was created and deallocated in
     /// diagnostics.
     pub(crate) allocation_spans: RefCell<FxHashMap<AllocId, (Span, Option<Span>)>>,
@@ -603,34 +600,6 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
         let stack_addr = if tcx.pointer_size().bits() < 32 { page_size } else { page_size * 32 };
         let stack_size =
             if tcx.pointer_size().bits() < 32 { page_size * 4 } else { page_size * 16 };
-
-            
-        let llvm_bc_log_path = if config.llvm_log && !config.disable_bc {
-            let mut cwd = std::env::current_dir().unwrap();
-            if cwd.exists() && cwd.is_dir() {
-                cwd.push("llvm_bc.csv");
-                Some(cwd)
-            }else{
-                tcx.sess.fatal("Unable to resolve current directory for LLVM logging outputxc.");
-            }
-        }else {
-            None
-        };
-        let llvm_call_logs_path = if config.llvm_log && !config.disable_bc {
-            let mut cwd = std::env::current_dir().unwrap();
-            if cwd.exists() && cwd.is_dir() {
-                cwd.push("llvm_calls.csv");
-                // delete the file if it exists
-                if cwd.exists() {
-                    std::fs::remove_file(&cwd).unwrap();
-                }
-                Some(OpenOptions::new().create(true).append(true).open(cwd).unwrap())
-            }else{
-                tcx.sess.fatal("Unable to resolve current directory for LLVM logging outputxc.");
-            }
-        } else {
-            None
-        };
 
         MiriMachine {
             tcx,
@@ -714,8 +683,11 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
             stack_addr,
             stack_size,
             collect_leak_backtraces: config.collect_leak_backtraces,
-            llvm_bc_log_path,
-            llvm_call_logs_path,
+            llvm_logger: if config.llvm_log && !config.disable_bc {
+                LLVMLogger::new()
+            } else {
+                None
+            },
             allocation_spans: RefCell::new(FxHashMap::default()),
         }
     }
@@ -909,8 +881,7 @@ impl VisitTags for MiriMachine<'_, '_> {
             page_size: _,
             stack_addr: _,
             stack_size: _,
-            llvm_bc_log_path: _,
-            llvm_call_logs_path: _,
+            llvm_logger: _,
             collect_leak_backtraces: _,
             allocation_spans: _,
         } = self;

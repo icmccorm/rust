@@ -9,3 +9,5 @@ pub mod convert;
 pub mod hooks;
 pub mod threads;
 pub mod values;
+
+pub mod logging;

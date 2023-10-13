@@ -11,16 +11,12 @@ use crate::{MiriInterpCx, MiriInterpCxExt};
 use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, MiriInterpCxOpaque};
 use inkwell::module::Module;
-use inkwell::support::LLVMString;
 pub use inkwell::values::FunctionValue;
 use log::debug;
 use ouroboros::self_referencing;
 use parking_lot::ReentrantMutex;
 use rustc_hash::FxHashSet;
 use std::cell::RefCell;
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 
 #[self_referencing]
@@ -41,33 +37,19 @@ pub static LLVM_INTERPRETER: ReentrantMutex<RefCell<Option<LLI>>> =
     ReentrantMutex::new(RefCell::new(None));
 
 impl LLI {
-    fn log_path(file: &mut File, path: PathBuf, status: Result<(), LLVMString>) {
-        let failed = u8::from(status.is_err());
-        let message = status.as_ref().err().map(|e| e.to_string()).unwrap_or("".to_string());
-        let entry = format!("{},{},{}\n", path.to_string_lossy(), failed, message);
-        file.write_all(entry.as_bytes()).unwrap();
-        file.flush().unwrap();
-    }
-
     pub fn create(miri: &mut MiriInterpCx<'_, '_>, paths: &FxHashSet<PathBuf>) -> Self {
         let result = LLITryBuilder {
             context: Context::create(),
             module_builder: |ctx| {
                 let module = Context::create_module(ctx, "main");
-                let mut log_file =
-                    miri.eval_context_ref().machine.llvm_bc_log_path.clone().map(|path| {
-                        if path.exists() {
-                            std::fs::remove_file(&path).unwrap();
-                        }
-                        OpenOptions::new().create(true).append(true).open(path).unwrap()
-                    });
+
                 for path in paths.iter() {
                     debug!("LLVM: {}", path.to_string_lossy());
                     match Module::parse_bitcode_from_path(path.clone(), ctx) {
                         Ok(m) => {
                             let error = module.link_in_module(m.clone());
-                            if let Some(ref mut file) = log_file {
-                                LLI::log_path(file, path.clone(), error);
+                            if let Some(logger) = & mut miri.eval_context_mut().machine.llvm_logger {
+                                logger.log_bytecode(path, error);
                             }
                         }
                         Err(err) =>
