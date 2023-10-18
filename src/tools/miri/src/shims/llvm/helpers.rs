@@ -38,28 +38,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         gvty: &GenericValueTy,
     ) -> InterpResult<'tcx, TyAndLayout<'tcx>> {
         let this = self.eval_context_ref();
-        match gvty.ty() {
-            BasicTypeEnum::PointerType(_) => {
-                let miri_pointer = gvty.val_ref.as_miri_pointer();
-                let as_rust_pointer = this.lli_wrapped_pointer_to_maybe_pointer(miri_pointer);
-                match this.maybe_alloc_id(as_rust_pointer) {
-                    Some(alloc_id) => {
-                        let (_, align, _) = this.get_alloc_info(alloc_id);
-                        let core_type = match align.bytes() {
-                            8 => this.tcx.types.u8,
-                            16 => this.tcx.types.u16,
-                            32 => this.tcx.types.u32,
-                            64 => this.tcx.types.u64,
-                            128 => this.tcx.types.u128,
-                            _ => this.tcx.types.u8,
-                        };
-                        this.raw_pointer_to(core_type)
-                    }
-                    None => this.raw_pointer_to(this.tcx.types.u8),
-                }
-            }
-            _ => this.get_equivalent_rust_layout(gvty.ty()),
-        }
+        this.get_equivalent_rust_layout(gvty.ty())
     }
 
     fn get_equivalent_rust_layout(
@@ -83,16 +62,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     128 => ctx.layout_of(ctx.tcx.types.u128),
                     _ => throw_unsup_llvm_type!(it),
                 },
-            BasicTypeEnum::PointerType(pt) => {
-                match pt.get_alignment().get_zero_extended_constant() {
-                    Some(8) => ctx.raw_pointer_to(ctx.tcx.types.u8),
-                    Some(16) => ctx.raw_pointer_to(ctx.tcx.types.u16),
-                    Some(32) => ctx.raw_pointer_to(ctx.tcx.types.u32),
-                    Some(64) => ctx.raw_pointer_to(ctx.tcx.types.u64),
-                    Some(128) => ctx.raw_pointer_to(ctx.tcx.types.u128),
-                    _ => ctx.raw_pointer_to(ctx.tcx.types.u8),
-                }
-            }
+            BasicTypeEnum::PointerType(_) => ctx.raw_pointer_to(ctx.tcx.types.u8),
             _ => throw_unsup_llvm_type!(ty),
         }
     }

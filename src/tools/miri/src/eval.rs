@@ -161,7 +161,8 @@ pub struct MiriConfig {
     /// Whether to collect a backtrace when each allocation is created, just in case it leaks.
     pub collect_leak_backtraces: bool,
     /// Whether to log LLVM bytecode and function calls to files
-    pub llvm_log: bool
+    pub llvm_log: bool,
+    pub singular_llvm_bc_file: Option<PathBuf>,
 }
 
 impl Default for MiriConfig {
@@ -201,7 +202,8 @@ impl Default for MiriConfig {
             num_cpus: 1,
             page_size: None,
             collect_leak_backtraces: true,
-            llvm_log: false
+            llvm_log: false,
+            singular_llvm_bc_file: None,
         }
     }
 }
@@ -450,9 +452,17 @@ pub fn eval_entry<'tcx>(
         }
     };
 
-    if !config.disable_bc && !config.external_bc_files.is_empty() {
+    if !config.disable_bc
+        && (!config.external_bc_files.is_empty() || config.singular_llvm_bc_file.is_some())
+    {
         let mg = LLVM_INTERPRETER.lock();
-        mg.replace(Some(LLI::create(&mut ecx, &config.external_bc_files)));
+        if let Some(path_buff) = config.singular_llvm_bc_file {
+            let mut set = FxHashSet::default();
+            set.insert(path_buff);
+            mg.replace(Some(LLI::create(&mut ecx, &set)));
+        } else {
+            mg.replace(Some(LLI::create(&mut ecx, &config.external_bc_files)));
+        }
     }
 
     // Perform the main execution.

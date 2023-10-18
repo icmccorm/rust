@@ -110,7 +110,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             (llvm_parameter_types.as_slice(), ThreadLinkDestination::ToMiriDefault(dest.clone()))
         };
 
-        if args.len() > llvm_parameter_types.len() {
+        if args.len() > llvm_parameter_types.len() && !function.get_type().is_var_arg() {
             throw_llvm_argument_mismatch!(function, args.len());
         }
 
@@ -122,7 +122,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
         let scalar_pair_expansion = args.len() < llvm_parameter_types.len();
 
-        debug!("link={}, sret={:?}", thread_link_destination, has_sret);
+        debug!("link={}, sret={:?}, scalar-expand={:?}", thread_link_destination, has_sret, scalar_pair_expansion);
 
         let last_type = llvm_parameter_types.first().copied();
         let original_arg_length = args.len();
@@ -137,7 +137,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             let num_types_remaining = llvm_parameter_types.len() - 1;
             let num_args_remaining = args.len();
             if scalar_pair_expansion
-                && num_types_remaining >= 2
+                && num_types_remaining >= 1
                 && num_types_remaining > num_args_remaining
                 && (*llvm_parameter_types.last().unwrap()
                     == llvm_parameter_types[llvm_parameter_types.len() - 1])

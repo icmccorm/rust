@@ -45,42 +45,49 @@ fn convert_opty_to_generic_value<'tcx, 'lli>(
 
             Ok(convert_opty_to_aggregate(ctx, opty, llvm_field_types)?)
         }
-        BasicTypeEnum::FloatType(ft) => {
-            let scalar = ctx.read_scalar(opty)?;
-            if let Scalar::Int(si) = scalar {
-                match bte.get_llvm_type_kind() {
-                    llvm_sys::LLVMTypeKind::LLVMFloatTypeKind => {
-                        if si.size() != Size::from_bytes(std::mem::size_of::<f32>()) {
-                            throw_rust_type_mismatch!(opty.layout, ft);
-                        }
-                        let bits = scalar.to_f32()?.to_bits();
-                        let bytes = ctx.to_vec_endian(bits, opty.layout.size.bytes_usize());
-                        let float = f32::from_ne_bytes(bytes.try_into().unwrap());
-                        debug!("[Op to GV]: Float value: {}", float);
-                        Ok(GenericValue::new_f32(float))
-                    }
-                    llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind => {
-                        if si.size() != Size::from_bytes(std::mem::size_of::<f64>()) {
-                            if si.size() != Size::from_bytes(std::mem::size_of::<f32>()) {
-                                throw_rust_type_mismatch!(opty.layout, ft);
+        BasicTypeEnum::FloatType(ft) =>
+            match opty.layout.abi {
+                rustc_abi::Abi::Scalar(_) => {
+                    let scalar = ctx.read_scalar(opty)?;
+                    if let Scalar::Int(si) = scalar {
+                        match bte.get_llvm_type_kind() {
+                            llvm_sys::LLVMTypeKind::LLVMFloatTypeKind => {
+                                if si.size() != Size::from_bytes(std::mem::size_of::<f32>()) {
+                                    throw_rust_type_mismatch!(opty.layout, ft);
+                                }
+                                let bits = scalar.to_f32()?.to_bits();
+                                let bytes = ctx.to_vec_endian(bits, opty.layout.size.bytes_usize());
+                                let float = f32::from_ne_bytes(bytes.try_into().unwrap());
+                                debug!("[Op to GV]: Float value: {}", float);
+                                Ok(GenericValue::new_f32(float))
+                            }
+                            llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind => {
+                                if si.size() != Size::from_bytes(std::mem::size_of::<f64>()) {
+                                    if si.size() != Size::from_bytes(std::mem::size_of::<f32>()) {
+                                        throw_rust_type_mismatch!(opty.layout, ft);
+                                    }
+                                }
+                                let double = scalar.to_f64()?.to_bits();
+                                let bytes =
+                                    ctx.to_vec_endian(double, opty.layout.size.bytes_usize());
+                                let double = f64::from_ne_bytes(bytes.try_into().unwrap());
+                                debug!("[Op to GV]: Double value: {}", double);
+                                Ok(GenericValue::new_f64(double))
+                            }
+                            _ => {
+                                let bits = si.assert_bits(opty.layout.size);
+                                let bytes = ctx.to_vec_endian(bits, opty.layout.size.bytes_usize());
+                                Ok(GenericValue::from_byte_slice(&bytes))
                             }
                         }
-                        let double = scalar.to_f64()?.to_bits();
-                        let bytes = ctx.to_vec_endian(double, opty.layout.size.bytes_usize());
-                        let double = f64::from_ne_bytes(bytes.try_into().unwrap());
-                        debug!("[Op to GV]: Double value: {}", double);
-                        Ok(GenericValue::new_f64(double))
-                    }
-                    _ => {
-                        let bits = si.assert_bits(opty.layout.size);
-                        let bytes = ctx.to_vec_endian(bits, opty.layout.size.bytes_usize());
-                        Ok(GenericValue::from_byte_slice(&bytes))
+                    } else {
+                        throw_rust_type_mismatch!(opty.layout, ft);
                     }
                 }
-            } else {
-                throw_rust_type_mismatch!(opty.layout, ft);
-            }
-        }
+                _ => {
+                    throw_rust_type_mismatch!(opty.layout, ft);
+                }
+            },
         BasicTypeEnum::IntType(it) =>
             match opty.layout.abi {
                 rustc_abi::Abi::Scalar(sc) => {
@@ -88,7 +95,7 @@ fn convert_opty_to_generic_value<'tcx, 'lli>(
                         let mp = opty.assert_mem_place();
                         let ptr = mp.ptr();
                         let alloc =
-                            ctx.get_ptr_alloc(ptr, value.size(ctx), value.align(ctx).pref)?;
+                            ctx.get_ptr_alloc(ptr, value.size(ctx), value.align(ctx).abi)?;
                         if let Some(a) = alloc {
                             a.read_scalar(alloc_range(Size::ZERO, value.size(ctx)), true)?
                         } else {
@@ -144,13 +151,12 @@ fn convert_opty_to_generic_value<'tcx, 'lli>(
                     throw_rust_type_mismatch!(opty.layout, pt);
                 }
                 match opty.layout.abi {
-                    rustc_abi::Abi::Scalar(_) | rustc_abi::Abi::ScalarPair(_, _) =>
-                        ctx.read_pointer(opty)?,
+                    rustc_abi::Abi::Scalar(_) => ctx.read_pointer(opty)?,
                     _ =>
                         if let Left(mp) = opty.as_mplace_or_imm() {
                             mp.ptr()
                         } else {
-                            ctx.read_pointer(opty)?
+                            throw_rust_type_mismatch!(opty.layout, pt);
                         },
                 }
             };

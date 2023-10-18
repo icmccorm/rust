@@ -1,5 +1,6 @@
 use super::memory::obtain_ctx_mut;
 use crate::concurrency::thread::EvalContextExt as ThreadEvalContextExt;
+use crate::helpers::EvalContextExt as HelperEvalContextExt;
 use crate::shims::foreign_items::EmulateByNameResult;
 use crate::shims::foreign_items::EvalContextExt as ForeignEvalContextExt;
 use crate::shims::llvm::convert::to_bytes::EvalContextExt as ToBytesEvalContextExt;
@@ -156,8 +157,9 @@ fn miri_call_by_name_result<'tcx>(
             ctx.resolve_llvm_interface_unchecked(tref, args_ref);
         debug!("LLVM to Shim: {:?}, TID: {:?}", name_rust_str, ctx.get_active_thread());
 
-        let group_id = ctx.eval_context_ref().machine.threads.get_thread_group(ctx.get_active_thread());
-        if let Some(logger) = & mut ctx.eval_context_mut().machine.llvm_logger {
+        let group_id =
+            ctx.eval_context_ref().machine.threads.get_thread_group(ctx.get_active_thread());
+        if let Some(logger) = &mut ctx.eval_context_mut().machine.llvm_logger {
             logger.log_llvm_call(name_rust_str, group_id, None);
         }
 
@@ -318,10 +320,12 @@ fn miri_call_by_name_result<'tcx>(
                             let dest = ctx.opty_as_scalar(&op_ty_args[0])?;
                             let dest_as_pointer = dest.to_pointer(ctx)?;
                             let bytes = ctx.scalar_to_bytes(Scalar::from_u64(num_secs), layout);
-                            ctx.write_bytes_ptr(dest_as_pointer, bytes.clone())?;
+                            if !ctx.ptr_is_null(dest_as_pointer)? {
+                                ctx.write_bytes_ptr(dest_as_pointer, bytes.clone())?;
+                            }
                             GenericValue::from_byte_slice(&bytes)
                         }
-                        Err(_) => panic!("SystemTime before UNIX EPOCH.s"),
+                        Err(_) => panic!("SystemTime before UNIX EPOCH."),
                     }
                 },
             "strchr" =>

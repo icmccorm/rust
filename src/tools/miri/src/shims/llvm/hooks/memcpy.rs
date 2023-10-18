@@ -74,17 +74,14 @@ pub fn eval_memcpy<'tcx>(
                 function
             )
         }
-        let error = ctx.mem_copy(
+        ctx.mem_copy(
             src_as_pointer,
             Align::ONE,
             dest_as_pointer,
             Align::ONE,
             Size::from_bytes(length_value),
             nonoverlapping,
-        );
-        if error.is_err() {
-            throw_interop_format!("invalid memory copy with {}", function)
-        }
+        )?;
     }
     let as_miri_ptr = ctx.pointer_to_lli_wrapped_pointer(dest_as_pointer);
     let as_gv = unsafe { GenericValue::create_generic_value_of_miri_pointer(as_miri_ptr) };

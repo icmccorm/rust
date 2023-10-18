@@ -1121,23 +1121,19 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     _ => Ok(EmulateByNameResult::NotSupported),
                 };
                 if let Ok(EmulateByNameResult::NotSupported) = shim_result {
-                    if !this.machine.external_bc_files.is_empty() {
-                        use crate::shims::llvm_ffi_support::EvalContextExt as _;
-                        // An Ok(false) here means that the function being called was not exported
-                        // by the specified `.bc` file; we should continue and check if it corresponds to
-                        // a provided shim.
-                        //
-                        // We only do this if we're not already executing LLVM code, because otherwise
-                        // we would end up with endless stack overflows in cases where a system call is
-                        // exposed as an LLVM function, but implemented in terms of itself.
-
-                        // TODO: When multithreading is added, check the thread ID
-                        if this.has_llvm_interpreter()
-                            && !this.thread_is_lli_thread(this.get_active_thread())?
-                        {
-                            if this.call_external_llvm_fct(link_name, dest, args)? {
-                                return Ok(EmulateByNameResult::NeedsJumping);
-                            }
+                    use crate::shims::llvm_ffi_support::EvalContextExt as _;
+                    // An Ok(false) here means that the function being called was not exported
+                    // by the specified `.bc` file; we should continue and check if it corresponds to
+                    // a provided shim.
+                    //
+                    // We only do this if we're not already executing LLVM code, because otherwise
+                    // we would end up with endless stack overflows in cases where a system call is
+                    // exposed as an LLVM function, but implemented in terms of itself.
+                    if this.has_llvm_interpreter()
+                        && !this.thread_is_lli_thread(this.get_active_thread())?
+                    {
+                        if this.call_external_llvm_fct(link_name, dest, args)? {
+                            return Ok(EmulateByNameResult::NeedsJumping);
                         }
                     }
                 }

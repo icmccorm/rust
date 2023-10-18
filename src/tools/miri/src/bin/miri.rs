@@ -89,14 +89,13 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
                 env::set_current_dir(cwd).unwrap();
             }
             
-            if !config.disable_bc {
+            if !config.disable_bc && config.external_bc_files.is_empty() && config.singular_llvm_bc_file.is_none() {
                 let cwd = env::current_dir().unwrap();
                 if cwd.exists() && cwd.is_dir() {
                     config.external_bc_files.extend(collect_llvm_bytecode(cwd));
                 }else{
                     tcx.sess.fatal("Unable to resolve CARGO_TARGET_DIR.");
                 }
-    
                 if !config.external_bc_files.is_empty() {
                     config.provenance_mode = ProvenanceMode::Permissive;
                 }
@@ -547,6 +546,12 @@ fn main() {
             };
         } else if arg == "-Zmiri-disable-bc" {
             miri_config.disable_bc = true
+        } else if let Some(param) = arg.strip_prefix("-Zmiri-llvm-bc-singular=") { 
+            let path = std::path::Path::new(&param);
+            if !path.exists() {
+                show_error!("-Zmiri-llvm-bc-singular= `{}` does not exist", param);
+            }
+            miri_config.singular_llvm_bc_file = Some(path.to_path_buf());
         } else if let Some(param) = arg.strip_prefix("-Zmiri-extern-bc=") {
             let csv_filenames = param.to_string();
             for filename in csv_filenames.split(',') {
