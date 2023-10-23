@@ -546,27 +546,18 @@ fn main() {
             };
         } else if arg == "-Zmiri-disable-bc" {
             miri_config.disable_bc = true
-        } else if let Some(param) = arg.strip_prefix("-Zmiri-llvm-bc-singular=") { 
-            let path = std::path::Path::new(&param);
-            if !path.exists() {
-                show_error!("-Zmiri-llvm-bc-singular= `{}` does not exist", param);
-            }
-            miri_config.singular_llvm_bc_file = Some(path.to_path_buf());
-        } else if let Some(param) = arg.strip_prefix("-Zmiri-extern-bc=") {
-            let csv_filenames = param.to_string();
-            for filename in csv_filenames.split(',') {
-                let path = std::path::Path::new(&filename);
-                if path.exists() {
-                    if path.is_dir() {
-                        let llvm_files = collect_llvm_bytecode(path.to_path_buf());
-                        miri_config.external_bc_files.extend(llvm_files);
-                    } else {
-                        let canon_path = fs::canonicalize(path);
-                        miri_config.external_bc_files.insert(canon_path.unwrap());
-                    }
-                } else {
-                    show_error!("-Zmiri-extern-bc `{}` does not exist", filename);
+        } else if let Some(param) = arg.strip_prefix("-Zmiri-extern-bc-file=") {
+            let filename = param.to_string();
+            if std::path::Path::new(&filename).exists() {
+                if let Some(other_filename) = miri_config.singular_llvm_bc_file {
+                    show_error!(
+                        "-Zmiri-extern-bc-file= is already set to {}",
+                        other_filename.display()
+                    );
                 }
+                miri_config.singular_llvm_bc_file = Some(filename.into());
+            } else {
+                show_error!("-Zmiri-extern-bc-file `{}` does not exist", filename);
             }
         } else if let Some(param) = arg.strip_prefix("-Zmiri-extern-so-file=") {
             let filename = param.to_string();
