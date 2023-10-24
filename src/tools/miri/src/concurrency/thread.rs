@@ -3,7 +3,6 @@ use inkwell::types::AsTypeRef;
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::{FunctionValue, GenericValueRef};
 use log::{debug, trace};
-
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
 use std::num::TryFromIntError;
@@ -860,9 +859,35 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
+    fn run_lli_function_to_completion<'lli>(
+        &mut self,
+        function: FunctionValue<'lli>,
+    ) -> InterpResult<'tcx> {
+        debug!(
+            "Running LLI function {:?} to completion",
+            function.get_name().to_string_lossy().to_string()
+        );
+        let this = self.eval_context_mut();
+        let active_thread = this.get_active_thread();
+        if let Some(logger) = &mut this.machine.llvm_logger {
+            logger.log_llvm_call(
+                function.get_name().to_string_lossy().to_string().as_str(),
+                active_thread,
+                None,
+            );
+        }
+        this.create_lli_thread(active_thread, function, vec![].as_slice())?;
+        let mut terminated = false;
+        while !terminated {
+            terminated = this.step_lli_thread(active_thread)?;
+        }
+        this.terminate_lli_thread(active_thread);
+        Ok(())
+    }
+
     fn start_rust_to_lli_thread<'lli>(
         &mut self,
-        link_type: ThreadLinkDestination<'tcx>,
+        link_type: Option<ThreadLinkDestination<'tcx>>,
         function: FunctionValue<'lli>,
         mut args: Vec<GenericValueRef>,
     ) -> InterpResult<'tcx, ThreadId> {
@@ -883,23 +908,25 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         debug!("Created Miri thread object for Rust to LLI call, TID: {:?}", group_id);
 
         let name = function.get_name().to_str().unwrap();
-        if let Some(logger) = & mut this.machine.llvm_logger {
-            logger.log_llvm_call(name, group_id, Some(&link_type));
+        if let Some(logger) = &mut this.machine.llvm_logger {
+            logger.log_llvm_call(name, group_id, link_type.as_ref());
         }
 
         this.create_lli_thread(uninit_thread_id, function, args.as_slice())?;
+        if let Some(link_type) = link_type {
+            let mut link = ThreadLink::new(
+                prev,
+                uninit_thread_id,
+                link_type,
+                ThreadLinkSource::FromLLI(
+                    function.get_type().get_return_type().map(|bte| bte.as_type_ref()),
+                ),
+            );
+            let _ = args.drain(0..).map(|arg| link.take_ownership(ThreadLinkAllocation::LLI(arg)));
 
-        let mut link = ThreadLink::new(
-            prev,
-            uninit_thread_id,
-            link_type,
-            ThreadLinkSource::FromLLI(
-                function.get_type().get_return_type().map(|bte| bte.as_type_ref()),
-            ),
-        );
-        let _ = args.drain(0..).map(|arg| link.take_ownership(ThreadLinkAllocation::LLI(arg)));
+            this.active_thread_mut().thread_kind.set(ThreadKind::LLVM(link));
+        }
 
-        this.active_thread_mut().thread_kind.set(ThreadKind::LLVM(link));
         let init_thread_id = this.set_active_thread(prev);
 
         this.join_thread(init_thread_id)?;
@@ -947,7 +974,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let link_destination = ThreadLinkDestination::ToLLI(lli_return_type);
 
         let instance_name = this.tcx.item_name(inst.def_id());
-        if let Some(logger) = & mut this.machine.llvm_logger {
+        if let Some(logger) = &mut this.machine.llvm_logger {
             logger.log_llvm_call(instance_name.as_str(), group_id, Some(&link_destination));
         }
 

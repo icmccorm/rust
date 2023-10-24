@@ -178,6 +178,7 @@ fn miri_call_by_name_result<'tcx>(
         let args = op_ty_args.as_slice();
 
         let gv_to_return = match name_rust_str {
+            "__cxa_atexit" => ctx.void_generic_value(),
             //void *malloc(size_t size);
             "malloc" | "_Znwm" =>
                 if num_args == 1 {

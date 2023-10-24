@@ -870,6 +870,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             | "sinhf"
             | "tanf"
             | "tanhf"
+            | "cosf"
+            | "sinf"
             | "acosf"
             | "asinf"
             | "atanf"
@@ -887,6 +889,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     "tanf" => f.tan(),
                     "tanhf" => f.tanh(),
                     "acosf" => f.acos(),
+                    "cosf" => f.cos(),
+                    "sinf" => f.sin(),
                     "asinf" => f.asin(),
                     "atanf" => f.atan(),
                     "log1pf" => f.ln_1p(),

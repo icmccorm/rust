@@ -20,21 +20,18 @@ pub fn obtain_ctx_mut(
 pub extern "C-unwind" fn llvm_malloc(
     ctx_raw: *mut MiriInterpCxOpaque,
     bytes: u64,
-    alignment: u64,
+    _alignment: u64,
     is_static: bool,
 ) -> MiriPointer {
     let ctx = obtain_ctx_mut(ctx_raw);
     let kind = if is_static { MiriMemoryKind::LLVMStatic } else { MiriMemoryKind::LLVMStack };
-    let allocation = ctx.malloc_align(bytes, alignment, !is_static, kind);
+    let allocation = ctx.malloc(bytes, false, kind);
     if let Ok(ptr) = allocation {
         if let Some(crate::Provenance::Concrete { alloc_id, .. }) = ptr.provenance {
             if is_static {
                 ctx.machine.static_roots.push(alloc_id);
             }
-            debug!(
-                "[llvm_malloc] AID: {:?}, bytes: {}, alignment: {}, is_static: {}",
-                alloc_id, bytes, alignment, is_static
-            );
+            debug!("[llvm_malloc] AID: {:?}, bytes: {}, is_static: {}", alloc_id, bytes, is_static);
             ctx.pointer_to_lli_wrapped_pointer(ptr)
         } else {
             panic_any("malloc returned a pointer with a non-AllocID provenance");

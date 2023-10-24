@@ -205,7 +205,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
     fn set_pending_return_value(&mut self, id: ThreadId, val_ref: GenericValueRef) {
         let this = self.eval_context_mut();
-        this.machine.pending_return_values.try_insert(id, val_ref).unwrap();
+        if id.to_u32() == 0 {
+            this.machine.pending_return_values.insert(id, val_ref);
+        } else {
+            this.machine.pending_return_values.try_insert(id, val_ref).unwrap();
+        }
     }
 
     fn get_pending_return_value(

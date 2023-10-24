@@ -53,7 +53,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     }
 
     fn terminate_lli_thread(&self, id: ThreadId) {
-        if let Some(ll) = LLVM_INTERPRETER.lock().borrow_mut().as_mut() {
+        if let Some(ll) = LLVM_INTERPRETER.lock().borrow().as_ref() {
             ll.with_engine(|engine| {
                 unsafe {
                     engine.as_ref().unwrap().terminate_thread(id.into());
@@ -163,7 +163,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             .map(|gv| GenericValueRef::new(unsafe { gv.into_raw() }))
             .collect::<Vec<_>>();
         let lli_thread_id =
-            this.start_rust_to_lli_thread(thread_link_destination, function, exposed)?;
+            this.start_rust_to_lli_thread(Some(thread_link_destination), function, exposed)?;
         debug!("Started LLI Thread, TID: {:?}", lli_thread_id);
         Ok(())
     }

@@ -22,7 +22,7 @@ use rustc_middle::{
 use rustc_target::abi::FIRST_VARIANT;
 use std::cell::Cell;
 use std::fmt::Formatter;
-
+use crate::rustc_const_eval::interpret::Projectable;
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
 
 #[derive(Debug, Clone)]
@@ -248,7 +248,8 @@ fn convert_to_opty<'tcx>(
         rustc_abi::Abi::Scalar(_) => {
             let scalar_op = OpTy::from(convert_to_immty(miri, ctx)?);
             if let Some(existing) = ctx.destination.get_mut() {
-                miri.copy_op(&scalar_op, existing, true)?;
+                let op_transmuted = scalar_op.transmute(existing.layout, miri)?;
+                miri.copy_op(&op_transmuted, existing, true)?;
             }
             Ok((scalar_op, ctx.get_destination()))
         }
@@ -388,7 +389,7 @@ fn convert_to_immty<'tcx>(
                         Scalar::from_uint(converted_int, ctx.rust_layout.size)
                     };
                     return Ok(ImmTy::from_scalar(scalar, ctx.rust_layout));
-                }
+                } 
                 BasicTypeEnum::PointerType(_) => {
                     let wrapped_pointer = generic.val_ref.as_miri_pointer();
                     let mp = miri.lli_wrapped_pointer_to_maybe_pointer(wrapped_pointer);
@@ -396,22 +397,7 @@ fn convert_to_immty<'tcx>(
                         "[GV to Op]: Provenance: (AID: {}, Addr: {})",
                         wrapped_pointer.prov.alloc_id, wrapped_pointer.addr
                     );
-                    // LLVM16 pointers are opaque; we cannot determine a pointee type.
-                    // Figuring out the types required for a shim call at this stage would
-                    // require a significant rewrite for the shim API. So instead,
-                    // we use u8 when provenance is wildcard or undefined and calculate the
-                    // maximum size up to a u128 otherwise.
-                    let pointer_ty_layout =
-                        if let Some(crate::Provenance::Concrete { alloc_id, .. }) = mp.provenance {
-                            let (size, _, _) = miri.get_alloc_info(alloc_id);
-                            let base =
-                                intptrcast::GlobalStateInner::alloc_base_addr(miri, alloc_id)?;
-                            let diff = base + size.bytes() - mp.addr().bytes();
-                            nearest_pointer_type(miri, diff)?
-                        } else {
-                            ctx.rust_layout
-                        };
-                    debug!("Adjusted pointer type: {:?}", pointer_ty_layout.ty);
+                    let pointer_ty_layout = ctx.rust_layout;
                     let scalar = Scalar::from_maybe_pointer(mp, miri);
                     let imm = ImmTy::from_scalar(scalar, pointer_ty_layout);
                     return Ok(imm);
@@ -443,24 +429,4 @@ fn convert_to_immty<'tcx>(
             return Ok(ImmTy::from_scalar(scalar, layout));
         }
     }
-}
-
-fn nearest_pointer_type<'tcx>(
-    miri: &MiriInterpCx<'_, 'tcx>,
-    diff: u64,
-) -> InterpResult<'tcx, TyAndLayout<'tcx>> {
-    let pointee_type = if diff >= 16 {
-        miri.tcx.types.u128
-    } else if diff >= 8 {
-        miri.tcx.types.u64
-    } else if diff >= 4 {
-        miri.tcx.types.u32
-    } else if diff >= 2 {
-        miri.tcx.types.u16
-    } else if diff >= 1 {
-        miri.tcx.types.u8
-    } else {
-        miri.tcx.types.unit
-    };
-    miri.raw_pointer_to(pointee_type)
 }

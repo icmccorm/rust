@@ -455,14 +455,18 @@ pub fn eval_entry<'tcx>(
     if !config.disable_bc
         && (!config.external_bc_files.is_empty() || config.singular_llvm_bc_file.is_some())
     {
-        let mg = LLVM_INTERPRETER.lock();
-        if let Some(path_buff) = config.singular_llvm_bc_file {
-            let mut set = FxHashSet::default();
-            set.insert(path_buff);
-            mg.replace(Some(LLI::create(&mut ecx, &set)));
-        } else {
-            mg.replace(Some(LLI::create(&mut ecx, &config.external_bc_files)));
-        }
+        LLVM_INTERPRETER.lock().replace_with(|_| {
+            let mut interpreter = if let Some(path_buff) = config.singular_llvm_bc_file {
+                let mut set = FxHashSet::default();
+                set.insert(path_buff);
+                LLI::create(&mut ecx, &set)
+            } else {
+                LLI::create(&mut ecx, &config.external_bc_files)
+            };
+            interpreter.initialize_engine(&mut ecx).unwrap();
+            Some(interpreter)
+        });
+        LLVM_INTERPRETER.lock().borrow().as_ref().unwrap().run_constructors(&mut ecx).unwrap();
     }
 
     // Perform the main execution.
@@ -481,6 +485,10 @@ pub fn eval_entry<'tcx>(
     // Machine cleanup. Only do this if all threads have terminated; threads that are still running
     // might cause Stacked Borrows errors (https://github.com/rust-lang/miri/issues/2396).
     if ecx.have_all_terminated() {
+        LLVM_INTERPRETER.lock().borrow_mut().take().map(|interpreter| {
+            interpreter.run_destructors(&mut ecx).expect("LLI destructor execution failed");
+            interpreter
+        });
         // Even if all threads have terminated, we have to beware of data races since some threads
         // might not have joined the main thread (https://github.com/rust-lang/miri/issues/2020,
         // https://github.com/rust-lang/miri/issues/2508).
