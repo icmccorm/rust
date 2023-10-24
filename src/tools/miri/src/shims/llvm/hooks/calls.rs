@@ -96,7 +96,7 @@ fn perform_opty_conversion<'tcx, 'lli>(
     if let Some(return_type) = return_type_opt {
         debug!("Preparing GV return value");
         let place_opty = ctx.place_to_op(return_place)?;
-        Ok(ctx.op_to_generic_value(&place_opty, *return_type)?)
+        Ok(ctx.op_to_generic_value(&place_opty, Some(*return_type))?)
     } else {
         debug!("Preparing void return value");
         Ok(ctx.void_generic_value())

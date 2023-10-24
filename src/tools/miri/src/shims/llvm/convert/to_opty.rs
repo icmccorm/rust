@@ -2,7 +2,7 @@ extern crate itertools;
 extern crate rustc_abi;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalExt;
 
-use crate::rustc_const_eval::interpret::Projectable;
+//use crate::rustc_const_eval::interpret::Projectable;
 use crate::shims::llvm::values::generic_value::GenericValueTy;
 use crate::{intptrcast, MiriInterpCx, Provenance};
 use inkwell::types::BasicTypeEnum;
@@ -248,8 +248,7 @@ fn convert_to_opty<'tcx>(
         rustc_abi::Abi::Scalar(_) => {
             let scalar_op = OpTy::from(convert_to_immty(miri, ctx)?);
             if let Some(existing) = ctx.destination.get_mut() {
-                let op_transmuted = scalar_op.transmute(existing.layout, miri)?;
-                miri.copy_op(&op_transmuted, existing, false)?;
+                miri.copy_op(&scalar_op, existing, true)?;
             }
             Ok((scalar_op, ctx.get_destination()))
         }

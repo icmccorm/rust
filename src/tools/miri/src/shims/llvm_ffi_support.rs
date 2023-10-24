@@ -28,6 +28,8 @@ macro_rules! throw_llvm_argument_mismatch {
     };
 }
 
+pub type ResolvedLLVMType<'a> = Option<BasicTypeEnum<'a>>;
+
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
 
 pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
@@ -103,7 +105,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     )
                 }
             };
-            let converted = this.op_to_generic_value(&op, *head)?;
+            let converted = this.op_to_generic_value(&op, Some(*head))?;
             generic_args.push(converted);
             (tail, alloc)
         } else {
@@ -114,7 +116,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             throw_llvm_argument_mismatch!(function, args.len());
         }
 
-        let mut llvm_parameter_types = llvm_parameter_types.to_vec();
+        let mut llvm_parameter_types: Vec<ResolvedLLVMType<'_>> =
+            llvm_parameter_types.to_vec().iter().map(|t| Some(*t)).collect();
         llvm_parameter_types.reverse();
 
         let mut args = args.to_vec();
@@ -122,14 +125,15 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
         let scalar_pair_expansion = args.len() < llvm_parameter_types.len();
 
-        debug!("link={}, sret={:?}, scalar-expand={:?}", thread_link_destination, has_sret, scalar_pair_expansion);
-
-        let last_type = llvm_parameter_types.first().copied();
+        debug!(
+            "link={}, sret={:?}, scalar-expand={:?}",
+            thread_link_destination, has_sret, scalar_pair_expansion
+        );
         let original_arg_length = args.len();
         while let Some(current_arg) = args.pop() {
             if llvm_parameter_types.is_empty() {
                 if function.get_type().is_var_arg() {
-                    llvm_parameter_types.push(last_type.unwrap());
+                    llvm_parameter_types.push(None);
                 } else {
                     throw_llvm_argument_mismatch!(function, original_arg_length);
                 }
@@ -142,12 +146,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 && (*llvm_parameter_types.last().unwrap()
                     == llvm_parameter_types[llvm_parameter_types.len() - 1])
             {
-                if let Some((first, second)) =
-                    this.resolve_scalar_pair(&current_arg, llvm_parameter_types.last().unwrap())?
-                {
-                    args.push(second);
-                    args.push(first);
-                    continue;
+                if let Some(t) = llvm_parameter_types.last().unwrap() {
+                    if let Some((first, second)) = this.resolve_scalar_pair(&current_arg, t)? {
+                        args.push(second);
+                        args.push(first);
+                        continue;
+                    }
                 }
             }
             let first_type = llvm_parameter_types.pop().unwrap();

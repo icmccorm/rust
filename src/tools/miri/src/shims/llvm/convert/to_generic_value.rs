@@ -2,6 +2,7 @@ extern crate either;
 extern crate rustc_abi;
 use super::to_bytes::EvalContextExt as ToBytesEvalExt;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalExt;
+use crate::shims::llvm_ffi_support::ResolvedLLVMType;
 use crate::{MiriInterpCx, Provenance};
 use either::Either::{Left, Right};
 use inkwell::{types::BasicTypeEnum, values::GenericValue};
@@ -22,7 +23,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn op_to_generic_value<'lli>(
         &mut self,
         opty: &OpTy<'tcx, Provenance>,
-        bte: BasicTypeEnum<'lli>,
+        bte: ResolvedLLVMType<'lli>,
     ) -> InterpResult<'tcx, GenericValue<'lli>> {
         let this = self.eval_context_mut();
         convert_opty_to_generic_value(this, opty, bte)
@@ -33,181 +34,226 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 fn convert_opty_to_generic_value<'tcx, 'lli>(
     ctx: &mut MiriInterpCx<'_, 'tcx>,
     opty: &OpTy<'tcx, Provenance>,
-    bte: BasicTypeEnum<'lli>,
+    bte: ResolvedLLVMType<'lli>,
 ) -> InterpResult<'tcx, GenericValue<'lli>> {
-    debug!("[Op to GV]: {:?} -> {:?}", opty.layout.ty, bte.print_to_string());
-    match bte {
-        BasicTypeEnum::ArrayType(at) => {
-            if !opty.layout.ty.is_adt() {
-                throw_rust_type_mismatch!(opty.layout, at);
-            }
-            let llvm_field_types = repeat(at.get_element_type()).take(at.len() as usize).collect();
+    if let Some(bte) = bte {
+        debug!("[Op to GV]: {:?} -> {:?}", opty.layout.ty, bte.print_to_string());
+        match bte {
+            BasicTypeEnum::ArrayType(at) => {
+                if !opty.layout.ty.is_adt() {
+                    throw_rust_type_mismatch!(opty.layout, at);
+                }
+                let llvm_field_types =
+                    repeat(at.get_element_type()).take(at.len() as usize).collect();
 
-            Ok(convert_opty_to_aggregate(ctx, opty, llvm_field_types)?)
-        }
-        BasicTypeEnum::FloatType(ft) =>
-            match opty.layout.abi {
-                rustc_abi::Abi::Scalar(_) => {
-                    let scalar = ctx.read_scalar(opty)?;
-                    if let Scalar::Int(si) = scalar {
-                        match bte.get_llvm_type_kind() {
-                            llvm_sys::LLVMTypeKind::LLVMFloatTypeKind => {
-                                if si.size() != Size::from_bytes(std::mem::size_of::<f32>()) {
-                                    throw_rust_type_mismatch!(opty.layout, ft);
-                                }
-                                let bits = scalar.to_f32()?.to_bits();
-                                let bytes = ctx.to_vec_endian(bits, opty.layout.size.bytes_usize());
-                                let float = f32::from_ne_bytes(bytes.try_into().unwrap());
-                                debug!("[Op to GV]: Float value: {}", float);
-                                Ok(GenericValue::new_f32(float))
-                            }
-                            llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind => {
-                                if si.size() != Size::from_bytes(std::mem::size_of::<f64>()) {
+                Ok(convert_opty_to_aggregate(ctx, opty, llvm_field_types)?)
+            }
+            BasicTypeEnum::FloatType(ft) =>
+                match opty.layout.abi {
+                    rustc_abi::Abi::Scalar(_) => {
+                        let scalar = ctx.read_scalar(opty)?;
+                        if let Scalar::Int(si) = scalar {
+                            match bte.get_llvm_type_kind() {
+                                llvm_sys::LLVMTypeKind::LLVMFloatTypeKind => {
                                     if si.size() != Size::from_bytes(std::mem::size_of::<f32>()) {
                                         throw_rust_type_mismatch!(opty.layout, ft);
                                     }
+                                    let bits = scalar.to_f32()?.to_bits();
+                                    let bytes =
+                                        ctx.to_vec_endian(bits, opty.layout.size.bytes_usize());
+                                    let float = f32::from_ne_bytes(bytes.try_into().unwrap());
+                                    debug!("[Op to GV]: Float value: {}", float);
+                                    Ok(GenericValue::new_f32(float))
                                 }
-                                let double = scalar.to_f64()?.to_bits();
-                                let bytes =
-                                    ctx.to_vec_endian(double, opty.layout.size.bytes_usize());
-                                let double = f64::from_ne_bytes(bytes.try_into().unwrap());
-                                debug!("[Op to GV]: Double value: {}", double);
-                                Ok(GenericValue::new_f64(double))
+                                llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind => {
+                                    if si.size() != Size::from_bytes(std::mem::size_of::<f64>()) {
+                                        if si.size() != Size::from_bytes(std::mem::size_of::<f32>())
+                                        {
+                                            throw_rust_type_mismatch!(opty.layout, ft);
+                                        }
+                                    }
+                                    let double = scalar.to_f64()?.to_bits();
+                                    let bytes =
+                                        ctx.to_vec_endian(double, opty.layout.size.bytes_usize());
+                                    let double = f64::from_ne_bytes(bytes.try_into().unwrap());
+                                    debug!("[Op to GV]: Double value: {}", double);
+                                    Ok(GenericValue::new_f64(double))
+                                }
+                                _ => {
+                                    let bits = si.assert_bits(opty.layout.size);
+                                    let bytes =
+                                        ctx.to_vec_endian(bits, opty.layout.size.bytes_usize());
+                                    Ok(GenericValue::from_byte_slice(&bytes))
+                                }
                             }
-                            _ => {
-                                let bits = si.assert_bits(opty.layout.size);
-                                let bytes = ctx.to_vec_endian(bits, opty.layout.size.bytes_usize());
-                                Ok(GenericValue::from_byte_slice(&bytes))
-                            }
+                        } else {
+                            throw_rust_type_mismatch!(opty.layout, ft);
                         }
-                    } else {
+                    }
+                    _ => {
                         throw_rust_type_mismatch!(opty.layout, ft);
                     }
-                }
-                _ => {
-                    throw_rust_type_mismatch!(opty.layout, ft);
-                }
-            },
-        BasicTypeEnum::IntType(it) =>
-            match opty.layout.abi {
-                rustc_abi::Abi::Scalar(sc) => {
-                    let scalar = if let rustc_abi::Scalar::Union { value } = sc {
-                        let mp = opty.assert_mem_place();
-                        let ptr = mp.ptr();
-                        let alloc =
-                            ctx.get_ptr_alloc(ptr, value.size(ctx), value.align(ctx).abi)?;
-                        if let Some(a) = alloc {
-                            a.read_scalar(alloc_range(Size::ZERO, value.size(ctx)), true)?
-                        } else {
-                            bug!("unable to resolve allocation for union scalar value.");
-                        }
-                    } else {
-                        ctx.read_scalar(opty)?
-                    };
-                    let bits = match scalar {
-                        Scalar::Int(si) =>
-                            match si.to_bits(opty.layout.size) {
-                                Ok(n) => n,
-                                Err(s) => si.to_bits(s).unwrap(),
-                            },
-                        Scalar::Ptr(p, _) => {
-                            let (_, addr) = p.into_parts();
-                            addr.bits().into()
-                        }
-                    };
-                    debug!("[Op to GV]: Int value: {}", u64::try_from(bits).unwrap());
-                    let bytes = ctx.to_vec_endian(bits, opty.layout.size.bytes_usize());
-                    if let Some(dest_size) = it.size_of().get_zero_extended_constant() {
-                        if dest_size < bytes.len() as u64 {
-                            throw_rust_type_mismatch!(opty.layout, it);
-                        }
-                    }
-                    Ok(GenericValue::from_byte_slice(&bytes))
-                }
-                rustc_abi::Abi::ScalarPair(_, _) | rustc_abi::Abi::Aggregate { sized: true } => {
-                    let bytes = ctx.op_to_bytes(opty)?;
-                    Ok(GenericValue::from_byte_slice(bytes.as_slice()))
-                }
-                _ => {
-                    throw_rust_type_mismatch!(opty.layout, it);
-                }
-            },
-        BasicTypeEnum::PointerType(pt) => {
-            let pointer_opty = if let ty::Adt(adef, sr) = opty.layout.ty.kind() {
-                if let Some(vidx) = is_enum_of_nonnullable_ptr(ctx, *adef, sr) {
-                    debug!("[Op to GV]: Enum of nonnullable pointer: {:?}", vidx);
-                    let downcast_op = ctx.project_downcast(opty, vidx)?;
-                    let field_op = ctx.project_field(&downcast_op, 0)?;
-                    ctx.read_pointer(&field_op)?
-                } else {
-                    if let Left(mp) = opty.as_mplace_or_imm() {
-                        mp.ptr()
-                    } else {
-                        ctx.read_pointer(opty)?
-                    }
-                }
-            } else {
-                if opty.layout.size != ctx.tcx.data_layout.pointer_size {
-                    throw_rust_type_mismatch!(opty.layout, pt);
-                }
+                },
+            BasicTypeEnum::IntType(it) =>
                 match opty.layout.abi {
-                    rustc_abi::Abi::Scalar(_) => ctx.read_pointer(opty)?,
-                    _ =>
+                    rustc_abi::Abi::Scalar(sc) => {
+                        let scalar = if let rustc_abi::Scalar::Union { value } = sc {
+                            let mp = opty.assert_mem_place();
+                            let ptr = mp.ptr();
+                            let alloc =
+                                ctx.get_ptr_alloc(ptr, value.size(ctx), value.align(ctx).abi)?;
+                            if let Some(a) = alloc {
+                                a.read_scalar(alloc_range(Size::ZERO, value.size(ctx)), true)?
+                            } else {
+                                bug!("unable to resolve allocation for union scalar value.");
+                            }
+                        } else {
+                            ctx.read_scalar(opty)?
+                        };
+                        let bits = match scalar {
+                            Scalar::Int(si) =>
+                                si.to_bits(opty.layout.size)
+                                    .unwrap_or_else(|s| si.to_bits(s).unwrap()),
+                            Scalar::Ptr(p, _) => p.into_parts().1.bits().into(),
+                        };
+                        debug!("[Op to GV]: Int value: {}", u64::try_from(bits).unwrap());
+                        let bytes = ctx.to_vec_endian(bits, opty.layout.size.bytes_usize());
+                        if let Some(dest_size) = it.size_of().get_zero_extended_constant() {
+                            if dest_size < bytes.len() as u64 {
+                                throw_rust_type_mismatch!(opty.layout, it);
+                            }
+                        }
+                        Ok(GenericValue::from_byte_slice(&bytes))
+                    }
+                    rustc_abi::Abi::ScalarPair(_, _)
+                    | rustc_abi::Abi::Aggregate { sized: true } => {
+                        let bytes = ctx.op_to_bytes(opty)?;
+                        Ok(GenericValue::from_byte_slice(bytes.as_slice()))
+                    }
+                    _ => {
+                        throw_rust_type_mismatch!(opty.layout, it);
+                    }
+                },
+            BasicTypeEnum::PointerType(pt) => {
+                let pointer_opty = if let ty::Adt(adef, sr) = opty.layout.ty.kind() {
+                    if let Some(vidx) = is_enum_of_nonnullable_ptr(ctx, *adef, sr) {
+                        debug!("[Op to GV]: Enum of nonnullable pointer: {:?}", vidx);
+                        let downcast_op = ctx.project_downcast(opty, vidx)?;
+                        let field_op = ctx.project_field(&downcast_op, 0)?;
+                        ctx.read_pointer(&field_op)?
+                    } else {
                         if let Left(mp) = opty.as_mplace_or_imm() {
                             mp.ptr()
                         } else {
-                            throw_rust_type_mismatch!(opty.layout, pt);
-                        },
-                }
-            };
-            let wrapped_pointer = ctx.pointer_to_lli_wrapped_pointer(pointer_opty);
-            debug!(
-                "[Op to GV]: Pointer value: (AID: {}, Addr: {})",
-                wrapped_pointer.prov.alloc_id, wrapped_pointer.addr
-            );
-            let as_gv =
-                unsafe { GenericValue::create_generic_value_of_miri_pointer(wrapped_pointer) };
-            return Ok(as_gv);
-        }
-        BasicTypeEnum::StructType(st) => {
-            if !opty.layout.ty.is_adt() {
-                throw_rust_type_mismatch!(opty.layout, st);
-            }
-            let llvm_field_types = st.get_field_types();
-            Ok(convert_opty_to_aggregate(ctx, opty, llvm_field_types)?)
-        }
-        BasicTypeEnum::VectorType(vt) =>
-            match opty.layout.abi {
-                rustc_abi::Abi::Vector { element, count } => {
-                    let pointer = match opty.as_mplace_or_imm() {
-                        Left(mp) => mp.ptr(),
-                        Right(imm) => {
-                            if let rustc_const_eval::interpret::Immediate::Scalar(Scalar::Ptr(
-                                ptr,
-                                ..,
-                            )) = *imm
-                            {
-                                ptr.into()
-                            } else {
-                                bug!(
-                                    "expected a pointer to the start of a vector, but found {:?}",
-                                    *imm
-                                );
-                            }
+                            ctx.read_pointer(opty)?
                         }
-                    };
-                    let wrapped_pointer = ctx.pointer_to_lli_wrapped_pointer(pointer);
-                    if u64::from(vt.get_size()) != count {
+                    }
+                } else {
+                    if opty.layout.size != ctx.tcx.data_layout.pointer_size {
+                        throw_rust_type_mismatch!(opty.layout, pt);
+                    }
+                    match opty.layout.abi {
+                        rustc_abi::Abi::Scalar(_) => ctx.read_pointer(opty)?,
+                        _ =>
+                            if let Left(mp) = opty.as_mplace_or_imm() {
+                                mp.ptr()
+                            } else {
+                                throw_rust_type_mismatch!(opty.layout, pt);
+                            },
+                    }
+                };
+                let wrapped_pointer = ctx.pointer_to_lli_wrapped_pointer(pointer_opty);
+                debug!(
+                    "[Op to GV]: Pointer value: (AID: {}, Addr: {})",
+                    wrapped_pointer.prov.alloc_id, wrapped_pointer.addr
+                );
+                let as_gv =
+                    unsafe { GenericValue::create_generic_value_of_miri_pointer(wrapped_pointer) };
+                return Ok(as_gv);
+            }
+            BasicTypeEnum::StructType(st) => {
+                if !opty.layout.ty.is_adt() {
+                    throw_rust_type_mismatch!(opty.layout, st);
+                }
+                let llvm_field_types = st.get_field_types();
+                Ok(convert_opty_to_aggregate(ctx, opty, llvm_field_types)?)
+            }
+            BasicTypeEnum::VectorType(vt) =>
+                match opty.layout.abi {
+                    rustc_abi::Abi::Vector { element, count } => {
+                        let pointer = match opty.as_mplace_or_imm() {
+                            Left(mp) => mp.ptr(),
+                            Right(imm) => {
+                                if let rustc_const_eval::interpret::Immediate::Scalar(
+                                    Scalar::Ptr(ptr, ..),
+                                ) = *imm
+                                {
+                                    ptr.into()
+                                } else {
+                                    bug!(
+                                        "expected a pointer to the start of a vector, but found {:?}",
+                                        *imm
+                                    );
+                                }
+                            }
+                        };
+                        let wrapped_pointer = ctx.pointer_to_lli_wrapped_pointer(pointer);
+                        if u64::from(vt.get_size()) != count {
+                            throw_rust_type_mismatch!(opty.layout, vt);
+                        }
+                        let rust_vector_element_size = element.size(&ctx.tcx).bytes();
+                        let llvm_vector_element_size =
+                            ctx.resolve_llvm_type_size(vt.get_element_type())?;
+                        if rust_vector_element_size != llvm_vector_element_size {
+                            throw_rust_type_mismatch!(opty.layout, vt);
+                        }
+                        debug!(
+                            "[Op to GV]: Vector pointer value: (AID: {}, Addr: {})",
+                            wrapped_pointer.prov.alloc_id, wrapped_pointer.addr
+                        );
+                        let as_gv = unsafe {
+                            GenericValue::create_generic_value_of_miri_pointer(wrapped_pointer)
+                        };
+                        return Ok(as_gv);
+                    }
+                    _ => {
                         throw_rust_type_mismatch!(opty.layout, vt);
                     }
-                    let rust_vector_element_size = element.size(&ctx.tcx).bytes();
-                    let llvm_vector_element_size =
-                        ctx.resolve_llvm_type_size(vt.get_element_type())?;
-                    if rust_vector_element_size != llvm_vector_element_size {
-                        throw_rust_type_mismatch!(opty.layout, vt);
-                    }
+                },
+        }
+    } else {
+        if let rustc_abi::Abi::Scalar(sc) = opty.layout.abi {
+            match sc.primitive() {
+                rustc_abi::Primitive::Int(_, _) => {
+                    let scalar = ctx.read_scalar(opty)?.assert_int();
+                    let bits = scalar
+                        .to_bits(opty.layout.size)
+                        .unwrap_or_else(|s| scalar.to_bits(s).unwrap());
+                    debug!("[Op to GV]: Int value: {}", u64::try_from(bits).unwrap());
+                    let bytes = ctx.to_vec_endian(bits, opty.layout.size.bytes_usize());
+                    Ok(GenericValue::from_byte_slice(&bytes))
+                }
+                rustc_abi::Primitive::F32 => {
+                    let scalar = ctx.read_scalar(opty)?;
+                    let bits = scalar.to_f32()?.to_bits();
+                    let bytes = ctx.to_vec_endian(bits, opty.layout.size.bytes_usize());
+                    let float = f32::from_ne_bytes(bytes.try_into().unwrap());
+                    debug!("[Op to GV]: Float value: {}", float);
+                    Ok(GenericValue::new_f32(float))
+                }
+                rustc_abi::Primitive::F64 => {
+                    let scalar = ctx.read_scalar(opty)?;
+                    let double = scalar.to_f64()?.to_bits();
+                    let bytes = ctx.to_vec_endian(double, opty.layout.size.bytes_usize());
+                    let double = f64::from_ne_bytes(bytes.try_into().unwrap());
+                    debug!("[Op to GV]: Double value: {}", double);
+                    Ok(GenericValue::new_f64(double))
+                }
+                rustc_abi::Primitive::Pointer(_) => {
+                    let ptr = ctx.read_pointer(opty)?;
+                    let wrapped_pointer = ctx.pointer_to_lli_wrapped_pointer(ptr);
                     debug!(
-                        "[Op to GV]: Vector pointer value: (AID: {}, Addr: {})",
+                        "[Op to GV]: Pointer value: (AID: {}, Addr: {})",
                         wrapped_pointer.prov.alloc_id, wrapped_pointer.addr
                     );
                     let as_gv = unsafe {
@@ -215,10 +261,10 @@ fn convert_opty_to_generic_value<'tcx, 'lli>(
                     };
                     return Ok(as_gv);
                 }
-                _ => {
-                    throw_rust_type_mismatch!(opty.layout, vt);
-                }
-            },
+            }
+        } else {
+            throw_unsup_var_arg!(opty.layout);
+        }
     }
 }
 
@@ -266,7 +312,7 @@ fn convert_opty_to_aggregate<'lli, 'tcx>(
     for (rust_field, llvm_field) in rust_llvm_field_pairs {
         let as_op = ctx.project_field(&arg, rust_field)?;
         debug!("Field {}", rust_field);
-        let as_gv = convert_opty_to_generic_value(ctx, &as_op, llvm_field)?;
+        let as_gv = convert_opty_to_generic_value(ctx, &as_op, Some(llvm_field))?;
         gen_ag.append_aggregate_value(as_gv);
     }
     Ok(gen_ag)

@@ -53,6 +53,15 @@ macro_rules! throw_rust_type_mismatch {
     }
 }
 #[macro_export]
+macro_rules! throw_unsup_var_arg {
+    ($rust_layout:expr) => {
+        throw_interop_format!(
+            "Non-scalar variable arguments are not supported: \"{}\".",
+            $rust_layout.ty,
+        )
+    }
+}
+#[macro_export]
 macro_rules! throw_rust_field_mismatch {
     ($rust_layout:expr, $llvm_field_count:expr) => {
         throw_interop_format!(
