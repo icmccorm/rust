@@ -1,3 +1,4 @@
+extern crate rustc_abi;
 use super::memory::obtain_ctx_mut;
 use crate::concurrency::thread::EvalContextExt as ThreadEvalContextExt;
 use crate::helpers::EvalContextExt as HelperEvalContextExt;
@@ -22,6 +23,7 @@ use llvm_sys::miri::MiriInterpCxOpaque;
 use llvm_sys::miri::MiriPointer;
 use llvm_sys::prelude::LLVMTypeRef;
 use log::debug;
+use rustc_abi::Align;
 use rustc_const_eval::interpret::FnVal;
 use rustc_const_eval::interpret::InterpResult;
 use rustc_const_eval::interpret::MemoryKind;
@@ -259,7 +261,6 @@ fn miri_call_by_name_result<'tcx>(
                     Some(&args[2]),
                     MemcpyMode::DisjointOrEqual,
                 )?,
-
             "strcpy" =>
                 eval_memcpy(ctx, name_rust_str, &args[0], &args[1], None, MemcpyMode::Disjoint)?,
             "__strcpy_chk" =>
@@ -329,34 +330,29 @@ fn miri_call_by_name_result<'tcx>(
                         Err(_) => panic!("SystemTime before UNIX EPOCH."),
                     }
                 },
+
             "strchr" =>
                 if num_args != 2 {
                     throw_shim_argument_mismatch!(name_rust_str, 2, num_args);
                 } else {
-                    let src = ctx.opty_as_scalar(&op_ty_args[0])?;
-                    let src_as_pointer = src.to_pointer(ctx)?;
-                    let src_as_slice = ctx.pointer_to_slice(src_as_pointer)?;
-                    let src_as_cstring = CStr::from_bytes_until_nul(src_as_slice);
+                    let src_as_ptr = ctx.opty_as_scalar(&op_ty_args[0])?;
+                    let src_as_ptr = src_as_ptr.to_pointer(ctx)?;
+                    let src = ctx.read_c_str(src_as_ptr)?;
 
-                    let c_as_scalar = ctx.opty_as_scalar(&op_ty_args[1])?;
+                    let val = ctx.read_scalar(&op_ty_args[1])?.to_i32()?;
+                    // The docs say val is "interpreted as unsigned char".
                     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                    let c_value = c_as_scalar.to_i32()? as u8;
-                    if let Ok(cstr) = src_as_cstring {
-                        let result = cstr.to_bytes().iter().position(|&x| x == c_value);
-                        if let Some(pos) = result {
-                            let offset_pointer =
-                                src_as_pointer.offset(Size::from_bytes(pos), ctx)?;
-                            let as_miri_ptr = ctx.pointer_to_lli_wrapped_pointer(offset_pointer);
-                            unsafe {
-                                GenericValue::create_generic_value_of_miri_pointer(as_miri_ptr)
-                            }
-                        } else {
-                            ctx.void_generic_value()
-                        }
+                    let val = val as u8;
+                    // C requires that this must always be a valid pointer (C18 §7.1.4).
+                    ctx.ptr_get_alloc_id(src_as_ptr)?;
+
+                    let idx = src.iter().position(|&c| c == val);
+                    if let Some(idx) = idx {
+                        let new_ptr = src_as_ptr.offset(Size::from_bytes(idx as u64), ctx)?;
+                        let as_miri_ptr = ctx.pointer_to_lli_wrapped_pointer(new_ptr);
+                        unsafe { GenericValue::create_generic_value_of_miri_pointer(as_miri_ptr) }
                     } else {
-                        throw_interop_format!(
-                            "expected a null-terminated string, but couldn't locate a null-terminator."
-                        )
+                        ctx.void_generic_value()
                     }
                 },
             "printf" => {
@@ -375,6 +371,41 @@ fn miri_call_by_name_result<'tcx>(
                 }
                 ctx.void_generic_value()
             }
+            "strdup" =>
+                if num_args != 1 {
+                    throw_shim_argument_mismatch!(name_rust_str, 1, num_args);
+                } else {
+                    let src = ctx.opty_as_scalar(&op_ty_args[0])?;
+                    let src_as_pointer = src.to_pointer(ctx)?;
+                    let src_len = ctx.read_c_str(src_as_pointer)?.len() + 1;
+                    let allocation =
+                        ctx.malloc(src_len.try_into().unwrap(), false, MiriMemoryKind::LLVMHeap)?;
+                    ctx.mem_copy(
+                        src_as_pointer,
+                        Align::ONE,
+                        allocation,
+                        Align::ONE,
+                        Size::from_bytes(src_len),
+                        true,
+                    )?;
+                    let as_miri_ptr = ctx.pointer_to_lli_wrapped_pointer(allocation);
+                    unsafe { GenericValue::create_generic_value_of_miri_pointer(as_miri_ptr) }
+                },
+            "strcmp" =>
+                if num_args != 2 {
+                    throw_shim_argument_mismatch!(name_rust_str, 2, num_args);
+                } else {
+                    let result = ctx.strcmp(&op_ty_args[0], &op_ty_args[1], None)?;
+                    GenericValue::from_byte_slice(&result.to_ne_bytes())
+                },
+            "strncmp" =>
+                if num_args != 3 {
+                    throw_shim_argument_mismatch!(name_rust_str, 3, num_args);
+                } else {
+                    let result =
+                        ctx.strcmp(&op_ty_args[0], &op_ty_args[1], Some(&op_ty_args[2]))?;
+                    GenericValue::from_byte_slice(&result.to_ne_bytes())
+                },
             _ => {
                 let rplace = match &return_type_opt {
                     Some(return_type) => {

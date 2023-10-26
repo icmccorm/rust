@@ -452,7 +452,7 @@ pub fn eval_entry<'tcx>(
         }
     };
 
-    if !config.disable_bc
+    let llvm_error = if !config.disable_bc
         && (!config.external_bc_files.is_empty() || config.singular_llvm_bc_file.is_some())
     {
         LLVM_INTERPRETER.lock().replace_with(|_| {
@@ -466,38 +466,59 @@ pub fn eval_entry<'tcx>(
             interpreter.initialize_engine(&mut ecx).unwrap();
             Some(interpreter)
         });
-        LLVM_INTERPRETER.lock().borrow().as_ref().unwrap().run_constructors(&mut ecx).unwrap();
-    }
+        let result = LLVM_INTERPRETER.lock().borrow().as_ref().unwrap().run_constructors(&mut ecx);
+        if let Err(err) = result { Some(err) } else { None }
+    } else {
+        None
+    };
 
-    // Perform the main execution.
-    let res: thread::Result<InterpResult<'_, !>> =
-        panic::catch_unwind(AssertUnwindSafe(|| ecx.run_threads()));
-    let res = res.unwrap_or_else(|panic_payload| {
-        ecx.handle_ice();
-        panic::resume_unwind(panic_payload)
-    });
-    let res = match res {
-        Err(res) => res,
-        // `Ok` can never happen
-        Ok(never) => match never {},
+    let result = if let Some(result) = llvm_error {
+        result
+    } else {
+        // Perform the main execution.
+        let res: thread::Result<InterpResult<'_, !>> =
+            panic::catch_unwind(AssertUnwindSafe(|| ecx.run_threads()));
+        let res = res.unwrap_or_else(|panic_payload| {
+            ecx.handle_ice();
+            panic::resume_unwind(panic_payload)
+        });
+        match res {
+            Err(res) => res,
+            // `Ok` can never happen
+            Ok(never) => match never {},
+        }
     };
 
     // Machine cleanup. Only do this if all threads have terminated; threads that are still running
     // might cause Stacked Borrows errors (https://github.com/rust-lang/miri/issues/2396).
-    if ecx.have_all_terminated() {
-        LLVM_INTERPRETER.lock().borrow_mut().take().map(|interpreter| {
-            interpreter.run_destructors(&mut ecx).expect("LLI destructor execution failed");
-            interpreter
-        });
+    let destructor_error = if ecx.have_all_terminated() {
+        let result = if LLVM_INTERPRETER.lock().borrow().as_ref().is_some() {
+            if let Err(err) =
+                LLVM_INTERPRETER.lock().borrow().as_ref().unwrap().run_destructors(&mut ecx)
+            {
+                Some(err)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Even if all threads have terminated, we have to beware of data races since some threads
         // might not have joined the main thread (https://github.com/rust-lang/miri/issues/2020,
         // https://github.com/rust-lang/miri/issues/2508).
         ecx.allow_data_races_all_threads_done();
         EnvVars::cleanup(&mut ecx).expect("error during env var cleanup");
-    }
+        result
+    } else {
+        None
+    };
 
     // Process the result.
-    let (return_code, leak_check) = report_error(&ecx, res)?;
+    let (return_code, leak_check) = report_error(&ecx, result)?;
+    if let Some(e) = destructor_error {
+        report_error(&ecx, e)?;
+    }
     if leak_check && !ignore_leaks {
         // Check for thread leaks.
         if !ecx.have_all_terminated() {

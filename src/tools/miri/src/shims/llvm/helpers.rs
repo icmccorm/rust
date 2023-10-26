@@ -2,6 +2,7 @@ extern crate either;
 extern crate rustc_abi;
 use super::values::generic_value::GenericValueTy;
 use super::values::resolved_ptr::ResolvedPointer;
+use crate::helpers::EvalContextExt as HelperEvalExt;
 use crate::rustc_middle::ty::layout::LayoutOf;
 use crate::shims::llvm_ffi_support::EvalContextExt as LLVMEvalContextExt;
 use crate::throw_unsup_llvm_type;
@@ -396,5 +397,46 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 intptrcast::GlobalStateInner::alloc_id_from_addr(this, mp.addr().bytes()),
             None => None,
         }
+    }
+
+    fn strcmp(
+        &mut self,
+        left: &OpTy<'tcx, crate::Provenance>,
+        right: &OpTy<'tcx, crate::Provenance>,
+        n: Option<&OpTy<'tcx, crate::Provenance>>,
+    ) -> InterpResult<'tcx, i32> {
+        let this = self.eval_context_mut();
+        let left = this.read_pointer(left)?;
+        let right = this.read_pointer(right)?;
+
+        // C requires that this must always be a valid pointer (C18 §7.1.4).
+        this.ptr_get_alloc_id(left)?;
+        this.ptr_get_alloc_id(right)?;
+        let mut left_bytes = this.read_c_str(left)?;
+        let mut right_bytes = this.read_c_str(right)?;
+        if let Some(n) = n {
+            let n = this.read_target_usize(n)?.try_into().unwrap();
+            if n <= left_bytes.len() {
+                left_bytes = &left_bytes[..n];
+            }
+            if n <= right_bytes.len() {
+                right_bytes = &right_bytes[..n];
+            }
+        }
+        let result = {
+            if left_bytes.len() > right_bytes.len() {
+                return Ok(1);
+            }
+            if left_bytes.len() < right_bytes.len() {
+                return Ok(-1);
+            }
+            use std::cmp::Ordering::*;
+            match left_bytes.cmp(right_bytes) {
+                Less => -1i32,
+                Equal => 0,
+                Greater => 1,
+            }
+        };
+        Ok(result)
     }
 }

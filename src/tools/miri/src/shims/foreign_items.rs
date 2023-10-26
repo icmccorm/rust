@@ -835,7 +835,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 )?;
                 this.write_pointer(ptr_dest, dest)?;
             }
-            "strcpy" => {
+            "__strcpy_chk" | "strcpy" => {
                 let [ptr_dest, ptr_src] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let ptr_dest = this.read_pointer(ptr_dest)?;
