@@ -283,31 +283,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
-    #[allow(clippy::arithmetic_side_effects)]
-    fn pointer_to_slice<'l>(
-        &'l self,
-        ptr: Pointer<Option<crate::Provenance>>,
-    ) -> InterpResult<'tcx, &'l [u8]>
-    where
-        'mir: 'l,
-        'tcx: 'l,
-    {
-        let ctx = self.eval_context_ref();
-        let alloc_id = if let Some(crate::Provenance::Concrete { alloc_id, .. }) = ptr.provenance {
-            alloc_id
-        } else {
-            throw_interop_format!(
-                "unable to resolve slice: invalid pointer to address {:?}",
-                ptr.addr()
-            );
-        };
-        let (alloc_size, _, _) = ctx.get_alloc_info(alloc_id);
-        let base_address = intptrcast::GlobalStateInner::alloc_base_addr(ctx, alloc_id)?;
-        let size_offset = ptr.addr() - Size::from_bytes(base_address);
-        let size_remaining = alloc_size - size_offset;
-        let slice = ctx.read_bytes_ptr_strip_provenance(ptr, size_remaining)?;
-        Ok(slice)
-    }
     fn opty_as_scalar(
         &self,
         opty: &OpTy<'tcx, Provenance>,
@@ -351,7 +326,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn resolve_scalar_pair(
         &mut self,
         arg: &OpTy<'tcx, crate::Provenance>,
-        llvm_type: &BasicTypeEnum<'_>,
     ) -> InterpResult<'tcx, Option<(OpTy<'tcx, crate::Provenance>, OpTy<'tcx, crate::Provenance>)>>
     {
         let this = self.eval_context_mut();
@@ -363,33 +337,36 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 curr_arg = this.project_field(&curr_arg, 0)?;
             }
             if matches!(curr_arg.layout.abi, rustc_target::abi::Abi::ScalarPair(_, _)) {
-                let field_values = arg
+                let mut field_values = arg
                     .layout
                     .fields
                     .index_by_increasing_offset()
                     .map(|idx| this.project_field(arg, idx))
-                    .collect::<InterpResult<'tcx, Vec<OpTy<'_, Provenance>>>>()?;
-                let llvm_size = this.resolve_llvm_type_size(*llvm_type)?;
-                for rust_field in field_values.iter() {
-                    let rust_field_size = rust_field.layout.size.bytes();
-                    if rust_field_size != llvm_size {
-                        return Ok(None);
-                    }
-                }
+                    .collect::<InterpResult<'tcx, Vec<OpTy<'tcx, crate::Provenance>>>>()?;
+
                 if let Some(logger) = &mut this.machine.llvm_logger {
-                    logger.log_llvm_conversion(
-                        curr_arg.layout,
-                        single_field_dereferenced,
-                        llvm_type,
-                    )
+                    logger.log_llvm_conversion(curr_arg.layout, single_field_dereferenced)
                 }
-                return Ok(Some((
-                    field_values.first().unwrap().clone(),
-                    field_values.last().unwrap().clone(),
-                )));
+                let last = field_values.pop().unwrap();
+                let first = field_values.pop().unwrap();
+                return Ok(Some((first, last)));
             }
         }
         Ok(None)
+    }
+
+    fn resolve_padded_size(&self, arg: &OpTy<'tcx, Provenance>, rust_field_idx: usize) -> Size {
+        if arg.layout.fields.count() <= 1 {
+            arg.layout.size
+        } else {
+            let curr_offset = arg.layout.fields.offset(rust_field_idx);
+            #[allow(clippy::arithmetic_side_effects)]
+            if rust_field_idx + 1 == arg.layout.fields.count() {
+                arg.layout.size - curr_offset
+            } else {
+                arg.layout.fields.offset(rust_field_idx + 1) - curr_offset
+            }
+        }
     }
 
     fn maybe_alloc_id(&self, mp: Pointer<Option<crate::Provenance>>) -> Option<AllocId> {

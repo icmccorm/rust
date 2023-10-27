@@ -1,11 +1,11 @@
 extern crate rustc_abi;
-use crate::shims::llvm::helpers::EvalContextExt;
+use crate::helpers::EvalContextExt;
+use crate::shims::llvm::helpers::EvalContextExt as HelperEvalExt;
 use crate::MiriInterpCx;
 use inkwell::values::GenericValue;
 use rustc_abi::{Align, Size};
 use rustc_const_eval::interpret::InterpResult;
 use rustc_const_eval::interpret::OpTy;
-use std::ffi::CStr;
 
 pub enum MemcpyMode {
     Disjoint,
@@ -32,17 +32,7 @@ pub fn eval_memcpy<'tcx>(
         let len_as_scalar = ctx.opty_as_scalar(len)?;
         len_as_scalar.to_target_usize(ctx)?
     } else {
-        let source_as_slice = ctx.pointer_to_slice(src_as_pointer)?;
-        let source_as_cstring = CStr::from_bytes_until_nul(source_as_slice);
-        if let Ok(cstr) = source_as_cstring {
-            // add 1 to cover null-terminator
-            (cstr.to_bytes().len() + 1) as u64
-        } else {
-            throw_interop_format!(
-                "invalid memory copy with {}: expected a null-terminated string, but couldn't locate a null-terminator.",
-                function
-            )
-        }
+        (ctx.read_c_str(src_as_pointer)?.len() + 1).try_into().unwrap()
     };
     let (src_prov, src_addr) = src_as_pointer.into_parts();
     let (dest_prov, dest_addr) = dest_as_pointer.into_parts();

@@ -1,4 +1,5 @@
 extern crate either;
+extern crate rustc_abi;
 use super::llvm::lli::LLVM_INTERPRETER;
 use crate::concurrency::thread::EvalContextExt as ThreadEvalContextExt;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMHelperEvalExt;
@@ -12,8 +13,11 @@ use inkwell::{
     values::{FunctionValue, GenericValueRef},
 };
 use log::debug;
+use rustc_abi::{Abi, Size};
 use rustc_const_eval::interpret::{InterpResult, MemoryKind, OpTy, PlaceTy};
+use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
+use rustc_target::abi::TyAndLayout;
 
 macro_rules! throw_llvm_argument_mismatch {
     ($function: expr, $args: expr) => {
@@ -26,6 +30,42 @@ macro_rules! throw_llvm_argument_mismatch {
             $args
         )
     };
+}
+
+pub enum ResolvedRustArgument<'tcx> {
+    Default(OpTy<'tcx, Provenance>),
+    Padded(OpTy<'tcx, Provenance>, Size),
+}
+
+impl<'tcx> ResolvedRustArgument<'tcx> {
+    pub fn opty(&self) -> &OpTy<'tcx, Provenance> {
+        match self {
+            ResolvedRustArgument::Default(op) => op,
+            ResolvedRustArgument::Padded(op, _) => op,
+        }
+    }
+    pub fn padded_size(&self) -> Size {
+        match self {
+            ResolvedRustArgument::Default(_) => self.value_size(),
+            ResolvedRustArgument::Padded(_, padding) => *padding,
+        }
+    }
+
+    pub fn layout(&self) -> TyAndLayout<'tcx, Ty<'tcx>> {
+        self.opty().layout
+    }
+
+    pub fn abi(&self) -> Abi {
+        self.layout().abi
+    }
+
+    pub fn value_size(&self) -> Size {
+        self.layout().size
+    }
+
+    pub fn ty(&self) -> Ty<'tcx> {
+        self.layout().ty
+    }
 }
 
 pub type ResolvedLLVMType<'a> = Option<BasicTypeEnum<'a>>;
@@ -108,7 +148,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     )
                 }
             };
-            let converted = this.op_to_generic_value(&op, Some(*head))?;
+            let converted =
+                this.op_to_generic_value(ResolvedRustArgument::Default(op), Some(*head))?;
             generic_args.push(converted);
             (tail, alloc)
         } else {
@@ -124,14 +165,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         llvm_parameter_types.reverse();
 
         let mut args = args.to_vec();
+
         args.reverse();
 
-        let scalar_pair_expansion = args.len() < llvm_parameter_types.len();
+        debug!("link={}, sret={:?}", thread_link_destination, has_sret);
 
-        debug!(
-            "link={}, sret={:?}, scalar-expand={:?}",
-            thread_link_destination, has_sret, scalar_pair_expansion
-        );
         let original_arg_length = args.len();
         while let Some(current_arg) = args.pop() {
             if llvm_parameter_types.is_empty() {
@@ -141,16 +179,15 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     throw_llvm_argument_mismatch!(function, original_arg_length);
                 }
             }
-            let num_types_remaining = llvm_parameter_types.len() - 1;
-            let num_args_remaining = args.len();
-            if scalar_pair_expansion
-                && num_types_remaining >= 1
-                && num_types_remaining > num_args_remaining
-                && (*llvm_parameter_types.last().unwrap()
-                    == llvm_parameter_types[llvm_parameter_types.len() - 1])
-            {
-                if let Some(t) = llvm_parameter_types.last().unwrap() {
-                    if let Some((first, second)) = this.resolve_scalar_pair(&current_arg, t)? {
+            let corresponding_llvm_type = llvm_parameter_types.last().unwrap();
+            if let Some(corresponding_llvm_type) = corresponding_llvm_type {
+                let num_types_remaining = llvm_parameter_types.len() - 1;
+
+                let llvm_type_size = this.resolve_llvm_type_size(*corresponding_llvm_type)?;
+                let rust_type_size = current_arg.layout.size.bytes();
+
+                if llvm_type_size < rust_type_size && num_types_remaining > 0 {
+                    if let Some((first, second)) = this.resolve_scalar_pair(&current_arg)? {
                         args.push(second);
                         args.push(first);
                         continue;
@@ -158,7 +195,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 }
             }
             let first_type = llvm_parameter_types.pop().unwrap();
-            generic_args.push(this.op_to_generic_value(&current_arg, first_type)?);
+            generic_args.push(
+                this.op_to_generic_value(ResolvedRustArgument::Default(current_arg), first_type)?,
+            );
         }
 
         let exposed = generic_args

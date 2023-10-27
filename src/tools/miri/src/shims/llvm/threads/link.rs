@@ -115,7 +115,7 @@ impl<'tcx> ThreadLink<'tcx> {
                             let as_place = PlaceTy::from(place_src.clone());
                             let place_opty = ctx.place_to_op(&as_place)?;
                             let to_gv: GenericValue<'_> =
-                                ctx.op_to_generic_value(&place_opty, Some(dest))?;
+                                ctx.op_to_generic_value(crate::shims::llvm_ffi_support::ResolvedRustArgument::Default(place_opty), Some(dest))?;
                             debug!(
                                 "[ThreadLink] Copying generic value produced from return place into pending GenericValue."
                             );

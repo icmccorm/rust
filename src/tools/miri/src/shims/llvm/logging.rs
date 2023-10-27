@@ -6,7 +6,7 @@ use std::{
     path::Path,
 };
 
-use inkwell::{support::LLVMString, types::BasicTypeEnum};
+use inkwell::support::LLVMString;
 use rustc_middle::ty::Ty;
 use rustc_target::abi::TyAndLayout;
 
@@ -15,7 +15,6 @@ use crate::eval::LLVMLoggingLevel;
 pub struct LLVMLogger {
     bytecode: Option<File>,
     conversions: Option<File>,
-    upcasts: Option<File>,
     pub flags: LLVMFlags,
 }
 
@@ -91,7 +90,7 @@ impl Drop for LLVMFlags {
 
 impl LLVMLogger {
     pub fn new(level: LLVMLoggingLevel) -> Option<LLVMLogger> {
-        let (bytecode, conversions, upcasts) = if let LLVMLoggingLevel::Verbose = level {
+        let (bytecode, conversions) = if let LLVMLoggingLevel::Verbose = level {
             let cwd = std::env::current_dir().unwrap();
             if !(cwd.exists() && cwd.is_dir()) {
                 return None;
@@ -110,15 +109,11 @@ impl LLVMLogger {
             let conversion_logs_path = resolve_path("llvm_conversions.csv");
             let conversion_logs_file =
                 OpenOptions::new().create(true).append(true).open(conversion_logs_path).unwrap();
-
-            let upcast_logs_path = resolve_path("llvm_upcasts.csv");
-            let upcast_logs_file =
-                OpenOptions::new().create(true).append(true).open(upcast_logs_path).unwrap();
-            (Some(bytecode_logs_file), Some(conversion_logs_file), Some(upcast_logs_file))
+            (Some(bytecode_logs_file), Some(conversion_logs_file))
         } else {
-            (None, None, None)
+            (None, None)
         };
-        Some(LLVMLogger { bytecode, conversions, upcasts, flags: LLVMFlags::new() })
+        Some(LLVMLogger { bytecode, conversions, flags: LLVMFlags::new() })
     }
 
     #[inline(always)]
@@ -137,27 +132,12 @@ impl LLVMLogger {
         &mut self,
         from: TyAndLayout<'_, Ty<'_>>,
         single_field_dereferenced: bool,
-        llvm_field_type: &BasicTypeEnum<'_>,
     ) {
         self.flags.scalar_pair_expansion.set(true);
         if let Some(file) = &mut self.conversions {
             let source_type = from.ty.to_string();
             let source_type_size = from.size.bytes();
-            let line = format!(
-                "\"{source_type}\",{source_type_size},{single_field_dereferenced},\"{llvm_field_type}\""
-            );
-            file.write_all(line.as_bytes()).unwrap();
-            file.write_all(b"\n").unwrap();
-            file.flush().unwrap();
-        }
-    }
-    #[inline(always)]
-    pub fn log_llvm_upcast(&mut self, parent: &BasicTypeEnum<'_>, child: &BasicTypeEnum<'_>) {
-        self.flags.integer_upcast.set(true);
-        if let Some(file) = &mut self.upcasts {
-            let parent_type = parent.to_string();
-            let child_type = child.to_string();
-            let line = format!("\"{parent_type}\",\"{child_type}\"",);
+            let line = format!("\"{source_type}\",{source_type_size},{single_field_dereferenced}");
             file.write_all(line.as_bytes()).unwrap();
             file.write_all(b"\n").unwrap();
             file.flush().unwrap();
