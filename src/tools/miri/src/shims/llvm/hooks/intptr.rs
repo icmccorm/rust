@@ -1,9 +1,9 @@
-use std::num::NonZeroU64;
+use super::memory::obtain_ctx_mut;
+use crate::{intptrcast, shims::llvm::helpers::EvalContextExt, BorTag};
 use llvm_sys::miri::{MiriInterpCxOpaque, MiriPointer, MiriProvenance};
 use log::debug;
 use rustc_const_eval::interpret::AllocId;
-use crate::{intptrcast, shims::llvm::helpers::EvalContextExt, BorTag};
-use super::memory::obtain_ctx_mut;
+use std::num::NonZeroU64;
 
 pub extern "C-unwind" fn miri_ptrtoint(ctx_raw: *mut MiriInterpCxOpaque, mp: MiriPointer) -> u64 {
     debug!("[ptrtoint] AID: {}, addr: {}", mp.prov.alloc_id, mp.addr);
@@ -21,12 +21,17 @@ pub extern "C-unwind" fn miri_ptrtoint(ctx_raw: *mut MiriInterpCxOpaque, mp: Mir
             mp.addr
         }
     };
+    if let Some(ref logger) = &ctx.machine.llvm_logger {
+        logger.flags.log_ptrtoint_llvm();
+    }
     addr_to_return
 }
 
 pub extern "C-unwind" fn miri_inttoptr(ctx_raw: *mut MiriInterpCxOpaque, addr: u64) -> MiriPointer {
     let ctx = obtain_ctx_mut(ctx_raw);
+
     let as_ptr = intptrcast::GlobalStateInner::ptr_from_addr_cast(ctx, addr);
+
     let as_miri_ptr = match as_ptr {
         Ok(p) => ctx.pointer_to_lli_wrapped_pointer(p),
         Err(e) => {
@@ -35,5 +40,8 @@ pub extern "C-unwind" fn miri_inttoptr(ctx_raw: *mut MiriInterpCxOpaque, addr: u
         }
     };
     debug!("[inttoptr] AID: {}, addr: {}", as_miri_ptr.prov.alloc_id, addr);
+    if let Some(ref logger) = &ctx.machine.llvm_logger {
+        logger.flags.log_inttoptr_llvm();
+    }
     as_miri_ptr
 }

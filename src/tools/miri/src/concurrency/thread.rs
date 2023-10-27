@@ -127,7 +127,7 @@ pub enum ThreadKind<'tcx> {
 /// A thread.
 pub struct Thread<'mir, 'tcx> {
     state: ThreadState,
-
+    is_llvm: Cell<bool>,
     /// Name of the thread.
     thread_name: Option<Vec<u8>>,
 
@@ -208,6 +208,17 @@ impl<'mir, 'tcx> Thread<'mir, 'tcx> {
         // empty stacks.
         self.top_user_relevant_frame.or_else(|| self.stack.len().checked_sub(1))
     }
+
+    pub fn is_llvm_thread(&self) -> bool {
+        self.is_llvm.get()
+    }
+
+    pub fn set_thread_kind(&self, thread_kind: ThreadKind<'tcx>) {
+        if let ThreadKind::LLVM(_) = thread_kind {
+            self.is_llvm.set(true);
+        }
+        self.thread_kind.set(thread_kind);
+    }
 }
 
 impl<'mir, 'tcx> std::fmt::Debug for Thread<'mir, 'tcx> {
@@ -226,6 +237,7 @@ impl<'mir, 'tcx> Thread<'mir, 'tcx> {
     fn new(name: Option<&str>, on_stack_empty: Option<StackEmptyCallback<'mir, 'tcx>>) -> Self {
         Self {
             state: ThreadState::Enabled,
+            is_llvm: Cell::new(false),
             thread_name: name.map(|name| Vec::from(name.as_bytes())),
             thread_kind: Cell::new(ThreadKind::MiriInternal),
             stack: Vec::new(),
@@ -246,6 +258,7 @@ impl VisitTags for Thread<'_, '_> {
             stack,
             top_user_relevant_frame: _,
             state: _,
+            is_llvm: _,
             thread_name: _,
             thread_kind: _,
             join_status: _,
@@ -337,7 +350,7 @@ pub struct ThreadManager<'mir, 'tcx> {
     /// Identifier of the currently active thread.
     active_thread: ThreadId,
     /// Threads used in the program.
-    ///
+    lli_thread_group: Cell<Option<ThreadId>>,
     /// Note that this vector also contains terminated threads.
     threads: IndexVec<ThreadId, Thread<'mir, 'tcx>>,
     /// This field is pub(crate) because the synchronization primitives
@@ -358,6 +371,7 @@ impl VisitTags for ThreadManager<'_, '_> {
         let ThreadManager {
             threads,
             thread_local_alloc_ids,
+            lli_thread_group: _,
             timeout_callbacks,
             active_thread: _,
             yield_active_thread: _,
@@ -386,6 +400,7 @@ impl<'mir, 'tcx> Default for ThreadManager<'mir, 'tcx> {
         Self {
             active_thread: ThreadId::new(0),
             threads,
+            lli_thread_group: Cell::new(None),
             sync: SynchronizationState::default(),
             thread_local_alloc_ids: Default::default(),
             yield_active_thread: false,
@@ -677,6 +692,10 @@ impl<'mir, 'tcx: 'mir> ThreadManager<'mir, 'tcx> {
         mut data_race: Option<&mut data_race::GlobalState>,
         current_span: Span,
     ) -> Vec<Pointer<Provenance>> {
+        let curr_id = self.active_thread;
+        if self.lli_thread_group.get() == Some(curr_id) {
+            self.lli_thread_group.set(None);
+        }
         self.thread_groups.remove(&self.active_thread);
         let mut free_tls_statics = Vec::new();
         {
@@ -869,13 +888,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         );
         let this = self.eval_context_mut();
         let active_thread = this.get_active_thread();
-        if let Some(logger) = &mut this.machine.llvm_logger {
-            logger.log_llvm_call(
-                function.get_name().to_string_lossy().to_string().as_str(),
-                active_thread,
-                None,
-            );
-        }
+
         this.create_lli_thread(active_thread, function, vec![].as_slice())?;
         let mut terminated = false;
         while !terminated {
@@ -903,14 +916,19 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
         let prev = this.set_active_thread(uninit_thread_id);
         let group_id = this.machine.threads.link_to_thread_group(prev, uninit_thread_id);
+
+        if let Some(current_group_id) = this.machine.threads.lli_thread_group.get() {
+            if group_id != current_group_id {
+                if let Some(ref logger) = &this.machine.llvm_logger {
+                    logger.flags.log_multithreading()
+                }
+            }
+        }
+        this.machine.threads.lli_thread_group.set(Some(group_id));
+
         this.active_thread_mut().last_error = old_error_place;
 
         debug!("Created Miri thread object for Rust to LLI call, TID: {:?}", group_id);
-
-        let name = function.get_name().to_str().unwrap();
-        if let Some(logger) = &mut this.machine.llvm_logger {
-            logger.log_llvm_call(name, group_id, link_type.as_ref());
-        }
 
         this.create_lli_thread(uninit_thread_id, function, args.as_slice())?;
         if let Some(link_type) = link_type {
@@ -960,7 +978,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         // Finally switch to new thread so that we can push the first stackframe.
         // After this all accesses will be treated as occurring in the new thread.
         let old_thread_id = this.set_active_thread(new_thread_id);
-        let group_id = this.machine.threads.link_to_thread_group(old_thread_id, new_thread_id);
         debug!("Switched to callback thread");
 
         this.active_thread_mut().last_error = old_error_place;
@@ -972,11 +989,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             this.allocate(dest_layout, MemoryKind::Machine(MiriMemoryKind::LLVMInterop))?;
 
         let link_destination = ThreadLinkDestination::ToLLI(lli_return_type);
-
-        let instance_name = this.tcx.item_name(inst.def_id());
-        if let Some(logger) = &mut this.machine.llvm_logger {
-            logger.log_llvm_call(instance_name.as_str(), group_id, Some(&link_destination));
-        }
 
         let mut link = ThreadLink::new(
             old_thread_id,

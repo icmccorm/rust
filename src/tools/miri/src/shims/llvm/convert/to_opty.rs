@@ -3,6 +3,7 @@ extern crate rustc_abi;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalExt;
 
 //use crate::rustc_const_eval::interpret::Projectable;
+use crate::rustc_const_eval::interpret::Projectable;
 use crate::shims::llvm::values::generic_value::GenericValueTy;
 use crate::{intptrcast, MiriInterpCx, Provenance};
 use inkwell::types::BasicTypeEnum;
@@ -22,7 +23,6 @@ use rustc_middle::{
 use rustc_target::abi::FIRST_VARIANT;
 use std::cell::Cell;
 use std::fmt::Formatter;
-use crate::rustc_const_eval::interpret::Projectable;
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
 
 #[derive(Debug, Clone)]
@@ -389,7 +389,7 @@ fn convert_to_immty<'tcx>(
                         Scalar::from_uint(converted_int, ctx.rust_layout.size)
                     };
                     return Ok(ImmTy::from_scalar(scalar, ctx.rust_layout));
-                } 
+                }
                 BasicTypeEnum::PointerType(_) => {
                     let wrapped_pointer = generic.val_ref.as_miri_pointer();
                     let mp = miri.lli_wrapped_pointer_to_maybe_pointer(wrapped_pointer);

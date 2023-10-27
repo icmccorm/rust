@@ -242,10 +242,10 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
     #[allow(clippy::arithmetic_side_effects)]
     fn lli_wrapped_pointer_to_resolved_pointer(
-        &self,
+        &mut self,
         mp: MiriPointer,
     ) -> InterpResult<'tcx, ResolvedPointer> {
-        let this = self.eval_context_ref();
+        let this = self.eval_context_mut();
         if mp.addr > 0 {
             let (provenance, alloc_id) = if mp.prov.alloc_id > 0 {
                 let alloc_id = AllocId(NonZeroU64::new(mp.prov.alloc_id).unwrap());
@@ -257,6 +257,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             } else {
                 let resolved_alloc_id =
                     intptrcast::GlobalStateInner::alloc_id_from_addr(this, mp.addr);
+                if let Some(ref logger) = &this.machine.llvm_logger {
+                    logger.flags.log_llvm_on_resolve();
+                }
                 if let Some(alloc_id) = resolved_alloc_id {
                     (crate::Provenance::Wildcard, alloc_id)
                 } else {

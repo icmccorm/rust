@@ -81,6 +81,12 @@ pub enum BacktraceStyle {
     Off,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum LLVMLoggingLevel {
+    Flags,
+    Verbose,
+}
+
 /// Configuration needed to spawn a Miri instance.
 #[derive(Clone)]
 pub struct MiriConfig {
@@ -161,7 +167,7 @@ pub struct MiriConfig {
     /// Whether to collect a backtrace when each allocation is created, just in case it leaks.
     pub collect_leak_backtraces: bool,
     /// Whether to log LLVM bytecode and function calls to files
-    pub llvm_log: bool,
+    pub llvm_log: Option<LLVMLoggingLevel>,
     pub singular_llvm_bc_file: Option<PathBuf>,
 }
 
@@ -202,7 +208,7 @@ impl Default for MiriConfig {
             num_cpus: 1,
             page_size: None,
             collect_leak_backtraces: true,
-            llvm_log: false,
+            llvm_log: None,
             singular_llvm_bc_file: None,
         }
     }

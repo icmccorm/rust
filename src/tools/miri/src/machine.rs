@@ -155,7 +155,8 @@ impl MiriMemoryKind {
             // Heap allocations are fine since the `Allocation` is created immediately.
             Rust | Miri | C | WinHeap | Mmap | LLVMInterop => true,
             // Everything else is unclear, let's not show potentially confusing spans.
-            Machine | Global | ExternStatic | Tls | Runtime | LLVMStatic | LLVMStack | LLVMHeap => false,
+            Machine | Global | ExternStatic | Tls | Runtime | LLVMStatic | LLVMStack | LLVMHeap =>
+                false,
         }
     }
 }
@@ -683,8 +684,8 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
             stack_addr,
             stack_size,
             collect_leak_backtraces: config.collect_leak_backtraces,
-            llvm_logger: if config.llvm_log && !config.disable_bc {
-                LLVMLogger::new()
+            llvm_logger: if config.llvm_log.is_some() && !config.disable_bc {
+                LLVMLogger::new(config.llvm_log.unwrap())
             } else {
                 None
             },

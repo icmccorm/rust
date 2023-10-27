@@ -1,4 +1,6 @@
+use serde::Serialize;
 use std::{
+    cell::Cell,
     fs::{File, OpenOptions},
     io::Write,
     path::Path,
@@ -8,89 +10,157 @@ use inkwell::{support::LLVMString, types::BasicTypeEnum};
 use rustc_middle::ty::Ty;
 use rustc_target::abi::TyAndLayout;
 
-use crate::ThreadId;
-
-use super::threads::link::ThreadLinkDestination;
+use crate::eval::LLVMLoggingLevel;
 
 pub struct LLVMLogger {
-    bytecode: File,
-    calls: File,
-    conversions: File,
+    bytecode: Option<File>,
+    conversions: Option<File>,
+    upcasts: Option<File>,
+    pub flags: LLVMFlags,
+}
+
+#[derive(Serialize, Debug)]
+pub struct LLVMFlags {
+    llvm_engaged: Cell<bool>,
+    intptr_llvm: Cell<bool>,
+    intptr_rust: Cell<bool>,
+    llvm_inttoptr: Cell<bool>,
+    llvm_ptrtoint: Cell<bool>,
+    llvm_on_resolve: Cell<bool>,
+    used_multithreading: Cell<bool>,
+    scalar_pair_expansion: Cell<bool>,
+    integer_upcast: Cell<bool>,
+}
+
+impl LLVMFlags {
+    pub fn new() -> Self {
+        LLVMFlags {
+            llvm_engaged: Cell::new(false),
+            intptr_llvm: Cell::new(false),
+            intptr_rust: Cell::new(false),
+            llvm_inttoptr: Cell::new(false),
+            llvm_ptrtoint: Cell::new(false),
+            llvm_on_resolve: Cell::new(false),
+            used_multithreading: Cell::new(false),
+            scalar_pair_expansion: Cell::new(false),
+            integer_upcast: Cell::new(false),
+        }
+    }
+    #[inline(always)]
+    pub fn log_llvm_engaged(&self) {
+        self.llvm_engaged.set(true)
+    }
+    #[inline(always)]
+    pub fn log_inttoptr_llvm(&self) {
+        self.llvm_inttoptr.set(true)
+    }
+    #[inline(always)]
+    pub fn log_ptrtoint_llvm(&self) {
+        self.llvm_ptrtoint.set(true)
+    }
+    #[inline(always)]
+    pub fn log_from_addr_cast_rust(&self) {
+        self.intptr_rust.set(true)
+    }
+    #[inline(always)]
+    pub fn log_from_addr_cast_llvm(&self) {
+        self.intptr_llvm.set(true)
+    }
+    #[inline(always)]
+    pub fn log_llvm_on_resolve(&self) {
+        self.llvm_on_resolve.set(true)
+    }
+    #[inline(always)]
+    pub fn log_multithreading(&self) {
+        self.used_multithreading.set(true)
+    }
+}
+impl Drop for LLVMFlags {
+    fn drop(&mut self) {
+        if let Ok(flags_json) = serde_json::to_string(&self) {
+            let mut flags_path = std::env::current_dir().unwrap();
+            flags_path.push("flags.json");
+            let flags_log_file = OpenOptions::new().create(true).write(true).open(flags_path);
+            if let Ok(mut flags_log_file) = flags_log_file {
+                flags_log_file.write_all(flags_json.as_bytes()).unwrap_or(());
+                flags_log_file.flush().unwrap_or(());
+            }
+        }
+    }
 }
 
 impl LLVMLogger {
-    pub fn new() -> Option<LLVMLogger> {
-        let cwd = std::env::current_dir().unwrap();
-        if !(cwd.exists() && cwd.is_dir()) {
-            return None;
-        }
-        let resolve_path = |path: &str| {
-            let mut root_path = cwd.clone();
-            root_path.push(path);
-            if root_path.exists() {
-                std::fs::remove_file(&root_path).unwrap();
+    pub fn new(level: LLVMLoggingLevel) -> Option<LLVMLogger> {
+        let (bytecode, conversions, upcasts) = if let LLVMLoggingLevel::Verbose = level {
+            let cwd = std::env::current_dir().unwrap();
+            if !(cwd.exists() && cwd.is_dir()) {
+                return None;
             }
-            root_path
+            let resolve_path = |path: &str| {
+                let mut root_path = cwd.clone();
+                root_path.push(path);
+                if root_path.exists() {
+                    std::fs::remove_file(&root_path).unwrap();
+                }
+                root_path
+            };
+            let bytecode_path = resolve_path("llvm_bc.csv");
+            let bytecode_logs_file =
+                OpenOptions::new().create(true).append(true).open(bytecode_path).unwrap();
+            let conversion_logs_path = resolve_path("llvm_conversions.csv");
+            let conversion_logs_file =
+                OpenOptions::new().create(true).append(true).open(conversion_logs_path).unwrap();
+
+            let upcast_logs_path = resolve_path("llvm_upcasts.csv");
+            let upcast_logs_file =
+                OpenOptions::new().create(true).append(true).open(upcast_logs_path).unwrap();
+            (Some(bytecode_logs_file), Some(conversion_logs_file), Some(upcast_logs_file))
+        } else {
+            (None, None, None)
         };
-        let bytecode_path = resolve_path("llvm_bc.csv");
-        let bytecode_logs_file =
-            OpenOptions::new().create(true).append(true).open(bytecode_path).unwrap();
-        let call_logs_path = resolve_path("llvm_calls.csv");
-        let call_logs_file =
-            OpenOptions::new().create(true).append(true).open(call_logs_path).unwrap();
-        let conversion_logs_path = resolve_path("llvm_conversions.csv");
-        let conversion_logs_file =
-            OpenOptions::new().create(true).append(true).open(conversion_logs_path).unwrap();
-        Some(LLVMLogger {
-            bytecode: bytecode_logs_file,
-            calls: call_logs_file,
-            conversions: conversion_logs_file,
-        })
+        Some(LLVMLogger { bytecode, conversions, upcasts, flags: LLVMFlags::new() })
     }
 
+    #[inline(always)]
     pub fn log_bytecode(&mut self, path: &Path, status: Result<(), LLVMString>) {
-        let failed = u8::from(status.is_err());
-        let message = status.as_ref().err().map(|e| e.to_string()).unwrap_or("".to_string());
-        let entry = format!("{},{},{}\n", path.to_string_lossy(), failed, message);
-        let file = &mut self.bytecode;
-        file.write_all(entry.as_bytes()).unwrap();
-        file.flush().unwrap();
+        if let Some(file) = &mut self.bytecode {
+            let failed = u8::from(status.is_err());
+            let message = status.as_ref().err().map(|e| e.to_string()).unwrap_or("".to_string());
+            let entry = format!("{},{},{}\n", path.to_string_lossy(), failed, message);
+
+            file.write_all(entry.as_bytes()).unwrap();
+            file.flush().unwrap();
+        }
     }
-
-    pub fn log_llvm_call(
-        &mut self,
-        function_name: &str,
-        thread_group_id: ThreadId,
-        link: Option<&ThreadLinkDestination<'_>>,
-    ) {
-        let function_origin = match link {
-            Some(ThreadLinkDestination::ToLLI(_)) => "rust",
-            Some(_) => "llvm",
-            None => "shim",
-        };
-        let thread_id = thread_group_id.to_u32();
-
-        let file = &mut self.calls;
-        let line = format!("{thread_id},{function_name},{function_origin}");
-        file.write_all(line.as_bytes()).unwrap();
-        file.write_all(b"\n").unwrap();
-        file.flush().unwrap();
-    }
-
+    #[inline(always)]
     pub fn log_llvm_conversion(
         &mut self,
         from: TyAndLayout<'_, Ty<'_>>,
         single_field_dereferenced: bool,
         llvm_field_type: &BasicTypeEnum<'_>,
     ) {
-        let file = &mut self.conversions;
-        let source_type = from.ty.to_string();
-        let source_type_size = from.size.bytes();
-        let line = format!(
-            "\"{source_type}\",{source_type_size},{single_field_dereferenced},\"{llvm_field_type}\""
-        );
-        file.write_all(line.as_bytes()).unwrap();
-        file.write_all(b"\n").unwrap();
-        file.flush().unwrap();
+        self.flags.scalar_pair_expansion.set(true);
+        if let Some(file) = &mut self.conversions {
+            let source_type = from.ty.to_string();
+            let source_type_size = from.size.bytes();
+            let line = format!(
+                "\"{source_type}\",{source_type_size},{single_field_dereferenced},\"{llvm_field_type}\""
+            );
+            file.write_all(line.as_bytes()).unwrap();
+            file.write_all(b"\n").unwrap();
+            file.flush().unwrap();
+        }
+    }
+    #[inline(always)]
+    pub fn log_llvm_upcast(&mut self, parent: &BasicTypeEnum<'_>, child: &BasicTypeEnum<'_>) {
+        self.flags.integer_upcast.set(true);
+        if let Some(file) = &mut self.upcasts {
+            let parent_type = parent.to_string();
+            let child_type = child.to_string();
+            let line = format!("\"{parent_type}\",\"{child_type}\"",);
+            file.write_all(line.as_bytes()).unwrap();
+            file.write_all(b"\n").unwrap();
+            file.flush().unwrap();
+        }
     }
 }

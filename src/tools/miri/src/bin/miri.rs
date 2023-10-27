@@ -39,6 +39,8 @@ use rustc_session::{CtfeBacktrace, EarlyErrorHandler};
 
 use miri::{BacktraceStyle, BorrowTrackerMethod, ProvenanceMode, RetagFields};
 
+
+
 struct MiriCompilerCalls {
     miri_config: miri::MiriConfig,
 }
@@ -366,7 +368,10 @@ fn main() {
         } else if arg == "-Zmiri-symbolic-alignment-check" {
             miri_config.check_alignment = miri::AlignmentCheck::Symbolic;
         } else if arg == "-Zmiri-llvm-log" {
-            miri_config.llvm_log = true
+            miri_config.llvm_log = Some(miri::LLVMLoggingLevel::Flags);
+        } else if arg == "-Zmiri-llvm-log-verbose" {
+            miri_config.llvm_log = Some(miri::LLVMLoggingLevel::Verbose);
+
         } else if arg == "-Zmiri-check-number-validity" {
             eprintln!(
                 "WARNING: the flag `-Zmiri-check-number-validity` no longer has any effect \

@@ -44,6 +44,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let function_opt = m.get_function(link_name.as_str());
                 let result = function_opt.is_some();
                 if let Some(function) = function_opt {
+                    if let Some(ref logger) = &self.eval_context_ref().machine.llvm_logger {
+                        logger.flags.log_llvm_engaged();
+                    }
                     self.call_external_llvm_and_store_return(function, args, dest)?;
                 }
                 Ok(result)

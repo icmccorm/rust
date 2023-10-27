@@ -26,7 +26,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         bte: ResolvedLLVMType<'lli>,
     ) -> InterpResult<'tcx, GenericValue<'lli>> {
         let this = self.eval_context_mut();
-        convert_opty_to_generic_value(this, opty, bte)
+        convert_opty_to_generic_value(this, opty, bte, None)
     }
 }
 
@@ -35,6 +35,7 @@ fn convert_opty_to_generic_value<'tcx, 'lli>(
     ctx: &mut MiriInterpCx<'_, 'tcx>,
     opty: &OpTy<'tcx, Provenance>,
     bte: ResolvedLLVMType<'lli>,
+    parent: ResolvedLLVMType<'lli>,
 ) -> InterpResult<'tcx, GenericValue<'lli>> {
     if let Some(bte) = bte {
         debug!("[Op to GV]: {:?} -> {:?}", opty.layout.ty, bte.print_to_string());
@@ -46,7 +47,7 @@ fn convert_opty_to_generic_value<'tcx, 'lli>(
                 let llvm_field_types =
                     repeat(at.get_element_type()).take(at.len() as usize).collect();
 
-                Ok(convert_opty_to_aggregate(ctx, opty, llvm_field_types)?)
+                Ok(convert_opty_to_aggregate(ctx, opty, bte, llvm_field_types)?)
             }
             BasicTypeEnum::FloatType(ft) =>
                 match opty.layout.abi {
@@ -67,10 +68,7 @@ fn convert_opty_to_generic_value<'tcx, 'lli>(
                                 }
                                 llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind => {
                                     if si.size() != Size::from_bytes(std::mem::size_of::<f64>()) {
-                                        if si.size() != Size::from_bytes(std::mem::size_of::<f32>())
-                                        {
-                                            throw_rust_type_mismatch!(opty.layout, ft);
-                                        }
+                                        throw_rust_type_mismatch!(opty.layout, ft);
                                     }
                                     let double = scalar.to_f64()?.to_bits();
                                     let bytes =
@@ -118,9 +116,18 @@ fn convert_opty_to_generic_value<'tcx, 'lli>(
                         };
                         debug!("[Op to GV]: Int value: {}", u64::try_from(bits).unwrap());
                         let bytes = ctx.to_vec_endian(bits, opty.layout.size.bytes_usize());
-                        if let Some(dest_size) = it.size_of().get_zero_extended_constant() {
+                        let dest_size = ctx.resolve_llvm_type_size(bte)?;
+                        if dest_size != bytes.len() as u64 {
                             if dest_size < bytes.len() as u64 {
                                 throw_rust_type_mismatch!(opty.layout, it);
+                            } else {
+                                if let Some(parent) = parent {
+                                    if let Some(ref mut logger) = &mut ctx.machine.llvm_logger {
+                                        logger.log_llvm_upcast(&parent, &bte)
+                                    }
+                                } else {
+                                    throw_rust_type_mismatch!(opty.layout, it);
+                                }
                             }
                         }
                         Ok(GenericValue::from_byte_slice(&bytes))
@@ -176,7 +183,7 @@ fn convert_opty_to_generic_value<'tcx, 'lli>(
                     throw_rust_type_mismatch!(opty.layout, st);
                 }
                 let llvm_field_types = st.get_field_types();
-                Ok(convert_opty_to_aggregate(ctx, opty, llvm_field_types)?)
+                Ok(convert_opty_to_aggregate(ctx, opty, bte, llvm_field_types)?)
             }
             BasicTypeEnum::VectorType(vt) =>
                 match opty.layout.abi {
@@ -292,6 +299,7 @@ fn is_enum_of_nonnullable_ptr<'tcx>(
 fn convert_opty_to_aggregate<'lli, 'tcx>(
     ctx: &mut MiriInterpCx<'_, 'tcx>,
     arg: &OpTy<'tcx, Provenance>,
+    parent_type: BasicTypeEnum<'lli>,
     llvm_fields: Vec<BasicTypeEnum<'lli>>,
 ) -> InterpResult<'tcx, GenericValue<'lli>> {
     let mut arg = arg.clone();
@@ -312,7 +320,8 @@ fn convert_opty_to_aggregate<'lli, 'tcx>(
     for (rust_field, llvm_field) in rust_llvm_field_pairs {
         let as_op = ctx.project_field(&arg, rust_field)?;
         debug!("Field {}", rust_field);
-        let as_gv = convert_opty_to_generic_value(ctx, &as_op, Some(llvm_field))?;
+        let as_gv =
+            convert_opty_to_generic_value(ctx, &as_op, Some(llvm_field), Some(parent_type))?;
         gen_ag.append_aggregate_value(as_gv);
     }
     Ok(gen_ag)

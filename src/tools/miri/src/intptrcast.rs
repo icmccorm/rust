@@ -5,11 +5,10 @@ use std::collections::hash_map::Entry;
 use log::trace;
 use rand::Rng;
 
+use crate::*;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_span::Span;
 use rustc_target::abi::{HasDataLayout, Size};
-
-use crate::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProvenanceMode {
@@ -134,6 +133,14 @@ impl<'mir, 'tcx> GlobalStateInner {
         addr: u64,
     ) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
         trace!("Casting {:#x} to a pointer", addr);
+
+        if let Some(ref logger) = &ecx.machine.llvm_logger {
+            if ecx.active_thread_ref().is_llvm_thread() {
+                logger.flags.log_from_addr_cast_llvm();
+            } else {
+                logger.flags.log_from_addr_cast_rust();
+            }
+        }
 
         let global_state = ecx.machine.intptrcast.borrow();
 

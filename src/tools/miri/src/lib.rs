@@ -114,7 +114,7 @@ pub use crate::diagnostics::{
     report_error, EvalContextExt as _, NonHaltingDiagnostic, TerminationInfo,
 };
 pub use crate::eval::{
-    create_ecx, eval_entry, AlignmentCheck, BacktraceStyle, IsolatedOp, MiriConfig, RejectOpWith,
+    create_ecx, eval_entry, AlignmentCheck, BacktraceStyle, IsolatedOp, MiriConfig, RejectOpWith, LLVMLoggingLevel
 };
 pub use crate::helpers::EvalContextExt as _;
 pub use crate::intptrcast::ProvenanceMode;
