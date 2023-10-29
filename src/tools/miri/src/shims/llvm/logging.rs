@@ -76,13 +76,16 @@ impl LLVMFlags {
 }
 impl Drop for LLVMFlags {
     fn drop(&mut self) {
-        if let Ok(flags_json) = serde_json::to_string(&self) {
-            let mut flags_path = std::env::current_dir().unwrap();
-            flags_path.push("flags.json");
-            let flags_log_file = OpenOptions::new().create(true).write(true).open(flags_path);
-            if let Ok(mut flags_log_file) = flags_log_file {
-                flags_log_file.write_all(flags_json.as_bytes()).unwrap_or(());
-                flags_log_file.flush().unwrap_or(());
+        if self.llvm_engaged.get() {
+            if let Ok(flags_json) = serde_json::to_string(&self) {
+                let mut flags_path = std::env::current_dir().unwrap();
+                flags_path.push("flags.json");
+                let flags_log_file =
+                    OpenOptions::new().create(true).write(true).truncate(true).open(flags_path);
+                if let Ok(mut flags_log_file) = flags_log_file {
+                    flags_log_file.write_all(flags_json.as_bytes()).unwrap_or(());
+                    flags_log_file.flush().unwrap_or(());
+                }
             }
         }
     }

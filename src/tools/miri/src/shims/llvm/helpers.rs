@@ -355,18 +355,27 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         Ok(None)
     }
 
-    fn resolve_padded_size(&self, arg: &OpTy<'tcx, Provenance>, rust_field_idx: usize) -> Size {
-        if arg.layout.fields.count() <= 1 {
-            arg.layout.size
+    fn resolve_padded_size(&self, layout: &TyAndLayout<'tcx>, rust_field_idx: usize) -> Size {
+        if layout.fields.count() <= 1 {
+            layout.size
         } else {
-            let curr_offset = arg.layout.fields.offset(rust_field_idx);
+            let curr_offset = layout.fields.offset(rust_field_idx);
             #[allow(clippy::arithmetic_side_effects)]
-            if rust_field_idx + 1 == arg.layout.fields.count() {
-                arg.layout.size - curr_offset
+            if rust_field_idx + 1 == layout.fields.count() {
+                layout.size - curr_offset
             } else {
-                arg.layout.fields.offset(rust_field_idx + 1) - curr_offset
+                layout.fields.offset(rust_field_idx + 1) - curr_offset
             }
         }
+    }
+
+    fn validate_size_matches(
+        &self,
+        source_size: Size,
+        destination_value_size: Size,
+        destination_padded_size: Size,
+    ) -> bool {
+        source_size == destination_value_size || source_size == destination_padded_size
     }
 
     fn maybe_alloc_id(&self, mp: Pointer<Option<crate::Provenance>>) -> Option<AllocId> {

@@ -308,7 +308,7 @@ fn convert_opty_to_aggregate<'lli, 'tcx>(
     let rust_llvm_field_pairs = rust_field_iterator.zip(llvm_fields);
 
     for (rust_field_idx, llvm_field) in rust_llvm_field_pairs {
-        let padded_size = ctx.resolve_padded_size(&arg, rust_field_idx);
+        let padded_size = ctx.resolve_padded_size(&arg.layout, rust_field_idx);
         let as_op = ctx.project_field(&arg, rust_field_idx)?;
         debug!(
             "Field {}, size: {}, padded size: {}",

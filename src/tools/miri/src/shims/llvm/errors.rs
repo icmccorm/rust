@@ -59,7 +59,7 @@ macro_rules! throw_unsup_var_arg {
             "Non-scalar variable arguments are not supported: \"{}\".",
             $rust_layout.ty,
         )
-    }
+    };
 }
 #[macro_export]
 macro_rules! throw_rust_field_mismatch {

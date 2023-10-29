@@ -14,7 +14,6 @@ pub struct GenericValueTy {
     pub val_ref: GenericValueRef,
 }
 impl GenericValueTy {
-
     pub fn new(ty: BasicTypeEnum<'_>, val_ref: GenericValueRef) -> Self {
         Self { type_ref: ty.as_type_ref(), val_ref }
     }

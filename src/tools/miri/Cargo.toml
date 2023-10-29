@@ -18,10 +18,9 @@ test = false # we have no unit tests
 doctest = false # and no doc tests
 
 [dependencies]
-inkwell = { path = "../../inkwell", features=["llvm17-0"] }
-llvm-sys = { path = "../../llvm-sys", version = "170.0.0" }
+inkwell = { path = "./inkwell", features=["llvm17-0"] }
+llvm-sys = { path = "./llvm-sys", version = "170.0.0" }
 ouroboros = "0.15.6"
-
 getrandom = { version = "0.2", features = ["std"] }
 env_logger = "0.10"
 log = "0.4"
@@ -36,6 +35,8 @@ infer = "0.13.0"
 once_cell = "1.17.1"
 libc = "0.2"
 parking_lot = "0.12.1"
+serde_json = "1.0.107"
+serde = { version = "1.0.185", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -46,7 +47,7 @@ libloading = "0.7"
 
 [dev-dependencies]
 colored = "2"
-ui_test = "0.11.7"
+ui_test = "0.21.1"
 rustc_version = "0.4"
 # Features chosen to match those required by env_logger, to avoid rebuilds
 regex = { version = "1.5.5", default-features = false, features = ["perf", "std"] }
