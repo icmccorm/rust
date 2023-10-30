@@ -3,6 +3,7 @@ extern crate rustc_abi;
 use super::values::generic_value::GenericValueTy;
 use super::values::resolved_ptr::ResolvedPointer;
 use crate::helpers::EvalContextExt as HelperEvalExt;
+use crate::rustc_const_eval::interpret::AllocMap;
 use crate::rustc_middle::ty::layout::LayoutOf;
 use crate::shims::llvm_ffi_support::EvalContextExt as LLVMEvalContextExt;
 use crate::throw_unsup_llvm_type;
@@ -39,6 +40,33 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         gvty: &GenericValueTy,
     ) -> InterpResult<'tcx, TyAndLayout<'tcx>> {
         let this = self.eval_context_ref();
+        if let BasicTypeEnum::PointerType(_) = gvty.ty() {
+            let wrapped_pointer = gvty.val_ref.as_miri_pointer();
+            let mp = this.lli_wrapped_pointer_to_maybe_pointer(wrapped_pointer);
+            if let Some(crate::Provenance::Concrete { alloc_id, .. }) = mp.provenance {
+                if let Some((kind, _)) = this.memory.alloc_map().get(alloc_id) {
+                    if let rustc_const_eval::interpret::MemoryKind::Machine(
+                        crate::MiriMemoryKind::LLVMStack | crate::MiriMemoryKind::LLVMStatic,
+                    ) = kind
+                    {
+                        let (size, _align, _) = this.get_alloc_info(alloc_id);
+                        let base_address =
+                            intptrcast::GlobalStateInner::alloc_base_addr(this, alloc_id)?;
+
+                        #[allow(clippy::arithmetic_side_effects)]
+                        let offset = mp.addr() - Size::from_bytes(base_address);
+
+                        if offset == Size::ZERO {
+                            if let Some(pointing_to) =
+                                self.get_equivalent_rust_int_from_size(size)?
+                            {
+                                return this.raw_pointer_to(pointing_to.ty);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         this.get_equivalent_rust_layout(gvty.ty())
     }
 
@@ -55,20 +83,34 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     _ => throw_unsup_llvm_type!(ft),
                 },
             BasicTypeEnum::IntType(it) =>
-                return match it.get_bit_width() {
-                    8 => ctx.layout_of(ctx.tcx.types.u8),
-                    16 => ctx.layout_of(ctx.tcx.types.u16),
-                    32 => ctx.layout_of(ctx.tcx.types.u32),
-                    64 => ctx.layout_of(ctx.tcx.types.u64),
-                    128 => ctx.layout_of(ctx.tcx.types.u128),
-                    _ => throw_unsup_llvm_type!(it),
+                if let Some(int_ty) =
+                    ctx.get_equivalent_rust_int_from_size(Size::from_bits(it.get_bit_width()))?
+                {
+                    Ok(int_ty)
+                } else {
+                    throw_unsup_llvm_type!(it)
                 },
             BasicTypeEnum::PointerType(_) => ctx.raw_pointer_to(ctx.tcx.types.u8),
             _ => throw_unsup_llvm_type!(ty),
         }
     }
 
-    #[allow(clippy::arithmetic_side_effects)]
+    fn get_equivalent_rust_int_from_size(
+        &self,
+        integer_size: Size,
+    ) -> InterpResult<'tcx, Option<TyAndLayout<'tcx>>> {
+        let this = self.eval_context_ref();
+        let result = match integer_size.bytes() {
+            1 => Some(this.layout_of(this.tcx.types.u8)?),
+            2 => Some(this.layout_of(this.tcx.types.u16)?),
+            4 => Some(this.layout_of(this.tcx.types.u32)?),
+            8 => Some(this.layout_of(this.tcx.types.u64)?),
+            16 => Some(this.layout_of(this.tcx.types.u128)?),
+            _ => None,
+        };
+        Ok(result)
+    }
+
     fn resolve_llvm_type_size<'lli>(&self, bte: BasicTypeEnum<'lli>) -> InterpResult<'tcx, u64> {
         let this = self.eval_context_ref();
         let possible_llvm_size = bte.size_of().and_then(|ce| ce.get_zero_extended_constant());
@@ -76,8 +118,10 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             return Ok(size);
         } else {
             let size = match bte {
+                #[allow(clippy::arithmetic_side_effects)]
                 BasicTypeEnum::ArrayType(at) =>
                     u64::from(at.len()) * self.resolve_llvm_type_size(at.get_element_type())?,
+
                 BasicTypeEnum::FloatType(_) =>
                     match bte.get_llvm_type_kind() {
                         llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind =>
@@ -86,9 +130,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                             this.layout_of(this.tcx.types.f32)?.size.bytes(),
                         _ => throw_unsup_llvm_type!(bte),
                     },
+
                 BasicTypeEnum::IntType(it) => u64::from(it.get_bit_width() / 8),
+
                 BasicTypeEnum::PointerType(_) =>
                     self.eval_context_ref().tcx().data_layout.pointer_size.bytes(),
+
                 BasicTypeEnum::StructType(st) =>
                     st.get_field_types()
                         .iter()
@@ -96,6 +143,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                         .collect::<InterpResult<'_, Vec<_>>>()?
                         .iter()
                         .sum(),
+
+                #[allow(clippy::arithmetic_side_effects)]
                 BasicTypeEnum::VectorType(vt) =>
                     u64::from(vt.get_size()) * self.resolve_llvm_type_size(vt.get_element_type())?,
             };

@@ -715,7 +715,6 @@ impl VClockAlloc {
                 | MiriMemoryKind::Miri
                 | MiriMemoryKind::C
                 | MiriMemoryKind::WinHeap
-                | MiriMemoryKind::LLVMHeap
                 | MiriMemoryKind::LLVMStack
                 | MiriMemoryKind::LLVMInterop
                 | MiriMemoryKind::Mmap,

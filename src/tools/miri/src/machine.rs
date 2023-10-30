@@ -123,7 +123,6 @@ pub enum MiriMemoryKind {
     /// This memory may not leak.
     LLVMStatic,
     LLVMStack,
-    LLVMHeap,
     LLVMInterop,
     /// Memory mapped directly by the program
     Mmap,
@@ -141,7 +140,7 @@ impl MayLeak for MiriMemoryKind {
     fn may_leak(self) -> bool {
         use self::MiriMemoryKind::*;
         match self {
-            Rust | Miri | C | WinHeap | Runtime | LLVMInterop | LLVMStack | LLVMHeap => false,
+            Rust | Miri | C | WinHeap | Runtime | LLVMInterop | LLVMStack => false,
             Machine | Global | ExternStatic | Tls | LLVMStatic | Mmap => true,
         }
     }
@@ -155,8 +154,7 @@ impl MiriMemoryKind {
             // Heap allocations are fine since the `Allocation` is created immediately.
             Rust | Miri | C | WinHeap | Mmap | LLVMInterop => true,
             // Everything else is unclear, let's not show potentially confusing spans.
-            Machine | Global | ExternStatic | Tls | Runtime | LLVMStatic | LLVMStack | LLVMHeap =>
-                false,
+            Machine | Global | ExternStatic | Tls | Runtime | LLVMStatic | LLVMStack => false,
         }
     }
 }
@@ -167,7 +165,6 @@ impl fmt::Display for MiriMemoryKind {
         match self {
             LLVMInterop => write!(f, "Allocated for interop between LLI and Miri"),
             LLVMStatic => write!(f, "Allocated by LLVM for global variable"),
-            LLVMHeap => write!(f, "Allocated in heap by LLVM"),
             LLVMStack => write!(f, "Allocated as local by LLVM"),
             Rust => write!(f, "Rust heap"),
             Miri => write!(f, "Miri bare-metal heap"),

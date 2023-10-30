@@ -26,7 +26,7 @@ pub struct LLVMFlags {
     llvm_inttoptr: Cell<bool>,
     llvm_ptrtoint: Cell<bool>,
     llvm_on_resolve: Cell<bool>,
-    used_multithreading: Cell<bool>,
+    llvm_used_multithreading: Cell<bool>,
     scalar_pair_expansion: Cell<bool>,
     integer_upcast: Cell<bool>,
 }
@@ -40,7 +40,7 @@ impl LLVMFlags {
             llvm_inttoptr: Cell::new(false),
             llvm_ptrtoint: Cell::new(false),
             llvm_on_resolve: Cell::new(false),
-            used_multithreading: Cell::new(false),
+            llvm_used_multithreading: Cell::new(false),
             scalar_pair_expansion: Cell::new(false),
             integer_upcast: Cell::new(false),
         }
@@ -70,10 +70,11 @@ impl LLVMFlags {
         self.llvm_on_resolve.set(true)
     }
     #[inline(always)]
-    pub fn log_multithreading(&self) {
-        self.used_multithreading.set(true)
+    pub fn log_llvm_multithreading(&self) {
+        self.llvm_used_multithreading.set(true)
     }
 }
+
 impl Drop for LLVMFlags {
     fn drop(&mut self) {
         if self.llvm_engaged.get() {

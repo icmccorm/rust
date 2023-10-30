@@ -920,7 +920,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         if let Some(current_group_id) = this.machine.threads.lli_thread_group.get() {
             if group_id != current_group_id {
                 if let Some(ref logger) = &this.machine.llvm_logger {
-                    logger.flags.log_multithreading()
+                    logger.flags.log_llvm_multithreading()
                 }
             }
         }
@@ -1028,7 +1028,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
 
         this.active_thread_mut().thread_kind.set(ThreadKind::MiriLinked(link));
-
+   
         // Restore the old active thread frame.
         let new_thread_id = this.set_active_thread(old_thread_id);
         this.join_thread(new_thread_id)?;
@@ -1047,7 +1047,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         ret_layout: TyAndLayout<'tcx>,
     ) -> InterpResult<'tcx, ThreadId> {
         let this = self.eval_context_mut();
-
         // Create the new thread
         let new_thread_id = this.machine.threads.create_thread({
             let mut state = tls::TlsDtorsState::default();

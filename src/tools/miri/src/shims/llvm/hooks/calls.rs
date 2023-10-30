@@ -183,7 +183,7 @@ fn miri_call_by_name_result<'tcx>(
                 if num_args == 1 {
                     let size_as_scalar = ctx.opty_as_scalar(&op_ty_args[0])?;
                     let size_value = size_as_scalar.to_u64()?;
-                    let allocation = ctx.malloc(size_value, false, MiriMemoryKind::LLVMHeap)?;
+                    let allocation = ctx.malloc(size_value, false, MiriMemoryKind::C)?;
 
                     let as_miri_ptr = ctx.pointer_to_lli_wrapped_pointer(allocation);
                     debug!(
@@ -199,7 +199,7 @@ fn miri_call_by_name_result<'tcx>(
                 if num_args == 1 {
                     let address = ctx.opty_as_scalar(&op_ty_args[0])?;
                     let as_pointer = address.to_pointer(ctx)?;
-                    ctx.free(as_pointer, MiriMemoryKind::LLVMHeap)?;
+                    ctx.free(as_pointer, MiriMemoryKind::C)?;
                     ctx.void_generic_value()
                 } else {
                     throw_shim_argument_mismatch!(name_rust_str, 1, num_args);
@@ -212,8 +212,7 @@ fn miri_call_by_name_result<'tcx>(
                     let size_as_scalar = ctx.opty_as_scalar(&op_ty_args[1])?;
                     let num_value = num_as_scalar.to_u64()?;
                     let size_value = size_as_scalar.to_u64()?;
-                    let allocation =
-                        ctx.malloc(num_value * size_value, true, MiriMemoryKind::LLVMHeap)?;
+                    let allocation = ctx.malloc(num_value * size_value, true, MiriMemoryKind::C)?;
                     let as_miri_ptr = ctx.pointer_to_lli_wrapped_pointer(allocation);
 
                     debug!(
@@ -233,8 +232,7 @@ fn miri_call_by_name_result<'tcx>(
                     let as_pointer = address.to_pointer(ctx)?;
                     let num_as_scalar = ctx.opty_as_scalar(&op_ty_args[1])?;
                     let num_value = num_as_scalar.to_u64()?;
-                    let allocation =
-                        ctx.realloc(as_pointer, num_value, MiriMemoryKind::LLVMHeap)?;
+                    let allocation = ctx.realloc(as_pointer, num_value, MiriMemoryKind::C)?;
                     let as_miri_ptr = ctx.pointer_to_lli_wrapped_pointer(allocation);
                     unsafe { GenericValue::create_generic_value_of_miri_pointer(as_miri_ptr) }
                 } else {
@@ -376,7 +374,7 @@ fn miri_call_by_name_result<'tcx>(
                     let src_as_pointer = src.to_pointer(ctx)?;
                     let src_len = ctx.read_c_str(src_as_pointer)?.len() + 1;
                     let allocation =
-                        ctx.malloc(src_len.try_into().unwrap(), false, MiriMemoryKind::LLVMHeap)?;
+                        ctx.malloc(src_len.try_into().unwrap(), false, MiriMemoryKind::C)?;
                     ctx.mem_copy(
                         src_as_pointer,
                         Align::ONE,

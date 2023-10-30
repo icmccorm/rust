@@ -199,6 +199,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 if !align.is_power_of_two() || align < this.pointer_size().bytes() {
                     let einval = this.eval_libc_i32("EINVAL");
                     this.write_int(einval, dest)?;
+                    
                 } else {
                     if size == 0 {
                         this.write_null(&ret)?;
