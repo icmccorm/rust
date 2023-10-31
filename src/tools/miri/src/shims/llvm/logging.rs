@@ -28,6 +28,7 @@ pub struct LLVMFlags {
     llvm_on_resolve: Cell<bool>,
     llvm_used_multithreading: Cell<bool>,
     scalar_pair_expansion: Cell<bool>,
+    size_based_type_inference: Cell<bool>,
     integer_upcast: Cell<bool>,
 }
 
@@ -42,6 +43,7 @@ impl LLVMFlags {
             llvm_on_resolve: Cell::new(false),
             llvm_used_multithreading: Cell::new(false),
             scalar_pair_expansion: Cell::new(false),
+            size_based_type_inference: Cell::new(false),
             integer_upcast: Cell::new(false),
         }
     }
@@ -72,6 +74,10 @@ impl LLVMFlags {
     #[inline(always)]
     pub fn log_llvm_multithreading(&self) {
         self.llvm_used_multithreading.set(true)
+    }
+    #[inline(always)]
+    pub fn log_size_based_type_inference(&self) {
+        self.size_based_type_inference.set(true)
     }
 }
 

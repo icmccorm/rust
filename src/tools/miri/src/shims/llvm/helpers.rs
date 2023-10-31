@@ -60,6 +60,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                             if let Some(pointing_to) =
                                 self.get_equivalent_rust_int_from_size(size)?
                             {
+                                if let Some(ref logger) = this.machine.llvm_logger {
+                                    logger.flags.log_size_based_type_inference();
+                                }
                                 return this.raw_pointer_to(pointing_to.ty);
                             }
                         }
