@@ -22,6 +22,7 @@ pub fn eval_memcpy<'tcx>(
     source_length: Option<&OpTy<'tcx, crate::Provenance>>,
     mode: MemcpyMode,
 ) -> InterpResult<'tcx, GenericValue<'tcx>> {
+
     let dest = ctx.opty_as_scalar(dest)?;
     let dest_as_pointer = dest.to_pointer(ctx)?;
 

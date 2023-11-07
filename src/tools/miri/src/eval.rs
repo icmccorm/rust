@@ -1,5 +1,4 @@
 //! Main evaluator loop and setting up the initial stack frame.
-
 use std::ffi::{OsStr, OsString};
 use std::iter;
 use std::panic::{self, AssertUnwindSafe};
@@ -169,6 +168,9 @@ pub struct MiriConfig {
     /// Whether to log LLVM bytecode and function calls to files
     pub llvm_log: Option<LLVMLoggingLevel>,
     pub singular_llvm_bc_file: Option<PathBuf>,
+    pub llvm_zero_stack: bool,
+    pub llvm_zero_heap: bool,
+    pub llvm_zero_static: bool,
 }
 
 impl Default for MiriConfig {
@@ -210,6 +212,9 @@ impl Default for MiriConfig {
             collect_leak_backtraces: true,
             llvm_log: None,
             singular_llvm_bc_file: None,
+            llvm_zero_stack: false,
+            llvm_zero_heap: false,
+            llvm_zero_static: false,
         }
     }
 }

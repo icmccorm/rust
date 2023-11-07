@@ -25,6 +25,31 @@ pub struct ResolvedPointer {
 }
 
 impl ResolvedPointer {
+    
+    #[allow(dead_code)]
+    fn access_range_as_string<'tcx>(
+        &self,
+        ctx: &MiriInterpCx<'_, 'tcx>,
+        bytes: u64,
+    ) -> InterpResult<'tcx, Option<String>> {
+        if let Some(alloc_id) = self.alloc_id {
+            let (_size, range) = self.get_access_size_range(bytes);
+            let base_address = intptrcast::GlobalStateInner::alloc_base_addr(ctx, alloc_id)?;
+            let offset = self.ptr.addr() - Size::from_bytes(base_address);
+            let (size, _, _) = ctx.get_alloc_info(alloc_id);
+            Ok(Some(format!(
+                "alloc{} - [0..{}-[{},{}]-{}]",
+                alloc_id.0.get(),
+                offset.bytes(),
+                offset.bytes() + range.start.bytes(),
+                offset.bytes() + range.start.bytes() + range.size.bytes() - 1,
+                size.bytes() - 1
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn access_alloc<'tcx, 'a>(
         &'a self,
         ctx: &'a MiriInterpCx<'_, 'tcx>,
@@ -134,6 +159,7 @@ impl Destination<ResolvedPointer> for ResolvedPointer {
         bytes: u64,
     ) -> InterpResult<'tcx> {
         let (mut alloc, range) = self.access_alloc_mut(ctx, bytes)?;
+
         alloc.write_scalar(range, Scalar::from_uint(value, Size::from_bytes(bytes)))?;
         Ok(())
     }

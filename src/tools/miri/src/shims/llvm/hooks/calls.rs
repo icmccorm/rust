@@ -183,8 +183,8 @@ fn miri_call_by_name_result<'tcx>(
                 if num_args == 1 {
                     let size_as_scalar = ctx.opty_as_scalar(&op_ty_args[0])?;
                     let size_value = size_as_scalar.to_u64()?;
-                    let allocation = ctx.malloc(size_value, false, MiriMemoryKind::C)?;
-
+                    let allocation =
+                        ctx.malloc(size_value, ctx.machine.llvm_zero_heap, MiriMemoryKind::C)?;
                     let as_miri_ptr = ctx.pointer_to_lli_wrapped_pointer(allocation);
                     debug!(
                         "[llvm_user_malloc] allocated {:?} bytes at {:?}",
@@ -247,7 +247,7 @@ fn miri_call_by_name_result<'tcx>(
                     Some(&args[2]),
                     MemcpyMode::DisjointOrEqual,
                 )?,
-            "__memcpy_chk" =>
+            "__memcpy_chk" => 
                 eval_memcpy(
                     ctx,
                     name_rust_str,
@@ -373,8 +373,11 @@ fn miri_call_by_name_result<'tcx>(
                     let src = ctx.opty_as_scalar(&op_ty_args[0])?;
                     let src_as_pointer = src.to_pointer(ctx)?;
                     let src_len = ctx.read_c_str(src_as_pointer)?.len() + 1;
-                    let allocation =
-                        ctx.malloc(src_len.try_into().unwrap(), false, MiriMemoryKind::C)?;
+                    let allocation = ctx.malloc(
+                        src_len.try_into().unwrap(),
+                        ctx.machine.llvm_zero_heap,
+                        MiriMemoryKind::C,
+                    )?;
                     ctx.mem_copy(
                         src_as_pointer,
                         Align::ONE,

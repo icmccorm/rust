@@ -20,18 +20,22 @@ pub fn obtain_ctx_mut(
 pub extern "C-unwind" fn llvm_malloc(
     ctx_raw: *mut MiriInterpCxOpaque,
     bytes: u64,
-    _alignment: u64,
+    alignment: u64,
     is_static: bool,
 ) -> MiriPointer {
     let ctx = obtain_ctx_mut(ctx_raw);
-    let kind = if is_static { MiriMemoryKind::LLVMStatic } else { MiriMemoryKind::LLVMStack };
-    let allocation = ctx.malloc(bytes, false, kind);
+    let (kind, zero) = if is_static {
+        (MiriMemoryKind::LLVMStatic, ctx.machine.llvm_zero_static)
+    } else {
+        (MiriMemoryKind::LLVMStack, ctx.machine.llvm_zero_stack)
+    };
+
+    let allocation = ctx.malloc_align(bytes, alignment, zero, kind);
     if let Ok(ptr) = allocation {
         if let Some(crate::Provenance::Concrete { alloc_id, .. }) = ptr.provenance {
             if is_static {
                 ctx.machine.static_roots.push(alloc_id);
             }
-            debug!("[llvm_malloc] AID: {:?}, bytes: {}, is_static: {}", alloc_id, bytes, is_static);
             ctx.pointer_to_lli_wrapped_pointer(ptr)
         } else {
             panic_any("malloc returned a pointer with a non-AllocID provenance");
@@ -52,7 +56,6 @@ fn llvm_free_result<'tcx>(
 
 pub extern "C-unwind" fn llvm_free(ctx_raw: *mut MiriInterpCxOpaque, ptr: MiriPointer) -> bool {
     let ctx = obtain_ctx_mut(ctx_raw);
-    debug!("[llvm_free] AID: {:?}", ptr.prov.alloc_id);
     let result = llvm_free_result(ctx, ptr);
     let status = result.is_err();
     if let Err(e) = result {
@@ -67,14 +70,9 @@ fn miri_memcpy_result<'tcx>(
     src_ptr: *const u8,
     src_len: u64,
 ) -> InterpResult<'tcx> {
-    debug!(
-        "Internal memcpy(), {} bytes to destination, (AID: {}, Addr: {})",
-        src_len, dest.prov.alloc_id, dest.addr
-    );
     let dest_pointer = ctx.lli_wrapped_pointer_to_resolved_pointer(dest)?;
     let slice = unsafe { std::slice::from_raw_parts(src_ptr, usize::try_from(src_len).unwrap()) };
     ctx.write_bytes_ptr(dest_pointer.ptr, slice.iter().copied())?;
-    debug!("Internal memcpy() finished");
     Ok(())
 }
 
@@ -99,13 +97,8 @@ fn miri_memset_result<'tcx>(
     val: u8,
     len: u64,
 ) -> InterpResult<'tcx, ()> {
-    debug!(
-        "Internal memset(), value {} copied {} times to destination, (AID: {}, Addr: {})",
-        val, len, dest.prov.alloc_id, dest.addr
-    );
     let dest_pointer = ctx.lli_wrapped_pointer_to_resolved_pointer(dest)?;
     ctx.write_bytes_ptr(dest_pointer.ptr, repeat(val).take(usize::try_from(len).unwrap()))?;
-    debug!("Internal memset() finished");
     Ok(())
 }
 
@@ -152,6 +145,7 @@ fn miri_register_global_result<'tcx>(
     let pointer = ctx.lli_wrapped_pointer_to_resolved_pointer(mp)?;
     if let Some(valid_pointer) = pointer.with_provenance() {
         debug!("[LLVM Extern Static] Registering {} - {:?}", name, pointer.ptr);
+
         if ctx.machine.extern_statics.try_insert(Symbol::intern(name), valid_pointer).is_err() {
             throw_unsup_format!(
                 "Unable to register LLVM global {} because it's already registered by Miri.",

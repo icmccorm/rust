@@ -1188,6 +1188,24 @@ pub fn isolation_abort_error<'tcx>(name: &str) -> InterpResult<'tcx> {
 
 /// Retrieve the list of local crates that should have been passed by cargo-miri in
 /// MIRI_LOCAL_CRATES and turn them into `CrateNum`s.
+/* 
+pub fn get_llvm_extern_static_types<'tcx>(tcx: TyCtxt<'tcx>) -> FxHashMap<Symbol, TyAndLayout<'tcx>> {
+    let mut static_map = FxHashMap::default();
+    tcx.hir().items().for_each(|id| {
+        let node = tcx.hir().get(id.hir_id());
+        if let rustc_hir::Node::ForeignItem(item) = node {
+            if let rustc_hir::ForeignItemKind::Static(ty, _) = item.kind {
+                let defn_id = ty.hir_id.owner.def_id;
+                let ty = tcx.type_of(defn_id).skip_binder();
+                if let Ok(layout) = tcx.layout_of(tcx.param_env(defn_id).and(ty)) {
+                    static_map.insert(node.ident().unwrap().name, layout);
+                }
+            }
+        }
+    });
+    static_map
+}*/
+
 pub fn get_extern_functions(tcx: TyCtxt<'_>) -> FxHashMap<String, Instance<'_>> {
     let mut cxx_map = FxHashMap::default();
 

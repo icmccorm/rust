@@ -371,7 +371,16 @@ fn main() {
             miri_config.llvm_log = Some(miri::LLVMLoggingLevel::Flags);
         } else if arg == "-Zmiri-llvm-log-verbose" {
             miri_config.llvm_log = Some(miri::LLVMLoggingLevel::Verbose);
-
+        } else if arg == "-Zmiri-llvm-zero-stack" {
+            miri_config.llvm_zero_stack = true;
+        } else if arg == "-Zmiri-llvm-zero-heap" {
+            miri_config.llvm_zero_heap = true;
+        } else if arg == "-Zmiri-llvm-zero-static" {
+            miri_config.llvm_zero_static = true;
+        }else if arg == "-Zmiri-llvm-zero-all" {
+            miri_config.llvm_zero_stack = true;
+            miri_config.llvm_zero_heap = true;
+            miri_config.llvm_zero_static = true;
         } else if arg == "-Zmiri-check-number-validity" {
             eprintln!(
                 "WARNING: the flag `-Zmiri-check-number-validity` no longer has any effect \

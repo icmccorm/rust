@@ -543,6 +543,10 @@ pub struct MiriMachine<'mir, 'tcx> {
     /// The spans we will use to report where an allocation was created and deallocated in
     /// diagnostics.
     pub(crate) allocation_spans: RefCell<FxHashMap<AllocId, (Span, Option<Span>)>>,
+
+    pub(crate) llvm_zero_stack: bool,
+    pub(crate) llvm_zero_heap: bool,
+    pub(crate) llvm_zero_static: bool,
 }
 
 impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
@@ -687,6 +691,9 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
                 None
             },
             allocation_spans: RefCell::new(FxHashMap::default()),
+            llvm_zero_stack: config.llvm_zero_stack,
+            llvm_zero_heap: config.llvm_zero_heap,
+            llvm_zero_static: config.llvm_zero_static,
         }
     }
 
@@ -882,6 +889,9 @@ impl VisitTags for MiriMachine<'_, '_> {
             llvm_logger: _,
             collect_leak_backtraces: _,
             allocation_spans: _,
+            llvm_zero_stack: _,
+            llvm_zero_heap: _,
+            llvm_zero_static: _,
         } = self;
 
         threads.visit_tags(visit);

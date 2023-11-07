@@ -6,7 +6,6 @@ use rustc_const_eval::interpret::AllocId;
 use std::num::NonZeroU64;
 
 pub extern "C-unwind" fn miri_ptrtoint(ctx_raw: *mut MiriInterpCxOpaque, mp: MiriPointer) -> u64 {
-    debug!("[ptrtoint] AID: {}, addr: {}", mp.prov.alloc_id, mp.addr);
     let ctx = obtain_ctx_mut(ctx_raw);
     let addr_to_return = if mp.prov.alloc_id == 0 {
         if mp.addr == 0 { 0 } else { mp.addr }
@@ -39,7 +38,6 @@ pub extern "C-unwind" fn miri_inttoptr(ctx_raw: *mut MiriInterpCxOpaque, addr: u
             MiriPointer { addr: 0, prov: MiriProvenance { alloc_id: 0, tag: 0 } }
         }
     };
-    debug!("[inttoptr] AID: {}, addr: {}", as_miri_ptr.prov.alloc_id, addr);
     if let Some(ref logger) = &ctx.machine.llvm_logger {
         logger.flags.log_inttoptr_llvm();
     }
