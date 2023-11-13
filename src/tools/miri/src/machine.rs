@@ -547,6 +547,7 @@ pub struct MiriMachine<'mir, 'tcx> {
     pub(crate) llvm_zero_stack: bool,
     pub(crate) llvm_zero_heap: bool,
     pub(crate) llvm_zero_static: bool,
+    pub(crate) llvm_read_uninit: bool,
 }
 
 impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
@@ -694,6 +695,7 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
             llvm_zero_stack: config.llvm_zero_stack,
             llvm_zero_heap: config.llvm_zero_heap,
             llvm_zero_static: config.llvm_zero_static,
+            llvm_read_uninit: config.llvm_read_uninit,
         }
     }
 
@@ -892,6 +894,7 @@ impl VisitTags for MiriMachine<'_, '_> {
             llvm_zero_stack: _,
             llvm_zero_heap: _,
             llvm_zero_static: _,
+            llvm_read_uninit: _,
         } = self;
 
         threads.visit_tags(visit);

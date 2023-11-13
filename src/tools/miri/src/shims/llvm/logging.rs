@@ -30,6 +30,7 @@ pub struct LLVMFlags {
     scalar_pair_expansion: Cell<bool>,
     size_based_type_inference: Cell<bool>,
     integer_upcast: Cell<bool>,
+    llvm_read_uninit: Cell<bool>,
 }
 
 impl LLVMFlags {
@@ -45,6 +46,7 @@ impl LLVMFlags {
             scalar_pair_expansion: Cell::new(false),
             size_based_type_inference: Cell::new(false),
             integer_upcast: Cell::new(false),
+            llvm_read_uninit: Cell::new(false),
         }
     }
     #[inline(always)]
@@ -78,6 +80,10 @@ impl LLVMFlags {
     #[inline(always)]
     pub fn log_size_based_type_inference(&self) {
         self.size_based_type_inference.set(true)
+    }
+
+    pub fn log_llvm_read_uninit(&self) {
+        self.llvm_read_uninit.set(true)
     }
 }
 

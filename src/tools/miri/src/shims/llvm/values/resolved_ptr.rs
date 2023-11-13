@@ -198,7 +198,16 @@ impl Source<ResolvedPointer> for ResolvedPointer {
     fn read_f32<'tcx>(&self, ctx: &MiriInterpCx<'_, 'tcx>) -> InterpResult<'tcx, f32> {
         let size = Size::from_bytes(std::mem::size_of::<f32>());
         let (alloc, range) = self.access_alloc(ctx, size.bytes())?;
-        let float_value = alloc.read_scalar(range, false)?.to_f32()?;
+        let float_value = if ctx.machine.llvm_read_uninit {
+            if alloc.is_uninit(range) {
+                if let Some(logger) = &ctx.machine.llvm_logger {
+                    logger.flags.log_llvm_read_uninit();
+                }
+            }
+            alloc.read_scalar_uninit(range, false)?.to_f32()?
+        }else{
+            alloc.read_scalar(range, false)?.to_f32()?
+        };
         let float_value = float_value.to_bits();
         let float_value = ctx.to_vec_endian(float_value, size.bytes_usize());
         let float_value = f32::from_ne_bytes(float_value.try_into().unwrap());
@@ -208,7 +217,16 @@ impl Source<ResolvedPointer> for ResolvedPointer {
     fn read_f64<'tcx>(&self, ctx: &MiriInterpCx<'_, 'tcx>) -> InterpResult<'tcx, f64> {
         let size = Size::from_bytes(std::mem::size_of::<f64>());
         let (alloc, range) = self.access_alloc(ctx, size.bytes())?;
-        let double_value = alloc.read_scalar(range, false)?.to_f64()?;
+        let double_value = if ctx.machine.llvm_read_uninit {
+            if alloc.is_uninit(range) {
+                if let Some(logger) = &ctx.machine.llvm_logger {
+                    logger.flags.log_llvm_read_uninit();
+                }
+            }
+            alloc.read_scalar_uninit(range, false)?.to_f64()?
+        }else{
+            alloc.read_scalar(range, false)?.to_f64()?
+        };
         let double_value = double_value.to_bits();
         let double_value = ctx.to_vec_endian(double_value, size.bytes_usize());
         let double_value = f64::from_ne_bytes(double_value.try_into().unwrap());
@@ -228,7 +246,16 @@ impl Source<ResolvedPointer> for ResolvedPointer {
             }
             u128::from(ptr_value.addr().bytes())
         } else {
-            let scalar_value = alloc.read_integer(range)?;
+            let scalar_value = if ctx.machine.llvm_read_uninit {
+                if alloc.is_uninit(range) {
+                    if let Some(logger) = &ctx.machine.llvm_logger {
+                        logger.flags.log_llvm_read_uninit();
+                    }
+                }
+                alloc.read_integer_uninit(range)?
+            }else{
+                alloc.read_integer(range)?
+            };
             scalar_value.to_bits(Size::from_bytes(bytes))?
         };
         Ok(int_value)
@@ -239,8 +266,17 @@ impl Source<ResolvedPointer> for ResolvedPointer {
         ctx: &MiriInterpCx<'_, 'tcx>,
     ) -> InterpResult<'tcx, Pointer<Option<crate::Provenance>>> {
         let (alloc, range) = self.access_alloc(ctx, ctx.tcx.data_layout.pointer_size.bytes())?;
-        let pointing_to = alloc.read_pointer(range.start)?.to_pointer(ctx)?;
-        Ok(pointing_to)
+        let pointer_val = if ctx.machine.llvm_read_uninit {
+            if alloc.is_uninit(range) {
+                if let Some(logger) = &ctx.machine.llvm_logger {
+                    logger.flags.log_llvm_read_uninit();
+                }
+            }
+            alloc.read_pointer_uninit(range.start)?
+        }else{
+            alloc.read_pointer(range.start)?
+        };
+        Ok(pointer_val.to_pointer(ctx)?)
     }
 
     fn check_aggregate_size<'tcx>(

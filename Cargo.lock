@@ -2741,8 +2741,9 @@ dependencies = [
  "regex 1.8.4",
  "rustc_version",
  "serde",
+ "serde_json",
  "smallvec",
- "ui_test 0.11.7",
+ "ui_test 0.21.2",
  "walkdir",
  "which",
 ]
@@ -5250,9 +5251,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.99"
+version = "1.0.108"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46266871c240a00b8f503b877622fe33430b3c7d963bdc0f2adc511e54a1eae3"
+checksum = "3d1c7e3eac408d115102c4c24ad393e0821bb3a5df4d506a80f85f7a742a526b"
 dependencies = [
  "indexmap 2.0.0",
  "itoa",
@@ -6087,18 +6088,23 @@ checksum = "abd2fc5d32b590614af8b0a20d837f32eca055edd0bbead59a9cfe80858be003"
 
 [[package]]
 name = "ui_test"
-version = "0.11.7"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c21899b59f53717dfad29e4f46e5b21a200a1b6888ab86532a07cfc8b48dd78c"
+checksum = "bfd8fb9b15c8332cf51bfc2dc4830063b2446a9c9d732421b56f2478024a3971"
 dependencies = [
+ "annotate-snippets",
+ "anyhow",
  "bstr",
  "cargo-platform",
  "cargo_metadata",
  "color-eyre",
  "colored",
+ "comma",
  "crossbeam-channel",
- "diff",
+ "indicatif",
  "lazy_static 1.4.0",
+ "levenshtein",
+ "prettydiff",
  "regex 1.8.4",
  "rustc_version",
  "rustfix",
@@ -6109,9 +6115,9 @@ dependencies = [
 
 [[package]]
 name = "ui_test"
-version = "0.20.0"
+version = "0.21.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfd8fb9b15c8332cf51bfc2dc4830063b2446a9c9d732421b56f2478024a3971"
+checksum = "aaf4bf7c184b8dfc7a4d3b90df789b1eb992ee42811cd115f32a7a1eb781058d"
 dependencies = [
  "annotate-snippets",
  "anyhow",

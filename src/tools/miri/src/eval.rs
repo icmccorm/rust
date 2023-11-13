@@ -171,6 +171,7 @@ pub struct MiriConfig {
     pub llvm_zero_stack: bool,
     pub llvm_zero_heap: bool,
     pub llvm_zero_static: bool,
+    pub llvm_read_uninit: bool,
 }
 
 impl Default for MiriConfig {
@@ -215,6 +216,7 @@ impl Default for MiriConfig {
             llvm_zero_stack: false,
             llvm_zero_heap: false,
             llvm_zero_static: false,
+            llvm_read_uninit: false,
         }
     }
 }
