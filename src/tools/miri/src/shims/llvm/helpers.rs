@@ -7,6 +7,7 @@ use crate::rustc_const_eval::interpret::AllocMap;
 use crate::rustc_middle::ty::layout::LayoutOf;
 use crate::shims::llvm_ffi_support::EvalContextExt as LLVMEvalContextExt;
 use crate::throw_unsup_llvm_type;
+use crate::throw_unsup_shim_llvm_type;
 use crate::{intptrcast, BorTag, Provenance, ThreadId};
 use either::Either::Right;
 use inkwell::miri::StackTrace;

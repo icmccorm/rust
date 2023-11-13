@@ -2,7 +2,7 @@
 macro_rules! throw_llvm_field_count_mismatch {
     ($llvm_field_count:expr, $rust_layout:expr) => {
         throw_interop_format!(
-            "LLVM field count mismatch: cannot convert an LLVM value with {} fields to a Rust value of type \"{}\" which has {} fields.",
+            "LLVM field count mismatch: cannot convert an LLVM value with {} fields to a Rust value of type `{}` which has {} fields.",
             $llvm_field_count,
             $rust_layout.ty,
             $rust_layout.fields.count()
@@ -13,7 +13,7 @@ macro_rules! throw_llvm_field_count_mismatch {
 macro_rules! throw_llvm_field_width_mismatch {
     ($llvm_field_width:expr, $rust_layout:expr) => {
         throw_interop_format!(
-            "LLVM field width mismatch: cannot convert an LLVM field of width {} to a Rust field of type \"{}\" which has width {}",
+            "LLVM field width mismatch: cannot convert an LLVM field of width {} to a Rust field of type `{}` which has width {}",
             $llvm_field_width,
             $rust_layout.ty,
             $rust_layout.size.bytes()
@@ -24,7 +24,7 @@ macro_rules! throw_llvm_field_width_mismatch {
 macro_rules! throw_llvm_type_mismatch {
     ($llvm_type:expr, $rust_type:expr) => {
         throw_interop_format!(
-            "LLVM type mismatch: cannot convert an LLVM value of type \"{}\" to a Rust value of type \"{}\"",
+            "LLVM type mismatch: cannot convert an LLVM value of type `{}` to a Rust value of type `{}`",
             $llvm_type.print_to_string().to_string(),
             $rust_type
         )
@@ -46,7 +46,7 @@ macro_rules! throw_unsup_llvm_type {
 #[macro_export]
 macro_rules! throw_unsup_shim_llvm_type {
     ($llvm_type:expr) => {
-        throw_interop_format!("LLVM Type \"{}\" is not supported for use in shims.", $llvm_type.print_to_string().to_string())
+        throw_interop_format!("LLVM Type `{}` is not supported for use in shims.", $llvm_type.print_to_string().to_string())
     };
 }
 
@@ -55,7 +55,7 @@ macro_rules! throw_unsup_shim_llvm_type {
 macro_rules! throw_rust_type_mismatch {
     ($rust_layout:expr, $llvm_type:expr) => {
         throw_interop_format!(
-            "Rust type mismatch: cannot convert a Rust value of type \"{}\" to an LLVM value of type \"{}\".",
+            "Rust type mismatch: cannot convert a Rust value of type `{}` to an LLVM value of type `{}`.",
             $rust_layout.ty,
             $llvm_type.print_to_string().to_string()
         )
@@ -65,7 +65,7 @@ macro_rules! throw_rust_type_mismatch {
 macro_rules! throw_unsup_var_arg {
     ($rust_layout:expr) => {
         throw_interop_format!(
-            "Non-scalar variable arguments are not supported: \"{}\".",
+            "Non-scalar variable arguments are not supported: `{}`.",
             $rust_layout.ty,
         )
     };
@@ -74,7 +74,7 @@ macro_rules! throw_unsup_var_arg {
 macro_rules! throw_rust_field_mismatch {
     ($rust_layout:expr, $llvm_field_count:expr) => {
         throw_interop_format!(
-            "Rust field count mismatch: cannot convert a Rust value of type \"{}\" which has {} fields to an LLVM value with {} fields",
+            "Rust field count mismatch: cannot convert a Rust value of type `{}` which has {} fields to an LLVM value with {} fields",
             $rust_layout.ty,
             $rust_layout.fields.count(),
             $llvm_field_count,
