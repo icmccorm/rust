@@ -83,7 +83,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 match ty.get_llvm_type_kind() {
                     llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind => ctx.layout_of(ctx.tcx.types.f64),
                     llvm_sys::LLVMTypeKind::LLVMFloatTypeKind => ctx.layout_of(ctx.tcx.types.f32),
-                    _ => throw_unsup_llvm_type!(ft),
+                    _ => throw_unsup_shim_llvm_type!(ft),
                 },
             BasicTypeEnum::IntType(it) =>
                 if let Some(int_ty) =
@@ -91,10 +91,10 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 {
                     Ok(int_ty)
                 } else {
-                    throw_unsup_llvm_type!(it)
+                    throw_unsup_shim_llvm_type!(it)
                 },
             BasicTypeEnum::PointerType(_) => ctx.raw_pointer_to(ctx.tcx.types.u8),
-            _ => throw_unsup_llvm_type!(ty),
+            _ => throw_unsup_shim_llvm_type!(ty),
         }
     }
 
