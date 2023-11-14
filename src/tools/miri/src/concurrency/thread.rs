@@ -886,6 +886,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             "Running LLI function {:?} to completion",
             function.get_name().to_string_lossy().to_string()
         );
+
+        if let Some(logger) = &self.eval_context_ref().machine.llvm_logger {
+            logger.flags.log_llvm_engaged();
+        }
+        
         let this = self.eval_context_mut();
         let active_thread = this.get_active_thread();
 
