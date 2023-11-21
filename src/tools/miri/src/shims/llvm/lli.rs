@@ -101,9 +101,13 @@ impl LLI {
         self.with_engine(|engine| {
             let engine = engine.as_ref().unwrap();
             unsafe {
-                engine
-                    .get_constructors()
-                    .iter()
+                let constructors = engine.get_constructors();
+                if constructors.len() > 0 {
+                    if let Some(logger) = &mut miri.eval_context_mut().machine.llvm_logger {
+                        logger.flags.log_llvm_invoked_constructor();
+                    }
+                }
+                constructors.iter()
                     .try_for_each(|cstor| miri.run_lli_function_to_completion(*cstor))
             }
         })
@@ -112,9 +116,13 @@ impl LLI {
         self.with_engine(|engine| {
             let engine = engine.as_ref().unwrap();
             unsafe {
-                engine
-                    .get_destructors()
-                    .iter()
+                let destructors = engine.get_destructors();
+                if destructors.len() > 0 {
+                    if let Some(logger) = &mut miri.eval_context_mut().machine.llvm_logger {
+                        logger.flags.log_llvm_invoked_destructor();
+                    }
+                }
+                destructors.iter()
                     .try_for_each(|dstor| miri.run_lli_function_to_completion(*dstor))
             }
         })

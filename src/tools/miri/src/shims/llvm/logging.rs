@@ -31,6 +31,8 @@ pub struct LLVMFlags {
     size_based_type_inference: Cell<bool>,
     integer_upcast: Cell<bool>,
     llvm_read_uninit: Cell<bool>,
+    llvm_invoked_constructor: Cell<bool>,
+    llvm_invoked_destructor: Cell<bool>,
 }
 
 impl LLVMFlags {
@@ -47,6 +49,8 @@ impl LLVMFlags {
             size_based_type_inference: Cell::new(false),
             integer_upcast: Cell::new(false),
             llvm_read_uninit: Cell::new(false),
+            llvm_invoked_constructor: Cell::new(false),
+            llvm_invoked_destructor: Cell::new(false),
         }
     }
     #[inline(always)]
@@ -81,25 +85,33 @@ impl LLVMFlags {
     pub fn log_size_based_type_inference(&self) {
         self.size_based_type_inference.set(true)
     }
-
+    #[inline(always)]
     pub fn log_llvm_read_uninit(&self) {
         self.llvm_read_uninit.set(true)
+    }
+    #[inline(always)]
+    pub fn log_llvm_invoked_constructor(&self) {
+        self.llvm_invoked_constructor.set(true)
+    }
+    #[inline(always)]
+    pub fn log_llvm_invoked_destructor(&self) {
+        self.llvm_invoked_destructor.set(true)
     }
 }
 
 impl Drop for LLVMFlags {
     fn drop(&mut self) {
-        if self.llvm_engaged.get() {
-            if let Ok(flags_json) = serde_json::to_string(&self) {
-                let mut flags_path = std::env::current_dir().unwrap();
-                flags_path.push("flags.json");
-                let flags_log_file =
-                    OpenOptions::new().create(true).write(true).truncate(true).open(flags_path);
-                if let Ok(mut flags_log_file) = flags_log_file {
-                    flags_log_file.write_all(flags_json.as_bytes()).unwrap_or(());
-                    flags_log_file.flush().unwrap_or(());
-                }
+        if let Ok(flags_json) = serde_json::to_string(&self) {
+            let mut flags_path = std::env::current_dir().unwrap();
+            flags_path.push("flags.json");
+            let flags_log_file =
+                OpenOptions::new().create(true).write(true).truncate(true).open(flags_path);
+            if let Ok(mut flags_log_file) = flags_log_file {
+                flags_log_file.write_all(flags_json.as_bytes()).unwrap_or(());
+                flags_log_file.flush().unwrap_or(());
             }
+        }else{
+            panic!("Failed to serialize flags.")
         }
     }
 }
