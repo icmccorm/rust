@@ -598,11 +598,22 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         }
     }
 
-    /// "Safe" (bounds and align-checked) allocation access.
     pub fn get_ptr_alloc<'a>(
         &'a self,
         ptr: Pointer<Option<M::Provenance>>,
         size: Size,
+        align: Align,
+    ) -> InterpResult<'tcx, Option<AllocRef<'a, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
+    {
+        unsafe { self.get_ptr_alloc_range(ptr, size, alloc_range(Size::ZERO, size), align) }
+    }
+
+    /// "Safe" (bounds and align-checked) allocation access.
+    pub unsafe fn get_ptr_alloc_range<'a>(
+        &'a self,
+        ptr: Pointer<Option<M::Provenance>>,
+        size: Size,
+        access_range: AllocRange,
         align: Align,
     ) -> InterpResult<'tcx, Option<AllocRef<'a, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
     {
@@ -618,8 +629,15 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             },
         )?;
         if let Some((alloc_id, offset, prov, alloc)) = ptr_and_alloc {
+            let access_range = alloc_range(offset + access_range.start, access_range.size);
+            M::before_memory_read(
+                *self.tcx,
+                &self.machine,
+                &alloc.extra,
+                (alloc_id, prov),
+                access_range,
+            )?;
             let range = alloc_range(offset, size);
-            M::before_memory_read(*self.tcx, &self.machine, &alloc.extra, (alloc_id, prov), range)?;
             Ok(Some(AllocRef { alloc, range, tcx: *self.tcx, alloc_id }))
         } else {
             // Even in this branch we have to be sure that we actually access the allocation, in
@@ -671,11 +689,22 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         Ok((alloc, &mut self.machine))
     }
 
-    /// "Safe" (bounds and align-checked) allocation access.
     pub fn get_ptr_alloc_mut<'a>(
         &'a mut self,
         ptr: Pointer<Option<M::Provenance>>,
         size: Size,
+        align: Align,
+    ) -> InterpResult<'tcx, Option<AllocRefMut<'a, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
+    {
+        unsafe { self.get_ptr_alloc_mut_range(ptr, size, alloc_range(Size::ZERO, size), align) }
+    }
+
+    /// "Safe" (bounds and align-checked) allocation access.
+    pub unsafe fn get_ptr_alloc_mut_range<'a>(
+        &'a mut self,
+        ptr: Pointer<Option<M::Provenance>>,
+        size: Size,
+        access_range: AllocRange,
         align: Align,
     ) -> InterpResult<'tcx, Option<AllocRefMut<'a, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
     {
@@ -685,8 +714,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             // FIXME: can we somehow avoid looking up the allocation twice here?
             // We cannot call `get_raw_mut` inside `check_and_deref_ptr` as that would duplicate `&mut self`.
             let (alloc, machine) = self.get_alloc_raw_mut(alloc_id)?;
+            let access_range = alloc_range(offset + access_range.start, access_range.size);
+            M::before_memory_write(tcx, machine, &mut alloc.extra, (alloc_id, prov), access_range)?;
             let range = alloc_range(offset, size);
-            M::before_memory_write(tcx, machine, &mut alloc.extra, (alloc_id, prov), range)?;
             Ok(Some(AllocRefMut { alloc, range, tcx, alloc_id }))
         } else {
             Ok(None)

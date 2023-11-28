@@ -3,14 +3,16 @@ extern crate rustc_abi;
 use super::llvm::lli::LLVM_INTERPRETER;
 use crate::concurrency::thread::EvalContextExt as ThreadEvalContextExt;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMHelperEvalExt;
+use crate::shims::llvm::convert::to_generic_value::convert_opty_to_generic_value;
 use crate::shims::llvm::threads::link::ThreadLinkDestination;
-use crate::{shims::llvm::convert::to_generic_value::EvalContextExt as GenValEvalExt, Provenance};
+use crate::MiriInterpCx;
+use crate::Provenance;
 use crate::{throw_interop_format, ThreadId};
 use either::Either;
 use inkwell::{
     attributes::{Attribute, AttributeLoc},
     types::BasicTypeEnum,
-    values::{FunctionValue, GenericValueRef},
+    values::{FunctionValue, GenericValue, GenericValueRef},
 };
 use log::debug;
 use rustc_abi::{Abi, Size};
@@ -18,6 +20,7 @@ use rustc_const_eval::interpret::{InterpResult, MemoryKind, OpTy, PlaceTy};
 use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
 use rustc_target::abi::TyAndLayout;
+use crate::machine::MiriInterpCxExt;
 
 macro_rules! throw_llvm_argument_mismatch {
     ($function: expr, $args: expr) => {
@@ -31,23 +34,51 @@ macro_rules! throw_llvm_argument_mismatch {
         )
     };
 }
+pub struct ResolvedRustArgument<'tcx> {
+    inner: ResolvedRustArgumentInner<'tcx>,
+}
 
-pub enum ResolvedRustArgument<'tcx> {
+enum ResolvedRustArgumentInner<'tcx> {
     Default(OpTy<'tcx, Provenance>),
     Padded(OpTy<'tcx, Provenance>, Size),
 }
 
 impl<'tcx> ResolvedRustArgument<'tcx> {
+    pub fn new(
+        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        arg: OpTy<'tcx, Provenance>,
+    ) -> InterpResult<'tcx, Self> {
+        let arg = ctx.dereference_into_singular_field(arg)?;
+        Ok(Self { inner: ResolvedRustArgumentInner::Default(arg) })
+    }
+    pub fn new_padded(
+        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        arg: OpTy<'tcx, Provenance>,
+        padding: Size,
+    ) -> InterpResult<'tcx, Self> {
+        let arg = ctx.dereference_into_singular_field(arg)?;
+        Ok(Self { inner: ResolvedRustArgumentInner::Padded(arg, padding) })
+    }
+
+    pub fn to_generic_value<'lli>(
+        self,
+        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        bte: ResolvedLLVMType<'lli>,
+    ) -> InterpResult<'tcx, GenericValue<'lli>> {
+        let this = ctx.eval_context_mut();
+        convert_opty_to_generic_value(this, self, bte)
+    }
+
     pub fn opty(&self) -> &OpTy<'tcx, Provenance> {
-        match self {
-            ResolvedRustArgument::Default(op) => op,
-            ResolvedRustArgument::Padded(op, _) => op,
+        match &self.inner {
+            ResolvedRustArgumentInner::Default(op) => op,
+            ResolvedRustArgumentInner::Padded(op, _) => op,
         }
     }
     pub fn padded_size(&self) -> Size {
-        match self {
-            ResolvedRustArgument::Default(_) => self.value_size(),
-            ResolvedRustArgument::Padded(_, padding) => *padding,
+        match self.inner {
+            ResolvedRustArgumentInner::Default(_) => self.value_size(),
+            ResolvedRustArgumentInner::Padded(_, padding) => padding,
         }
     }
 
@@ -148,8 +179,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     )
                 }
             };
-            let converted =
-                this.op_to_generic_value(ResolvedRustArgument::Default(op), Some(*head))?;
+            let as_resolved = ResolvedRustArgument::new(this, op)?;
+            let converted = as_resolved.to_generic_value(this, Some(*head))?;
             generic_args.push(converted);
             (tail, alloc)
         } else {
@@ -195,9 +226,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 }
             }
             let first_type = llvm_parameter_types.pop().unwrap();
-            generic_args.push(
-                this.op_to_generic_value(ResolvedRustArgument::Default(current_arg), first_type)?,
-            );
+            let resolved_arg = ResolvedRustArgument::new(this, current_arg)?;
+            generic_args.push(resolved_arg.to_generic_value(this, first_type)?);
         }
 
         let exposed = generic_args

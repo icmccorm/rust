@@ -14,24 +14,8 @@ use rustc_middle::ty::GenericArgsRef;
 use rustc_middle::ty::{self, AdtDef};
 use std::iter::repeat;
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
-    fn void_generic_value(&self) -> GenericValue<'static> {
-        GenericValue::from_byte_slice(&[0])
-    }
-    fn op_to_generic_value<'lli>(
-        &mut self,
-        arg: ResolvedRustArgument<'tcx>,
-        bte: ResolvedLLVMType<'lli>,
-    ) -> InterpResult<'tcx, GenericValue<'lli>> {
-        let this = self.eval_context_mut();
-        convert_opty_to_generic_value(this, arg, bte)
-    }
-}
-
 #[allow(clippy::arithmetic_side_effects)]
-fn convert_opty_to_generic_value<'tcx, 'lli>(
+pub fn convert_opty_to_generic_value<'tcx, 'lli>(
     ctx: &mut MiriInterpCx<'_, 'tcx>,
     arg: ResolvedRustArgument<'tcx>,
     bte: ResolvedLLVMType<'lli>,
@@ -40,56 +24,47 @@ fn convert_opty_to_generic_value<'tcx, 'lli>(
         debug!("[Op to GV]: {:?} -> {:?}", arg.ty(), bte.print_to_string());
         match bte {
             BasicTypeEnum::ArrayType(at) => {
-                if !arg.ty().is_adt() {
-                    throw_rust_type_mismatch!(arg.layout(), at);
-                }
                 let llvm_field_types =
                     repeat(at.get_element_type()).take(at.len() as usize).collect();
-
                 Ok(convert_opty_to_aggregate(ctx, arg.opty(), llvm_field_types)?)
             }
             BasicTypeEnum::FloatType(ft) =>
-                match arg.abi() {
-                    rustc_abi::Abi::Scalar(_) => {
-                        let scalar = ctx.read_scalar(arg.opty())?;
-                        if let Scalar::Int(si) = scalar {
-                            match bte.get_llvm_type_kind() {
-                                llvm_sys::LLVMTypeKind::LLVMFloatTypeKind => {
-                                    if si.size() != Size::from_bytes(std::mem::size_of::<f32>()) {
-                                        throw_rust_type_mismatch!(arg.layout(), ft);
-                                    }
-                                    let bits = scalar.to_f32()?.to_bits();
-                                    let bytes =
-                                        ctx.to_vec_endian(bits, arg.value_size().bytes_usize());
-                                    let float = f32::from_ne_bytes(bytes.try_into().unwrap());
-                                    debug!("[Op to GV]: Float value: {}", float);
-                                    Ok(GenericValue::new_f32(float))
+                if let rustc_abi::Abi::Scalar(..) = arg.abi() {
+                    let scalar = ctx.read_scalar(arg.opty())?;
+                    if let Scalar::Int(si) = scalar {
+                        match bte.get_llvm_type_kind() {
+                            llvm_sys::LLVMTypeKind::LLVMFloatTypeKind => {
+                                if si.size() != Size::from_bytes(std::mem::size_of::<f32>()) {
+                                    throw_rust_type_mismatch!(arg.layout(), ft);
                                 }
-                                llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind => {
-                                    if si.size() != Size::from_bytes(std::mem::size_of::<f64>()) {
-                                        throw_rust_type_mismatch!(arg.layout(), ft);
-                                    }
-                                    let double = scalar.to_f64()?.to_bits();
-                                    let bytes =
-                                        ctx.to_vec_endian(double, arg.value_size().bytes_usize());
-                                    let double = f64::from_ne_bytes(bytes.try_into().unwrap());
-                                    debug!("[Op to GV]: Double value: {}", double);
-                                    Ok(GenericValue::new_f64(double))
-                                }
-                                _ => {
-                                    let bits = si.assert_bits(arg.value_size());
-                                    let bytes =
-                                        ctx.to_vec_endian(bits, arg.value_size().bytes_usize());
-                                    Ok(GenericValue::from_byte_slice(&bytes))
-                                }
+                                let bits = scalar.to_f32()?.to_bits();
+                                let bytes = ctx.to_vec_endian(bits, arg.value_size().bytes_usize());
+                                let float = f32::from_ne_bytes(bytes.try_into().unwrap());
+                                debug!("[Op to GV]: Float value: {}", float);
+                                Ok(GenericValue::new_f32(float))
                             }
-                        } else {
-                            throw_rust_type_mismatch!(arg.layout(), ft);
+                            llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind => {
+                                if si.size() != Size::from_bytes(std::mem::size_of::<f64>()) {
+                                    throw_rust_type_mismatch!(arg.layout(), ft);
+                                }
+                                let double = scalar.to_f64()?.to_bits();
+                                let bytes =
+                                    ctx.to_vec_endian(double, arg.value_size().bytes_usize());
+                                let double = f64::from_ne_bytes(bytes.try_into().unwrap());
+                                debug!("[Op to GV]: Double value: {}", double);
+                                Ok(GenericValue::new_f64(double))
+                            }
+                            _ => {
+                                let bits = si.assert_bits(arg.value_size());
+                                let bytes = ctx.to_vec_endian(bits, arg.value_size().bytes_usize());
+                                Ok(GenericValue::from_byte_slice(&bytes))
+                            }
                         }
-                    }
-                    _ => {
+                    } else {
                         throw_rust_type_mismatch!(arg.layout(), ft);
                     }
+                } else {
+                    throw_rust_type_mismatch!(arg.layout(), ft);
                 },
             BasicTypeEnum::IntType(it) =>
                 match arg.abi() {
@@ -170,9 +145,6 @@ fn convert_opty_to_generic_value<'tcx, 'lli>(
                 return Ok(as_gv);
             }
             BasicTypeEnum::StructType(st) => {
-                if !arg.ty().is_adt() {
-                    throw_rust_type_mismatch!(arg.layout(), st);
-                }
                 let llvm_field_types = st.get_field_types();
                 Ok(convert_opty_to_aggregate(ctx, arg.opty(), llvm_field_types)?)
             }
@@ -292,13 +264,7 @@ fn convert_opty_to_aggregate<'lli, 'tcx>(
     arg: &OpTy<'tcx, Provenance>,
     llvm_fields: Vec<BasicTypeEnum<'lli>>,
 ) -> InterpResult<'tcx, GenericValue<'lli>> {
-    let mut arg = arg.clone();
     debug!("[Op to GV] Aggregate Conversion, rust_type: {:?}", arg.layout.ty,);
-    while arg.layout.fields.count() == 1 && llvm_fields.len() > 1 {
-        // the compiler optimized a #repr(C) struct with a single
-        // field to be the same as the field when exposed to LLVM bytecode.
-        arg = ctx.project_field(&arg, 0)?;
-    }
     if arg.layout.fields.count() != llvm_fields.len() {
         throw_rust_field_mismatch!(arg.layout, llvm_fields.len());
     }
@@ -309,18 +275,15 @@ fn convert_opty_to_aggregate<'lli, 'tcx>(
 
     for (rust_field_idx, llvm_field) in rust_llvm_field_pairs {
         let padded_size = ctx.resolve_padded_size(&arg.layout, rust_field_idx);
-        let as_op = ctx.project_field(&arg, rust_field_idx)?;
+        let as_op = ctx.project_field(arg, rust_field_idx)?;
         debug!(
             "Field {}, size: {}, padded size: {}",
             rust_field_idx,
             as_op.layout.size.bytes(),
             padded_size.bytes()
         );
-        let as_gv = convert_opty_to_generic_value(
-            ctx,
-            ResolvedRustArgument::Padded(as_op, padded_size),
-            Some(llvm_field),
-        )?;
+        let as_resolved = ResolvedRustArgument::new_padded(ctx, as_op, padded_size)?;
+        let as_gv = convert_opty_to_generic_value(ctx, as_resolved, Some(llvm_field))?;
         gen_ag.append_aggregate_value(as_gv);
     }
     Ok(gen_ag)

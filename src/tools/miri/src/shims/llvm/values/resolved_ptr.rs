@@ -26,7 +26,6 @@ pub struct ResolvedPointer {
 }
 
 impl ResolvedPointer {
-    
     #[allow(dead_code)]
     fn access_range_as_string<'tcx>(
         &self,
@@ -60,13 +59,14 @@ impl ResolvedPointer {
         (AllocRef<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>>, AllocRange),
     > {
         let (size, range) = self.get_access_size_range(access_size);
-        if let Some(ar) = ctx.get_ptr_alloc(self.ptr, size, self.align)? {
+        if let Some(ar) = unsafe { ctx.get_ptr_alloc_range(self.ptr, size, range, self.align)? } {
             Ok((ar, range))
         } else {
             let addr = self.ptr.addr().bytes_usize();
             throw_ub_format!("unable to resolve allocation for pointer {addr}")
         }
     }
+
     pub fn access_alloc_mut<'tcx, 'a>(
         &'a self,
         ctx: &'a mut MiriInterpCx<'_, 'tcx>,
@@ -76,7 +76,8 @@ impl ResolvedPointer {
         (AllocRefMut<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>>, AllocRange),
     > {
         let (size, range) = self.get_access_size_range(access_size);
-        if let Some(ar) = ctx.get_ptr_alloc_mut(self.ptr, size, self.align)? {
+        if let Some(ar) = unsafe { ctx.get_ptr_alloc_mut_range(self.ptr, size, range, self.align)? }
+        {
             Ok((ar, range))
         } else {
             let addr = self.ptr.addr().bytes_usize();
@@ -206,7 +207,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
                 }
             }
             alloc.read_scalar_uninit(range, false)?.to_f32()?
-        }else{
+        } else {
             alloc.read_scalar(range, false)?.to_f32()?
         };
         let float_value = float_value.to_bits();
@@ -225,7 +226,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
                 }
             }
             alloc.read_scalar_uninit(range, false)?.to_f64()?
-        }else{
+        } else {
             alloc.read_scalar(range, false)?.to_f64()?
         };
         let double_value = double_value.to_bits();
@@ -254,7 +255,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
                     }
                 }
                 alloc.read_integer_uninit(range)?
-            }else{
+            } else {
                 alloc.read_integer(range)?
             };
             scalar_value.to_bits(Size::from_bytes(bytes))?
@@ -274,7 +275,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
                 }
             }
             alloc.read_pointer_uninit(range.start)?
-        }else{
+        } else {
             alloc.read_pointer(range.start)?
         };
         Ok(pointer_val.to_pointer(ctx)?)

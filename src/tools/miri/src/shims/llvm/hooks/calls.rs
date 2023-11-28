@@ -5,12 +5,12 @@ use crate::helpers::EvalContextExt as HelperEvalContextExt;
 use crate::shims::foreign_items::EmulateByNameResult;
 use crate::shims::foreign_items::EvalContextExt as ForeignEvalContextExt;
 use crate::shims::llvm::convert::to_bytes::EvalContextExt as ToBytesEvalContextExt;
-use crate::shims::llvm::convert::to_generic_value::EvalContextExt as ToGenericEvalContextExt;
 use crate::shims::llvm::convert::to_opty::EvalContextExt as ToOpTyEvalContextExt;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMHelpersEvalContextExt;
 use crate::shims::llvm::hooks::memcpy::eval_memcpy;
 use crate::shims::llvm::hooks::memcpy::MemcpyMode;
 use crate::shims::llvm::values::generic_value::GenericValueTy;
+use crate::shims::llvm_ffi_support::ResolvedRustArgument;
 use crate::MiriInterpCx;
 use crate::MiriInterpCxExt;
 use crate::MiriMemoryKind;
@@ -98,10 +98,7 @@ fn perform_opty_conversion<'tcx, 'lli>(
     if let Some(return_type) = return_type_opt {
         debug!("Preparing GV return value");
         let place_opty = ctx.place_to_op(return_place)?;
-        Ok(ctx.op_to_generic_value(
-            crate::shims::llvm_ffi_support::ResolvedRustArgument::Default(place_opty),
-            Some(*return_type),
-        )?)
+        ResolvedRustArgument::new(ctx, place_opty)?.to_generic_value(ctx, Some(*return_type))
     } else {
         debug!("Preparing void return value");
         Ok(ctx.void_generic_value())
@@ -179,7 +176,7 @@ fn miri_call_by_name_result<'tcx>(
         let gv_to_return = match name_rust_str {
             "__cxa_atexit" => ctx.void_generic_value(),
             //void *malloc(size_t size);
-            "malloc" | "_Znwm" =>
+            "malloc" | "_Znwm" | "_Znam" =>
                 if num_args == 1 {
                     let size_as_scalar = ctx.opty_as_scalar(&op_ty_args[0])?;
                     let size_value = size_as_scalar.to_u64()?;
@@ -195,7 +192,7 @@ fn miri_call_by_name_result<'tcx>(
                     throw_shim_argument_mismatch!(name_rust_str, 1, num_args);
                 },
             //void free(void *address);
-            "free" | "_Znam" =>
+            "free" | "_ZdlPv" =>
                 if num_args == 1 {
                     let address = ctx.opty_as_scalar(&op_ty_args[0])?;
                     let as_pointer = address.to_pointer(ctx)?;
@@ -247,7 +244,7 @@ fn miri_call_by_name_result<'tcx>(
                     Some(&args[2]),
                     MemcpyMode::DisjointOrEqual,
                 )?,
-            "__memcpy_chk" => 
+            "__memcpy_chk" =>
                 eval_memcpy(
                     ctx,
                     name_rust_str,

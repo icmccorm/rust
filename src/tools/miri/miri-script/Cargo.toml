@@ -21,3 +21,5 @@ xshell = "0.2"
 rustc_version = "0.4"
 dunce = "1.0.4"
 directories = "4"
+
+[workspace]

@@ -36,10 +36,8 @@ pub extern "C-unwind" fn llvm_malloc(
             if is_static {
                 ctx.machine.static_roots.push(alloc_id);
             }
-            ctx.pointer_to_lli_wrapped_pointer(ptr)
-        } else {
-            panic_any("malloc returned a pointer with a non-AllocID provenance");
         }
+        ctx.pointer_to_lli_wrapped_pointer(ptr)
     } else {
         panic_any("malloc failed");
     }

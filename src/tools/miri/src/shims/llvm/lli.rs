@@ -1,7 +1,7 @@
 extern crate rustc_hash;
 use super::hooks::calls::{miri_call_by_name, miri_call_by_pointer};
 use super::hooks::errors::miri_error_trace_recorder;
-use super::hooks::intptr::{miri_inttoptr, miri_ptrtoint};
+use super::hooks::intptr::{miri_inttoptr, miri_ptrtoint, miri_get_element_pointer};
 use super::hooks::load::miri_memory_load;
 use super::hooks::memory::{
     llvm_free, llvm_malloc, miri_memcpy, miri_memset, miri_register_global,
@@ -89,6 +89,7 @@ impl LLI {
             engine.set_miri_memset(Some(miri_memset));
             engine.set_miri_inttoptr(Some(miri_inttoptr));
             engine.set_miri_ptrtoint(Some(miri_ptrtoint));
+            engine.set_miri_get_element_pointer(Some(miri_get_element_pointer));
             engine.set_miri_register_global(Some(miri_register_global));
             engine.set_miri_interpcx_wrapper(miri as *mut _ as *mut MiriInterpCxOpaque);
             n.engine.replace(engine);

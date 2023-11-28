@@ -1,8 +1,8 @@
 use crate::concurrency::thread::EvalContextExt as ConcurrencyExt;
-use crate::shims::llvm::convert::to_generic_value::EvalContextExt as ToGenericExt;
 use crate::shims::llvm::convert::to_opty::EvalContextExt as ToOpTyExt;
 use crate::shims::llvm::helpers::EvalContextExt;
 use crate::shims::llvm::values::generic_value::GenericValueTy;
+use crate::shims::llvm_ffi_support::ResolvedRustArgument;
 use crate::MiriInterpCx;
 use crate::ThreadId;
 use inkwell::types::BasicTypeEnum;
@@ -14,7 +14,6 @@ use rustc_const_eval::interpret::InterpResult;
 use rustc_const_eval::interpret::MPlaceTy;
 use rustc_const_eval::interpret::MemoryKind;
 use rustc_const_eval::interpret::PlaceTy;
-
 #[derive(Debug)]
 #[allow(clippy::upper_case_acronyms)]
 
@@ -114,19 +113,16 @@ impl<'tcx> ThreadLink<'tcx> {
                         if let Some(dest) = dest_opt {
                             let as_place = PlaceTy::from(place_src.clone());
                             let place_opty = ctx.place_to_op(&as_place)?;
-                            let to_gv: GenericValue<'_> = ctx.op_to_generic_value(
-                                crate::shims::llvm_ffi_support::ResolvedRustArgument::Default(
-                                    place_opty,
-                                ),
-                                Some(dest),
-                            )?;
+                            let place_resolved = ResolvedRustArgument::new(ctx, place_opty)?;
+                            let place_as_generic =
+                                place_resolved.to_generic_value(ctx, Some(dest))?;
                             debug!(
                                 "[ThreadLink] Copying generic value produced from return place into pending GenericValue."
                             );
                             // TODO: set pending
                             ctx.set_pending_return_value(
                                 self.linked_id,
-                                GenericValueRef::new(unsafe { to_gv.into_raw() }),
+                                GenericValueRef::new(unsafe { place_as_generic.into_raw() }),
                             );
                         }
                         ctx.deallocate_ptr(

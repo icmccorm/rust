@@ -27,6 +27,7 @@ use rustc_middle::ty::{self, Ty, TypeAndMut};
 use rustc_span::FileNameDisplayPreference;
 use rustc_target::abi::Size;
 use std::num::NonZeroU64;
+use inkwell::values::GenericValue;
 
 #[macro_export]
 macro_rules! throw_interop_format {
@@ -362,11 +363,19 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     }
 
     fn can_dereference_into_singular_field(&self, layout: &TyAndLayout<'tcx>) -> bool {
-        match &layout.fields {
-            rustc_abi::FieldsShape::Array { stride: _, count: 1 } => true,
-            rustc_abi::FieldsShape::Arbitrary { offsets, .. } => offsets.len() == 1,
-            _ => false,
+        matches!(layout.ty.kind(), ty::Adt(_, _)) && layout.fields.count() == 1
+    }
+
+    fn dereference_into_singular_field(
+        &mut self,
+        arg: OpTy<'tcx, crate::Provenance>,
+    ) -> InterpResult<'tcx, OpTy<'tcx, crate::Provenance>> {
+        let this = self.eval_context_mut();
+        let mut curr_arg = arg;
+        while this.can_dereference_into_singular_field(&curr_arg.layout) {
+            curr_arg = this.project_field(&curr_arg, 0)?;
         }
+        Ok(curr_arg)
     }
 
     fn is_fieldless(&self, layout: &TyAndLayout<'tcx>) -> bool {
@@ -480,5 +489,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             }
         };
         Ok(result)
+    }
+
+    fn void_generic_value(&self) -> GenericValue<'static> {
+        GenericValue::from_byte_slice(&[0])
     }
 }
