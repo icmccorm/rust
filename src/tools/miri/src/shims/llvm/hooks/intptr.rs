@@ -6,6 +6,7 @@ use crate::MiriInterpCx;
 use crate::MiriMemoryKind;
 use crate::Pointer;
 use crate::Provenance::*;
+use crate::*;
 use crate::{intptrcast, shims::llvm::helpers::EvalContextExt, BorTag};
 use llvm_sys::miri::{MiriInterpCxOpaque, MiriPointer, MiriProvenance};
 use log::debug;
@@ -86,13 +87,31 @@ fn miri_get_element_pointer_result<'tcx>(
                     this,
                     ptr_offset.addr().bytes(),
                 )
-                .and_then(|offset_alloc_id| this.memory.alloc_map().get(offset_alloc_id))
-                .and_then(|(kind, _)| {
-                    match kind {
-                        rustc_const_eval::interpret::MemoryKind::Machine(
-                            MiriMemoryKind::LLVMStack | MiriMemoryKind::LLVMStatic,
-                        ) => None,
-                        _ => Some(Wildcard),
+                .and_then(|offset_alloc_id| {
+                    let alloc_map = ctx.memory.alloc_map();
+                    let alloc1 = alloc_map.get(alloc_id);
+                    let alloc2 = alloc_map.get(offset_alloc_id);
+                    alloc1.and_then(|a1| alloc2.map(|a2| (a1.0, a2.0)))
+                })
+                .and_then(|pair| {
+                    /*  It's undefined behavior dereference a pointer produced by GEP if that pointer is outside
+                     *  of the bounds of the original allocation. Additionally, we do not want to allow use of GEP
+                     *  to offset from a non-stack allocation into a stack allocation. So, if any of these cases
+                     *  apply, we keep the provenance of the base pointer, which will make it so that the pointer we
+                     *  produce will cause an access-out-of-bounds error when dereferenced.
+                     */
+                    if let (MemoryKind::Machine(a), MemoryKind::Machine(b)) = pair {
+                        match (a, b) {
+                            (a, b)
+                                if a == MiriMemoryKind::LLVMStack
+                                    || b == MiriMemoryKind::LLVMStack
+                                    || a == MiriMemoryKind::LLVMStatic
+                                    || b == MiriMemoryKind::LLVMStatic =>
+                                base_ptr.provenance,
+                            _ => Some(Provenance::Wildcard),
+                        }
+                    } else {
+                        Some(Provenance::Wildcard)
                     }
                 });
                 return Ok(Pointer::new(provenance, ptr_offset.addr()));
