@@ -360,8 +360,10 @@ fn convert_to_immty<'tcx>(
                     let wrapped_pointer = generic.val_ref.as_miri_pointer();
                     let mp = miri.lli_wrapped_pointer_to_maybe_pointer(wrapped_pointer);
                     debug!(
-                        "[GV to Op]: Provenance: (AID: {}, Addr: {})",
-                        wrapped_pointer.prov.alloc_id, wrapped_pointer.addr
+                        "[GV to Op]: Provenance: (Tag: {}, AID: {}, Addr: {})",
+                        wrapped_pointer.prov.tag,
+                        wrapped_pointer.prov.alloc_id,
+                        wrapped_pointer.addr
                     );
                     let pointer_ty_layout = ctx.rust_layout;
                     let scalar = Scalar::from_maybe_pointer(mp, miri);

@@ -178,8 +178,10 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
                             throw_rust_type_mismatch!(arg.layout(), vt);
                         }
                         debug!(
-                            "[Op to GV]: Vector pointer value: (AID: {}, Addr: {})",
-                            wrapped_pointer.prov.alloc_id, wrapped_pointer.addr
+                            "[Op to GV]: Vector pointer value: (Tag: {}, AID: {}, Addr: {})",
+                            wrapped_pointer.prov.tag,
+                            wrapped_pointer.prov.alloc_id,
+                            wrapped_pointer.addr
                         );
                         let as_gv = unsafe {
                             GenericValue::create_generic_value_of_miri_pointer(wrapped_pointer)
