@@ -59,7 +59,12 @@ impl ResolvedPointer {
         (AllocRef<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>>, AllocRange),
     > {
         let (size, range) = self.get_access_size_range(access_size);
-        if let Some(ar) = unsafe { ctx.get_ptr_alloc_range(self.ptr, size, range, self.align)? } {
+        let alloc_reference = if ctx.machine.lli_config.access_all_in_range {
+            ctx.get_ptr_alloc(self.ptr, size, self.align)?
+        } else {
+            unsafe { ctx.get_ptr_alloc_range(self.ptr, size, range, self.align)? }
+        };
+        if let Some(ar) = alloc_reference {
             Ok((ar, range))
         } else {
             let addr = self.ptr.addr().bytes_usize();
@@ -76,8 +81,12 @@ impl ResolvedPointer {
         (AllocRefMut<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>>, AllocRange),
     > {
         let (size, range) = self.get_access_size_range(access_size);
-        if let Some(ar) = unsafe { ctx.get_ptr_alloc_mut_range(self.ptr, size, range, self.align)? }
-        {
+        let alloc_reference = if ctx.machine.lli_config.access_all_in_range {
+            ctx.get_ptr_alloc_mut(self.ptr, size, self.align)?
+        } else {
+            unsafe { ctx.get_ptr_alloc_mut_range(self.ptr, size, range, self.align)? }
+        };
+        if let Some(ar) = alloc_reference {
             Ok((ar, range))
         } else {
             let addr = self.ptr.addr().bytes_usize();

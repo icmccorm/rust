@@ -93,6 +93,7 @@ pub struct LLIConfig {
     pub zero_static: bool,
     pub read_uninit: bool,
     pub gep_strict: bool,
+    pub access_all_in_range: bool,
 }
 
 /// Configuration needed to spawn a Miri instance.

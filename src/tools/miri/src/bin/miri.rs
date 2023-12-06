@@ -383,6 +383,8 @@ fn main() {
             miri_config.lli_config.zero_static = true;
         }else if arg == "-Zmiri-llvm-gep-strict" {
             miri_config.lli_config.gep_strict = true;
+        }else if arg == "-Zmiri-llvm-access-all-in-range" {
+            miri_config.lli_config.access_all_in_range = true;
         }else if arg == "-Zmiri-llvm-read-uninit" {
             miri_config.lli_config.read_uninit = true;
         } else if arg == "-Zmiri-check-number-validity" {
