@@ -86,6 +86,15 @@ pub enum LLVMLoggingLevel {
     Verbose,
 }
 
+#[derive(Clone, Default)]
+pub struct LLIConfig {
+    pub zero_stack: bool,
+    pub zero_heap: bool,
+    pub zero_static: bool,
+    pub read_uninit: bool,
+    pub gep_strict: bool,
+}
+
 /// Configuration needed to spawn a Miri instance.
 #[derive(Clone)]
 pub struct MiriConfig {
@@ -168,10 +177,8 @@ pub struct MiriConfig {
     /// Whether to log LLVM bytecode and function calls to files
     pub llvm_log: Option<LLVMLoggingLevel>,
     pub singular_llvm_bc_file: Option<PathBuf>,
-    pub llvm_zero_stack: bool,
-    pub llvm_zero_heap: bool,
-    pub llvm_zero_static: bool,
-    pub llvm_read_uninit: bool,
+    /// Runtime configuration flags for LLI
+    pub lli_config: LLIConfig,
 }
 
 impl Default for MiriConfig {
@@ -213,10 +220,7 @@ impl Default for MiriConfig {
             collect_leak_backtraces: true,
             llvm_log: None,
             singular_llvm_bc_file: None,
-            llvm_zero_stack: false,
-            llvm_zero_heap: false,
-            llvm_zero_static: false,
-            llvm_read_uninit: false,
+            lli_config: LLIConfig::default(),
         }
     }
 }

@@ -200,7 +200,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
     fn read_f32<'tcx>(&self, ctx: &MiriInterpCx<'_, 'tcx>) -> InterpResult<'tcx, f32> {
         let size = Size::from_bytes(std::mem::size_of::<f32>());
         let (alloc, range) = self.access_alloc(ctx, size.bytes())?;
-        let float_value = if ctx.machine.llvm_read_uninit {
+        let float_value = if ctx.machine.lli_config.read_uninit {
             if alloc.is_uninit(range) {
                 if let Some(logger) = &ctx.machine.llvm_logger {
                     logger.flags.log_llvm_read_uninit();
@@ -219,7 +219,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
     fn read_f64<'tcx>(&self, ctx: &MiriInterpCx<'_, 'tcx>) -> InterpResult<'tcx, f64> {
         let size = Size::from_bytes(std::mem::size_of::<f64>());
         let (alloc, range) = self.access_alloc(ctx, size.bytes())?;
-        let double_value = if ctx.machine.llvm_read_uninit {
+        let double_value = if ctx.machine.lli_config.read_uninit {
             if alloc.is_uninit(range) {
                 if let Some(logger) = &ctx.machine.llvm_logger {
                     logger.flags.log_llvm_read_uninit();
@@ -248,7 +248,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
             }
             u128::from(ptr_value.addr().bytes())
         } else {
-            let scalar_value = if ctx.machine.llvm_read_uninit {
+            let scalar_value = if ctx.machine.lli_config.read_uninit {
                 if alloc.is_uninit(range) {
                     if let Some(logger) = &ctx.machine.llvm_logger {
                         logger.flags.log_llvm_read_uninit();
@@ -268,7 +268,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
         ctx: &MiriInterpCx<'_, 'tcx>,
     ) -> InterpResult<'tcx, Pointer<Option<crate::Provenance>>> {
         let (alloc, range) = self.access_alloc(ctx, ctx.tcx.data_layout.pointer_size.bytes())?;
-        let pointer_val = if ctx.machine.llvm_read_uninit {
+        let pointer_val = if ctx.machine.lli_config.read_uninit {
             if alloc.is_uninit(range) {
                 if let Some(logger) = &ctx.machine.llvm_logger {
                     logger.flags.log_llvm_read_uninit();

@@ -25,9 +25,9 @@ pub extern "C-unwind" fn llvm_malloc(
 ) -> MiriPointer {
     let ctx = obtain_ctx_mut(ctx_raw);
     let (kind, zero) = if is_static {
-        (MiriMemoryKind::LLVMStatic, ctx.machine.llvm_zero_static)
+        (MiriMemoryKind::LLVMStatic, ctx.machine.lli_config.zero_static)
     } else {
-        (MiriMemoryKind::LLVMStack, ctx.machine.llvm_zero_stack)
+        (MiriMemoryKind::LLVMStack, ctx.machine.lli_config.zero_stack)
     };
 
     let allocation = ctx.malloc_align(bytes, alignment, zero, kind);

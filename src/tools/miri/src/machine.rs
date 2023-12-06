@@ -34,12 +34,12 @@ use rustc_span::{SpanData, Symbol};
 use rustc_target::abi::{Align, Size};
 use rustc_target::spec::abi::Abi;
 
-use crate::shims::llvm::logging::LLVMLogger;
 use crate::{
     concurrency::{data_race, weak_memory},
     shims::unix::FileHandler,
     *,
 };
+use crate::{eval::LLIConfig, shims::llvm::logging::LLVMLogger};
 
 /// First real-time signal.
 /// `signal(7)` says this must be between 32 and 64 and specifies 34 or 35
@@ -544,10 +544,7 @@ pub struct MiriMachine<'mir, 'tcx> {
     /// diagnostics.
     pub(crate) allocation_spans: RefCell<FxHashMap<AllocId, (Span, Option<Span>)>>,
 
-    pub(crate) llvm_zero_stack: bool,
-    pub(crate) llvm_zero_heap: bool,
-    pub(crate) llvm_zero_static: bool,
-    pub(crate) llvm_read_uninit: bool,
+    pub(crate) lli_config: LLIConfig,
 }
 
 impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
@@ -692,10 +689,7 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
                 None
             },
             allocation_spans: RefCell::new(FxHashMap::default()),
-            llvm_zero_stack: config.llvm_zero_stack,
-            llvm_zero_heap: config.llvm_zero_heap,
-            llvm_zero_static: config.llvm_zero_static,
-            llvm_read_uninit: config.llvm_read_uninit,
+            lli_config: config.lli_config.clone(),
         }
     }
 
@@ -891,10 +885,7 @@ impl VisitTags for MiriMachine<'_, '_> {
             llvm_logger: _,
             collect_leak_backtraces: _,
             allocation_spans: _,
-            llvm_zero_stack: _,
-            llvm_zero_heap: _,
-            llvm_zero_static: _,
-            llvm_read_uninit: _,
+            lli_config: _ 
         } = self;
 
         threads.visit_tags(visit);

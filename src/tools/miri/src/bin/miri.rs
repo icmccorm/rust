@@ -372,17 +372,19 @@ fn main() {
         } else if arg == "-Zmiri-llvm-log-verbose" {
             miri_config.llvm_log = Some(miri::LLVMLoggingLevel::Verbose);
         } else if arg == "-Zmiri-llvm-zero-stack" {
-            miri_config.llvm_zero_stack = true;
+            miri_config.lli_config.zero_stack = true;
         } else if arg == "-Zmiri-llvm-zero-heap" {
-            miri_config.llvm_zero_heap = true;
+            miri_config.lli_config.zero_heap = true;
         } else if arg == "-Zmiri-llvm-zero-static" {
-            miri_config.llvm_zero_static = true;
+            miri_config.lli_config.zero_static = true;
         }else if arg == "-Zmiri-llvm-zero-all" {
-            miri_config.llvm_zero_stack = true;
-            miri_config.llvm_zero_heap = true;
-            miri_config.llvm_zero_static = true;
+            miri_config.lli_config.zero_stack = true;
+            miri_config.lli_config.zero_heap = true;
+            miri_config.lli_config.zero_static = true;
+        }else if arg == "-Zmiri-llvm-gep-strict" {
+            miri_config.lli_config.gep_strict = true;
         }else if arg == "-Zmiri-llvm-read-uninit" {
-            miri_config.llvm_read_uninit = true;
+            miri_config.lli_config.read_uninit = true;
         } else if arg == "-Zmiri-check-number-validity" {
             eprintln!(
                 "WARNING: the flag `-Zmiri-check-number-validity` no longer has any effect \

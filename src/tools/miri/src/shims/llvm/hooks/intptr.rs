@@ -83,6 +83,11 @@ fn miri_get_element_pointer_result<'tcx>(
         let addr_upper_bound = base_address.checked_add(size.bytes());
         if let Some(addr_upper_bound) = addr_upper_bound {
             if ptr_offset.addr().bytes() >= addr_upper_bound {
+                let default_offset_provenance = if this.machine.lli_config.gep_strict {
+                    base_ptr.provenance
+                } else {
+                    Some(Provenance::Wildcard)
+                };
                 let provenance = intptrcast::GlobalStateInner::alloc_id_from_addr(
                     this,
                     ptr_offset.addr().bytes(),
@@ -100,18 +105,14 @@ fn miri_get_element_pointer_result<'tcx>(
                      *  apply, we keep the provenance of the base pointer, which will make it so that the pointer we
                      *  produce will cause an access-out-of-bounds error when dereferenced.
                      */
-                    if let (MemoryKind::Machine(a), MemoryKind::Machine(b)) = pair {
-                        match (a, b) {
-                            (a, b)
-                                if a == MiriMemoryKind::LLVMStack
-                                    || b == MiriMemoryKind::LLVMStack
-                                    || a == MiriMemoryKind::LLVMStatic
-                                    || b == MiriMemoryKind::LLVMStatic =>
-                                base_ptr.provenance,
-                            _ => Some(Provenance::Wildcard),
-                        }
+                    if let (
+                        MemoryKind::Machine(MiriMemoryKind::C),
+                        MemoryKind::Machine(MiriMemoryKind::C),
+                    ) = pair
+                    {
+                        default_offset_provenance
                     } else {
-                        Some(Provenance::Wildcard)
+                        base_ptr.provenance
                     }
                 });
                 return Ok(Pointer::new(provenance, ptr_offset.addr()));
