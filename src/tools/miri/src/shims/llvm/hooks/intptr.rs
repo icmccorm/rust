@@ -1,6 +1,7 @@
 use super::memory::obtain_ctx_mut;
 use crate::machine::MiriInterpCxExt;
 use crate::rustc_const_eval::interpret::AllocMap;
+use crate::rustc_const_eval::interpret::MemoryKind;
 use crate::InterpResult;
 use crate::MiriInterpCx;
 use crate::MiriMemoryKind;
@@ -77,23 +78,18 @@ fn miri_get_element_pointer_result<'tcx>(
 ) -> InterpResult<'tcx, Pointer<Option<crate::Provenance>>> {
     let this = ctx.eval_context_mut();
     let (ptr_offset, _) = base_ptr.overflowing_offset(offset, this);
-    if let Some(Concrete { alloc_id, .. }) = base_ptr.provenance {
+    if let Some(Concrete { alloc_id, tag }) = base_ptr.provenance {
         let (size, _, _) = this.get_alloc_info(alloc_id);
         let base_address = intptrcast::GlobalStateInner::alloc_base_addr(this, alloc_id)?;
         let addr_upper_bound = base_address.checked_add(size.bytes());
         if let Some(addr_upper_bound) = addr_upper_bound {
             if ptr_offset.addr().bytes() >= addr_upper_bound {
-                let default_offset_provenance = if this.machine.lli_config.gep_strict {
-                    base_ptr.provenance
-                } else {
-                    Some(Provenance::Wildcard)
-                };
                 let provenance = intptrcast::GlobalStateInner::alloc_id_from_addr(
                     this,
                     ptr_offset.addr().bytes(),
                 )
                 .and_then(|offset_alloc_id| {
-                    let alloc_map = ctx.memory.alloc_map();
+                    let alloc_map = this.memory.alloc_map();
                     let alloc1 = alloc_map.get(alloc_id);
                     let alloc2 = alloc_map.get(offset_alloc_id);
                     alloc1.and_then(|a1| alloc2.map(|a2| (a1.0, a2.0)))
@@ -105,16 +101,24 @@ fn miri_get_element_pointer_result<'tcx>(
                      *  apply, we keep the provenance of the base pointer, which will make it so that the pointer we
                      *  produce will cause an access-out-of-bounds error when dereferenced.
                      */
-                    if let (
-                        MemoryKind::Machine(MiriMemoryKind::C),
-                        MemoryKind::Machine(MiriMemoryKind::C),
-                    ) = pair
+                    let (base_mem_type, offset_mem_type) = pair;
+                    if this.machine.lli_config.gep_strict
+                        || (matches!(base_mem_type, MemoryKind::Machine(MiriMemoryKind::LLVMStack))
+                            || matches!(
+                                base_mem_type,
+                                MemoryKind::Machine(MiriMemoryKind::LLVMStack)
+                            )
+                            || base_mem_type != offset_mem_type)
                     {
-                        default_offset_provenance
+                        base_ptr.provenance.map(|p| Ok(p))
                     } else {
-                        base_ptr.provenance
+                        Some(
+                            intptrcast::GlobalStateInner::expose_ptr(this, alloc_id, tag)
+                                .map(|_| Wildcard),
+                        )
                     }
-                });
+                })
+                .map_or(Ok(None), |r| r.map(Some))?;
                 return Ok(Pointer::new(provenance, ptr_offset.addr()));
             }
         }
