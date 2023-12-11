@@ -192,7 +192,7 @@ fn miri_call_by_name_result<'tcx>(
                     throw_shim_argument_mismatch!(name_rust_str, 1, num_args);
                 },
             //void free(void *address);
-            "free" | "_ZdlPv" =>
+            "free" | "_ZdlPv" | "_ZdaPv" =>
                 if num_args == 1 {
                     let address = ctx.opty_as_scalar(&op_ty_args[0])?;
                     let as_pointer = address.to_pointer(ctx)?;
