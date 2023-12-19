@@ -1,9 +1,9 @@
 extern crate itertools;
 extern crate rustc_abi;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalExt;
-use crate::shims::llvm::values::generic_value::GenericValueTy;
 use crate::{intptrcast, MiriInterpCx, Provenance};
 use inkwell::types::BasicTypeEnum;
+use inkwell::values::GenericValueRef;
 use itertools::Itertools;
 use log::debug;
 use rustc_abi::{Endian, FieldIdx, Size, VariantIdx};
@@ -26,14 +26,21 @@ impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 
 
 #[derive(Debug, Clone)]
 enum OpTySource {
-    Generic(GenericValueTy),
+    Generic(GenericValueRef),
     Bytes(FieldBytes),
 }
 
 impl std::fmt::Display for OpTySource {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            OpTySource::Generic(gv) => write!(f, "{:?}", gv.ty().print_to_string()),
+            OpTySource::Generic(gv) => {
+                let as_string = if let Some(type_tag) = gv.get_type_tag() {
+                    type_tag.print_to_string().to_string()
+                } else {
+                    "None".to_string()
+                };
+                write!(f, "{:?}", as_string)
+            }
             OpTySource::Bytes(b) => write!(f, "{}", b),
         }
     }
@@ -42,7 +49,7 @@ impl std::fmt::Display for OpTySource {
 pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn generic_value_to_opty(
         &mut self,
-        src: GenericValueTy,
+        src: GenericValueRef,
         rust_layout: TyAndLayout<'tcx>,
     ) -> InterpResult<'tcx, (OpTy<'tcx, Provenance>, Option<PlaceTy<'tcx, Provenance>>)> {
         let this = self.eval_context_mut();
@@ -51,7 +58,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     }
     fn write_generic_value(
         &mut self,
-        src: GenericValueTy,
+        src: GenericValueRef,
         dest: PlaceTy<'tcx, Provenance>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
@@ -68,7 +75,7 @@ struct ConversionContext<'tcx> {
 }
 
 impl<'tcx> ConversionContext<'tcx> {
-    fn new(source: GenericValueTy, rust_layout: TyAndLayout<'tcx>) -> Self {
+    fn new(source: GenericValueRef, rust_layout: TyAndLayout<'tcx>) -> Self {
         let padded_size = rust_layout.size;
         ConversionContext {
             source: OpTySource::Generic(source),
@@ -77,7 +84,7 @@ impl<'tcx> ConversionContext<'tcx> {
             destination: Cell::new(None),
         }
     }
-    fn new_to_place(source: GenericValueTy, destination: PlaceTy<'tcx, Provenance>) -> Self {
+    fn new_to_place(source: GenericValueRef, destination: PlaceTy<'tcx, Provenance>) -> Self {
         let context = Self::new(source, destination.layout);
         context.destination.set(Some(destination));
         context
@@ -122,7 +129,7 @@ impl<'tcx> ConversionContext<'tcx> {
         if self.rust_layout.fields.count() > 0 {
             match &self.source {
                 OpTySource::Generic(gvr) => {
-                    let first_field = gvr.val_ref.get_aggregate_value(0).unwrap();
+                    let first_field = gvr.assert_field(0);
                     return u32::try_from(first_field.as_int()).unwrap();
                 }
                 OpTySource::Bytes(b) => {
@@ -215,7 +222,7 @@ fn convert_to_opty<'tcx>(
 
             match &ctx.source {
                 OpTySource::Generic(generic) => {
-                    let mut llvm_fields = generic.resolve_fields();
+                    let mut llvm_fields = generic.assert_fields();
                     let rust_field_count = ctx.rust_layout.fields.count();
                     if rust_field_count == llvm_fields.len() {
                         for (llvm_field, (rust_field, padded_size)) in
@@ -241,10 +248,10 @@ fn convert_to_opty<'tcx>(
                             ctx.padded_size,
                         );
                         convert_to_opty(miri, &mut new_context)?;
-                    } else if matches!(generic.ty(), BasicTypeEnum::IntType(_))
+                    } else if matches!(generic.get_type_tag(), Some(BasicTypeEnum::IntType(_)))
                         && ctx.rust_layout.fields.count() > 0
                     {
-                        let field_bytes = generic.val_ref.as_int().to_ne_bytes();
+                        let field_bytes = generic.as_int().to_ne_bytes();
                         let field_width: usize = ctx.rust_layout.size.bytes().try_into().unwrap();
                         let field_bytes = FieldBytes::new(field_bytes, field_width);
                         let mut new_context = ConversionContext::new_from_field(
@@ -302,17 +309,17 @@ fn convert_to_immty<'tcx>(
             }
         }
     };
-
     match &ctx.source {
         OpTySource::Generic(generic) => {
             let layouts = &miri.machine.layouts;
             let rust_type = ctx.rust_layout.ty;
-            match generic.ty() {
+            let llvm_type = generic.assert_type_tag();
+            match llvm_type {
                 BasicTypeEnum::FloatType(_) =>
                     if let ty::Float(rft) = rust_type.kind() {
                         match rft {
                             ty::FloatTy::F32 => {
-                                let val = generic.val_ref.as_f32();
+                                let val = generic.as_f32();
                                 debug!("[GV to Op]: Float value: {:?}", val);
                                 let imm = ImmTy::from_scalar(
                                     Scalar::from_f32(Single::from_bits(val.to_bits().into())),
@@ -321,7 +328,7 @@ fn convert_to_immty<'tcx>(
                                 return Ok(imm);
                             }
                             ty::FloatTy::F64 => {
-                                let val = generic.val_ref.as_f64();
+                                let val = generic.as_f64();
                                 debug!("[GV to Op]: Float value: {:?}", val);
                                 let imm = ImmTy::from_scalar(
                                     Scalar::from_f64(Double::from_bits(val.to_bits().into())),
@@ -332,9 +339,9 @@ fn convert_to_immty<'tcx>(
                         }
                     },
                 BasicTypeEnum::IntType(_) => {
-                    let converted_int = generic.val_ref.as_int();
+                    let converted_int = generic.as_int();
                     debug!("[GV to Op]: Int value: {:?}", converted_int);
-                    let byte_width = Size::from_bytes(u64::from(generic.val_ref.int_width_bytes()));
+                    let byte_width = Size::from_bytes(u64::from(generic.int_width_bytes()));
 
                     if byte_width == ctx.rust_layout.size
                         || (byte_width > ctx.rust_layout.size && byte_width == ctx.padded_size)
@@ -357,7 +364,7 @@ fn convert_to_immty<'tcx>(
                     }
                 }
                 BasicTypeEnum::PointerType(_) => {
-                    let wrapped_pointer = generic.val_ref.as_miri_pointer();
+                    let wrapped_pointer = generic.as_miri_pointer();
                     let mp = miri.lli_wrapped_pointer_to_maybe_pointer(wrapped_pointer);
                     debug!(
                         "[GV to Op]: Provenance: (Tag: {}, AID: {}, Addr: {})",
@@ -372,7 +379,7 @@ fn convert_to_immty<'tcx>(
                 }
                 _ => {}
             }
-            throw_llvm_type_mismatch!(generic.ty(), rust_type);
+            throw_llvm_type_mismatch!(llvm_type, rust_type);
         }
         OpTySource::Bytes(fieldbytes) => {
             let value = fieldbytes.as_uint();

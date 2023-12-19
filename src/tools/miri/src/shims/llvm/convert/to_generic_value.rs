@@ -286,7 +286,7 @@ fn convert_opty_to_aggregate<'lli, 'tcx>(
         );
         let as_resolved = ResolvedRustArgument::new_padded(ctx, as_op, padded_size)?;
         let as_gv = convert_opty_to_generic_value(ctx, as_resolved, Some(llvm_field))?;
-        gen_ag.append_aggregate_value(as_gv);
+        gen_ag.as_mut().append_aggregate_value(as_gv);
     }
     Ok(gen_ag)
 }

@@ -9,7 +9,6 @@ use crate::shims::llvm::convert::to_opty::EvalContextExt as ToOpTyEvalContextExt
 use crate::shims::llvm::helpers::EvalContextExt as LLVMHelpersEvalContextExt;
 use crate::shims::llvm::hooks::memcpy::eval_memcpy;
 use crate::shims::llvm::hooks::memcpy::MemcpyMode;
-use crate::shims::llvm::values::generic_value::GenericValueTy;
 use crate::shims::llvm_ffi_support::ResolvedRustArgument;
 use crate::MiriInterpCx;
 use crate::MiriInterpCxExt;
@@ -44,7 +43,7 @@ use std::time::SystemTime;
 fn miri_call_by_instance_result<'tcx>(
     ctx: &mut MiriInterpCx<'_, 'tcx>,
     inst: Instance<'tcx>,
-    mut function_args: Vec<GenericValueTy>,
+    mut function_args: Vec<GenericValueRef>,
     return_type: Option<BasicTypeEnum<'static>>,
 ) -> InterpResult<'tcx> {
     debug!("LLVM to Rust Call: {:?}", ctx.tcx.item_name(inst.def_id()));

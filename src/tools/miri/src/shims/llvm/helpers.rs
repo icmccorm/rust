@@ -1,6 +1,5 @@
 extern crate either;
 extern crate rustc_abi;
-use super::values::generic_value::GenericValueTy;
 use super::values::resolved_ptr::ResolvedPointer;
 use crate::helpers::EvalContextExt as HelperEvalExt;
 use crate::rustc_const_eval::interpret::AllocMap;
@@ -12,7 +11,7 @@ use crate::{intptrcast, BorTag, Provenance, ThreadId};
 use either::Either::Right;
 use inkwell::miri::StackTrace;
 use inkwell::types::{AnyTypeEnum, BasicType, BasicTypeEnum};
-use inkwell::values::GenericValueRef;
+use inkwell::values::{GenericValue, GenericValueRef};
 use llvm_sys::execution_engine::LLVMGenericValueArrayRef;
 use llvm_sys::miri::{MiriPointer, MiriProvenance};
 use llvm_sys::prelude::LLVMTypeRef;
@@ -27,7 +26,6 @@ use rustc_middle::ty::{self, Ty, TypeAndMut};
 use rustc_span::FileNameDisplayPreference;
 use rustc_target::abi::Size;
 use std::num::NonZeroU64;
-use inkwell::values::GenericValue;
 
 #[macro_export]
 macro_rules! throw_interop_format {
@@ -39,11 +37,12 @@ impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 
 pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn get_equivalent_rust_layout_for_value(
         &self,
-        gvty: &GenericValueTy,
+        generic_value_ref: &GenericValueRef,
     ) -> InterpResult<'tcx, TyAndLayout<'tcx>> {
         let this = self.eval_context_ref();
-        if let BasicTypeEnum::PointerType(_) = gvty.ty() {
-            let wrapped_pointer = gvty.val_ref.as_miri_pointer();
+        let type_tag = generic_value_ref.assert_type_tag();
+        if let BasicTypeEnum::PointerType(_) = type_tag {
+            let wrapped_pointer = generic_value_ref.as_miri_pointer();
             let mp = this.lli_wrapped_pointer_to_maybe_pointer(wrapped_pointer);
             if let Some(crate::Provenance::Concrete { alloc_id, .. }) = mp.provenance {
                 if let Some((kind, _)) = this.memory.alloc_map().get(alloc_id) {
@@ -72,7 +71,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 }
             }
         }
-        this.get_equivalent_rust_layout(gvty.ty())
+        this.get_equivalent_rust_layout(type_tag)
     }
 
     fn get_equivalent_rust_layout(
@@ -162,13 +161,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         &self,
         fn_ty: LLVMTypeRef,
         args_ref: LLVMGenericValueArrayRef,
-    ) -> InterpResult<'tcx, (Vec<GenericValueTy>, Option<BasicTypeEnum<'static>>)> {
+    ) -> InterpResult<'tcx, (Vec<GenericValueRef>, Option<BasicTypeEnum<'static>>)> {
         let fn_ty = unsafe { AnyTypeEnum::new(fn_ty).into_function_type() };
         let args = inkwell::values::GenericValueArrayRef::new(args_ref);
         let ret_ty = fn_ty.get_return_type();
         let num_arguments_provided = args.len();
         let num_arguments_expected = u64::try_from(fn_ty.get_param_types().len()).unwrap();
-
         if num_arguments_provided != num_arguments_expected {
             throw_interop_format!(
                 "expected {} arguments, but got {}.",
@@ -176,12 +174,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 num_arguments_provided
             )
         }
-
-        let parameter_types = fn_ty.get_param_types();
-        let args = parameter_types
-            .iter()
-            .enumerate()
-            .map(|(idx, t)| GenericValueTy::new(*t, args.get_element_at(idx as u64).unwrap()))
+        let args = (0..num_arguments_provided)
+            .map(|idx| args.get_element_at(idx as u64).unwrap())
             .collect();
         Ok((args, ret_ty))
     }
@@ -190,16 +184,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         &self,
         fn_ty: LLVMTypeRef,
         args_ref: LLVMGenericValueArrayRef,
-    ) -> (Vec<GenericValueTy>, Option<BasicTypeEnum<'static>>) {
+    ) -> (Vec<GenericValueRef>, Option<BasicTypeEnum<'static>>) {
         let fn_ty = unsafe { AnyTypeEnum::new(fn_ty).into_function_type() };
         let args = inkwell::values::GenericValueArrayRef::new(args_ref);
         let ret_ty = fn_ty.get_return_type();
-        let parameter_types = fn_ty.get_param_types();
-        let args = parameter_types
-            .iter()
-            .enumerate()
-            .map(|(idx, t)| GenericValueTy::new(*t, args.get_element_at(idx as u64).unwrap()))
-            .collect();
+        let args = (0..args.len()).map(|idx| args.get_element_at(idx as u64).unwrap()).collect();
         (args, ret_ty)
     }
 

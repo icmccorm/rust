@@ -125,7 +125,6 @@ impl ResolvedPointer {
         index: u32,
     ) -> InterpResult<'tcx, ResolvedPointer> {
         let new_offset = self.offset + Size::from_bytes(size * u64::from(index));
-
         let (new_ptr, new_offset) = if new_offset.bytes() >= self.align.bytes() {
             let num_align = new_offset.bytes() / self.align.bytes();
             let ptr_by_align =
@@ -190,10 +189,10 @@ impl Destination<ResolvedPointer> for ResolvedPointer {
     fn resolve_field<'tcx>(
         &mut self,
         ctx: &mut MiriInterpCx<'_, 'tcx>,
-        size: u64,
+        field_size: u64,
         index: u32,
     ) -> InterpResult<'tcx, ResolvedPointer> {
-        self.offset_to_field(ctx, size, index)
+        self.offset_to_field(ctx, field_size, index)
     }
 
     fn ensure_aggregate_size<'tcx>(

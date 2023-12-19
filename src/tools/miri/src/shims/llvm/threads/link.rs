@@ -1,7 +1,6 @@
 use crate::concurrency::thread::EvalContextExt as ConcurrencyExt;
 use crate::shims::llvm::convert::to_opty::EvalContextExt as ToOpTyExt;
 use crate::shims::llvm::helpers::EvalContextExt;
-use crate::shims::llvm::values::generic_value::GenericValueTy;
 use crate::shims::llvm_ffi_support::ResolvedRustArgument;
 use crate::MiriInterpCx;
 use crate::ThreadId;
@@ -158,9 +157,8 @@ impl<'tcx> ThreadLink<'tcx> {
                         let prev: ThreadId = ctx.set_active_thread(self.linked_id);
                         let return_ref_opt = ctx.get_pending_return_value(self.id)?;
                         if let Some(return_ref) = return_ref_opt {
-                            let return_type_wrapped = unsafe { BasicTypeEnum::new(return_type) };
-                            let gvty = GenericValueTy::new(return_type_wrapped, return_ref);
-                            ctx.write_generic_value(gvty, place)?;
+                            return_ref.set_type_tag(unsafe { &BasicTypeEnum::new(return_type) });
+                            ctx.write_generic_value(return_ref, place)?;
                             ctx.set_active_thread(prev);
                         } else {
                             bug!("Unable to resolve return value for thread {:?}.", self.id);
