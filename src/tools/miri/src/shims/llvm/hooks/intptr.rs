@@ -1,10 +1,8 @@
 use super::memory::obtain_ctx_mut;
 use crate::machine::MiriInterpCxExt;
 use crate::rustc_const_eval::interpret::AllocMap;
-use crate::rustc_const_eval::interpret::MemoryKind;
 use crate::InterpResult;
 use crate::MiriInterpCx;
-use crate::MiriMemoryKind;
 use crate::Pointer;
 use crate::Provenance::*;
 use crate::*;
@@ -78,32 +76,37 @@ fn miri_get_element_pointer_result<'tcx>(
 ) -> InterpResult<'tcx, Pointer<Option<crate::Provenance>>> {
     let this = ctx.eval_context_mut();
     let (ptr_offset, _) = base_ptr.overflowing_offset(offset, this);
-    debug!("GEP - {} to {}", base_ptr.addr().bytes(), ptr_offset.addr().bytes());
+
+    let source_alloc_id = base_ptr.provenance.map_or(
+        intptrcast::GlobalStateInner::alloc_id_from_addr(this, base_ptr.addr().bytes()),
+        |p| p.get_alloc_id(),
+    );
+    let source_allocation =
+        source_alloc_id.map(|alloc_id| this.memory.alloc_map().get(alloc_id)).flatten();
+    let source_allocation_kind = source_allocation.map(|s| s.0);
+
+    let dest_alloc_id =
+        intptrcast::GlobalStateInner::alloc_id_from_addr(this, ptr_offset.addr().bytes());
+    let dest_allocation =
+        dest_alloc_id.map(|alloc_id| this.memory.alloc_map().get(alloc_id)).flatten();
+    let dest_allocation_kind = dest_allocation.map(|d| d.0);
+
     if let Some(Concrete { alloc_id, tag }) = base_ptr.provenance {
         let (size, _, _) = this.get_alloc_info(alloc_id);
         let base_address = intptrcast::GlobalStateInner::alloc_base_addr(this, alloc_id)?;
         let addr_upper_bound = base_address.checked_add(size.bytes());
-        debug!("GEP FROM - ({})", alloc_id.0);
-        if let Some(source_allocation) = this.memory.alloc_map().get(alloc_id) {
+        if source_allocation.is_some() {
             if let Some(addr_upper_bound) = addr_upper_bound {
                 if ptr_offset.addr().bytes() >= addr_upper_bound {
-                    let source_allocation_kind = source_allocation.0;
-                    let provenance = if matches!(source_allocation_kind, MemoryKind::Machine(MiriMemoryKind::LLVMStack)) 
-                        || matches!(
-                            source_allocation_kind,
-                            MemoryKind::Machine(MiriMemoryKind::LLVMStatic)
-                        ) {
-                            base_ptr.provenance
-                        }else{
-                            debug!("GEP EXP - Exposing provenance: {}", alloc_id.0);
-                            intptrcast::GlobalStateInner::expose_ptr(this, alloc_id, tag)?;
-                            Some(Wildcard)
-                        };
-                    debug!("GEP TO - ({:?})", provenance);
-                    return Ok(Pointer::new(provenance, ptr_offset.addr()));
+                    intptrcast::GlobalStateInner::expose_ptr(this, alloc_id, tag)?;
+                    return Ok(Pointer::new(Some(Wildcard), ptr_offset.addr()));
                 }
             }
         }
     }
+    debug!(
+        "GEP - {:?}({:?}) to {:?}",
+        source_allocation_kind, base_ptr.provenance, dest_allocation_kind
+    );
     Ok(ptr_offset)
 }
