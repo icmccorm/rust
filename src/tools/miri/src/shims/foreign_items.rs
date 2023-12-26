@@ -26,6 +26,17 @@ use rustc_target::{
     spec::abi::Abi,
 };
 
+#[derive(Eq, PartialEq, Copy, Clone, Debug)]
+#[repr(u32)]
+pub enum Whitespace {
+    Space = 0x20,
+    FormFeed = 0x0c,
+    LineFeed = 0x0a,
+    CarriageReturn = 0x0d,
+    HorizontalTab = 0x09,
+    VerticalTab = 0x0b,
+}
+
 use super::backtrace::EvalContextExt as _;
 use crate::helpers::target_os_is_unix;
 use crate::*;
@@ -835,6 +846,26 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 )?;
                 this.write_pointer(ptr_dest, dest)?;
             }
+            "__strncpy_chk" | "strncpy" => {
+                let [ptr_dest, ptr_src, num] = if link_name.as_str() == "__strncpy_chk" {
+                        let [ptr_dest, ptr_src, num, _] =
+                            this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                        [ptr_dest, ptr_src, num]
+                    }else{
+                        let [ptr_dest, ptr_src, num] =
+                            this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                        [ptr_dest, ptr_src, num]
+                    };
+                    
+                
+                let ptr_dest = this.read_pointer(ptr_dest)?;
+                let ptr_src = this.read_pointer(ptr_src)?;
+                let num = this.read_target_usize(num)?;
+                let mut src_contents = this.read_c_str(ptr_src)?.to_vec();
+                src_contents.resize(num.try_into().unwrap(), 0);
+                this.write_bytes_ptr(ptr_dest, src_contents)?;
+                this.write_pointer(ptr_dest, dest)?;
+            }
             "__strcpy_chk" | "strcpy" => {
                 let [ptr_dest, ptr_src] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
@@ -857,6 +888,17 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     true,
                 )?;
                 this.write_pointer(ptr_dest, dest)?;
+            }
+            "iswspace" | "isspace" => {
+                let [wchar] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let wchar = this.read_scalar(wchar)?.to_i32()?;
+                let is_ws = wchar == (Whitespace::CarriageReturn as i32)
+                    || wchar == (Whitespace::LineFeed as i32)
+                    || wchar == (Whitespace::HorizontalTab as i32)
+                    || wchar == (Whitespace::VerticalTab as i32)
+                    || wchar == (Whitespace::FormFeed as i32)
+                    || wchar == (Whitespace::Space as i32);
+                this.write_scalar(Scalar::from_bool(is_ws), dest)?;
             }
             | "abs" => {
                 let [n] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;

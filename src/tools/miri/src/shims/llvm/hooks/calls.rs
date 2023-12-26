@@ -22,6 +22,8 @@ use llvm_sys::miri::MiriInterpCxOpaque;
 use llvm_sys::miri::MiriPointer;
 use llvm_sys::prelude::LLVMTypeRef;
 use log::debug;
+use rand::Rng;
+use rand::SeedableRng;
 use rustc_abi::Align;
 use rustc_const_eval::interpret::FnVal;
 use rustc_const_eval::interpret::InterpResult;
@@ -64,7 +66,6 @@ fn miri_call_by_instance_result<'tcx>(
     let return_layout = ctx.layout_of(return_ty)?;
     debug!("Expecting return type {:?}", return_ty);
 
-    debug!("Starting callback thread");
     ctx.eval_context_mut().start_callback_thread(
         inst,
         op_ty_args.as_slice(),
@@ -179,8 +180,11 @@ fn miri_call_by_name_result<'tcx>(
                 if num_args == 1 {
                     let size_as_scalar = ctx.opty_as_scalar(&op_ty_args[0])?;
                     let size_value = size_as_scalar.to_u64()?;
-                    let allocation =
-                        ctx.malloc(size_value, ctx.machine.lli_config.zero_heap, MiriMemoryKind::C)?;
+                    let allocation = ctx.malloc(
+                        size_value,
+                        ctx.machine.lli_config.zero_heap,
+                        MiriMemoryKind::C,
+                    )?;
                     let as_miri_ptr = ctx.pointer_to_lli_wrapped_pointer(allocation);
                     debug!(
                         "[llvm_user_malloc] allocated {:?} bytes at {:?}",
@@ -221,7 +225,6 @@ fn miri_call_by_name_result<'tcx>(
                     throw_shim_argument_mismatch!(name_rust_str, 2, num_args);
                 },
 
-            //void *realloc(void *address, int newsize);
             "realloc" =>
                 if num_args == 2 {
                     let address = ctx.opty_as_scalar(&op_ty_args[0])?;
@@ -229,6 +232,12 @@ fn miri_call_by_name_result<'tcx>(
                     let num_as_scalar = ctx.opty_as_scalar(&op_ty_args[1])?;
                     let num_value = num_as_scalar.to_u64()?;
                     let allocation = ctx.realloc(as_pointer, num_value, MiriMemoryKind::C)?;
+                    if ctx.machine.lli_config.zero_heap {
+                        ctx.write_bytes_ptr(
+                            allocation,
+                            std::iter::repeat(0).take(usize::try_from(num_value).unwrap()),
+                        )?;
+                    }
                     let as_miri_ptr = ctx.pointer_to_lli_wrapped_pointer(allocation);
                     unsafe { GenericValue::create_generic_value_of_miri_pointer(as_miri_ptr) }
                 } else {
@@ -252,13 +261,10 @@ fn miri_call_by_name_result<'tcx>(
                     Some(&args[2]),
                     MemcpyMode::DisjointOrEqual,
                 )?,
-            "strcpy" =>
-                eval_memcpy(ctx, name_rust_str, &args[0], &args[1], None, MemcpyMode::Disjoint)?,
-            "__strcpy_chk" =>
+            "strcpy" | "__strcpy_chk" =>
                 eval_memcpy(ctx, name_rust_str, &args[0], &args[1], None, MemcpyMode::Disjoint)?,
 
-            //void * memcpy ( void * destination, const void * source, size_t num );
-            "memmove" =>
+            "memmove" | "__memmove_chk" =>
                 eval_memcpy(
                     ctx,
                     name_rust_str,
@@ -267,17 +273,6 @@ fn miri_call_by_name_result<'tcx>(
                     Some(&args[2]),
                     MemcpyMode::Overlapping,
                 )?,
-            "__memmove_chk" =>
-                eval_memcpy(
-                    ctx,
-                    name_rust_str,
-                    &args[0],
-                    &args[1],
-                    Some(&args[2]),
-                    MemcpyMode::Overlapping,
-                )?,
-
-            //  (void * dest, int c, size_t len, size_t destlen);s
             "__memset_chk" =>
                 if num_args != 4 {
                     throw_shim_argument_mismatch!(name_rust_str, 4, num_args);
@@ -299,6 +294,7 @@ fn miri_call_by_name_result<'tcx>(
                     let as_miri_ptr = ctx.pointer_to_lli_wrapped_pointer(dest_as_pointer);
                     unsafe { GenericValue::create_generic_value_of_miri_pointer(as_miri_ptr) }
                 },
+
             "time" =>
                 if num_args != 1 {
                     throw_shim_argument_mismatch!(name_rust_str, 1, num_args);
@@ -399,6 +395,22 @@ fn miri_call_by_name_result<'tcx>(
                     let result =
                         ctx.strcmp(&op_ty_args[0], &op_ty_args[1], Some(&op_ty_args[2]))?;
                     GenericValue::from_byte_slice(&result.to_ne_bytes())
+                },
+            "srand" =>
+                if num_args != 1 {
+                    throw_shim_argument_mismatch!(name_rust_str, 1, num_args);
+                } else {
+                    let seed = ctx.opty_as_scalar(&op_ty_args[0])?;
+                    let seed = seed.to_u32()?;
+                    ctx.machine.llvm_rng = rand::rngs::StdRng::seed_from_u64(seed.into());
+                    ctx.void_generic_value()
+                },
+            "rand" =>
+                if num_args != 0 {
+                    throw_shim_argument_mismatch!(name_rust_str, 0, num_args);
+                } else {
+                    let rand = ctx.machine.llvm_rng.gen::<u32>();
+                    GenericValue::from_byte_slice(&rand.to_ne_bytes())
                 },
             _ => {
                 let rplace = match &return_type_opt {

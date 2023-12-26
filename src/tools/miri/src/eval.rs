@@ -180,6 +180,8 @@ pub struct MiriConfig {
     pub singular_llvm_bc_file: Option<PathBuf>,
     /// Runtime configuration flags for LLI
     pub lli_config: LLIConfig,
+
+    pub descriptive_ub_error_titles: bool,
 }
 
 impl Default for MiriConfig {
@@ -222,6 +224,7 @@ impl Default for MiriConfig {
             llvm_log: None,
             singular_llvm_bc_file: None,
             lli_config: LLIConfig::default(),
+            descriptive_ub_error_titles: false,
         }
     }
 }

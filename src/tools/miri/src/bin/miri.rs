@@ -448,6 +448,8 @@ fn main() {
             miri_config.mute_stdout_stderr = true;
         } else if arg == "-Zmiri-retag-fields" {
             miri_config.retag_fields = RetagFields::Yes;
+        } else if arg == "-Zmiri-descriptive-ub" {
+            miri_config.descriptive_ub_error_titles = true;
         } else if let Some(retag_fields) = arg.strip_prefix("-Zmiri-retag-fields=") {
             miri_config.retag_fields = match retag_fields {
                 "all" => RetagFields::Yes,

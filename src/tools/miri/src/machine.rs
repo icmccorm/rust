@@ -486,6 +486,7 @@ pub struct MiriMachine<'mir, 'tcx> {
     /// Needs to be queried by ptr_to_int, hence needs interior mutability.
     pub(crate) rng: RefCell<StdRng>,
 
+    pub(crate) llvm_rng: StdRng,
     /// The allocation IDs to report when they are being allocated
     /// (helps for debugging memory leaks and use after free bugs).
     tracked_alloc_ids: FxHashSet<AllocId>,
@@ -543,8 +544,10 @@ pub struct MiriMachine<'mir, 'tcx> {
     /// The spans we will use to report where an allocation was created and deallocated in
     /// diagnostics.
     pub(crate) allocation_spans: RefCell<FxHashMap<AllocId, (Span, Option<Span>)>>,
-
+    pub(crate) descriptive_ub_error_titles: bool,
     pub(crate) lli_config: LLIConfig,
+
+
 }
 
 impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
@@ -630,6 +633,7 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
             local_crates,
             extern_statics: FxHashMap::default(),
             rng: RefCell::new(rng),
+            llvm_rng: StdRng::seed_from_u64(config.seed.unwrap_or(0)),
             tracked_alloc_ids: config.tracked_alloc_ids.clone(),
             check_alignment: config.check_alignment,
             cmpxchg_weak_failure_rate: config.cmpxchg_weak_failure_rate,
@@ -690,6 +694,7 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
             },
             allocation_spans: RefCell::new(FxHashMap::default()),
             lli_config: config.lli_config.clone(),
+            descriptive_ub_error_titles: config.descriptive_ub_error_titles,
         }
     }
 
@@ -860,6 +865,7 @@ impl VisitTags for MiriMachine<'_, '_> {
             backtrace_style: _,
             local_crates: _,
             rng: _,
+            llvm_rng: _,
             tracked_alloc_ids: _,
             check_alignment: _,
             cmpxchg_weak_failure_rate: _,
@@ -885,7 +891,8 @@ impl VisitTags for MiriMachine<'_, '_> {
             llvm_logger: _,
             collect_leak_backtraces: _,
             allocation_spans: _,
-            lli_config: _ 
+            lli_config: _,
+            descriptive_ub_error_titles: _,
         } = self;
 
         threads.visit_tags(visit);

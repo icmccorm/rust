@@ -221,6 +221,7 @@ pub fn report_error<'tcx, 'mir>(
     use UndefinedBehaviorInfo::*;
 
     let mut msg = vec![];
+    let descriptive_ub = ecx.machine.descriptive_ub_error_titles;
 
     let (title, helps) = if let MachineStop(info) = e.kind() {
         let info = info.downcast_ref::<TerminationInfo>().expect("invalid MachineStop payload");
@@ -230,6 +231,12 @@ pub fn report_error<'tcx, 'mir>(
             Abort(_) => Some("abnormal termination"),
             UnsupportedInIsolation(_) | Int2PtrWithStrictProvenance =>
                 Some("unsupported operation"),
+            StackedBorrowsUb { .. } | TreeBorrowsUb { .. } if descriptive_ub => {
+                Some("Borrowing Violation")
+            }
+            DataRace {..} if descriptive_ub => {
+                Some("Data Race")
+            }
             StackedBorrowsUb { .. } | TreeBorrowsUb { .. } | DataRace { .. } =>
                 Some("Undefined Behavior"),
             Deadlock => Some("deadlock"),
@@ -301,6 +308,39 @@ pub fn report_error<'tcx, 'mir>(
             {
                 ecx.handle_ice(); // print interpreter backtrace
                 bug!("This validation error should be impossible in Miri: {}", ecx.format_error(e));
+            }
+            UndefinedBehavior(ub_info) if descriptive_ub => {
+                match ub_info {
+                    BoundsCheckFailed { .. } => "Bounds Check Failed",
+                    DivisionByZero => "Division By Zero",
+                    RemainderByZero => "Remainder By Zero",
+                    DivisionOverflow => "Division Overflow",
+                    RemainderOverflow => "Remainder Overflow",
+                    PointerArithOverflow => "Pointer Arithmetic Overflow",
+                    InvalidMeta(_) => "Invalid Pointer Metadata",
+                    UnterminatedCString(_) => "Unterminated CString",
+                    PointerUseAfterFree(_, _) => "Use-After-Free",
+                    PointerOutOfBounds { .. } => "Out of Bounds Access",
+                    DanglingIntPointer(_, _) => "Dangling Int Pointer",
+                    AlignmentCheckFailed { .. } => "Invalid Alignment",
+                    WriteToReadOnly(_) => "Write to Read-Only",
+                    DerefFunctionPointer(_) => "Deref Function Pointer",
+                    DerefVTablePointer(_) => "Deref VTable Pointer",
+                    InvalidBool(_) => "Invalid Boolean Value",
+                    InvalidChar(_) => "Invalid Char Value",
+                    InvalidTag(_) => "Invalid Enum Tag",
+                    InvalidFunctionPointer(_) => "Invalid Function Pointer",
+                    InvalidVTablePointer(_) => "Invalid VTable Pointer",
+                    InvalidStr(_) => "Invalid UTF-8",
+                    InvalidUninitBytes(_) => "Using Uninitialized Memory",
+                    DeadLocal => "Dead Local",
+                    ScalarSizeMismatch(_) => "Scalar Size Mismatch",
+                    UninhabitedEnumVariantWritten(_) => "Uninhabited Enum Variant Written",
+                    UninhabitedEnumVariantRead(_) => "Uninhabited Enum Variant Read",
+                    AbiMismatchArgument { .. } => "ABI Mismatch Argument",
+                    AbiMismatchReturn { .. } => "ABI Mismatch Return",
+                    _ => "Undefined Behavior"
+                }
             }
             UndefinedBehavior(_) => "Undefined Behavior",
             ResourceExhaustion(_) => "resource exhaustion",
