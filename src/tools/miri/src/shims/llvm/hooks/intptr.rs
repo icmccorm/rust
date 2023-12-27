@@ -12,6 +12,7 @@ use log::debug;
 use rustc_const_eval::interpret::AllocId;
 use rustc_target::abi::Size;
 use std::num::NonZeroU64;
+use crate::shims::llvm::logging::LLVMFlag;
 
 pub extern "C-unwind" fn miri_ptrtoint(ctx_raw: *mut MiriInterpCxOpaque, mp: MiriPointer) -> u64 {
     let ctx = obtain_ctx_mut(ctx_raw);
@@ -29,7 +30,7 @@ pub extern "C-unwind" fn miri_ptrtoint(ctx_raw: *mut MiriInterpCxOpaque, mp: Mir
         }
     };
     if let Some(ref logger) = &ctx.machine.llvm_logger {
-        logger.flags.log_ptrtoint_llvm();
+        logger.log_flag(LLVMFlag::LLVMPtrToInt);
     }
     addr_to_return
 }
@@ -47,7 +48,7 @@ pub extern "C-unwind" fn miri_inttoptr(ctx_raw: *mut MiriInterpCxOpaque, addr: u
         }
     };
     if let Some(ref logger) = &ctx.machine.llvm_logger {
-        logger.flags.log_inttoptr_llvm();
+        logger.log_flag(LLVMFlag::LLVMIntToPtr);
     }
     as_miri_ptr
 }

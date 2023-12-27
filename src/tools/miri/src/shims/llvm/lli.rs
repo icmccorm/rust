@@ -20,6 +20,7 @@ use rustc_const_eval::interpret::InterpResult;
 use rustc_hash::FxHashSet;
 use std::cell::RefCell;
 use std::path::PathBuf;
+use crate::shims::llvm::logging::LLVMFlag;
 
 #[self_referencing]
 pub struct LLI /*<'mir, 'tcx>*/ {
@@ -105,7 +106,7 @@ impl LLI {
                 let constructors = engine.get_constructors();
                 if constructors.len() > 0 {
                     if let Some(logger) = &mut miri.eval_context_mut().machine.llvm_logger {
-                        logger.flags.log_llvm_invoked_constructor();
+                        logger.log_flag(LLVMFlag::LLVMInvokedConstructor)
                     }
                 }
                 constructors.iter()
@@ -120,7 +121,7 @@ impl LLI {
                 let destructors = engine.get_destructors();
                 if destructors.len() > 0 {
                     if let Some(logger) = &mut miri.eval_context_mut().machine.llvm_logger {
-                        logger.flags.log_llvm_invoked_destructor();
+                        logger.log_flag(LLVMFlag::LLVMInvokedDestructor)
                     }
                 }
                 destructors.iter()

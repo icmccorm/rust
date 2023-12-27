@@ -175,7 +175,6 @@ fn miri_call_by_name_result<'tcx>(
 
         let gv_to_return = match name_rust_str {
             "__cxa_atexit" => ctx.void_generic_value(),
-            //void *malloc(size_t size);
             "malloc" | "_Znwm" | "_Znam" =>
                 if num_args == 1 {
                     let size_as_scalar = ctx.opty_as_scalar(&op_ty_args[0])?;
@@ -194,7 +193,6 @@ fn miri_call_by_name_result<'tcx>(
                 } else {
                     throw_shim_argument_mismatch!(name_rust_str, 1, num_args);
                 },
-            //void free(void *address);
             "free" | "_ZdlPv" | "_ZdaPv" =>
                 if num_args == 1 {
                     let address = ctx.opty_as_scalar(&op_ty_args[0])?;
@@ -204,8 +202,6 @@ fn miri_call_by_name_result<'tcx>(
                 } else {
                     throw_shim_argument_mismatch!(name_rust_str, 1, num_args);
                 },
-
-            //void *calloc(int num, int size);
             "calloc" =>
                 if num_args == 2 {
                     let num_as_scalar = ctx.opty_as_scalar(&op_ty_args[0])?;

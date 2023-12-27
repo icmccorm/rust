@@ -12,7 +12,7 @@ use rustc_apfloat::{
     ieee::{Double, Single},
     Float,
 };
-
+use crate::shims::llvm::logging::LLVMFlag;
 use rustc_const_eval::interpret::{
     alloc_range, AllocId, AllocRange, AllocRef, AllocRefMut, InterpResult, Pointer, Scalar,
 };
@@ -211,7 +211,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
         let float_value = if ctx.machine.lli_config.read_uninit {
             if alloc.is_uninit(range) {
                 if let Some(logger) = &ctx.machine.llvm_logger {
-                    logger.flags.log_llvm_read_uninit();
+                    logger.log_flag(LLVMFlag::LLVMReadUninit);
                 }
             }
             alloc.read_scalar_uninit(range, false)?.to_f32()?
@@ -230,7 +230,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
         let double_value = if ctx.machine.lli_config.read_uninit {
             if alloc.is_uninit(range) {
                 if let Some(logger) = &ctx.machine.llvm_logger {
-                    logger.flags.log_llvm_read_uninit();
+                    logger.log_flag(LLVMFlag::LLVMReadUninit);
                 }
             }
             alloc.read_scalar_uninit(range, false)?.to_f64()?
@@ -259,7 +259,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
             let scalar_value = if ctx.machine.lli_config.read_uninit {
                 if alloc.is_uninit(range) {
                     if let Some(logger) = &ctx.machine.llvm_logger {
-                        logger.flags.log_llvm_read_uninit();
+                        logger.log_flag(LLVMFlag::LLVMReadUninit);
                     }
                 }
                 alloc.read_integer_uninit(range)?
@@ -279,7 +279,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
         let pointer_val = if ctx.machine.lli_config.read_uninit {
             if alloc.is_uninit(range) {
                 if let Some(logger) = &ctx.machine.llvm_logger {
-                    logger.flags.log_llvm_read_uninit();
+                    logger.log_flag(LLVMFlag::LLVMReadUninit);
                 }
             }
             alloc.read_pointer_uninit(range.start)?

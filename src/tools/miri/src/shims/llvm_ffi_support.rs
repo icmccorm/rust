@@ -21,6 +21,7 @@ use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
 use rustc_target::abi::TyAndLayout;
 use crate::machine::MiriInterpCxExt;
+use crate::shims::llvm::logging::LLVMFlag;
 
 macro_rules! throw_llvm_argument_mismatch {
     ($function: expr, $args: expr) => {
@@ -116,7 +117,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let result = function_opt.is_some();
                 if let Some(function) = function_opt {
                     if let Some(ref logger) = &self.eval_context_ref().machine.llvm_logger {
-                        logger.flags.log_llvm_engaged();
+                        logger.log_flag(LLVMFlag::LLVMEngaged)
                     }
                     self.call_external_llvm_and_store_return(function, args, dest)?;
                 }

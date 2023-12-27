@@ -9,7 +9,7 @@ use std::num::TryFromIntError;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
-
+use crate::shims::llvm::logging::LLVMFlag;
 use either::Either;
 
 use rustc_data_structures::fx::FxHashMap;
@@ -920,7 +920,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         if let Some(current_group_id) = this.machine.threads.lli_thread_group.get() {
             if group_id != current_group_id {
                 if let Some(ref logger) = &this.machine.llvm_logger {
-                    logger.flags.log_llvm_multithreading()
+                    logger.log_flag(LLVMFlag::LLVMMultithreading)
                 }
             }
         }

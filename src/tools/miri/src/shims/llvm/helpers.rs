@@ -26,6 +26,7 @@ use rustc_middle::ty::{self, Ty, TypeAndMut};
 use rustc_span::FileNameDisplayPreference;
 use rustc_target::abi::Size;
 use std::num::NonZeroU64;
+use crate::shims::llvm::logging::LLVMFlag;
 
 #[macro_export]
 macro_rules! throw_interop_format {
@@ -62,7 +63,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                                 self.get_equivalent_rust_int_from_size(size)?
                             {
                                 if let Some(ref logger) = this.machine.llvm_logger {
-                                    logger.flags.log_size_based_type_inference();
+                                    logger.log_flag(LLVMFlag::SizeBasedTypeInference);
                                 }
                                 return this.raw_pointer_to(pointing_to.ty);
                             }
@@ -301,7 +302,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let resolved_alloc_id =
                     intptrcast::GlobalStateInner::alloc_id_from_addr(this, mp.addr);
                 if let Some(ref logger) = &this.machine.llvm_logger {
-                    logger.flags.log_llvm_on_resolve();
+                    logger.log_flag(LLVMFlag::LLVMOnResolve)
                 }
                 if let Some(alloc_id) = resolved_alloc_id {
                     (crate::Provenance::Wildcard, alloc_id)

@@ -9,6 +9,7 @@ use crate::*;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_span::Span;
 use rustc_target::abi::{HasDataLayout, Size};
+use crate::shims::llvm::logging::LLVMFlag;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProvenanceMode {
@@ -136,9 +137,9 @@ impl<'mir, 'tcx> GlobalStateInner {
 
         if let Some(ref logger) = &ecx.machine.llvm_logger {
             if ecx.active_thread_ref().is_llvm_thread() {
-                logger.flags.log_from_addr_cast_llvm();
+                logger.log_flag(LLVMFlag::FromAddrCastLLVM);
             } else {
-                logger.flags.log_from_addr_cast_rust();
+                logger.log_flag(LLVMFlag::FromAddrCastRust);
             }
         }
 
