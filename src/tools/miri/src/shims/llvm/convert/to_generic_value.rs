@@ -3,8 +3,9 @@ extern crate rustc_abi;
 use super::to_bytes::EvalContextExt as ToBytesEvalExt;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalExt;
 use crate::shims::llvm_ffi_support::{ResolvedLLVMType, ResolvedRustArgument};
-use crate::{MiriInterpCx, Provenance, MiriInterpCxExt};
+use crate::{MiriInterpCx, MiriInterpCxExt, Provenance};
 use either::Either::{Left, Right};
+use inkwell::values::FunctionValue;
 use inkwell::{types::BasicTypeEnum, values::GenericValue};
 use log::debug;
 use rustc_abi::{Size, VariantIdx};
@@ -13,7 +14,6 @@ use rustc_const_eval::interpret::{alloc_range, InterpResult, OpTy, Scalar};
 use rustc_middle::ty::GenericArgsRef;
 use rustc_middle::ty::{self, AdtDef};
 use std::iter::repeat;
-use inkwell::values::FunctionValue;
 
 macro_rules! throw_llvm_argument_mismatch {
     ($function: expr, $args: expr) => {
@@ -52,7 +52,7 @@ impl<'tcx, 'lli> LLVMArgumentConverter<'tcx, 'lli> {
         rust_args.reverse();
         let original_argument_count = rust_args.len();
         Ok(Self { function, rust_args, original_argument_count, llvm_types })
-    }  
+    }
 
     fn advance_arg(&mut self) -> Option<ResolvedRustArgument<'tcx>> {
         self.rust_args.pop()
@@ -69,27 +69,29 @@ impl<'tcx, 'lli> LLVMArgumentConverter<'tcx, 'lli> {
     fn peek_type(&self) -> Option<&ResolvedLLVMType<'lli>> {
         self.llvm_types.last()
     }
-    
+
     fn assert_type(&mut self) -> InterpResult<'tcx, ResolvedLLVMType<'lli>> {
-        if let Some(llvm_type) = self.advance_type() {
-            Ok(llvm_type)
-        }else{
-            self.error()
-        }
+        if let Some(llvm_type) = self.advance_type() { Ok(llvm_type) } else { self.error() }
     }
 
     fn error<A>(&self) -> InterpResult<'tcx, A> {
         throw_llvm_argument_mismatch!(self.function, self.original_argument_count)
     }
 
-    fn consume_scalar_argument(&mut self, ctx: &MiriInterpCx<'_, 'tcx>, llvm_type: BasicTypeEnum<'_>) -> InterpResult<'tcx,ResolvedRustArgument<'tcx>> {
+    fn consume_scalar_argument(
+        &mut self,
+        ctx: &MiriInterpCx<'_, 'tcx>,
+        llvm_type: BasicTypeEnum<'_>,
+    ) -> InterpResult<'tcx, ResolvedRustArgument<'tcx>> {
         let this = ctx.eval_context_ref();
         let type_width = this.resolve_llvm_type_size(llvm_type)?;
         if let Some(arg) = self.peek_arg() {
             if let rustc_abi::Abi::Scalar(_) = arg.abi() {
                 if let Some(layout) = this.get_equivalent_rust_primitive_layout(llvm_type)? {
                     if arg.ty() == layout.ty {
-                        if arg.value_size().bytes() == type_width && arg.padded_size().bytes() == type_width {
+                        if arg.value_size().bytes() == type_width
+                            && arg.padded_size().bytes() == type_width
+                        {
                             return Ok(self.advance_arg().unwrap());
                         }
                     }
@@ -99,8 +101,11 @@ impl<'tcx, 'lli> LLVMArgumentConverter<'tcx, 'lli> {
         self.error()
     }
 
-
-    pub fn convert(mut self, ctx: &mut MiriInterpCx<'_, 'tcx>, function: FunctionValue<'_>) -> InterpResult<'tcx, Vec<GenericValue<'lli>>> {
+    pub fn convert(
+        mut self,
+        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        function: FunctionValue<'_>,
+    ) -> InterpResult<'tcx, Vec<GenericValue<'lli>>> {
         let this = ctx.eval_context_mut();
         let original_arg_length = self.rust_args.len();
         let is_var_arg = function.get_type().is_var_arg();
@@ -131,6 +136,9 @@ impl<'tcx, 'lli> LLVMArgumentConverter<'tcx, 'lli> {
             let first_type = self.assert_type()?;
             generic_args.push(current_arg.to_generic_value(this, first_type)?);
         }
+        if !self.llvm_types.is_empty() {
+            throw_llvm_argument_mismatch!(function, original_arg_length);
+        }
         Ok(generic_args)
     }
 
@@ -138,8 +146,7 @@ impl<'tcx, 'lli> LLVMArgumentConverter<'tcx, 'lli> {
         &mut self,
         ctx: &mut MiriInterpCx<'_, 'tcx>,
         arg: &ResolvedRustArgument<'tcx>,
-    ) -> InterpResult<'tcx, Option<Vec<ResolvedRustArgument<'tcx>>>>
-    {
+    ) -> InterpResult<'tcx, Option<Vec<ResolvedRustArgument<'tcx>>>> {
         let this = ctx.eval_context_mut();
         if !this.is_fieldless(&arg.layout()) {
             let curr_arg = arg.opty().clone();
@@ -157,9 +164,6 @@ impl<'tcx, 'lli> LLVMArgumentConverter<'tcx, 'lli> {
         Ok(None)
     }
 }
-
-
-
 
 #[allow(clippy::arithmetic_side_effects)]
 pub fn convert_opty_to_generic_value<'tcx, 'lli>(
@@ -248,6 +252,9 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
                     rustc_abi::Abi::ScalarPair(_, _)
                     | rustc_abi::Abi::Aggregate { sized: true } => {
                         let bytes = ctx.op_to_bytes(arg.opty())?;
+                        if bytes.len() != it.get_size() {
+                            throw_rust_type_mismatch!(arg.layout(), it);
+                        }
                         Ok(GenericValue::from_byte_slice(bytes.as_slice()))
                     }
                     _ => {
@@ -386,7 +393,6 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
         }
     }
 }
-
 
 fn is_enum_of_nonnullable_ptr<'tcx>(
     ctx: &MiriInterpCx<'_, 'tcx>,
