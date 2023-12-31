@@ -2,12 +2,15 @@ extern crate either;
 extern crate rustc_abi;
 use super::llvm::lli::LLVM_INTERPRETER;
 use crate::concurrency::thread::EvalContextExt as ThreadEvalContextExt;
-use crate::shims::llvm::helpers::EvalContextExt as LLVMHelperEvalExt;
+use crate::machine::MiriInterpCxExt;
 use crate::shims::llvm::convert::to_generic_value::convert_opty_to_generic_value;
+use crate::shims::llvm::convert::to_generic_value::LLVMArgumentConverter;
+use crate::shims::llvm::helpers::EvalContextExt as LLVMHelperEvalExt;
+use crate::shims::llvm::logging::LLVMFlag;
 use crate::shims::llvm::threads::link::ThreadLinkDestination;
 use crate::MiriInterpCx;
 use crate::Provenance;
-use crate::{throw_interop_format, ThreadId};
+use crate::ThreadId;
 use either::Either;
 use inkwell::{
     attributes::{Attribute, AttributeLoc},
@@ -20,21 +23,7 @@ use rustc_const_eval::interpret::{InterpResult, MemoryKind, OpTy, PlaceTy};
 use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
 use rustc_target::abi::TyAndLayout;
-use crate::machine::MiriInterpCxExt;
-use crate::shims::llvm::logging::LLVMFlag;
 
-macro_rules! throw_llvm_argument_mismatch {
-    ($function: expr, $args: expr) => {
-        throw_interop_format!(
-            "argument count mismatch: LLVM function {:?} {} expects {}{} arguments, but Rust provided {}",
-            $function.get_name(),
-            $function.get_type().print_to_string().to_string(),
-            (if $function.get_type().is_var_arg() { "at least " } else { "" }),
-            $function.get_params().len(),
-            $args
-        )
-    };
-}
 pub struct ResolvedRustArgument<'tcx> {
     inner: ResolvedRustArgumentInner<'tcx>,
 }
@@ -161,8 +150,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 .iter()
                 .any(|e| e.get_enum_kind_id() == Attribute::get_named_enum_kind_id("sret"));
 
-        let mut generic_args = vec![];
-        let (llvm_parameter_types, thread_link_destination): (
+        let (sret_argument, llvm_parameter_types, thread_link_destination): (
+            Option<GenericValue<'_>>,
             &[BasicTypeEnum<'_>],
             ThreadLinkDestination<'tcx>,
         ) = if has_sret {
@@ -182,55 +171,20 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             };
             let as_resolved = ResolvedRustArgument::new(this, op)?;
             let converted = as_resolved.to_generic_value(this, Some(*head))?;
-            generic_args.push(converted);
-            (tail, alloc)
+            (Some(converted), tail, alloc)
         } else {
-            (llvm_parameter_types.as_slice(), ThreadLinkDestination::ToMiriDefault(dest.clone()))
+            (
+                None,
+                llvm_parameter_types.as_slice(),
+                ThreadLinkDestination::ToMiriDefault(dest.clone()),
+            )
         };
-
-        if args.len() > llvm_parameter_types.len() && !function.get_type().is_var_arg() {
-            throw_llvm_argument_mismatch!(function, args.len());
-        }
-
-        let mut llvm_parameter_types: Vec<ResolvedLLVMType<'_>> =
-            llvm_parameter_types.to_vec().iter().map(|t| Some(*t)).collect();
-        llvm_parameter_types.reverse();
-
-        let mut args = args.to_vec();
-
-        args.reverse();
-
         debug!("link={}, sret={:?}", thread_link_destination, has_sret);
-
-        let original_arg_length = args.len();
-        while let Some(current_arg) = args.pop() {
-            if llvm_parameter_types.is_empty() {
-                if function.get_type().is_var_arg() {
-                    llvm_parameter_types.push(None);
-                } else {
-                    throw_llvm_argument_mismatch!(function, original_arg_length);
-                }
-            }
-            let corresponding_llvm_type = llvm_parameter_types.last().unwrap();
-            if let Some(corresponding_llvm_type) = corresponding_llvm_type {
-                let num_types_remaining = llvm_parameter_types.len() - 1;
-
-                let llvm_type_size = this.resolve_llvm_type_size(*corresponding_llvm_type)?;
-                let rust_type_size = current_arg.layout.size.bytes();
-
-                if llvm_type_size < rust_type_size && num_types_remaining > 0 {
-                    if let Some((first, second)) = this.resolve_scalar_pair(&current_arg)? {
-                        args.push(second);
-                        args.push(first);
-                        continue;
-                    }
-                }
-            }
-            let first_type = llvm_parameter_types.pop().unwrap();
-            let resolved_arg = ResolvedRustArgument::new(this, current_arg)?;
-            generic_args.push(resolved_arg.to_generic_value(this, first_type)?);
+        let converter = LLVMArgumentConverter::new(this, function, args.to_vec(), llvm_parameter_types.to_vec())?;
+        let mut generic_args = converter.convert(this, function)?;
+        if let Some(sret_argument) = sret_argument {
+            generic_args.insert(0, sret_argument);
         }
-
         let exposed = generic_args
             .drain(0..)
             .map(|gv| GenericValueRef::new(unsafe { gv.into_raw() }))

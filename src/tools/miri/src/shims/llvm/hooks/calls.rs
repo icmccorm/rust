@@ -411,11 +411,14 @@ fn miri_call_by_name_result<'tcx>(
             _ => {
                 let rplace = match &return_type_opt {
                     Some(return_type) => {
-                        let ret_eqv_rust_layout = ctx.get_equivalent_rust_layout(*return_type)?;
-                        PlaceTy::from(ctx.allocate(
-                            ret_eqv_rust_layout,
-                            MemoryKind::Machine(MiriMemoryKind::LLVMInterop),
-                        )?)
+                        if let Some(ret_eqv_layout) = ctx.get_equivalent_rust_primitive_layout(*return_type)?{
+                            PlaceTy::from(ctx.allocate(
+                                ret_eqv_layout,
+                                MemoryKind::Machine(MiriMemoryKind::LLVMInterop),
+                            )?)
+                        }else{
+                            throw_unsup_shim_llvm_type!(return_type)
+                        }
                     }
                     None =>
                         PlaceTy::from(ctx.allocate(

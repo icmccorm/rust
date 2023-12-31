@@ -27,7 +27,7 @@ pub enum LLVMFlag {
     LLVMReadUninit,
     LLVMInvokedConstructor,
     LLVMInvokedDestructor,
-    ScalarPairExpansion,
+    AggregateExpansion
 }
 
 impl std::fmt::Display for LLVMFlag {
@@ -44,7 +44,7 @@ impl std::fmt::Display for LLVMFlag {
             LLVMFlag::LLVMReadUninit => "LLVMReadUninit",
             LLVMFlag::LLVMInvokedConstructor => "LLVMInvokedConstructor",
             LLVMFlag::LLVMInvokedDestructor => "LLVMInvokedDestructor",
-            LLVMFlag::ScalarPairExpansion => "ScalarPairExpansion",
+            LLVMFlag::AggregateExpansion => "AggregateExpansion",
         };
         write!(f, "{}", string)
     }
@@ -104,16 +104,15 @@ impl LLVMLogger {
         }
     }
     #[inline(always)]
-    pub fn log_llvm_conversion(
+    pub fn log_aggregate_expansion(
         &mut self,
         from: TyAndLayout<'_, Ty<'_>>,
-        single_field_dereferenced: bool,
     ) {
-        self.log_flag(LLVMFlag::ScalarPairExpansion);
+        self.log_flag(LLVMFlag::AggregateExpansion);
         if let Some(file) = &mut self.conversions {
             let source_type = from.ty.to_string();
             let source_type_size = from.size.bytes();
-            let line = format!("\"{source_type}\",{source_type_size},{single_field_dereferenced}");
+            let line = format!("\"{source_type}\",{source_type_size}");
             file.write_all(line.as_bytes()).unwrap();
             file.write_all(b"\n").unwrap();
             file.flush().unwrap();

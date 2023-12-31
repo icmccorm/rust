@@ -4,6 +4,7 @@ use super::values::resolved_ptr::ResolvedPointer;
 use crate::helpers::EvalContextExt as HelperEvalExt;
 use crate::rustc_const_eval::interpret::AllocMap;
 use crate::rustc_middle::ty::layout::LayoutOf;
+use crate::shims::llvm::logging::LLVMFlag;
 use crate::shims::llvm_ffi_support::EvalContextExt as LLVMEvalContextExt;
 use crate::throw_unsup_llvm_type;
 use crate::throw_unsup_shim_llvm_type;
@@ -26,11 +27,15 @@ use rustc_middle::ty::{self, Ty, TypeAndMut};
 use rustc_span::FileNameDisplayPreference;
 use rustc_target::abi::Size;
 use std::num::NonZeroU64;
-use crate::shims::llvm::logging::LLVMFlag;
 
 #[macro_export]
 macro_rules! throw_interop_format {
     ($($tt:tt)*) => { throw_machine_stop!($crate::TerminationInfo::InteroperationError { msg: format!($($tt)*) }) };
+}
+
+#[macro_export]
+macro_rules! err_interop_format {
+    ($($tt:tt)*) => { Err($crate::InterpErrorInfo::MachineStop($crate::TerminationInfo::InteroperationError { msg: format!($($tt)*) })) };
 }
 
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
@@ -72,32 +77,33 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 }
             }
         }
-        this.get_equivalent_rust_layout(type_tag)
+        let primitive_layout = this.get_equivalent_rust_primitive_layout(type_tag)?;
+        if let Some(primitive_layout) = primitive_layout {
+            return Ok(primitive_layout);
+        }else{
+            throw_unsup_shim_llvm_type!(type_tag)
+        }
     }
 
-    fn get_equivalent_rust_layout(
+    fn get_equivalent_rust_primitive_layout(
         &self,
         ty: BasicTypeEnum<'_>,
-    ) -> InterpResult<'tcx, TyAndLayout<'tcx>> {
+    ) -> InterpResult<'tcx, Option<TyAndLayout<'tcx>>> {
         let ctx = self.eval_context_ref();
-        match ty {
-            BasicTypeEnum::FloatType(ft) =>
+        let resolved_ty = match ty {
+            BasicTypeEnum::FloatType(_) =>
                 match ty.get_llvm_type_kind() {
-                    llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind => ctx.layout_of(ctx.tcx.types.f64),
-                    llvm_sys::LLVMTypeKind::LLVMFloatTypeKind => ctx.layout_of(ctx.tcx.types.f32),
-                    _ => throw_unsup_shim_llvm_type!(ft),
+                    llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind => Some(ctx.layout_of(ctx.tcx.types.f64)?),
+                    llvm_sys::LLVMTypeKind::LLVMFloatTypeKind => Some(ctx.layout_of(ctx.tcx.types.f32)?),
+                    _ => None,
                 },
             BasicTypeEnum::IntType(it) =>
-                if let Some(int_ty) =
-                    ctx.get_equivalent_rust_int_from_size(Size::from_bits(it.get_bit_width()))?
-                {
-                    Ok(int_ty)
-                } else {
-                    throw_unsup_shim_llvm_type!(it)
-                },
-            BasicTypeEnum::PointerType(_) => ctx.raw_pointer_to(ctx.tcx.types.u8),
-            _ => throw_unsup_shim_llvm_type!(ty),
-        }
+            ctx.get_equivalent_rust_int_from_size(Size::from_bits(it.get_bit_width()))?
+            ,
+            BasicTypeEnum::PointerType(_) => Some(ctx.raw_pointer_to(ctx.tcx.types.u8)?),
+            _ => None,
+        };
+        Ok(resolved_ty)
     }
 
     fn get_equivalent_rust_int_from_size(
@@ -375,37 +381,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         )
     }
 
-    fn resolve_scalar_pair(
-        &mut self,
-        arg: &OpTy<'tcx, crate::Provenance>,
-    ) -> InterpResult<'tcx, Option<(OpTy<'tcx, crate::Provenance>, OpTy<'tcx, crate::Provenance>)>>
-    {
-        let this = self.eval_context_mut();
-        if !this.is_fieldless(&arg.layout) {
-            let mut curr_arg = arg.clone();
-            let single_field_dereferenced =
-                this.can_dereference_into_singular_field(&curr_arg.layout);
-            while this.can_dereference_into_singular_field(&curr_arg.layout) {
-                curr_arg = this.project_field(&curr_arg, 0)?;
-            }
-            if matches!(curr_arg.layout.abi, rustc_target::abi::Abi::ScalarPair(_, _)) {
-                let mut field_values = arg
-                    .layout
-                    .fields
-                    .index_by_increasing_offset()
-                    .map(|idx| this.project_field(arg, idx))
-                    .collect::<InterpResult<'tcx, Vec<OpTy<'tcx, crate::Provenance>>>>()?;
-
-                if let Some(logger) = &mut this.machine.llvm_logger {
-                    logger.log_llvm_conversion(curr_arg.layout, single_field_dereferenced)
-                }
-                let last = field_values.pop().unwrap();
-                let first = field_values.pop().unwrap();
-                return Ok(Some((first, last)));
-            }
-        }
-        Ok(None)
-    }
 
     fn resolve_padded_size(&self, layout: &TyAndLayout<'tcx>, rust_field_idx: usize) -> Size {
         if layout.fields.count() <= 1 {
