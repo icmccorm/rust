@@ -27,8 +27,11 @@ pub enum LLVMFlag {
     LLVMReadUninit,
     LLVMInvokedConstructor,
     LLVMInvokedDestructor,
-    AggregateExpansion
+    AggregateExpansion,
+    ExposedPointerThroughScalar,
 }
+
+
 
 impl std::fmt::Display for LLVMFlag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -45,6 +48,7 @@ impl std::fmt::Display for LLVMFlag {
             LLVMFlag::LLVMInvokedConstructor => "LLVMInvokedConstructor",
             LLVMFlag::LLVMInvokedDestructor => "LLVMInvokedDestructor",
             LLVMFlag::AggregateExpansion => "AggregateExpansion",
+            LLVMFlag::ExposedPointerThroughScalar => "ExposedPointerThroughScalar",
         };
         write!(f, "{}", string)
     }

@@ -304,7 +304,7 @@ fn miri_call_by_name_result<'tcx>(
                             ))?;
                             let dest = ctx.opty_as_scalar(&op_ty_args[0])?;
                             let dest_as_pointer = dest.to_pointer(ctx)?;
-                            let bytes = ctx.scalar_to_bytes(Scalar::from_u64(num_secs), layout);
+                            let bytes = ctx.scalar_to_bytes(Scalar::from_u64(num_secs), layout)?;
                             if !ctx.ptr_is_null(dest_as_pointer)? {
                                 ctx.write_bytes_ptr(dest_as_pointer, bytes.clone())?;
                             }

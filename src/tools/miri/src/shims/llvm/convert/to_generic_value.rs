@@ -217,7 +217,12 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
                 } else {
                     throw_rust_type_mismatch!(arg.layout(), ft);
                 },
-            BasicTypeEnum::IntType(it) =>
+            BasicTypeEnum::IntType(it) => {
+                if arg.value_size().bytes() < it.get_byte_width() as u64
+                    && arg.padded_size().bytes() != it.get_byte_width() as u64
+                {
+                    throw_rust_type_mismatch!(arg.layout(), it);
+                }
                 match arg.abi() {
                     rustc_abi::Abi::Scalar(sc) => {
                         let scalar = if let rustc_abi::Scalar::Union { value } = sc {
@@ -233,34 +238,19 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
                         } else {
                             ctx.read_scalar(arg.opty())?
                         };
-                        let bits = match scalar {
-                            Scalar::Int(si) =>
-                                si.to_bits(arg.value_size())
-                                    .unwrap_or_else(|s| si.to_bits(s).unwrap()),
-                            Scalar::Ptr(p, _) => p.into_parts().1.bits().into(),
-                        };
-                        debug!("[Op to GV]: Int value: {}", u64::try_from(bits).unwrap());
-                        let bytes = ctx.to_vec_endian(bits, arg.value_size().bytes_usize());
-                        let dest_size = ctx.resolve_llvm_type_size(bte)?;
-                        if (bytes.len() as u64) < dest_size
-                            && arg.padded_size() != Size::from_bytes(dest_size)
-                        {
-                            throw_rust_type_mismatch!(arg.layout(), it);
-                        }
+                        let bytes = ctx.scalar_to_bytes(scalar, arg.layout())?;
                         Ok(GenericValue::from_byte_slice(&bytes))
                     }
                     rustc_abi::Abi::ScalarPair(_, _)
                     | rustc_abi::Abi::Aggregate { sized: true } => {
                         let bytes = ctx.op_to_bytes(arg.opty())?;
-                        if bytes.len() != it.get_size() {
-                            throw_rust_type_mismatch!(arg.layout(), it);
-                        }
                         Ok(GenericValue::from_byte_slice(bytes.as_slice()))
                     }
                     _ => {
                         throw_rust_type_mismatch!(arg.layout(), it);
                     }
-                },
+                }
+            }
             BasicTypeEnum::PointerType(pt) => {
                 let pointer_opty = if let ty::Adt(adef, sr) = arg.ty().kind() {
                     if let Some(vidx) = is_enum_of_nonnullable_ptr(ctx, *adef, sr) {
