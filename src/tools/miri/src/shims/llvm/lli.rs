@@ -21,6 +21,19 @@ use rustc_hash::FxHashSet;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use crate::shims::llvm::logging::LLVMFlag;
+use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalContextExt;
+use crate::shims::llvm::convert::to_generic_value::LLVMArgumentConverter;
+use crate::shims::llvm::threads::link::ThreadLinkDestination;
+use crate::shims::llvm_ffi_support::ResolvedRustArgument;
+use rustc_const_eval::interpret::OpTy;
+use crate::MemoryKind;
+use crate::shims::either::Either;
+use inkwell::types::BasicTypeEnum;
+use inkwell::values::GenericValue;
+use inkwell::attributes::Attribute;
+use crate::Provenance;
+use rustc_const_eval::interpret::PlaceTy;
+use inkwell::attributes::AttributeLoc;
 
 #[self_referencing]
 pub struct LLI /*<'mir, 'tcx>*/ {
@@ -110,7 +123,7 @@ impl LLI {
                     }
                 }
                 constructors.iter()
-                    .try_for_each(|cstor| miri.run_lli_function_to_completion(*cstor))
+                    .try_for_each(|cstor| miri.run_lli_function_to_completion(engine, *cstor))
             }
         })
     }
@@ -125,8 +138,83 @@ impl LLI {
                     }
                 }
                 destructors.iter()
-                    .try_for_each(|dstor| miri.run_lli_function_to_completion(*dstor))
+                    .try_for_each(|dstor| miri.run_lli_function_to_completion(engine, *dstor))
             }
+        })
+    }
+
+    #[allow(clippy::arithmetic_side_effects)]
+    pub fn call_external_llvm_and_store_return<'lli, 'tcx>(
+        &self,
+        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        function: FunctionValue<'lli>,
+        args: &[OpTy<'tcx, Provenance>],
+        dest: &PlaceTy<'tcx, Provenance>,
+    ) -> InterpResult<'tcx> {
+        debug!(
+            "Calling {:?}: {:?}",
+            function.get_name(),
+            function.get_type().print_to_string().to_string()
+        );
+        self.with_engine(|engine| {
+            let engine = engine.as_ref().unwrap();
+            let this = ctx.eval_context_mut();
+
+            this.update_last_rust_call_location();
+
+            let llvm_parameter_types = function.get_type().get_param_types();
+    
+            let has_sret = !llvm_parameter_types.is_empty()
+                && function
+                    .attributes(AttributeLoc::Param(0))
+                    .iter()
+                    .any(|e| e.get_enum_kind_id() == Attribute::get_named_enum_kind_id("sret"));
+    
+            let (sret_argument, llvm_parameter_types, thread_link_destination): (
+                Option<GenericValue<'lli>>,
+                &[BasicTypeEnum<'lli>],
+                ThreadLinkDestination<'tcx>,
+            ) = if has_sret {
+                let (head, tail) = llvm_parameter_types.split_first().unwrap();
+                let (op, alloc) = match dest.as_mplace_or_local() {
+                    Either::Left(mp) => (OpTy::from(mp), ThreadLinkDestination::ToMiriStructReturn),
+                    Either::Right(_) => {
+                        let allocation = this.allocate(
+                            dest.layout,
+                            MemoryKind::Machine(crate::MiriMemoryKind::LLVMInterop),
+                        )?;
+                        (
+                            OpTy::from(allocation.clone()),
+                            ThreadLinkDestination::ToMiriMirroredLocal(allocation, dest.clone()),
+                        )
+                    }
+                };
+                let as_resolved = ResolvedRustArgument::new(this, op)?;
+                let converted = as_resolved.to_generic_value(this, Some(*head))?;
+                (Some(converted), tail, alloc)
+            } else {
+                (
+                    None,
+                    llvm_parameter_types.as_slice(),
+                    ThreadLinkDestination::ToMiriDefault(dest.clone()),
+                )
+            };
+            debug!("link={}, sret={:?}", thread_link_destination, has_sret);
+            let converter = LLVMArgumentConverter::new(
+                this,
+                function,
+                args.to_vec(),
+                llvm_parameter_types.to_vec(),
+            )?;
+            let mut generic_args = converter.convert(this, function)?;
+            if let Some(sret_argument) = sret_argument {
+                generic_args.insert(0, sret_argument);
+            }
+            
+            let lli_thread_id =
+                this.start_rust_to_lli_thread(engine, Some(thread_link_destination), function, generic_args)?;
+            debug!("Started LLI Thread, TID: {:?}", lli_thread_id);
+            Ok(())
         })
     }
 }

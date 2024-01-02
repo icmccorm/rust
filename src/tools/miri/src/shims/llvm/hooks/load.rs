@@ -18,7 +18,7 @@ fn memory_load_result<'tcx>(
     value_size: u64,
 ) -> InterpResult<'tcx, ()> {
     let source = ctx.lli_wrapped_pointer_to_resolved_pointer(source)?;
-    let mut destination = GenericValueRef::new(destination_ref);
+    let mut destination = unsafe { GenericValueRef::new(destination_ref) };
     let value_type = unsafe { BasicTypeEnum::new(value_type_ref) };
     memory_access_core(ctx, &source, &mut destination, value_type, value_size)?;
     Ok(())

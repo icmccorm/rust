@@ -5,42 +5,18 @@ use crate::shims::llvm_ffi_support::ResolvedRustArgument;
 use crate::MiriInterpCx;
 use crate::ThreadId;
 use inkwell::types::BasicTypeEnum;
-use inkwell::values::GenericValue;
-use inkwell::values::GenericValueRef;
 use llvm_sys::prelude::LLVMTypeRef;
 use log::debug;
 use rustc_const_eval::interpret::InterpResult;
 use rustc_const_eval::interpret::MPlaceTy;
 use rustc_const_eval::interpret::MemoryKind;
 use rustc_const_eval::interpret::PlaceTy;
-#[derive(Debug)]
+use inkwell::values::GenericValueRef;
 #[allow(clippy::upper_case_acronyms)]
 
-pub enum ThreadLinkAllocation<'tcx> {
-    Miri(MPlaceTy<'tcx, crate::Provenance>),
-    LLI(GenericValueRef),
-}
-
-impl<'tcx> ThreadLinkAllocation<'tcx> {
-    pub fn deallocate(self, ctx: &mut MiriInterpCx<'_, 'tcx>) -> InterpResult<'tcx> {
-        match self {
-            ThreadLinkAllocation::Miri(mp) =>
-                ctx.deallocate_ptr(
-                    mp.ptr(),
-                    Some((mp.layout.size, mp.align)),
-                    MemoryKind::Machine(crate::MiriMemoryKind::LLVMInterop),
-                ),
-            ThreadLinkAllocation::LLI(gv) => {
-                unsafe {
-                    drop(GenericValue::from_raw(gv.into_raw()));
-                }
-                Ok(())
-            }
-        }
-    }
-}
 
 #[derive(Debug)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum ThreadLinkDestination<'tcx> {
     ToLLI(Option<BasicTypeEnum<'static>>),
     ToMiriStructReturn,
@@ -74,7 +50,7 @@ pub struct ThreadLink<'tcx> {
     id: ThreadId,
     link: ThreadLinkDestination<'tcx>,
     source: ThreadLinkSource<'tcx>,
-    lli_allocations: Vec<ThreadLinkAllocation<'tcx>>,
+    lli_allocations: Vec<MPlaceTy<'tcx, crate::Provenance>>,
 }
 impl<'tcx> ThreadLink<'tcx> {
     pub fn new(
@@ -86,15 +62,7 @@ impl<'tcx> ThreadLink<'tcx> {
         Self { linked_id, id, link, source, lli_allocations: Vec::new() }
     }
 
-    pub fn take_ownership(&mut self, to_deallocate: ThreadLinkAllocation<'tcx>) {
-        let ownership_type = match to_deallocate {
-            ThreadLinkAllocation::Miri(ref place) => {
-                format!("Miri Place - {:?}", place.ptr())
-            }
-            ThreadLinkAllocation::LLI(_) => "LLI GenericValue".to_string(),
-        };
-
-        debug!("[ThreadLink] Taking ownership of {:?}, TID:{:?}", ownership_type, self.id);
+    pub fn take_ownership(&mut self, to_deallocate: MPlaceTy<'tcx, crate::Provenance>) {
         self.lli_allocations.push(to_deallocate)
     }
 
@@ -121,7 +89,7 @@ impl<'tcx> ThreadLink<'tcx> {
                             // TODO: set pending
                             ctx.set_pending_return_value(
                                 self.linked_id,
-                                GenericValueRef::new(unsafe { place_as_generic.into_raw() }),
+                                unsafe{ GenericValueRef::new(place_as_generic.into_raw() ) },
                             );
                         }
                         ctx.deallocate_ptr(
@@ -169,7 +137,13 @@ impl<'tcx> ThreadLink<'tcx> {
                 },
             ThreadLinkDestination::ToMiriStructReturn => {}
         }
-        self.lli_allocations.drain(0..).try_for_each(|tla| tla.deallocate(ctx))?;
+        self.lli_allocations.drain(0..).try_for_each(|mp| {
+            ctx.deallocate_ptr(
+                mp.ptr(),
+                Some((mp.layout.size, mp.align)),
+                MemoryKind::Machine(crate::MiriMemoryKind::LLVMInterop),
+            )
+        })?;
         Ok(())
     }
 }

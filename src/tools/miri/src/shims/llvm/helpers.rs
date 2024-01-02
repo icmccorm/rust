@@ -13,7 +13,7 @@ use either::Either::Right;
 use inkwell::miri::StackTrace;
 use inkwell::types::{AnyTypeEnum, BasicType, BasicTypeEnum};
 use inkwell::values::{GenericValue, GenericValueRef};
-use llvm_sys::execution_engine::LLVMGenericValueArrayRef;
+use inkwell::values::GenericValueArrayRef;
 use llvm_sys::miri::{MiriPointer, MiriProvenance};
 use llvm_sys::prelude::LLVMTypeRef;
 use log::debug;
@@ -27,6 +27,7 @@ use rustc_middle::ty::{self, Ty, TypeAndMut};
 use rustc_span::FileNameDisplayPreference;
 use rustc_target::abi::Size;
 use std::num::NonZeroU64;
+use llvm_sys::execution_engine::LLVMGenericValueArrayRef;
 
 #[macro_export]
 macro_rules! throw_interop_format {
@@ -43,7 +44,7 @@ impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 
 pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn get_equivalent_rust_layout_for_value(
         &self,
-        generic_value_ref: &GenericValueRef,
+        generic_value_ref: &GenericValueRef<'_>,
     ) -> InterpResult<'tcx, TyAndLayout<'tcx>> {
         let this = self.eval_context_ref();
         let type_tag = generic_value_ref.assert_type_tag();
@@ -168,9 +169,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         &self,
         fn_ty: LLVMTypeRef,
         args_ref: LLVMGenericValueArrayRef,
-    ) -> InterpResult<'tcx, (Vec<GenericValueRef>, Option<BasicTypeEnum<'static>>)> {
+    ) -> InterpResult<'tcx, (Vec<GenericValueRef<'static>>, Option<BasicTypeEnum<'static>>)> {
         let fn_ty = unsafe { AnyTypeEnum::new(fn_ty).into_function_type() };
-        let args = inkwell::values::GenericValueArrayRef::new(args_ref);
+        let args = unsafe { GenericValueArrayRef::new(args_ref) };
         let ret_ty = fn_ty.get_return_type();
         let num_arguments_provided = args.len();
         let num_arguments_expected = u64::try_from(fn_ty.get_param_types().len()).unwrap();
@@ -191,9 +192,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         &self,
         fn_ty: LLVMTypeRef,
         args_ref: LLVMGenericValueArrayRef,
-    ) -> (Vec<GenericValueRef>, Option<BasicTypeEnum<'static>>) {
+    ) -> (Vec<GenericValueRef<'static>>, Option<BasicTypeEnum<'static>>) {
         let fn_ty = unsafe { AnyTypeEnum::new(fn_ty).into_function_type() };
-        let args = inkwell::values::GenericValueArrayRef::new(args_ref);
+        let args = unsafe { inkwell::values::GenericValueArrayRef::new(args_ref) };
         let ret_ty = fn_ty.get_return_type();
         let args = (0..args.len()).map(|idx| args.get_element_at(idx as u64).unwrap()).collect();
         (args, ret_ty)
@@ -254,7 +255,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         err_opt
     }
 
-    fn set_pending_return_value(&mut self, id: ThreadId, val_ref: GenericValueRef) {
+    fn set_pending_return_value(&mut self, id: ThreadId, val_ref: GenericValueRef<'static>) {
         let this = self.eval_context_mut();
         if id.to_u32() == 0 {
             this.machine.pending_return_values.insert(id, val_ref);
@@ -266,7 +267,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn get_pending_return_value(
         &mut self,
         id: ThreadId,
-    ) -> InterpResult<'tcx, Option<GenericValueRef>> {
+    ) -> InterpResult<'tcx, Option<GenericValueRef<'static>>> {
         let this = self.eval_context_mut();
         if let Some(val_ref) = this.machine.pending_return_values.remove(&id) {
             Ok(Some(val_ref))

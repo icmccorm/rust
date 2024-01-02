@@ -523,7 +523,7 @@ pub struct MiriMachine<'mir, 'tcx> {
     pub(crate) foreign_error_trace: Cell<Option<StackTrace>>,
     pub(crate) foreign_error_rust_call_location: Cell<Option<Span>>,
     pub(crate) _exposed_foreign_allocations: FxHashSet<AllocId>,
-    pub(crate) pending_return_values: FxHashMap<ThreadId, GenericValueRef>,
+    pub(crate) pending_return_values: FxHashMap<ThreadId, GenericValueRef<'static>>,
 
     /// Run a garbage collector for BorTags every N basic blocks.
     pub(crate) gc_interval: u32,

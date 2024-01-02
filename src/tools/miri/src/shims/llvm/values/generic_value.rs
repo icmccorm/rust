@@ -4,7 +4,7 @@ use crate::MiriInterpCx;
 use inkwell::values::GenericValueRef;
 use rustc_const_eval::interpret::{InterpResult, Pointer};
 
-impl Destination<GenericValueRef> for GenericValueRef {
+impl<'lli> Destination<GenericValueRef<'lli>> for GenericValueRef<'lli> {
     fn write_f32<'tcx>(
         &mut self,
         _ctx: &mut MiriInterpCx<'_, 'tcx>,
@@ -48,7 +48,7 @@ impl Destination<GenericValueRef> for GenericValueRef {
         _ctx: &mut MiriInterpCx<'_, 'tcx>,
         _size: u64,
         index: u32,
-    ) -> InterpResult<'tcx, GenericValueRef> {
+    ) -> InterpResult<'tcx, GenericValueRef<'lli>> {
         Ok(self.assert_field(index.into()))
     }
 
@@ -62,7 +62,7 @@ impl Destination<GenericValueRef> for GenericValueRef {
     }
 }
 
-impl Source<GenericValueRef> for GenericValueRef {
+impl<'lli> Source<GenericValueRef<'lli>> for GenericValueRef<'lli> {
     fn read_f32<'tcx>(&self, _ctx: &MiriInterpCx<'_, 'tcx>) -> InterpResult<'tcx, f32> {
         Ok(self.as_f32())
     }
@@ -109,7 +109,7 @@ impl Source<GenericValueRef> for GenericValueRef {
         _ctx: &MiriInterpCx<'_, 'tcx>,
         _size: u64,
         index: u32,
-    ) -> InterpResult<'tcx, GenericValueRef> {
+    ) -> InterpResult<'tcx, GenericValueRef<'lli>> {
         Ok(self.assert_field(index.into()))
     }
 }

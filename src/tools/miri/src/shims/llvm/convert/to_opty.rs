@@ -25,12 +25,12 @@ use super::field_bytes::FieldBytes;
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
 
 #[derive(Debug, Clone)]
-enum OpTySource {
-    Generic(GenericValueRef),
+enum OpTySource<'lli> {
+    Generic(GenericValueRef<'lli>),
     Bytes(FieldBytes),
 }
 
-impl std::fmt::Display for OpTySource {
+impl<'lli> std::fmt::Display for OpTySource<'lli> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             OpTySource::Generic(gv) => {
@@ -47,18 +47,18 @@ impl std::fmt::Display for OpTySource {
 }
 
 pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
-    fn generic_value_to_opty(
+    fn generic_value_to_opty<'lli>(
         &mut self,
-        src: GenericValueRef,
+        src: GenericValueRef<'lli>,
         rust_layout: TyAndLayout<'tcx>,
     ) -> InterpResult<'tcx, (OpTy<'tcx, Provenance>, Option<PlaceTy<'tcx, Provenance>>)> {
         let this = self.eval_context_mut();
         let mut converter = ConversionContext::new(src, rust_layout);
         convert_to_opty(this, &mut converter)
     }
-    fn write_generic_value(
+    fn write_generic_value<'lli>(
         &mut self,
-        src: GenericValueRef,
+        src: GenericValueRef<'lli>,
         dest: PlaceTy<'tcx, Provenance>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
@@ -67,15 +67,15 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         Ok(())
     }
 }
-struct ConversionContext<'tcx> {
-    pub source: OpTySource,
+struct ConversionContext<'tcx, 'lli> {
+    pub source: OpTySource<'lli>,
     pub rust_layout: TyAndLayout<'tcx>,
     pub padded_size: Size,
     destination: Cell<Option<PlaceTy<'tcx, Provenance>>>,
 }
 
-impl<'tcx> ConversionContext<'tcx> {
-    fn new(source: GenericValueRef, rust_layout: TyAndLayout<'tcx>) -> Self {
+impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
+    fn new(source: GenericValueRef<'lli>, rust_layout: TyAndLayout<'tcx>) -> Self {
         let padded_size = rust_layout.size;
         ConversionContext {
             source: OpTySource::Generic(source),
@@ -84,14 +84,14 @@ impl<'tcx> ConversionContext<'tcx> {
             destination: Cell::new(None),
         }
     }
-    fn new_to_place(source: GenericValueRef, destination: PlaceTy<'tcx, Provenance>) -> Self {
+    fn new_to_place(source: GenericValueRef<'lli>, destination: PlaceTy<'tcx, Provenance>) -> Self {
         let context = Self::new(source, destination.layout);
         context.destination.set(Some(destination));
         context
     }
 
     fn new_from_field(
-        source: OpTySource,
+        source: OpTySource<'lli>,
         destination: PlaceTy<'tcx, Provenance>,
         padded_size: Size,
     ) -> Self {
@@ -175,9 +175,9 @@ impl<'tcx> ConversionContext<'tcx> {
     }
 }
 
-fn convert_to_opty<'tcx>(
+fn convert_to_opty<'tcx, 'lli>(
     miri: &mut MiriInterpCx<'_, 'tcx>,
-    ctx: &mut ConversionContext<'tcx>,
+    ctx: &mut ConversionContext<'tcx, 'lli>,
 ) -> InterpResult<'tcx, (OpTy<'tcx, Provenance>, Option<PlaceTy<'tcx, Provenance>>)> {
     debug!("[GV to Op]: {} to {:?}", ctx.source, ctx.rust_layout.ty);
     match ctx.rust_layout.abi {
@@ -291,7 +291,7 @@ fn convert_to_opty<'tcx>(
 #[allow(clippy::arithmetic_side_effects)]
 fn convert_to_immty<'tcx>(
     miri: &MiriInterpCx<'_, 'tcx>,
-    ctx: &ConversionContext<'tcx>,
+    ctx: &ConversionContext<'tcx, '_>,
 ) -> InterpResult<'tcx, ImmTy<'tcx, crate::Provenance>> {
     let truncate_to_pointer_size = |v: u128| -> u64 {
         let as_bytes: [u8; 16] = v.to_ne_bytes();

@@ -1,7 +1,10 @@
 //! Implements threads.
+use crate::shims::llvm::logging::LLVMFlag;
+use either::Either;
 use inkwell::types::AsTypeRef;
 use inkwell::types::BasicTypeEnum;
-use inkwell::values::{FunctionValue, GenericValueRef};
+use inkwell::values::{GenericValue, FunctionValue};
+use inkwell::execution_engine::ExecutionEngine;
 use log::{debug, trace};
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
@@ -9,8 +12,6 @@ use std::num::TryFromIntError;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
-use crate::shims::llvm::logging::LLVMFlag;
-use either::Either;
 
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
@@ -26,10 +27,10 @@ use crate::concurrency::sync::SynchronizationState;
 use crate::shims::tls;
 use crate::*;
 
-use crate::shims::llvm::threads::link::{
-    ThreadLink, ThreadLinkAllocation, ThreadLinkDestination, ThreadLinkSource,
-};
+use crate::shims::llvm::threads::link::{ThreadLink, ThreadLinkDestination, ThreadLinkSource};
 use crate::shims::llvm_ffi_support::EvalContextExt as LLIEvalExt;
+use crate::shims::llvm::helpers::EvalContextExt as LLVMHelperEvalExt;
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SchedulingAction {
@@ -880,6 +881,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
     fn run_lli_function_to_completion<'lli>(
         &mut self,
+        engine: & ExecutionEngine<'lli>,
         function: FunctionValue<'lli>,
     ) -> InterpResult<'tcx> {
         debug!(
@@ -887,22 +889,29 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             function.get_name().to_string_lossy().to_string()
         );
         let this = self.eval_context_mut();
-        let active_thread = this.get_active_thread();
+        let active_thread_id = this.get_active_thread();
 
-        this.create_lli_thread(active_thread, function, vec![].as_slice())?;
+        unsafe {
+            engine.create_thread(active_thread_id.into(), function, vec![].as_slice());
+        }
+        if let Some(info) = this.get_foreign_error() {
+            return Err(info);
+        }
+
         let mut terminated = false;
         while !terminated {
-            terminated = this.step_lli_thread(active_thread)?;
+            terminated = this.step_lli_thread(active_thread_id)?;
         }
-        this.terminate_lli_thread(active_thread);
+        this.terminate_lli_thread(active_thread_id);
         Ok(())
     }
 
     fn start_rust_to_lli_thread<'lli>(
         &mut self,
+        engine: & ExecutionEngine<'lli>,
         link_type: Option<ThreadLinkDestination<'tcx>>,
         function: FunctionValue<'lli>,
-        mut args: Vec<GenericValueRef>,
+        args: Vec<GenericValue<'lli>>,
     ) -> InterpResult<'tcx, ThreadId> {
         let this = self.eval_context_mut();
 
@@ -930,9 +939,16 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
         debug!("Created Miri thread object for Rust to LLI call, TID: {:?}", group_id);
 
-        this.create_lli_thread(uninit_thread_id, function, args.as_slice())?;
+        unsafe {
+            engine.create_thread(uninit_thread_id.into(), function, args.as_slice());
+        }
+        if let Some(info) = this.get_foreign_error() {
+            return Err(info);
+        }
+        debug!("Created LLI Thread for {:?}", function.get_name());
+
         if let Some(link_type) = link_type {
-            let mut link = ThreadLink::new(
+            let link = ThreadLink::new(
                 prev,
                 uninit_thread_id,
                 link_type,
@@ -940,8 +956,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     function.get_type().get_return_type().map(|bte| bte.as_type_ref()),
                 ),
             );
-            let _ = args.drain(0..).map(|arg| link.take_ownership(ThreadLinkAllocation::LLI(arg)));
-
             this.active_thread_mut().thread_kind.set(ThreadKind::LLVM(link));
         }
 
@@ -1018,7 +1032,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             let callee_arg = this.local_to_place(this.frame_idx(), local)?;
             this.copy_op(arg, &callee_arg, true)?;
             if let Some(place) = mp {
-                link.take_ownership(ThreadLinkAllocation::Miri(place.assert_mem_place()))
+                link.take_ownership(place.assert_mem_place())
             }
         }
         // Initialize remaining locals.
@@ -1028,7 +1042,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
 
         this.active_thread_mut().thread_kind.set(ThreadKind::MiriLinked(link));
-   
+
         // Restore the old active thread frame.
         let new_thread_id = this.set_active_thread(old_thread_id);
         this.join_thread(new_thread_id)?;

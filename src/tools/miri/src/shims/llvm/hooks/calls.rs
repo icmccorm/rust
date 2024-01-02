@@ -45,7 +45,7 @@ use std::time::SystemTime;
 fn miri_call_by_instance_result<'tcx>(
     ctx: &mut MiriInterpCx<'_, 'tcx>,
     inst: Instance<'tcx>,
-    mut function_args: Vec<GenericValueRef>,
+    mut function_args: Vec<GenericValueRef<'static>>,
     return_type: Option<BasicTypeEnum<'static>>,
 ) -> InterpResult<'tcx> {
     debug!("LLVM to Rust Call: {:?}", ctx.tcx.item_name(inst.def_id()));
@@ -463,7 +463,7 @@ fn miri_call_by_name_result<'tcx>(
         }
         ctx.set_pending_return_value(
             ctx.get_active_thread(),
-            GenericValueRef::new(unsafe { gv_to_return.into_raw() }),
+            unsafe { GenericValueRef::new(gv_to_return.into_raw()) },
         );
         debug!("Returning to LLVM...");
         Ok(())

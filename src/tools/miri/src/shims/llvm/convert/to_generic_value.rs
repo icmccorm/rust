@@ -78,29 +78,6 @@ impl<'tcx, 'lli> LLVMArgumentConverter<'tcx, 'lli> {
         throw_llvm_argument_mismatch!(self.function, self.original_argument_count)
     }
 
-    fn consume_scalar_argument(
-        &mut self,
-        ctx: &MiriInterpCx<'_, 'tcx>,
-        llvm_type: BasicTypeEnum<'_>,
-    ) -> InterpResult<'tcx, ResolvedRustArgument<'tcx>> {
-        let this = ctx.eval_context_ref();
-        let type_width = this.resolve_llvm_type_size(llvm_type)?;
-        if let Some(arg) = self.peek_arg() {
-            if let rustc_abi::Abi::Scalar(_) = arg.abi() {
-                if let Some(layout) = this.get_equivalent_rust_primitive_layout(llvm_type)? {
-                    if arg.ty() == layout.ty {
-                        if arg.value_size().bytes() == type_width
-                            && arg.padded_size().bytes() == type_width
-                        {
-                            return Ok(self.advance_arg().unwrap());
-                        }
-                    }
-                }
-            }
-        }
-        self.error()
-    }
-
     pub fn convert(
         mut self,
         ctx: &mut MiriInterpCx<'_, 'tcx>,
