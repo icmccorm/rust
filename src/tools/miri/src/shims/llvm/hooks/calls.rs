@@ -7,13 +7,12 @@ use crate::shims::foreign_items::EvalContextExt as ForeignEvalContextExt;
 use crate::shims::llvm::convert::to_bytes::EvalContextExt as ToBytesEvalContextExt;
 use crate::shims::llvm::convert::to_opty::EvalContextExt as ToOpTyEvalContextExt;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMHelpersEvalContextExt;
+use crate::shims::llvm_ffi_support::EvalContextExt as FFIEvalContextExt;
 use crate::shims::llvm::hooks::memcpy::eval_memcpy;
 use crate::shims::llvm::hooks::memcpy::MemcpyMode;
-use crate::shims::llvm_ffi_support::ResolvedRustArgument;
 use crate::MiriInterpCx;
 use crate::MiriInterpCxExt;
 use crate::MiriMemoryKind;
-use crate::Provenance;
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::GenericValue;
 use inkwell::values::GenericValueRef;
@@ -90,21 +89,6 @@ fn miri_call_by_pointer_result<'tcx>(
     }
 }
 
-fn perform_opty_conversion<'tcx, 'lli>(
-    ctx: &mut MiriInterpCx<'_, 'tcx>,
-    return_place: &PlaceTy<'tcx, Provenance>,
-    return_type_opt: &'lli Option<BasicTypeEnum<'_>>,
-) -> InterpResult<'tcx, GenericValue<'lli>> {
-    if let Some(return_type) = return_type_opt {
-        debug!("Preparing GV return value");
-        let place_opty = ctx.place_to_op(return_place)?;
-        ResolvedRustArgument::new(ctx, place_opty)?.to_generic_value(ctx, Some(*return_type))
-    } else {
-        debug!("Preparing void return value");
-        Ok(ctx.void_generic_value())
-    }
-}
-
 pub extern "C-unwind" fn miri_call_by_pointer(
     ctx_raw: *mut MiriInterpCxOpaque,
     fn_ptr: MiriPointer,
@@ -174,7 +158,7 @@ fn miri_call_by_name_result<'tcx>(
         let args = op_ty_args.as_slice();
 
         let gv_to_return = match name_rust_str {
-            "__cxa_atexit" => ctx.void_generic_value(),
+            "__cxa_atexit" => GenericValue::new_void(),
             "malloc" | "_Znwm" | "_Znam" =>
                 if num_args == 1 {
                     let size_as_scalar = ctx.opty_as_scalar(&op_ty_args[0])?;
@@ -198,7 +182,7 @@ fn miri_call_by_name_result<'tcx>(
                     let address = ctx.opty_as_scalar(&op_ty_args[0])?;
                     let as_pointer = address.to_pointer(ctx)?;
                     ctx.free(as_pointer, MiriMemoryKind::C)?;
-                    ctx.void_generic_value()
+                    GenericValue::new_void()
                 } else {
                     throw_shim_argument_mismatch!(name_rust_str, 1, num_args);
                 },
@@ -335,7 +319,7 @@ fn miri_call_by_name_result<'tcx>(
                         let as_miri_ptr = ctx.pointer_to_lli_wrapped_pointer(new_ptr);
                         unsafe { GenericValue::create_generic_value_of_miri_pointer(as_miri_ptr) }
                     } else {
-                        ctx.void_generic_value()
+                        GenericValue::new_void()
                     }
                 },
             "printf" => {
@@ -352,7 +336,7 @@ fn miri_call_by_name_result<'tcx>(
                         println!("{}", as_cstring.to_str().unwrap());
                     }
                 }
-                ctx.void_generic_value()
+                GenericValue::new_void()
             }
             "strdup" =>
                 if num_args != 1 {
@@ -399,7 +383,7 @@ fn miri_call_by_name_result<'tcx>(
                     let seed = ctx.opty_as_scalar(&op_ty_args[0])?;
                     let seed = seed.to_u32()?;
                     ctx.machine.llvm_rng = rand::rngs::StdRng::seed_from_u64(seed.into());
-                    ctx.void_generic_value()
+                    GenericValue::new_void()
                 },
             "rand" =>
                 if num_args != 0 {
@@ -440,7 +424,7 @@ fn miri_call_by_name_result<'tcx>(
                     throw_unsup_format!("can't call foreign function `{name_symbol}` on OS `{os}`");
                 } else {
                     debug!("Finished executing, preparing return value...");
-                    let return_gv = perform_opty_conversion(ctx, &rplace, &return_type_opt)?;
+                    let return_gv = ctx.perform_opty_conversion(&rplace, return_type_opt)?;
                     callback_places.push(rplace);
                     return_gv
                 }

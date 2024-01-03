@@ -1,7 +1,7 @@
 use crate::concurrency::thread::EvalContextExt as ConcurrencyExt;
 use crate::shims::llvm::convert::to_opty::EvalContextExt as ToOpTyExt;
+use crate::shims::llvm_ffi_support::EvalContextExt as FFIEvalContextExt;
 use crate::shims::llvm::helpers::EvalContextExt;
-use crate::shims::llvm_ffi_support::ResolvedRustArgument;
 use crate::MiriInterpCx;
 use crate::ThreadId;
 use inkwell::types::BasicTypeEnum;
@@ -11,7 +11,8 @@ use rustc_const_eval::interpret::InterpResult;
 use rustc_const_eval::interpret::MPlaceTy;
 use rustc_const_eval::interpret::MemoryKind;
 use rustc_const_eval::interpret::PlaceTy;
-use inkwell::values::GenericValueRef;
+use inkwell::values::{GenericValue, GenericValueRef};
+
 #[allow(clippy::upper_case_acronyms)]
 
 
@@ -79,14 +80,7 @@ impl<'tcx> ThreadLink<'tcx> {
                     ThreadLinkSource::FromMiri(place_src) => {
                         if let Some(dest) = dest_opt {
                             let as_place = PlaceTy::from(place_src.clone());
-                            let place_opty = ctx.place_to_op(&as_place)?;
-                            let place_resolved = ResolvedRustArgument::new(ctx, place_opty)?;
-                            let place_as_generic =
-                                place_resolved.to_generic_value(ctx, Some(dest))?;
-                            debug!(
-                                "[ThreadLink] Copying generic value produced from return place into pending GenericValue."
-                            );
-                            // TODO: set pending
+                            let place_as_generic = ctx.perform_opty_conversion(&as_place, Some(dest))?;
                             ctx.set_pending_return_value(
                                 self.linked_id,
                                 unsafe{ GenericValueRef::new(place_as_generic.into_raw() ) },
@@ -130,6 +124,9 @@ impl<'tcx> ThreadLink<'tcx> {
                             ctx.set_active_thread(prev);
                         } else {
                             bug!("Unable to resolve return value for thread {:?}.", self.id);
+                        }
+                        if let Some(return_ref) = return_ref_opt{
+                            drop(unsafe { GenericValue::from_raw(return_ref.into_raw()) });
                         }
                     }
                 } else {

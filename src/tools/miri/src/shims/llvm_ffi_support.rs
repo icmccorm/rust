@@ -1,87 +1,14 @@
-extern crate rustc_abi;
 use super::llvm::lli::LLVM_INTERPRETER;
-use crate::machine::MiriInterpCxExt;
-use crate::shims::llvm::convert::to_generic_value::convert_opty_to_generic_value;
-use crate::shims::llvm::helpers::EvalContextExt as LLVMHelperEvalExt;
 use crate::shims::llvm::logging::LLVMFlag;
-use crate::MiriInterpCx;
 use crate::Provenance;
 use crate::ThreadId;
-use inkwell::values::GenericValueRef;
-use rustc_abi::{Abi, Size};
+use inkwell::values::{GenericValue, GenericValueRef};
 use rustc_const_eval::interpret::{InterpResult, OpTy, PlaceTy};
-use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
-use rustc_target::abi::TyAndLayout;
+use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalContextExt;
+use crate::shims::llvm::lli::ResolvedRustArgument;
 use inkwell::types::BasicTypeEnum;
-use inkwell::values::GenericValue;
-
-pub struct ResolvedRustArgument<'tcx> {
-    inner: ResolvedRustArgumentInner<'tcx>,
-}
-
-enum ResolvedRustArgumentInner<'tcx> {
-    Default(OpTy<'tcx, Provenance>),
-    Padded(OpTy<'tcx, Provenance>, Size),
-}
-
-impl<'tcx> ResolvedRustArgument<'tcx> {
-    pub fn new(
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
-        arg: OpTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, Self> {
-        let arg = ctx.dereference_into_singular_field(arg)?;
-        Ok(Self { inner: ResolvedRustArgumentInner::Default(arg) })
-    }
-    pub fn new_padded(
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
-        arg: OpTy<'tcx, Provenance>,
-        padding: Size,
-    ) -> InterpResult<'tcx, Self> {
-        let arg = ctx.dereference_into_singular_field(arg)?;
-        Ok(Self { inner: ResolvedRustArgumentInner::Padded(arg, padding) })
-    }
-
-    pub fn to_generic_value<'lli>(
-        self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
-        bte: ResolvedLLVMType<'lli>,
-    ) -> InterpResult<'tcx, GenericValue<'lli>> {
-        let this = ctx.eval_context_mut();
-        convert_opty_to_generic_value(this, self, bte)
-    }
-
-    pub fn opty(&self) -> &OpTy<'tcx, Provenance> {
-        match &self.inner {
-            ResolvedRustArgumentInner::Default(op) => op,
-            ResolvedRustArgumentInner::Padded(op, _) => op,
-        }
-    }
-    pub fn padded_size(&self) -> Size {
-        match self.inner {
-            ResolvedRustArgumentInner::Default(_) => self.value_size(),
-            ResolvedRustArgumentInner::Padded(_, padding) => padding,
-        }
-    }
-
-    pub fn layout(&self) -> TyAndLayout<'tcx, Ty<'tcx>> {
-        self.opty().layout
-    }
-
-    pub fn abi(&self) -> Abi {
-        self.layout().abi
-    }
-
-    pub fn value_size(&self) -> Size {
-        self.layout().size
-    }
-
-    pub fn ty(&self) -> Ty<'tcx> {
-        self.layout().ty
-    }
-}
-
-pub type ResolvedLLVMType<'a> = Option<BasicTypeEnum<'a>>;
+use log::debug;
 
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
 
@@ -107,6 +34,23 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             });
         }
         Ok(false)
+    }
+
+    fn perform_opty_conversion<'lli>(
+        &mut self,
+        return_place: &PlaceTy<'tcx, Provenance>,
+        return_type_opt: Option<BasicTypeEnum<'lli>>,
+    ) -> InterpResult<'tcx, GenericValue<'lli>> {
+        let this = self.eval_context_mut();
+        if let Some(return_type) = return_type_opt {
+            debug!("Preparing GV return value");
+            let place_opty = this.place_to_op(return_place)?;
+            let place_resolved = ResolvedRustArgument::new(this, place_opty)?;
+            place_resolved.to_generic_value(this, Some(return_type))
+        } else {
+            debug!("Preparing void return value");
+            Ok(GenericValue::new_void())
+        }
     }
 
     fn terminate_lli_thread(&self, id: ThreadId) {
@@ -151,6 +95,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         if let Some(ll) = LLVM_INTERPRETER.lock().borrow().as_ref() {
             return ll.with_engine(|engine| unsafe {
                 let result = engine.as_ref().unwrap().step_thread(id.into(), pending_return_opt);
+                if let Some(pending_return) = pending_return_opt{
+                    drop(GenericValue::from_raw(pending_return.into_raw()));
+                }
                 if let Some(info) = this.get_foreign_error() { Err(info) } else { Ok(result) }
             });
         }

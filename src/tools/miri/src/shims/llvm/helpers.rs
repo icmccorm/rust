@@ -12,7 +12,7 @@ use crate::{intptrcast, BorTag, Provenance, ThreadId};
 use either::Either::Right;
 use inkwell::miri::StackTrace;
 use inkwell::types::{AnyTypeEnum, BasicType, BasicTypeEnum};
-use inkwell::values::{GenericValue, GenericValueRef};
+use inkwell::values::GenericValueRef;
 use inkwell::values::GenericValueArrayRef;
 use llvm_sys::miri::{MiriPointer, MiriProvenance};
 use llvm_sys::prelude::LLVMTypeRef;
@@ -219,7 +219,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             }
         }
     }
-
+        
     fn pointer_to_lli_wrapped_pointer(
         &self,
         ptr: Pointer<Option<crate::Provenance>>,
@@ -455,9 +455,5 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             }
         };
         Ok(result)
-    }
-
-    fn void_generic_value(&self) -> GenericValue<'static> {
-        GenericValue::from_byte_slice(&[0])
     }
 }

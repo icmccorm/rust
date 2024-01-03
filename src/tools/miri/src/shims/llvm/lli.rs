@@ -24,7 +24,6 @@ use crate::shims::llvm::logging::LLVMFlag;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalContextExt;
 use crate::shims::llvm::convert::to_generic_value::LLVMArgumentConverter;
 use crate::shims::llvm::threads::link::ThreadLinkDestination;
-use crate::shims::llvm_ffi_support::ResolvedRustArgument;
 use rustc_const_eval::interpret::OpTy;
 use crate::MemoryKind;
 use crate::shims::either::Either;
@@ -34,6 +33,10 @@ use inkwell::attributes::Attribute;
 use crate::Provenance;
 use rustc_const_eval::interpret::PlaceTy;
 use inkwell::attributes::AttributeLoc;
+use crate::shims::llvm::convert::to_generic_value::convert_opty_to_generic_value;
+use rustc_target::abi::Size;
+use rustc_middle::ty::{layout::TyAndLayout, Ty};
+use rustc_target::abi::Abi;
 
 #[self_referencing]
 pub struct LLI /*<'mir, 'tcx>*/ {
@@ -58,7 +61,6 @@ impl LLI {
             context: Context::create(),
             module_builder: |ctx| {
                 let module = Context::create_module(ctx, "main");
-
                 for path in paths.iter() {
                     debug!("LLVM: {}", path.to_string_lossy());
                     match Module::parse_bitcode_from_path(path.clone(), ctx) {
@@ -218,3 +220,72 @@ impl LLI {
         })
     }
 }
+
+
+pub struct ResolvedRustArgument<'tcx> {
+    inner: ResolvedRustArgumentInner<'tcx>,
+}
+enum ResolvedRustArgumentInner<'tcx> {
+    Default(OpTy<'tcx, Provenance>),
+    Padded(OpTy<'tcx, Provenance>, Size),
+}
+
+impl<'tcx> ResolvedRustArgument<'tcx> {
+    pub fn new(
+        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        arg: OpTy<'tcx, Provenance>,
+    ) -> InterpResult<'tcx, Self> {
+        let arg = ctx.dereference_into_singular_field(arg)?;
+        Ok(Self { inner: ResolvedRustArgumentInner::Default(arg) })
+    }
+    pub fn new_padded(
+        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        arg: OpTy<'tcx, Provenance>,
+        padding: Size,
+    ) -> InterpResult<'tcx, Self> {
+        let arg = ctx.dereference_into_singular_field(arg)?;
+        Ok(Self { inner: ResolvedRustArgumentInner::Padded(arg, padding) })
+    }
+
+    pub fn to_generic_value<'lli>(
+        self,
+        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        bte: ResolvedLLVMType<'lli>,
+    ) -> InterpResult<'tcx, GenericValue<'lli>> {
+        let this = ctx.eval_context_mut();
+        let mut value = GenericValue::new_void();
+        convert_opty_to_generic_value(this, value.as_mut(), self, bte)?;
+        Ok(value)
+    }
+
+    pub fn opty(&self) -> &OpTy<'tcx, Provenance> {
+        match &self.inner {
+            ResolvedRustArgumentInner::Default(op) => op,
+            ResolvedRustArgumentInner::Padded(op, _) => op,
+        }
+    }
+    pub fn padded_size(&self) -> Size {
+        match self.inner {
+            ResolvedRustArgumentInner::Default(_) => self.value_size(),
+            ResolvedRustArgumentInner::Padded(_, padding) => padding,
+        }
+    }
+
+    pub fn layout(&self) -> TyAndLayout<'tcx> {
+        self.opty().layout
+    }
+
+    pub fn abi(&self) -> Abi {
+        self.layout().abi
+    }
+
+    pub fn value_size(&self) -> Size {
+        self.layout().size
+    }
+
+    pub fn ty(&self) -> Ty<'tcx> {
+        self.layout().ty
+    }
+}
+
+pub type ResolvedLLVMType<'a> = Option<BasicTypeEnum<'a>>;
