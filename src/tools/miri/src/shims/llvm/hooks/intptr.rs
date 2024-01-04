@@ -1,6 +1,7 @@
 use super::memory::obtain_ctx_mut;
 use crate::machine::MiriInterpCxExt;
 use crate::rustc_const_eval::interpret::AllocMap;
+use crate::shims::llvm::logging::LLVMFlag;
 use crate::InterpResult;
 use crate::MiriInterpCx;
 use crate::Pointer;
@@ -12,7 +13,6 @@ use log::debug;
 use rustc_const_eval::interpret::AllocId;
 use rustc_target::abi::Size;
 use std::num::NonZeroU64;
-use crate::shims::llvm::logging::LLVMFlag;
 
 pub extern "C-unwind" fn miri_ptrtoint(ctx_raw: *mut MiriInterpCxOpaque, mp: MiriPointer) -> u64 {
     let ctx = obtain_ctx_mut(ctx_raw);

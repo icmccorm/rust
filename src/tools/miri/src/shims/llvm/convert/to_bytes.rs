@@ -1,6 +1,6 @@
 extern crate rustc_abi;
-use crate::{shims::llvm::logging::LLVMFlag, Provenance};
 use crate::intptrcast;
+use crate::{shims::llvm::logging::LLVMFlag, Provenance};
 use rustc_abi::Abi;
 use rustc_const_eval::interpret::{InterpResult, OpTy, Scalar};
 use rustc_middle::ty::layout::TyAndLayout;
@@ -9,7 +9,11 @@ impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 
 
 pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     #![allow(clippy::arithmetic_side_effects)]
-    fn scalar_to_bytes(&mut self, scalar: Scalar<Provenance>, layout: TyAndLayout<'_>) -> InterpResult<'tcx, Vec<u8>> {
+    fn scalar_to_bytes(
+        &mut self,
+        scalar: Scalar<Provenance>,
+        layout: TyAndLayout<'_>,
+    ) -> InterpResult<'tcx, Vec<u8>> {
         let this = self.eval_context_mut();
         let scalar_bits = match scalar {
             Scalar::Int(si) => si.to_bits(si.size()).unwrap(),
@@ -40,7 +44,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let this = self.eval_context_mut();
         match opty.layout.abi {
             rustc_abi::Abi::Scalar(_) => {
-                
                 let as_scalar = this.read_scalar(opty)?;
 
                 Ok(this.scalar_to_bytes(as_scalar, opty.layout)?)

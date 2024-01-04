@@ -1,3 +1,5 @@
+use super::access::memory_access_core;
+use super::memory::obtain_ctx_mut;
 use crate::shims::llvm::helpers::EvalContextExt;
 use crate::MiriInterpCx;
 use inkwell::{types::BasicTypeEnum, values::GenericValueRef};
@@ -7,8 +9,6 @@ use llvm_sys::{
     prelude::LLVMTypeRef,
 };
 use rustc_const_eval::interpret::InterpResult;
-use super::access::memory_access_core;
-use super::memory::obtain_ctx_mut;
 
 fn memory_load_result<'tcx>(
     ctx: &mut MiriInterpCx<'_, 'tcx>,

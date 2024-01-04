@@ -11,8 +11,9 @@ use crate::{intptrcast, BorTag, Provenance, ThreadId};
 use either::Either::Right;
 use inkwell::miri::StackTrace;
 use inkwell::types::{AnyTypeEnum, BasicType, BasicTypeEnum};
-use inkwell::values::GenericValueRef;
 use inkwell::values::GenericValueArrayRef;
+use inkwell::values::GenericValueRef;
+use llvm_sys::execution_engine::LLVMGenericValueArrayRef;
 use llvm_sys::miri::{MiriPointer, MiriProvenance};
 use llvm_sys::prelude::LLVMTypeRef;
 use log::debug;
@@ -26,7 +27,6 @@ use rustc_middle::ty::{self, Ty, TypeAndMut};
 use rustc_span::FileNameDisplayPreference;
 use rustc_target::abi::Size;
 use std::num::NonZeroU64;
-use llvm_sys::execution_engine::LLVMGenericValueArrayRef;
 
 #[macro_export]
 macro_rules! throw_interop_format {
@@ -80,7 +80,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let primitive_layout = this.get_equivalent_rust_primitive_layout(type_tag)?;
         if let Some(primitive_layout) = primitive_layout {
             return Ok(primitive_layout);
-        }else{
+        } else {
             throw_unsup_shim_llvm_type!(type_tag)
         }
     }
@@ -93,13 +93,14 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let resolved_ty = match ty {
             BasicTypeEnum::FloatType(_) =>
                 match ty.get_llvm_type_kind() {
-                    llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind => Some(ctx.layout_of(ctx.tcx.types.f64)?),
-                    llvm_sys::LLVMTypeKind::LLVMFloatTypeKind => Some(ctx.layout_of(ctx.tcx.types.f32)?),
+                    llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind =>
+                        Some(ctx.layout_of(ctx.tcx.types.f64)?),
+                    llvm_sys::LLVMTypeKind::LLVMFloatTypeKind =>
+                        Some(ctx.layout_of(ctx.tcx.types.f32)?),
                     _ => None,
                 },
             BasicTypeEnum::IntType(it) =>
-            ctx.get_equivalent_rust_int_from_size(Size::from_bits(it.get_bit_width()))?
-            ,
+                ctx.get_equivalent_rust_int_from_size(Size::from_bits(it.get_bit_width()))?,
             BasicTypeEnum::PointerType(_) => Some(ctx.raw_pointer_to(ctx.tcx.types.u8)?),
             _ => None,
         };
@@ -218,7 +219,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             }
         }
     }
-        
+
     fn pointer_to_lli_wrapped_pointer(
         &self,
         ptr: Pointer<Option<crate::Provenance>>,
@@ -262,7 +263,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             this.machine.pending_return_values.try_insert(id, val_ref).unwrap();
         }
     }
-    
+
     fn get_pending_return_value(
         &mut self,
         id: ThreadId,
@@ -377,7 +378,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             rustc_abi::FieldsShape::Union(_) | rustc_abi::FieldsShape::Primitive
         )
     }
-
 
     fn resolve_padded_size(&self, layout: &TyAndLayout<'tcx>, rust_field_idx: usize) -> Size {
         if layout.fields.count() <= 1 {

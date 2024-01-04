@@ -25,7 +25,7 @@ pub trait Source<T> {
         &self,
         ctx: &MiriInterpCx<'_, 'tcx>,
         size: u64,
-        index: u32
+        index: u32,
     ) -> InterpResult<'tcx, T>;
 }
 pub trait Destination<T> {
@@ -159,7 +159,7 @@ where
     } else {
         u64::from(aggregate_length)
     };
-    
+
     for i in 0..aggregate_length {
         let field_source = source.resolve_field(ctx, item_size, i)?;
         let mut field_destination = destination.resolve_field(ctx, item_size, i)?;

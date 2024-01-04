@@ -1,14 +1,14 @@
 use super::llvm::lli::LLVM_INTERPRETER;
+use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalContextExt;
+use crate::shims::llvm::lli::ResolvedRustArgument;
 use crate::shims::llvm::logging::LLVMFlag;
 use crate::Provenance;
 use crate::ThreadId;
+use inkwell::types::BasicTypeEnum;
 use inkwell::values::{GenericValue, GenericValueRef};
+use log::debug;
 use rustc_const_eval::interpret::{InterpResult, OpTy, PlaceTy};
 use rustc_span::Symbol;
-use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalContextExt;
-use crate::shims::llvm::lli::ResolvedRustArgument;
-use inkwell::types::BasicTypeEnum;
-use log::debug;
 
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
 
@@ -78,7 +78,10 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         Ok(false)
     }
 
-    fn get_thread_exit_value(&self, id: ThreadId) -> InterpResult<'tcx, Option<GenericValueRef<'static>>> {
+    fn get_thread_exit_value(
+        &self,
+        id: ThreadId,
+    ) -> InterpResult<'tcx, Option<GenericValueRef<'static>>> {
         let this = self.eval_context_ref();
         if let Some(ll) = LLVM_INTERPRETER.lock().borrow().as_ref() {
             return ll.with_engine(|engine| unsafe {
@@ -92,11 +95,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn step_lli_thread(&mut self, id: ThreadId) -> InterpResult<'tcx, bool> {
         let this = self.eval_context_mut();
         let pending_return_opt = this.get_pending_return_value(id)?;
-        
+
         if let Some(ll) = LLVM_INTERPRETER.lock().borrow().as_ref() {
             return ll.with_engine(|engine| unsafe {
                 let result = engine.as_ref().unwrap().step_thread(id.into(), pending_return_opt);
-                if let Some(pending_return) = pending_return_opt{
+                if let Some(pending_return) = pending_return_opt {
                     drop(GenericValue::from_raw(pending_return.into_raw()));
                 }
                 if let Some(info) = this.get_foreign_error() { Err(info) } else { Ok(result) }

@@ -1,4 +1,5 @@
 extern crate rustc_abi;
+use crate::shims::llvm::logging::LLVMFlag;
 use crate::{
     intptrcast,
     shims::llvm::{
@@ -12,7 +13,6 @@ use rustc_apfloat::{
     ieee::{Double, Single},
     Float,
 };
-use crate::shims::llvm::logging::LLVMFlag;
 use rustc_const_eval::interpret::{
     alloc_range, AllocId, AllocRange, AllocRef, AllocRefMut, InterpResult, Pointer, Scalar,
 };

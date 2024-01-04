@@ -46,10 +46,12 @@ macro_rules! throw_unsup_llvm_type {
 #[macro_export]
 macro_rules! throw_unsup_shim_llvm_type {
     ($llvm_type:expr) => {
-        throw_interop_format!("LLVM Type `{}` is not supported for use in shims.", $llvm_type.print_to_string().to_string())
+        throw_interop_format!(
+            "LLVM Type `{}` is not supported for use in shims.",
+            $llvm_type.print_to_string().to_string()
+        )
     };
 }
-
 
 #[macro_export]
 macro_rules! throw_rust_type_mismatch {

@@ -31,8 +31,6 @@ pub enum LLVMFlag {
     ExposedPointerThroughScalar,
 }
 
-
-
 impl std::fmt::Display for LLVMFlag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let string = match self {
@@ -108,10 +106,7 @@ impl LLVMLogger {
         }
     }
     #[inline(always)]
-    pub fn log_aggregate_expansion(
-        &mut self,
-        from: TyAndLayout<'_, Ty<'_>>,
-    ) {
+    pub fn log_aggregate_expansion(&mut self, from: TyAndLayout<'_, Ty<'_>>) {
         self.log_flag(LLVMFlag::Expansion);
         if let Some(file) = &mut self.conversions {
             let source_type = from.ty.to_string();

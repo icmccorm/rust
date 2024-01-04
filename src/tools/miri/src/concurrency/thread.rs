@@ -1,10 +1,10 @@
 //! Implements threads.
 use crate::shims::llvm::logging::LLVMFlag;
 use either::Either;
+use inkwell::execution_engine::ExecutionEngine;
 use inkwell::types::AsTypeRef;
 use inkwell::types::BasicTypeEnum;
-use inkwell::values::{GenericValue, FunctionValue};
-use inkwell::execution_engine::ExecutionEngine;
+use inkwell::values::{FunctionValue, GenericValue};
 use log::{debug, trace};
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
@@ -27,10 +27,9 @@ use crate::concurrency::sync::SynchronizationState;
 use crate::shims::tls;
 use crate::*;
 
+use crate::shims::llvm::helpers::EvalContextExt as LLVMHelperEvalExt;
 use crate::shims::llvm::threads::link::{ThreadLink, ThreadLinkDestination, ThreadLinkSource};
 use crate::shims::llvm_ffi_support::EvalContextExt as LLIEvalExt;
-use crate::shims::llvm::helpers::EvalContextExt as LLVMHelperEvalExt;
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SchedulingAction {
@@ -881,7 +880,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
     fn run_lli_function_to_completion<'lli>(
         &mut self,
-        engine: & ExecutionEngine<'lli>,
+        engine: &ExecutionEngine<'lli>,
         function: FunctionValue<'lli>,
     ) -> InterpResult<'tcx> {
         debug!(
@@ -908,7 +907,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
     fn start_rust_to_lli_thread<'lli>(
         &mut self,
-        engine: & ExecutionEngine<'lli>,
+        engine: &ExecutionEngine<'lli>,
         link_type: Option<ThreadLinkDestination<'tcx>>,
         function: FunctionValue<'lli>,
         args: Vec<GenericValue<'lli>>,

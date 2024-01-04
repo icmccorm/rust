@@ -1,42 +1,42 @@
 extern crate rustc_hash;
 use super::hooks::calls::{miri_call_by_name, miri_call_by_pointer};
 use super::hooks::errors::miri_error_trace_recorder;
-use super::hooks::intptr::{miri_inttoptr, miri_ptrtoint, miri_get_element_pointer};
+use super::hooks::intptr::{miri_get_element_pointer, miri_inttoptr, miri_ptrtoint};
 use super::hooks::load::miri_memory_load;
 use super::hooks::memory::{
     llvm_free, llvm_malloc, miri_memcpy, miri_memset, miri_register_global,
 };
 use super::hooks::store::miri_memory_store;
 use crate::concurrency::thread::EvalContextExt;
+use crate::shims::either::Either;
+use crate::shims::llvm::convert::to_generic_value::convert_opty_to_generic_value;
+use crate::shims::llvm::convert::to_generic_value::LLVMArgumentConverter;
+use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalContextExt;
+use crate::shims::llvm::logging::LLVMFlag;
+use crate::shims::llvm::threads::link::ThreadLinkDestination;
+use crate::MemoryKind;
+use crate::Provenance;
 use crate::{MiriInterpCx, MiriInterpCxExt};
+use inkwell::attributes::Attribute;
+use inkwell::attributes::AttributeLoc;
 use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, MiriInterpCxOpaque};
 use inkwell::module::Module;
+use inkwell::types::BasicTypeEnum;
 pub use inkwell::values::FunctionValue;
+use inkwell::values::GenericValue;
 use log::debug;
 use ouroboros::self_referencing;
 use parking_lot::ReentrantMutex;
 use rustc_const_eval::interpret::InterpResult;
-use rustc_hash::FxHashSet;
-use std::cell::RefCell;
-use std::path::PathBuf;
-use crate::shims::llvm::logging::LLVMFlag;
-use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalContextExt;
-use crate::shims::llvm::convert::to_generic_value::LLVMArgumentConverter;
-use crate::shims::llvm::threads::link::ThreadLinkDestination;
 use rustc_const_eval::interpret::OpTy;
-use crate::MemoryKind;
-use crate::shims::either::Either;
-use inkwell::types::BasicTypeEnum;
-use inkwell::values::GenericValue;
-use inkwell::attributes::Attribute;
-use crate::Provenance;
 use rustc_const_eval::interpret::PlaceTy;
-use inkwell::attributes::AttributeLoc;
-use crate::shims::llvm::convert::to_generic_value::convert_opty_to_generic_value;
-use rustc_target::abi::Size;
+use rustc_hash::FxHashSet;
 use rustc_middle::ty::{layout::TyAndLayout, Ty};
 use rustc_target::abi::Abi;
+use rustc_target::abi::Size;
+use std::cell::RefCell;
+use std::path::PathBuf;
 
 #[self_referencing]
 pub struct LLI /*<'mir, 'tcx>*/ {
@@ -124,7 +124,8 @@ impl LLI {
                         logger.log_flag(LLVMFlag::LLVMInvokedConstructor)
                     }
                 }
-                constructors.iter()
+                constructors
+                    .iter()
                     .try_for_each(|cstor| miri.run_lli_function_to_completion(engine, *cstor))
             }
         })
@@ -139,7 +140,8 @@ impl LLI {
                         logger.log_flag(LLVMFlag::LLVMInvokedDestructor)
                     }
                 }
-                destructors.iter()
+                destructors
+                    .iter()
                     .try_for_each(|dstor| miri.run_lli_function_to_completion(engine, *dstor))
             }
         })
@@ -165,13 +167,13 @@ impl LLI {
             this.update_last_rust_call_location();
 
             let llvm_parameter_types = function.get_type().get_param_types();
-    
+
             let has_sret = !llvm_parameter_types.is_empty()
                 && function
                     .attributes(AttributeLoc::Param(0))
                     .iter()
                     .any(|e| e.get_enum_kind_id() == Attribute::get_named_enum_kind_id("sret"));
-    
+
             let (sret_argument, llvm_parameter_types, thread_link_destination): (
                 Option<GenericValue<'lli>>,
                 &[BasicTypeEnum<'lli>],
@@ -212,15 +214,17 @@ impl LLI {
             if let Some(sret_argument) = sret_argument {
                 generic_args.insert(0, sret_argument);
             }
-            println!("generic_args: {:?}", generic_args);
-            let lli_thread_id =
-                this.start_rust_to_lli_thread(engine, Some(thread_link_destination), function, generic_args)?;
+            let lli_thread_id = this.start_rust_to_lli_thread(
+                engine,
+                Some(thread_link_destination),
+                function,
+                generic_args,
+            )?;
             debug!("Started LLI Thread, TID: {:?}", lli_thread_id);
             Ok(())
         })
     }
 }
-
 
 pub struct ResolvedRustArgument<'tcx> {
     inner: ResolvedRustArgumentInner<'tcx>,

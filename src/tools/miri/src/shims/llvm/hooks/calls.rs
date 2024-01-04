@@ -7,9 +7,9 @@ use crate::shims::foreign_items::EvalContextExt as ForeignEvalContextExt;
 use crate::shims::llvm::convert::to_bytes::EvalContextExt as ToBytesEvalContextExt;
 use crate::shims::llvm::convert::to_opty::EvalContextExt as ToOpTyEvalContextExt;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMHelpersEvalContextExt;
-use crate::shims::llvm_ffi_support::EvalContextExt as FFIEvalContextExt;
 use crate::shims::llvm::hooks::memcpy::eval_memcpy;
 use crate::shims::llvm::hooks::memcpy::MemcpyMode;
+use crate::shims::llvm_ffi_support::EvalContextExt as FFIEvalContextExt;
 use crate::MiriInterpCx;
 use crate::MiriInterpCxExt;
 use crate::MiriMemoryKind;
@@ -395,12 +395,14 @@ fn miri_call_by_name_result<'tcx>(
             _ => {
                 let rplace = match &return_type_opt {
                     Some(return_type) => {
-                        if let Some(ret_eqv_layout) = ctx.get_equivalent_rust_primitive_layout(*return_type)?{
+                        if let Some(ret_eqv_layout) =
+                            ctx.get_equivalent_rust_primitive_layout(*return_type)?
+                        {
                             PlaceTy::from(ctx.allocate(
                                 ret_eqv_layout,
                                 MemoryKind::Machine(MiriMemoryKind::LLVMInterop),
                             )?)
-                        }else{
+                        } else {
                             throw_unsup_shim_llvm_type!(return_type)
                         }
                     }
@@ -445,10 +447,9 @@ fn miri_call_by_name_result<'tcx>(
                 MemoryKind::Machine(MiriMemoryKind::LLVMInterop),
             )?;
         }
-        ctx.set_pending_return_value(
-            ctx.get_active_thread(),
-            unsafe { GenericValueRef::new(gv_to_return.into_raw()) },
-        );
+        ctx.set_pending_return_value(ctx.get_active_thread(), unsafe {
+            GenericValueRef::new(gv_to_return.into_raw())
+        });
         debug!("Returning to LLVM...");
         Ok(())
     }
