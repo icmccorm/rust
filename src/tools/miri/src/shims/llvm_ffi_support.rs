@@ -92,6 +92,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn step_lli_thread(&mut self, id: ThreadId) -> InterpResult<'tcx, bool> {
         let this = self.eval_context_mut();
         let pending_return_opt = this.get_pending_return_value(id)?;
+        
         if let Some(ll) = LLVM_INTERPRETER.lock().borrow().as_ref() {
             return ll.with_engine(|engine| unsafe {
                 let result = engine.as_ref().unwrap().step_thread(id.into(), pending_return_opt);

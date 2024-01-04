@@ -212,7 +212,7 @@ impl LLI {
             if let Some(sret_argument) = sret_argument {
                 generic_args.insert(0, sret_argument);
             }
-            
+            println!("generic_args: {:?}", generic_args);
             let lli_thread_id =
                 this.start_rust_to_lli_thread(engine, Some(thread_link_destination), function, generic_args)?;
             debug!("Started LLI Thread, TID: {:?}", lli_thread_id);
@@ -281,6 +281,10 @@ impl<'tcx> ResolvedRustArgument<'tcx> {
 
     pub fn value_size(&self) -> Size {
         self.layout().size
+    }
+
+    pub fn is_immediate(&self) -> bool {
+        self.opty().as_mplace_or_imm().is_right()
     }
 
     pub fn ty(&self) -> Ty<'tcx> {

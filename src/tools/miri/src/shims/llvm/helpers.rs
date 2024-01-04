@@ -5,7 +5,6 @@ use crate::helpers::EvalContextExt as HelperEvalExt;
 use crate::rustc_const_eval::interpret::AllocMap;
 use crate::rustc_middle::ty::layout::LayoutOf;
 use crate::shims::llvm::logging::LLVMFlag;
-use crate::shims::llvm_ffi_support::EvalContextExt as LLVMEvalContextExt;
 use crate::throw_unsup_llvm_type;
 use crate::throw_unsup_shim_llvm_type;
 use crate::{intptrcast, BorTag, Provenance, ThreadId};
@@ -263,17 +262,14 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             this.machine.pending_return_values.try_insert(id, val_ref).unwrap();
         }
     }
-
+    
     fn get_pending_return_value(
         &mut self,
         id: ThreadId,
     ) -> InterpResult<'tcx, Option<GenericValueRef<'static>>> {
         let this = self.eval_context_mut();
-        if let Some(val_ref) = this.machine.pending_return_values.remove(&id) {
-            Ok(Some(val_ref))
-        } else {
-            this.get_thread_exit_value(id)
-        }
+        let pending_return = this.machine.pending_return_values.remove(&id);
+        Ok(pending_return)
     }
 
     fn update_last_rust_call_location(&self) {

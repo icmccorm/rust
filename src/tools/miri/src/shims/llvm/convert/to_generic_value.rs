@@ -15,16 +15,18 @@ use rustc_middle::ty::GenericArgsRef;
 use rustc_middle::ty::{self, AdtDef};
 use std::iter::repeat;
 use inkwell::values::GenericValueRef;
+use rustc_target::abi::FieldsShape;
+use rustc_target::abi::call::HomogeneousAggregate;
 
 macro_rules! throw_llvm_argument_mismatch {
-    ($function: expr, $args: expr) => {
+    ($function: expr, $rust_args: expr, $llvm_args: expr) => {
         throw_interop_format!(
             "argument count mismatch: LLVM function {:?} {} expects {}{} arguments, but Rust provided {}",
             $function.get_name(),
             $function.get_type().print_to_string().to_string(),
             (if $function.get_type().is_var_arg() { "at least " } else { "" }),
-            $function.get_params().len(),
-            $args
+            $llvm_args,
+            $rust_args
         )
     };
 }
@@ -32,7 +34,7 @@ macro_rules! throw_llvm_argument_mismatch {
 pub struct LLVMArgumentConverter<'tcx, 'lli> {
     function: FunctionValue<'lli>,
     rust_args: Vec<ResolvedRustArgument<'tcx>>,
-    original_argument_count: usize,
+    original_argument_counts: (usize, usize),
     llvm_types: Vec<ResolvedLLVMType<'lli>>,
 }
 #[allow(dead_code)]
@@ -51,8 +53,8 @@ impl<'tcx, 'lli> LLVMArgumentConverter<'tcx, 'lli> {
             .collect::<InterpResult<'tcx, Vec<_>>>()?;
         llvm_types.reverse();
         rust_args.reverse();
-        let original_argument_count = rust_args.len();
-        Ok(Self { function, rust_args, original_argument_count, llvm_types })
+        let original_argument_counts = (rust_args.len(), llvm_types.len());
+        Ok(Self { function, rust_args, original_argument_counts, llvm_types })
     }
 
     fn advance_arg(&mut self) -> Option<ResolvedRustArgument<'tcx>> {
@@ -76,13 +78,14 @@ impl<'tcx, 'lli> LLVMArgumentConverter<'tcx, 'lli> {
     }
 
     fn error<A>(&self) -> InterpResult<'tcx, A> {
-        throw_llvm_argument_mismatch!(self.function, self.original_argument_count)
+        let (rust_count, llvm_count) = self.original_argument_counts;
+        throw_llvm_argument_mismatch!(self.function, llvm_count, rust_count)
     }
 
     pub fn convert(
         mut self,
         ctx: &mut MiriInterpCx<'_, 'tcx>,
-        function: FunctionValue<'_>,
+        function: FunctionValue<'lli>,
     ) -> InterpResult<'tcx, Vec<GenericValue<'lli>>> {
         let this = ctx.eval_context_mut();
         let original_arg_length = self.rust_args.len();
@@ -90,22 +93,20 @@ impl<'tcx, 'lli> LLVMArgumentConverter<'tcx, 'lli> {
         if original_arg_length > self.llvm_types.len() && !is_var_arg {
             return self.error();
         }
-        let mut generic_args = Vec::with_capacity(self.llvm_types.len());
+        let mut generic_args= Vec::with_capacity(self.llvm_types.len());
         while let Some(current_arg) = self.advance_arg() {
             if self.llvm_types.is_empty() {
                 if is_var_arg {
                     self.llvm_types.push(None);
                 } else {
-                    throw_llvm_argument_mismatch!(function, original_arg_length);
+                    self.error()?;
                 }
             }
             let next_llvm_type = self.peek_type().unwrap();
             if let Some(next_llvm_type) = next_llvm_type {
-                let num_types_remaining = self.llvm_types.len() - 1;
-                let llvm_type_size = this.resolve_llvm_type_size(*next_llvm_type)?;
-                let rust_type_size = current_arg.layout().size.bytes();
-                if llvm_type_size < rust_type_size && num_types_remaining > 0 {
+                if self.can_expand_aggregate(this, &current_arg, next_llvm_type)? {
                     if let Some(mut fields) = self.expand_aggregate(this, &current_arg)? {
+
                         self.rust_args.append(&mut fields);
                         continue;
                     }
@@ -115,9 +116,33 @@ impl<'tcx, 'lli> LLVMArgumentConverter<'tcx, 'lli> {
             generic_args.push(current_arg.to_generic_value(this, first_type)?);
         }
         if !self.llvm_types.is_empty() {
-            throw_llvm_argument_mismatch!(function, original_arg_length);
+            println!("LLVM types remaining: {:?}", self.llvm_types.len());
+            self.error()?;
         }
         Ok(generic_args)
+    }
+
+    fn can_expand_aggregate(&self, ctx: &MiriInterpCx<'_, 'tcx>, rust_arg: &ResolvedRustArgument<'tcx>, llvm_type: &BasicTypeEnum<'_>) -> InterpResult<'tcx, bool> {
+        let this = ctx.eval_context_ref();
+        let llvm_type_size = this.resolve_llvm_type_size(*llvm_type)?;
+        let rust_type_size = rust_arg.layout().size.bytes();
+        let num_types_remaining = self.llvm_types.len() - 1;
+        if llvm_type_size < rust_type_size && num_types_remaining > 0 {
+            if matches!(*llvm_type, BasicTypeEnum::PointerType(_)) && !rust_arg.is_immediate() {
+                return Ok(false)
+            }
+            let is_homogenous = rust_arg.layout().homogeneous_aggregate(this);
+            if let Ok(HomogeneousAggregate::Homogeneous(_)) = is_homogenous {
+                let not_union = !(matches!(rust_arg.layout().fields, FieldsShape::Union(_)));
+                let inhabited = !rust_arg.abi().is_uninhabited();
+                let not_scalar = !rust_arg.abi().is_scalar();
+                let field_count = rust_arg.layout().fields.count();
+                if not_union && inhabited && not_scalar && field_count <= (num_types_remaining + 1) {
+                    return Ok(true)
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn expand_aggregate(
@@ -151,7 +176,8 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
     bte: ResolvedLLVMType<'lli>,
 ) -> InterpResult<'tcx> {
     if let Some(bte) = bte {
-        debug!("[Op to GV]: {:?} -> {:?}", arg.layout(), bte.print_to_string());
+        dest.set_type_tag(&bte);
+        debug!("[Op to GV]: {:?} -> {:?}", arg.ty(), bte.print_to_string());
         match bte {
             BasicTypeEnum::ArrayType(at) => {
                 let llvm_field_types =
@@ -198,9 +224,11 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
                 },
             BasicTypeEnum::IntType(it) => {
                 if arg.value_size().bytes() < it.get_byte_width() as u64
-                    && arg.padded_size().bytes() != it.get_byte_width() as u64
                 {
-                    throw_rust_type_mismatch!(arg.layout(), it);
+                    if  arg.padded_size().bytes() != it.get_byte_width() as u64 {
+                        debug!("Padded size: {}, value size: {}, LLVM int width: {}", arg.padded_size().bytes(), arg.value_size().bytes(), it.get_byte_width());
+                        throw_rust_type_mismatch!(arg.layout(), it);
+                    }
                 }
                 match arg.abi() {
                     rustc_abi::Abi::Scalar(sc) => {
@@ -222,7 +250,8 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
                     }
                     rustc_abi::Abi::ScalarPair(_, _)
                     | rustc_abi::Abi::Aggregate { sized: true } => {
-                        dest.set_bytes(&ctx.op_to_bytes(arg.opty())?);
+                        let bytes = ctx.op_to_bytes(arg.opty())?; 
+                        dest.set_bytes(&bytes);
                     }
                     _ => {
                         throw_rust_type_mismatch!(arg.layout(), it);

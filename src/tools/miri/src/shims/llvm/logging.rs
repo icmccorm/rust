@@ -27,7 +27,7 @@ pub enum LLVMFlag {
     LLVMReadUninit,
     LLVMInvokedConstructor,
     LLVMInvokedDestructor,
-    AggregateExpansion,
+    Expansion,
     ExposedPointerThroughScalar,
 }
 
@@ -47,7 +47,7 @@ impl std::fmt::Display for LLVMFlag {
             LLVMFlag::LLVMReadUninit => "LLVMReadUninit",
             LLVMFlag::LLVMInvokedConstructor => "LLVMInvokedConstructor",
             LLVMFlag::LLVMInvokedDestructor => "LLVMInvokedDestructor",
-            LLVMFlag::AggregateExpansion => "AggregateExpansion",
+            LLVMFlag::Expansion => "Expansion",
             LLVMFlag::ExposedPointerThroughScalar => "ExposedPointerThroughScalar",
         };
         write!(f, "{}", string)
@@ -112,7 +112,7 @@ impl LLVMLogger {
         &mut self,
         from: TyAndLayout<'_, Ty<'_>>,
     ) {
-        self.log_flag(LLVMFlag::AggregateExpansion);
+        self.log_flag(LLVMFlag::Expansion);
         if let Some(file) = &mut self.conversions {
             let source_type = from.ty.to_string();
             let source_type_size = from.size.bytes();

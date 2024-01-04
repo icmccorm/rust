@@ -1,21 +1,19 @@
 use crate::concurrency::thread::EvalContextExt as ConcurrencyExt;
 use crate::shims::llvm::convert::to_opty::EvalContextExt as ToOpTyExt;
-use crate::shims::llvm_ffi_support::EvalContextExt as FFIEvalContextExt;
 use crate::shims::llvm::helpers::EvalContextExt;
+use crate::shims::llvm_ffi_support::EvalContextExt as FFIEvalContextExt;
 use crate::MiriInterpCx;
 use crate::ThreadId;
 use inkwell::types::BasicTypeEnum;
+use inkwell::values::GenericValueRef;
 use llvm_sys::prelude::LLVMTypeRef;
 use log::debug;
 use rustc_const_eval::interpret::InterpResult;
 use rustc_const_eval::interpret::MPlaceTy;
 use rustc_const_eval::interpret::MemoryKind;
 use rustc_const_eval::interpret::PlaceTy;
-use inkwell::values::{GenericValue, GenericValueRef};
 
 #[allow(clippy::upper_case_acronyms)]
-
-
 #[derive(Debug)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum ThreadLinkDestination<'tcx> {
@@ -80,11 +78,11 @@ impl<'tcx> ThreadLink<'tcx> {
                     ThreadLinkSource::FromMiri(place_src) => {
                         if let Some(dest) = dest_opt {
                             let as_place = PlaceTy::from(place_src.clone());
-                            let place_as_generic = ctx.perform_opty_conversion(&as_place, Some(dest))?;
-                            ctx.set_pending_return_value(
-                                self.linked_id,
-                                unsafe{ GenericValueRef::new(place_as_generic.into_raw() ) },
-                            );
+                            let place_as_generic =
+                                ctx.perform_opty_conversion(&as_place, Some(dest))?;
+                            ctx.set_pending_return_value(self.linked_id, unsafe {
+                                GenericValueRef::new(place_as_generic.into_raw())
+                            });
                         }
                         ctx.deallocate_ptr(
                             place_src.ptr(),
@@ -117,16 +115,13 @@ impl<'tcx> ThreadLink<'tcx> {
                     if let Some(return_type) = gvty_opt {
                         debug!("[ThreadLink] Writing generic value to Miri destination.");
                         let prev: ThreadId = ctx.set_active_thread(self.linked_id);
-                        let return_ref_opt = ctx.get_pending_return_value(self.id)?;
+                        let return_ref_opt = ctx.get_thread_exit_value(self.id)?;
                         if let Some(return_ref) = return_ref_opt {
                             return_ref.set_type_tag(unsafe { &BasicTypeEnum::new(return_type) });
                             ctx.write_generic_value(return_ref, place)?;
                             ctx.set_active_thread(prev);
                         } else {
                             bug!("Unable to resolve return value for thread {:?}.", self.id);
-                        }
-                        if let Some(return_ref) = return_ref_opt{
-                            drop(unsafe { GenericValue::from_raw(return_ref.into_raw()) });
                         }
                     }
                 } else {

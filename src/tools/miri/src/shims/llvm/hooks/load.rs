@@ -20,6 +20,7 @@ fn memory_load_result<'tcx>(
     let source = ctx.lli_wrapped_pointer_to_resolved_pointer(source)?;
     let mut destination = unsafe { GenericValueRef::new(destination_ref) };
     let value_type = unsafe { BasicTypeEnum::new(value_type_ref) };
+    destination.set_type_tag(&value_type);
     memory_access_core(ctx, &source, &mut destination, value_type, value_size)?;
     Ok(())
 }
