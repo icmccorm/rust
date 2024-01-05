@@ -1,5 +1,6 @@
 use core::cell::UnsafeCell;
 use inkwell::support::LLVMString;
+use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::ty::Ty;
 use rustc_target::abi::TyAndLayout;
 use std::{
@@ -14,7 +15,10 @@ pub struct LLVMLogger {
     bytecode: Option<File>,
     conversions: Option<File>,
     flags: UnsafeCell<File>,
+    visited: UnsafeCell<FxHashSet<LLVMFlag>>,
 }
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq, Debug)]
 pub enum LLVMFlag {
     LLVMEngaged,
     LLVMIntToPtr,
@@ -54,11 +58,15 @@ impl std::fmt::Display for LLVMFlag {
 
 impl LLVMLogger {
     pub fn log_flag(&self, flag: LLVMFlag) {
-        let file = unsafe { &mut *self.flags.get() };
-        let line = format!("{}", flag);
-        file.write_all(line.as_bytes()).unwrap();
-        file.write_all(b"\n").unwrap();
-        file.flush().unwrap();
+        let visited = unsafe { &mut *self.visited.get() };
+        if !visited.contains(&flag) {
+            visited.insert(flag);
+            let file = unsafe { &mut *self.flags.get() };
+            let line = format!("{}", flag);
+            file.write_all(line.as_bytes()).unwrap();
+            file.write_all(b"\n").unwrap();
+            file.flush().unwrap();
+        }
     }
 
     pub fn new(level: LLVMLoggingLevel) -> Option<LLVMLogger> {
@@ -92,7 +100,8 @@ impl LLVMLogger {
                 .open(resolve_path("./llvm_flags.csv"))
                 .unwrap(),
         );
-        Some(LLVMLogger { bytecode, conversions, flags })
+        let visited = UnsafeCell::new(FxHashSet::default());
+        Some(LLVMLogger { bytecode, conversions, flags, visited })
     }
 
     #[inline(always)]

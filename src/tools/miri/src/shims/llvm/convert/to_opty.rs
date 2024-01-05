@@ -184,8 +184,7 @@ fn convert_to_opty<'tcx, 'lli>(
         rustc_abi::Abi::Scalar(_) => {
             let scalar_op = OpTy::from(convert_to_immty(miri, ctx)?);
             if let Some(existing) = ctx.destination.get_mut() {
-                //let op_transmuted = scalar_op.transmute(existing.layout, miri)?;
-                miri.copy_op(&scalar_op, existing, true)?;
+               miri.copy_op(&scalar_op, existing, true)?;
             }
             Ok((scalar_op, ctx.get_destination()))
         }
@@ -236,7 +235,7 @@ fn convert_to_opty<'tcx, 'lli>(
                             convert_to_opty(miri, &mut new_context)?;
                         }
                     } else if miri.can_dereference_into_singular_field(&ctx.rust_layout)
-                        && llvm_fields.len() > rust_field_count
+                        && llvm_fields.len() != rust_field_count
                     {
                         let mut field = miri.project_field(&destination, 0)?;
                         while miri.can_dereference_into_singular_field(&field.layout) {
@@ -293,22 +292,6 @@ fn convert_to_immty<'tcx>(
     miri: &MiriInterpCx<'_, 'tcx>,
     ctx: &ConversionContext<'tcx, '_>,
 ) -> InterpResult<'tcx, ImmTy<'tcx, crate::Provenance>> {
-    let truncate_to_pointer_size = |v: u128| -> u64 {
-        let as_bytes: [u8; 16] = v.to_ne_bytes();
-        let pointer_size = miri.tcx.data_layout.pointer_size;
-        match miri.tcx.data_layout.endian {
-            Endian::Little => {
-                let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(&as_bytes[..pointer_size.bytes().try_into().unwrap()]);
-                u64::from_ne_bytes(bytes)
-            }
-            Endian::Big => {
-                let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(&as_bytes[8..]);
-                u64::from_ne_bytes(bytes)
-            }
-        }
-    };
     match &ctx.source {
         OpTySource::Generic(generic) => {
             let layouts = &miri.machine.layouts;
@@ -348,7 +331,7 @@ fn convert_to_immty<'tcx>(
                     {
                         let scalar = if let ty::RawPtr(_) | ty::FnPtr(_) = ctx.rust_layout.ty.kind()
                         {
-                            let first_word = truncate_to_pointer_size(converted_int);
+                            let first_word = miri.to_vec_endian(converted_int,  miri.tcx.data_layout.pointer_size.bytes());
                             let as_maybe_ptr =
                                 intptrcast::GlobalStateInner::ptr_from_addr_cast(miri, first_word)?;
                             match as_maybe_ptr.into_pointer_or_addr() {
@@ -387,7 +370,7 @@ fn convert_to_immty<'tcx>(
             let scalar = match layout.ty.kind() {
                 | ty::FnPtr(_) | ty::RawPtr(_) => {
                     if let ty::RawPtr(_) | ty::FnPtr(_) = ctx.rust_layout.ty.kind() {
-                        let first_word = truncate_to_pointer_size(value);
+                        let first_word = to_vec_endian(value, miri.tcx.data_layout.pointer_size.bytes());
                         let as_maybe_ptr =
                             intptrcast::GlobalStateInner::ptr_from_addr_cast(miri, first_word)?;
                         match as_maybe_ptr.into_pointer_or_addr() {
