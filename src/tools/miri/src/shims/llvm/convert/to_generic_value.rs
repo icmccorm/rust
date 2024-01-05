@@ -257,8 +257,15 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
                         let bytes = ctx.scalar_to_bytes(scalar, arg.layout())?;
                         dest.set_bytes(&bytes);
                     }
-                    rustc_abi::Abi::ScalarPair(_, _)
-                    | rustc_abi::Abi::Aggregate { sized: true } => {
+                    rustc_abi::Abi::ScalarPair(_, _) => {
+                        let bytes = ctx.op_to_bytes(arg.opty())?;
+                        dest.set_bytes(&bytes);
+                    }
+                    
+                    rustc_abi::Abi::Aggregate { sized: true } => {
+                        if let Some(logger) = &ctx.machine.llvm_logger {
+                            logger.log_flag(LLVMFlag::AggregateToBytes);
+                        }
                         let bytes = ctx.op_to_bytes(arg.opty())?;
                         dest.set_bytes(&bytes);
                     }

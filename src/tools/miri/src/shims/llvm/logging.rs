@@ -33,7 +33,8 @@ pub enum LLVMFlag {
     LLVMInvokedDestructor,
     Expansion,
     ExposedPointerFromRustAtBoundary,
-    CastPointerFromLLVMAtBoundary
+    CastPointerFromLLVMAtBoundary,
+    AggregateAsBytes,
 }
 
 impl std::fmt::Display for LLVMFlag {
@@ -53,6 +54,7 @@ impl std::fmt::Display for LLVMFlag {
             LLVMFlag::Expansion => "Expansion",
             LLVMFlag::ExposedPointerFromRustAtBoundary => "ExposedPointerFromRustAtBoundary",
             LLVMFlag::CastPointerFromLLVMAtBoundary => "CastPointerFromLLVMAtBoundary",
+            LLVMFlag::AggregateAsBytes => "AggregateAsBytes",
         };
         write!(f, "{}", string)
     }

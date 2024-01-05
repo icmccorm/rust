@@ -375,7 +375,6 @@ fn convert_to_immty<'tcx>(
                         wrapped_pointer.prov.alloc_id,
                         wrapped_pointer.addr
                     );
-
                     let pointer_ty_layout = ctx.rust_layout;
                     let scalar = Scalar::from_maybe_pointer(mp, miri);
                     let imm = ImmTy::from_scalar(scalar, pointer_ty_layout);
