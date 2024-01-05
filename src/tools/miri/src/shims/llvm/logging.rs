@@ -32,7 +32,8 @@ pub enum LLVMFlag {
     LLVMInvokedConstructor,
     LLVMInvokedDestructor,
     Expansion,
-    ExposedPointerThroughScalar,
+    ExposedPointerFromRustAtBoundary,
+    CastPointerFromLLVMAtBoundary
 }
 
 impl std::fmt::Display for LLVMFlag {
@@ -50,7 +51,8 @@ impl std::fmt::Display for LLVMFlag {
             LLVMFlag::LLVMInvokedConstructor => "LLVMInvokedConstructor",
             LLVMFlag::LLVMInvokedDestructor => "LLVMInvokedDestructor",
             LLVMFlag::Expansion => "Expansion",
-            LLVMFlag::ExposedPointerThroughScalar => "ExposedPointerThroughScalar",
+            LLVMFlag::ExposedPointerFromRustAtBoundary => "ExposedPointerFromRustAtBoundary",
+            LLVMFlag::CastPointerFromLLVMAtBoundary => "CastPointerFromLLVMAtBoundary",
         };
         write!(f, "{}", string)
     }

@@ -20,7 +20,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             Scalar::Ptr(p, _) => {
                 if let crate::Provenance::Concrete { alloc_id, tag } = p.provenance {
                     if let Some(logger) = &mut this.machine.llvm_logger {
-                        logger.log_flag(LLVMFlag::ExposedPointerThroughScalar);
+                        logger.log_flag(LLVMFlag::ExposedPointerFromRustAtBoundary);
                     }
                     intptrcast::GlobalStateInner::expose_ptr(this, alloc_id, tag)?
                 }

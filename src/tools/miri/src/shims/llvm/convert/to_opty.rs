@@ -1,6 +1,8 @@
 extern crate itertools;
 extern crate rustc_abi;
+use super::field_bytes::FieldBytes;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalExt;
+use crate::shims::llvm::logging::LLVMFlag;
 use crate::{intptrcast, MiriInterpCx, Provenance};
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::GenericValueRef;
@@ -21,7 +23,6 @@ use rustc_target::abi::FIRST_VARIANT;
 use std::cell::Cell;
 use std::fmt::Formatter;
 
-use super::field_bytes::FieldBytes;
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
 
 #[derive(Debug, Clone)]
@@ -184,7 +185,7 @@ fn convert_to_opty<'tcx, 'lli>(
         rustc_abi::Abi::Scalar(_) => {
             let scalar_op = OpTy::from(convert_to_immty(miri, ctx)?);
             if let Some(existing) = ctx.destination.get_mut() {
-               miri.copy_op(&scalar_op, existing, true)?;
+                miri.copy_op(&scalar_op, existing, true)?;
             }
             Ok((scalar_op, ctx.get_destination()))
         }
@@ -292,6 +293,22 @@ fn convert_to_immty<'tcx>(
     miri: &MiriInterpCx<'_, 'tcx>,
     ctx: &ConversionContext<'tcx, '_>,
 ) -> InterpResult<'tcx, ImmTy<'tcx, crate::Provenance>> {
+    let truncate_to_pointer_size = |v: u128| -> u64 {
+        let as_bytes: [u8; 16] = v.to_ne_bytes();
+        let pointer_size = miri.tcx.data_layout.pointer_size;
+        match miri.tcx.data_layout.endian {
+            Endian::Little => {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&as_bytes[..pointer_size.bytes().try_into().unwrap()]);
+                u64::from_ne_bytes(bytes)
+            }
+            Endian::Big => {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&as_bytes[8..]);
+                u64::from_ne_bytes(bytes)
+            }
+        }
+    };
     match &ctx.source {
         OpTySource::Generic(generic) => {
             let layouts = &miri.machine.layouts;
@@ -325,22 +342,25 @@ fn convert_to_immty<'tcx>(
                     let converted_int = generic.as_int();
                     debug!("[GV to Op]: Int value: {:?}", converted_int);
                     let byte_width = Size::from_bytes(u64::from(generic.int_width_bytes()));
-
-                    if byte_width == ctx.rust_layout.size
-                        || (byte_width > ctx.rust_layout.size && byte_width == ctx.padded_size)
-                    {
-                        let scalar = if let ty::RawPtr(_) | ty::FnPtr(_) = ctx.rust_layout.ty.kind()
-                        {
-                            let first_word = miri.to_vec_endian(converted_int,  miri.tcx.data_layout.pointer_size.bytes());
+                    if let ty::RawPtr(_) | ty::FnPtr(_) = ctx.rust_layout.ty.kind() {
+                        if byte_width == ctx.rust_layout.size {
+                            let first_word = truncate_to_pointer_size(converted_int);
+                            if let Some(logger) = &miri.machine.llvm_logger {
+                                logger.log_flag(LLVMFlag::CastPointerFromLLVMAtBoundary);
+                            }
                             let as_maybe_ptr =
                                 intptrcast::GlobalStateInner::ptr_from_addr_cast(miri, first_word)?;
-                            match as_maybe_ptr.into_pointer_or_addr() {
+
+                            let scalar = match as_maybe_ptr.into_pointer_or_addr() {
                                 Ok(ptr) => Scalar::from_pointer(ptr, miri),
                                 Err(addr) => Scalar::from_uint(addr.bytes(), ctx.rust_layout.size),
-                            }
-                        } else {
-                            Scalar::from_uint(converted_int, ctx.rust_layout.size)
-                        };
+                            };
+                            return Ok(ImmTy::from_scalar(scalar, ctx.rust_layout));
+                        }
+                    } else if byte_width == ctx.rust_layout.size
+                        || (byte_width > ctx.rust_layout.size && byte_width == ctx.padded_size)
+                    {
+                        let scalar = Scalar::from_uint(converted_int, ctx.rust_layout.size);
                         return Ok(ImmTy::from_scalar(scalar, ctx.rust_layout));
                     } else {
                         throw_llvm_field_width_mismatch!(byte_width.bytes(), ctx.rust_layout);
@@ -355,6 +375,7 @@ fn convert_to_immty<'tcx>(
                         wrapped_pointer.prov.alloc_id,
                         wrapped_pointer.addr
                     );
+
                     let pointer_ty_layout = ctx.rust_layout;
                     let scalar = Scalar::from_maybe_pointer(mp, miri);
                     let imm = ImmTy::from_scalar(scalar, pointer_ty_layout);
@@ -370,7 +391,10 @@ fn convert_to_immty<'tcx>(
             let scalar = match layout.ty.kind() {
                 | ty::FnPtr(_) | ty::RawPtr(_) => {
                     if let ty::RawPtr(_) | ty::FnPtr(_) = ctx.rust_layout.ty.kind() {
-                        let first_word = to_vec_endian(value, miri.tcx.data_layout.pointer_size.bytes());
+                        if let Some(logger) = &miri.machine.llvm_logger {
+                            logger.log_flag(LLVMFlag::CastPointerFromLLVMAtBoundary);
+                        }
+                        let first_word = truncate_to_pointer_size(value);
                         let as_maybe_ptr =
                             intptrcast::GlobalStateInner::ptr_from_addr_cast(miri, first_word)?;
                         match as_maybe_ptr.into_pointer_or_addr() {
