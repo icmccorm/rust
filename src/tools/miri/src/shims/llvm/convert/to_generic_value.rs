@@ -182,6 +182,9 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
     bte: ResolvedLLVMType<'lli>,
 ) -> InterpResult<'tcx> {
     if let Some(bte) = bte {
+        if let Some(logger) = &ctx.machine.llvm_logger {
+            logger.log_flag(LLVMFlag::ScalarPairInSingleArg);
+        }
         dest.set_type_tag(&bte);
         debug!("[Op to GV]: {:?} -> {:?}", arg.ty(), bte.print_to_string());
         match bte {

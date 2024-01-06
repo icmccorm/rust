@@ -35,6 +35,7 @@ pub enum LLVMFlag {
     ExposedPointerFromRustAtBoundary,
     CastPointerFromLLVMAtBoundary,
     AggregateAsBytes,
+    ScalarPairInSingleArg
 }
 
 impl std::fmt::Display for LLVMFlag {
@@ -55,6 +56,7 @@ impl std::fmt::Display for LLVMFlag {
             LLVMFlag::ExposedPointerFromRustAtBoundary => "ExposedPointerFromRustAtBoundary",
             LLVMFlag::CastPointerFromLLVMAtBoundary => "CastPointerFromLLVMAtBoundary",
             LLVMFlag::AggregateAsBytes => "AggregateAsBytes",
+            LLVMFlag::ScalarPairInSingleArg => "ScalarPairInSingleArg",
         };
         write!(f, "{}", string)
     }
