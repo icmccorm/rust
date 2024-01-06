@@ -17,6 +17,7 @@ use rustc_middle::ty::{self, AdtDef};
 use rustc_target::abi::call::HomogeneousAggregate;
 use rustc_target::abi::FieldsShape;
 use std::iter::repeat;
+use crate::shims::llvm::logging::LLVMFlag;
 
 macro_rules! throw_llvm_argument_mismatch {
     ($function: expr, $rust_args: expr, $llvm_args: expr) => {
@@ -264,7 +265,7 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
                     
                     rustc_abi::Abi::Aggregate { sized: true } => {
                         if let Some(logger) = &ctx.machine.llvm_logger {
-                            logger.log_flag(LLVMFlag::AggregateToBytes);
+                            logger.log_flag(LLVMFlag::AggregateAsBytes);
                         }
                         let bytes = ctx.op_to_bytes(arg.opty())?;
                         dest.set_bytes(&bytes);
