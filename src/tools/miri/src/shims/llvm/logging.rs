@@ -8,7 +8,7 @@ use std::{
     io::Write,
     path::Path,
 };
-
+use log::debug;
 use crate::eval::LLVMLoggingLevel;
 
 pub struct LLVMLogger {
@@ -64,6 +64,7 @@ impl std::fmt::Display for LLVMFlag {
 
 impl LLVMLogger {
     pub fn log_flag(&self, flag: LLVMFlag) {
+        debug!("Logging flag: {}", flag);
         let visited = unsafe { &mut *self.visited.get() };
         if !visited.contains(&flag) {
             visited.insert(flag);
@@ -83,9 +84,6 @@ impl LLVMLogger {
         let resolve_path = |path: &str| {
             let mut root_path = cwd.clone();
             root_path.push(path);
-            if root_path.exists() {
-                std::fs::remove_file(&root_path).unwrap();
-            }
             root_path
         };
         let (bytecode, conversions) = if let LLVMLoggingLevel::Verbose = level {
