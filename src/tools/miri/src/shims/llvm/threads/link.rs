@@ -5,6 +5,7 @@ use crate::shims::llvm_ffi_support::EvalContextExt as FFIEvalContextExt;
 use crate::MiriInterpCx;
 use crate::ThreadId;
 use inkwell::types::BasicTypeEnum;
+use inkwell::values::GenericValue;
 use inkwell::values::GenericValueRef;
 use llvm_sys::prelude::LLVMTypeRef;
 use log::debug;
@@ -76,14 +77,15 @@ impl<'tcx> ThreadLink<'tcx> {
             ThreadLinkDestination::ToLLI(dest_opt) =>
                 match self.source {
                     ThreadLinkSource::FromMiri(place_src) => {
-                        if let Some(dest) = dest_opt {
+                        let return_value = if let Some(dest) = dest_opt {
                             let as_place = PlaceTy::from(place_src.clone());
-                            let place_as_generic =
-                                ctx.perform_opty_conversion(&as_place, Some(dest))?;
-                            ctx.set_pending_return_value(self.linked_id, unsafe {
-                                GenericValueRef::new(place_as_generic.into_raw())
-                            });
-                        }
+                            ctx.perform_opty_conversion(&as_place, Some(dest))?
+                        } else {
+                            GenericValue::new_void()
+                        };
+                        ctx.set_pending_return_value(self.linked_id, unsafe {
+                            GenericValueRef::new(return_value.into_raw())
+                        });
                         ctx.deallocate_ptr(
                             place_src.ptr(),
                             Some((place_src.layout.size, place_src.align)),

@@ -220,6 +220,9 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
                                 dest.set_double_value(double);
                             }
                             _ => {
+                                if si.size() != Size::from_bytes(ft.size_of().get_zero_extended_constant().unwrap()) {
+                                    throw_rust_type_mismatch!(arg.layout(), ft);
+                                }
                                 let bits = si.assert_bits(arg.value_size());
                                 let bytes = ctx.to_vec_endian(bits, arg.value_size().bytes_usize());
                                 dest.set_bytes(&bytes);
@@ -234,6 +237,7 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
             BasicTypeEnum::IntType(it) => {
                 if arg.value_size().bytes() < it.get_byte_width() as u64 {
                     if arg.padded_size().bytes() != it.get_byte_width() as u64 {
+                
                         debug!(
                             "Padded size: {}, value size: {}, LLVM int width: {}",
                             arg.padded_size().bytes(),
@@ -241,6 +245,12 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
                             it.get_byte_width()
                         );
                         throw_rust_type_mismatch!(arg.layout(), it);
+                    }
+                }
+
+                if arg.value_size().bytes() == (it.get_byte_width() as u64) && arg.padded_size() != arg.value_size() {
+                    if let Some(logger) = &ctx.machine.llvm_logger {
+                        logger.log_flag(LLVMFlag::ValueMatchWithPadding);
                     }
                 }
                 match arg.abi() {

@@ -1,5 +1,7 @@
+use crate::eval::LLVMLoggingLevel;
 use core::cell::UnsafeCell;
 use inkwell::support::LLVMString;
+use log::debug;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::ty::Ty;
 use rustc_target::abi::TyAndLayout;
@@ -8,8 +10,6 @@ use std::{
     io::Write,
     path::Path,
 };
-use log::debug;
-use crate::eval::LLVMLoggingLevel;
 
 pub struct LLVMLogger {
     bytecode: Option<File>,
@@ -35,7 +35,8 @@ pub enum LLVMFlag {
     ExposedPointerFromRustAtBoundary,
     CastPointerFromLLVMAtBoundary,
     AggregateAsBytes,
-    ScalarPairInSingleArg
+    ScalarPairInSingleArg,
+    ValueMatchWithPadding,
 }
 
 impl std::fmt::Display for LLVMFlag {
@@ -57,6 +58,7 @@ impl std::fmt::Display for LLVMFlag {
             LLVMFlag::CastPointerFromLLVMAtBoundary => "CastPointerFromLLVMAtBoundary",
             LLVMFlag::AggregateAsBytes => "AggregateAsBytes",
             LLVMFlag::ScalarPairInSingleArg => "ScalarPairInSingleArg",
+            LLVMFlag::ValueMatchWithPadding => "ValueMatchWithPadding",
         };
         write!(f, "{}", string)
     }

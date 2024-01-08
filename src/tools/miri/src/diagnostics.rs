@@ -22,7 +22,7 @@ pub enum TerminationInfo {
         base_error: Option<String>,
     },
     InteroperationError {
-        msg: String
+        msg: String,
     },
     Abort(String),
     UnsupportedInIsolation(String),
@@ -219,7 +219,6 @@ pub fn report_error<'tcx, 'mir>(
 ) -> Option<(i64, bool)> {
     use InterpError::*;
     use UndefinedBehaviorInfo::*;
-
     let mut msg = vec![];
     let descriptive_ub = ecx.machine.descriptive_ub_error_titles;
 
@@ -231,12 +230,9 @@ pub fn report_error<'tcx, 'mir>(
             Abort(_) => Some("abnormal termination"),
             UnsupportedInIsolation(_) | Int2PtrWithStrictProvenance =>
                 Some("unsupported operation"),
-            StackedBorrowsUb { .. } | TreeBorrowsUb { .. } if descriptive_ub => {
-                Some("Borrowing Violation")
-            }
-            DataRace {..} if descriptive_ub => {
-                Some("Data Race")
-            }
+            StackedBorrowsUb { .. } | TreeBorrowsUb { .. } if descriptive_ub =>
+                Some("Borrowing Violation"),
+            DataRace { .. } if descriptive_ub => Some("Data Race"),
             StackedBorrowsUb { .. } | TreeBorrowsUb { .. } | DataRace { .. } =>
                 Some("Undefined Behavior"),
             Deadlock => Some("deadlock"),
@@ -309,7 +305,7 @@ pub fn report_error<'tcx, 'mir>(
                 ecx.handle_ice(); // print interpreter backtrace
                 bug!("This validation error should be impossible in Miri: {}", ecx.format_error(e));
             }
-            UndefinedBehavior(ub_info) if descriptive_ub => {
+            UndefinedBehavior(ub_info) if descriptive_ub =>
                 match ub_info {
                     BoundsCheckFailed { .. } => "Bounds Check Failed",
                     DivisionByZero => "Division By Zero",
@@ -339,9 +335,8 @@ pub fn report_error<'tcx, 'mir>(
                     UninhabitedEnumVariantRead(_) => "Uninhabited Enum Variant Read",
                     AbiMismatchArgument { .. } => "ABI Mismatch Argument",
                     AbiMismatchReturn { .. } => "ABI Mismatch Return",
-                    _ => "Undefined Behavior"
-                }
-            }
+                    _ => "Undefined Behavior",
+                },
             UndefinedBehavior(_) => "Undefined Behavior",
             ResourceExhaustion(_) => "resource exhaustion",
             Unsupported(

@@ -126,36 +126,35 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
     }
 
     #[allow(clippy::arithmetic_side_effects)]
-    fn get_discriminant(&self, miri: &MiriInterpCx<'_, 'tcx>) -> u32 {
+    fn get_discriminant(&self, miri: &MiriInterpCx<'_, 'tcx>) -> InterpResult<'tcx, u32> {
         if self.rust_layout.fields.count() > 0 {
             match &self.source {
-                OpTySource::Generic(gvr) => {
-                    let first_field = gvr.assert_field(0);
-                    return u32::try_from(first_field.as_int()).unwrap();
-                }
-                OpTySource::Bytes(b) => {
-                    let field = b.field(miri, self.rust_layout, 0);
-                    return u32::try_from(field.as_uint()).unwrap();
+                OpTySource::Generic(gvr) =>
+                    if let Some(llvm_field) = gvr.get_field(0) {
+                        Ok(u32::try_from(first_field.as_int()).unwrap())
+                    } else {
+                        throw_llvm_field_count_mismatch!(gvr.get_field_count(), self.rust_layout);
+                    },
+                OpTySource::Bytes(bytes) => {
+                    let field = bytes.field(miri, self.rust_layout, 0);
+                    Ok(u32::try_from(field.as_uint()).unwrap())
                 }
             }
         } else {
-            0
+            Ok(0)
         }
     }
-    fn get_aggregate_kind(&self, miri: &MiriInterpCx<'_, 'tcx>) -> Option<AggregateKind<'tcx>> {
+    fn get_aggregate_kind(
+        &self,
+        miri: &MiriInterpCx<'_, 'tcx>,
+    ) -> InterpResult<'tcx, Option<AggregateKind<'tcx>>> {
         let rust_type = self.rust_layout.ty;
-        if let ty::Adt(adt_def, sr) = rust_type.kind() {
+        let kind = if let ty::Adt(adt_def, sr) = rust_type.kind() {
             match adt_def.adt_kind() {
                 AdtKind::Struct =>
-                    return Some(AggregateKind::Adt(
-                        adt_def.did(),
-                        VariantIdx::from_u32(0),
-                        sr,
-                        None,
-                        None,
-                    )),
+                    Some(AggregateKind::Adt(adt_def.did(), VariantIdx::from_u32(0), sr, None, None)),
                 AdtKind::Union =>
-                    return Some(AggregateKind::Adt(
+                    Some(AggregateKind::Adt(
                         adt_def.did(),
                         VariantIdx::from_u32(0),
                         sr,
@@ -163,16 +162,18 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
                         Some(FieldIdx::from_u32(0)),
                     )),
                 AdtKind::Enum =>
-                    return Some(AggregateKind::Adt(
+                    Some(AggregateKind::Adt(
                         adt_def.did(),
-                        VariantIdx::from_u32(self.get_discriminant(miri)),
+                        VariantIdx::from_u32(self.get_discriminant(miri)?),
                         sr,
                         None,
                         None,
                     )),
             }
-        }
-        None
+        } else {
+            None
+        };
+        Ok(kind)
     }
 }
 
