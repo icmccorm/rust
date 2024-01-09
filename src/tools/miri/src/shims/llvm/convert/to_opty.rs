@@ -131,9 +131,9 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
             match &self.source {
                 OpTySource::Generic(gvr) =>
                     if let Some(llvm_field) = gvr.get_field(0) {
-                        Ok(u32::try_from(first_field.as_int()).unwrap())
+                        Ok(u32::try_from(llvm_field.as_int()).unwrap())
                     } else {
-                        throw_llvm_field_count_mismatch!(gvr.get_field_count(), self.rust_layout);
+                        throw_llvm_field_count_mismatch!(gvr.get_aggregate_size(), self.rust_layout);
                     },
                 OpTySource::Bytes(bytes) => {
                     let field = bytes.field(miri, self.rust_layout, 0);
@@ -195,7 +195,7 @@ fn convert_to_opty<'tcx, 'lli>(
         | rustc_abi::Abi::Vector { .. } => {
             let destination = ctx.get_or_create_destination(miri)?;
 
-            let (variant_dest, active_field_index) = if let Some(agk) = ctx.get_aggregate_kind(miri)
+            let (variant_dest, active_field_index) = if let Some(agk) = ctx.get_aggregate_kind(miri)?
             {
                 let (variant_index, active_field_index) = match agk {
                     mir::AggregateKind::Adt(_, variant_index, _, _, active_field_index) =>
