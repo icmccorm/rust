@@ -209,6 +209,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                             Align::from_bytes(align).unwrap(),
                             MiriMemoryKind::C.into(),
                         )?;
+                        if this.machine.lli_config.zero_heap {
+                            this.write_bytes_ptr(
+                                ptr,
+                                std::iter::repeat(0).take(usize::try_from(size).unwrap()),
+                            )?;
+                        }
                         this.write_pointer(ptr, &ret)?;
                     }
                     this.write_null(dest)?;
