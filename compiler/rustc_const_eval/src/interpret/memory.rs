@@ -598,11 +598,22 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         }
     }
 
-    /// "Safe" (bounds and align-checked) allocation access.
     pub fn get_ptr_alloc<'a>(
         &'a self,
         ptr: Pointer<Option<M::Provenance>>,
         size: Size,
+        align: Align,
+    ) -> InterpResult<'tcx, Option<AllocRef<'a, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
+    {
+        unsafe { self.get_ptr_alloc_range(ptr, size, alloc_range(Size::ZERO, size), align) }
+    }
+
+    /// "Safe" (bounds and align-checked) allocation access.
+    pub unsafe fn get_ptr_alloc_range<'a>(
+        &'a self,
+        ptr: Pointer<Option<M::Provenance>>,
+        size: Size,
+        access_range: AllocRange,
         align: Align,
     ) -> InterpResult<'tcx, Option<AllocRef<'a, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
     {
@@ -618,8 +629,15 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             },
         )?;
         if let Some((alloc_id, offset, prov, alloc)) = ptr_and_alloc {
+            let access_range = alloc_range(offset + access_range.start, access_range.size);
+            M::before_memory_read(
+                *self.tcx,
+                &self.machine,
+                &alloc.extra,
+                (alloc_id, prov),
+                access_range,
+            )?;
             let range = alloc_range(offset, size);
-            M::before_memory_read(*self.tcx, &self.machine, &alloc.extra, (alloc_id, prov), range)?;
             Ok(Some(AllocRef { alloc, range, tcx: *self.tcx, alloc_id }))
         } else {
             // Even in this branch we have to be sure that we actually access the allocation, in
@@ -671,11 +689,22 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         Ok((alloc, &mut self.machine))
     }
 
-    /// "Safe" (bounds and align-checked) allocation access.
     pub fn get_ptr_alloc_mut<'a>(
         &'a mut self,
         ptr: Pointer<Option<M::Provenance>>,
         size: Size,
+        align: Align,
+    ) -> InterpResult<'tcx, Option<AllocRefMut<'a, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
+    {
+        unsafe { self.get_ptr_alloc_mut_range(ptr, size, alloc_range(Size::ZERO, size), align) }
+    }
+
+    /// "Safe" (bounds and align-checked) allocation access.
+    pub unsafe fn get_ptr_alloc_mut_range<'a>(
+        &'a mut self,
+        ptr: Pointer<Option<M::Provenance>>,
+        size: Size,
+        access_range: AllocRange,
         align: Align,
     ) -> InterpResult<'tcx, Option<AllocRefMut<'a, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
     {
@@ -685,8 +714,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             // FIXME: can we somehow avoid looking up the allocation twice here?
             // We cannot call `get_raw_mut` inside `check_and_deref_ptr` as that would duplicate `&mut self`.
             let (alloc, machine) = self.get_alloc_raw_mut(alloc_id)?;
+            let access_range = alloc_range(offset + access_range.start, access_range.size);
+            M::before_memory_write(tcx, machine, &mut alloc.extra, (alloc_id, prov), access_range)?;
             let range = alloc_range(offset, size);
-            M::before_memory_write(tcx, machine, &mut alloc.extra, (alloc_id, prov), range)?;
             Ok(Some(AllocRefMut { alloc, range, tcx, alloc_id }))
         } else {
             Ok(None)
@@ -999,14 +1029,39 @@ impl<'tcx, 'a, Prov: Provenance, Extra, Bytes: AllocBytes> AllocRef<'a, 'tcx, Pr
         Ok(res)
     }
 
+    pub fn read_scalar_uninit(
+        &self,
+        range: AllocRange,
+        read_provenance: bool,
+    ) -> InterpResult<'tcx, Scalar<Prov>> {
+        let range = self.range.subrange(range);
+        let res = self
+            .alloc
+            .read_scalar_uninit(&self.tcx, range, read_provenance, false)
+            .map_err(|e| e.to_interp_error(self.alloc_id))?;
+        debug!("read_scalar at {:?}{range:?}: {res:?}", self.alloc_id);
+        Ok(res)
+    }
+
     /// `range` is relative to this allocation reference, not the base of the allocation.
     pub fn read_integer(&self, range: AllocRange) -> InterpResult<'tcx, Scalar<Prov>> {
         self.read_scalar(range, /*read_provenance*/ false)
     }
 
+    pub fn read_integer_uninit(&self, range: AllocRange) -> InterpResult<'tcx, Scalar<Prov>> {
+        self.read_scalar_uninit(range, /*read_provenance*/ false)
+    }
+
     /// `offset` is relative to this allocation reference, not the base of the allocation.
     pub fn read_pointer(&self, offset: Size) -> InterpResult<'tcx, Scalar<Prov>> {
         self.read_scalar(
+            alloc_range(offset, self.tcx.data_layout().pointer_size),
+            /*read_provenance*/ true,
+        )
+    }
+
+    pub fn read_pointer_uninit(&self, offset: Size) -> InterpResult<'tcx, Scalar<Prov>> {
+        self.read_scalar_uninit(
             alloc_range(offset, self.tcx.data_layout().pointer_size),
             /*read_provenance*/ true,
         )
@@ -1018,6 +1073,10 @@ impl<'tcx, 'a, Prov: Provenance, Extra, Bytes: AllocBytes> AllocRef<'a, 'tcx, Pr
             .alloc
             .get_bytes_strip_provenance(&self.tcx, self.range)
             .map_err(|e| e.to_interp_error(self.alloc_id))?)
+    }
+
+    pub fn is_uninit(&self, range: AllocRange) -> bool {
+        self.alloc.is_uninit(range)
     }
 
     /// Returns whether the allocation has provenance anywhere in the range of the `AllocRef`.

@@ -715,6 +715,8 @@ impl VClockAlloc {
                 | MiriMemoryKind::Miri
                 | MiriMemoryKind::C
                 | MiriMemoryKind::WinHeap
+                | MiriMemoryKind::LLVMStack
+                | MiriMemoryKind::LLVMInterop
                 | MiriMemoryKind::Mmap,
             )
             | MemoryKind::Stack => {
@@ -729,7 +731,8 @@ impl VClockAlloc {
                 | MiriMemoryKind::Machine
                 | MiriMemoryKind::Runtime
                 | MiriMemoryKind::ExternStatic
-                | MiriMemoryKind::Tls,
+                | MiriMemoryKind::Tls
+                | MiriMemoryKind::LLVMStatic,
             )
             | MemoryKind::CallerLocation => (VTimestamp::ZERO, VectorIdx::MAX_INDEX),
         };

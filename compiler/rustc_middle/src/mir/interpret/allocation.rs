@@ -523,11 +523,26 @@ impl<Prov: Provenance, Extra, Bytes: AllocBytes> Allocation<Prov, Extra, Bytes> 
         range: AllocRange,
         read_provenance: bool,
     ) -> AllocResult<Scalar<Prov>> {
-        // First and foremost, if anything is uninit, bail.
-        if self.init_mask.is_range_initialized(range).is_err() {
-            return Err(AllocError::InvalidUninitBytes(None));
-        }
+        self.read_scalar_uninit(cx, range, read_provenance, true)
+    }
 
+    pub fn is_uninit(&self, range: AllocRange) -> bool {
+        self.init_mask.is_range_initialized(range).is_err()
+    }
+
+    pub fn read_scalar_uninit(
+        &self,
+        cx: &impl HasDataLayout,
+        range: AllocRange,
+        read_provenance: bool,
+        check_uninit: bool,
+    ) -> AllocResult<Scalar<Prov>> {
+        // First and foremost, if anything is uninit, bail.
+        if check_uninit {
+            if self.is_uninit(range) {
+                return Err(AllocError::InvalidUninitBytes(None));
+            }
+        }
         // Get the integer part of the result. We HAVE TO check provenance before returning this!
         let bytes = self.get_bytes_unchecked(range);
         let bits = read_target_uint(cx.data_layout().endian, bytes).unwrap();

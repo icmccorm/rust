@@ -1,20 +1,24 @@
 //! Implements threads.
-
-use std::cell::RefCell;
+use crate::shims::llvm::logging::LLVMFlag;
+use either::Either;
+use inkwell::execution_engine::ExecutionEngine;
+use inkwell::types::AsTypeRef;
+use inkwell::types::BasicTypeEnum;
+use inkwell::values::{FunctionValue, GenericValue};
+use log::{debug, trace};
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
 use std::num::TryFromIntError;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
-use either::Either;
-use log::trace;
-
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec};
 use rustc_middle::mir::Mutability;
 use rustc_middle::ty::layout::TyAndLayout;
+use rustc_middle::ty::Instance;
 use rustc_span::Span;
 use rustc_target::spec::abi::Abi;
 
@@ -22,6 +26,10 @@ use crate::concurrency::data_race;
 use crate::concurrency::sync::SynchronizationState;
 use crate::shims::tls;
 use crate::*;
+
+use crate::shims::llvm::helpers::EvalContextExt as LLVMHelperEvalExt;
+use crate::shims::llvm::threads::link::{ThreadLink, ThreadLinkDestination, ThreadLinkSource};
+use crate::shims::llvm_ffi_support::EvalContextExt as LLIEvalExt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SchedulingAction {
@@ -108,12 +116,22 @@ enum ThreadJoinStatus {
     Joined,
 }
 
+#[derive(Debug, Default)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum ThreadKind<'tcx> {
+    MiriLinked(ThreadLink<'tcx>),
+    LLVM(ThreadLink<'tcx>),
+    #[default]
+    MiriInternal,
+}
 /// A thread.
 pub struct Thread<'mir, 'tcx> {
     state: ThreadState,
-
+    is_llvm: Cell<bool>,
     /// Name of the thread.
     thread_name: Option<Vec<u8>>,
+
+    pub thread_kind: Cell<ThreadKind<'tcx>>,
 
     /// The virtual call stack.
     stack: Vec<Frame<'mir, 'tcx, Provenance, FrameExtra<'tcx>>>,
@@ -190,6 +208,17 @@ impl<'mir, 'tcx> Thread<'mir, 'tcx> {
         // empty stacks.
         self.top_user_relevant_frame.or_else(|| self.stack.len().checked_sub(1))
     }
+
+    pub fn is_llvm_thread(&self) -> bool {
+        self.is_llvm.get()
+    }
+
+    pub fn set_thread_kind(&self, thread_kind: ThreadKind<'tcx>) {
+        if let ThreadKind::LLVM(_) = thread_kind {
+            self.is_llvm.set(true);
+        }
+        self.thread_kind.set(thread_kind);
+    }
 }
 
 impl<'mir, 'tcx> std::fmt::Debug for Thread<'mir, 'tcx> {
@@ -208,7 +237,9 @@ impl<'mir, 'tcx> Thread<'mir, 'tcx> {
     fn new(name: Option<&str>, on_stack_empty: Option<StackEmptyCallback<'mir, 'tcx>>) -> Self {
         Self {
             state: ThreadState::Enabled,
+            is_llvm: Cell::new(false),
             thread_name: name.map(|name| Vec::from(name.as_bytes())),
+            thread_kind: Cell::new(ThreadKind::MiriInternal),
             stack: Vec::new(),
             top_user_relevant_frame: None,
             join_status: ThreadJoinStatus::Joinable,
@@ -227,7 +258,9 @@ impl VisitTags for Thread<'_, '_> {
             stack,
             top_user_relevant_frame: _,
             state: _,
+            is_llvm: _,
             thread_name: _,
+            thread_kind: _,
             join_status: _,
             on_stack_empty: _, // we assume the closure captures no GC-relevant state
         } = self;
@@ -317,7 +350,7 @@ pub struct ThreadManager<'mir, 'tcx> {
     /// Identifier of the currently active thread.
     active_thread: ThreadId,
     /// Threads used in the program.
-    ///
+    lli_thread_group: Cell<Option<ThreadId>>,
     /// Note that this vector also contains terminated threads.
     threads: IndexVec<ThreadId, Thread<'mir, 'tcx>>,
     /// This field is pub(crate) because the synchronization primitives
@@ -330,6 +363,7 @@ pub struct ThreadManager<'mir, 'tcx> {
     yield_active_thread: bool,
     /// Callbacks that are called once the specified time passes.
     timeout_callbacks: FxHashMap<ThreadId, TimeoutCallbackInfo<'mir, 'tcx>>,
+    thread_groups: FxHashMap<ThreadId, ThreadId>,
 }
 
 impl VisitTags for ThreadManager<'_, '_> {
@@ -337,9 +371,11 @@ impl VisitTags for ThreadManager<'_, '_> {
         let ThreadManager {
             threads,
             thread_local_alloc_ids,
+            lli_thread_group: _,
             timeout_callbacks,
             active_thread: _,
             yield_active_thread: _,
+            thread_groups: _,
             sync,
         } = self;
 
@@ -364,10 +400,12 @@ impl<'mir, 'tcx> Default for ThreadManager<'mir, 'tcx> {
         Self {
             active_thread: ThreadId::new(0),
             threads,
+            lli_thread_group: Cell::new(None),
             sync: SynchronizationState::default(),
             thread_local_alloc_ids: Default::default(),
             yield_active_thread: false,
             timeout_callbacks: FxHashMap::default(),
+            thread_groups: FxHashMap::default(),
         }
     }
 }
@@ -388,6 +426,16 @@ impl<'mir, 'tcx: 'mir> ThreadManager<'mir, 'tcx> {
     /// active thread.
     fn get_thread_local_alloc_id(&self, def_id: DefId) -> Option<Pointer<Provenance>> {
         self.thread_local_alloc_ids.borrow().get(&(def_id, self.active_thread)).cloned()
+    }
+
+    fn link_to_thread_group(&mut self, parent: ThreadId, child: ThreadId) -> ThreadId {
+        let group_id = *self.thread_groups.get(&parent).unwrap_or(&parent);
+        self.thread_groups.insert(child, group_id);
+        group_id
+    }
+
+    pub fn get_thread_group(&self, thread: ThreadId) -> ThreadId {
+        *self.thread_groups.get(&thread).unwrap_or(&thread)
     }
 
     /// Set the pointer for the allocation of the given thread local
@@ -417,6 +465,12 @@ impl<'mir, 'tcx: 'mir> ThreadManager<'mir, 'tcx> {
         &self,
     ) -> impl Iterator<Item = &[Frame<'mir, 'tcx, Provenance, FrameExtra<'tcx>>]> {
         self.threads.iter().map(|t| &t.stack[..])
+    }
+
+    fn create_uninitialized_thread(&mut self) -> ThreadId {
+        let new_thread_id = ThreadId::new(self.threads.len());
+        self.threads.push(Thread::new(None, None));
+        new_thread_id
     }
 
     /// Create a new thread and returns its id.
@@ -516,6 +570,7 @@ impl<'mir, 'tcx: 'mir> ThreadManager<'mir, 'tcx> {
         // Mark the joined thread as being joined so that we detect if other
         // threads try to join it.
         self.threads[joined_thread_id].join_status = ThreadJoinStatus::Joined;
+
         if self.threads[joined_thread_id].state != ThreadState::Terminated {
             // The joined thread is still running, we need to wait for it.
             self.active_thread_mut().state = ThreadState::BlockedOnJoin(joined_thread_id);
@@ -637,6 +692,11 @@ impl<'mir, 'tcx: 'mir> ThreadManager<'mir, 'tcx> {
         mut data_race: Option<&mut data_race::GlobalState>,
         current_span: Span,
     ) -> Vec<Pointer<Provenance>> {
+        let curr_id = self.active_thread;
+        if self.lli_thread_group.get() == Some(curr_id) {
+            self.lli_thread_group.set(None);
+        }
+        self.thread_groups.remove(&self.active_thread);
         let mut free_tls_statics = Vec::new();
         {
             let mut thread_local_statics = self.thread_local_alloc_ids.borrow_mut();
@@ -681,6 +741,7 @@ impl<'mir, 'tcx: 'mir> ThreadManager<'mir, 'tcx> {
     /// blocked, terminated, or has explicitly asked to be preempted).
     fn schedule(&mut self, clock: &Clock) -> InterpResult<'tcx, SchedulingAction> {
         // This thread and the program can keep going.
+
         if self.threads[self.active_thread].state == ThreadState::Enabled
             && !self.yield_active_thread
         {
@@ -698,6 +759,7 @@ impl<'mir, 'tcx: 'mir> ThreadManager<'mir, 'tcx> {
         if potential_sleep_time == Some(Duration::new(0, 0)) {
             return Ok(SchedulingAction::ExecuteTimeoutCallback);
         }
+
         // No callbacks immediately scheduled, pick a regular thread to execute.
         // The active thread blocked or yielded. So we go search for another enabled thread.
         // Crucially, we start searching at the current active thread ID, rather than at 0, since we
@@ -711,6 +773,7 @@ impl<'mir, 'tcx: 'mir> ThreadManager<'mir, 'tcx> {
             .iter_enumerated()
             .skip(self.active_thread.index() + 1)
             .chain(self.threads.iter_enumerated().take(self.active_thread.index()));
+
         for (id, thread) in threads {
             debug_assert_ne!(self.active_thread, id);
             if thread.state == ThreadState::Enabled {
@@ -815,6 +878,177 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
+    fn run_lli_function_to_completion<'lli>(
+        &mut self,
+        engine: &ExecutionEngine<'lli>,
+        function: FunctionValue<'lli>,
+    ) -> InterpResult<'tcx> {
+        debug!(
+            "Running LLI function {:?} to completion",
+            function.get_name().to_string_lossy().to_string()
+        );
+        let this = self.eval_context_mut();
+        let active_thread_id = this.get_active_thread();
+
+        unsafe {
+            engine.create_thread(active_thread_id.into(), function, vec![].as_slice());
+        }
+        if let Some(info) = this.get_foreign_error() {
+            return Err(info);
+        }
+
+        let mut terminated = false;
+        while !terminated {
+            terminated = this.step_lli_thread(active_thread_id)?;
+        }
+        this.terminate_lli_thread(active_thread_id);
+        Ok(())
+    }
+
+    fn start_rust_to_lli_thread<'lli>(
+        &mut self,
+        engine: &ExecutionEngine<'lli>,
+        link_type: Option<ThreadLinkDestination<'tcx>>,
+        function: FunctionValue<'lli>,
+        args: Vec<GenericValue<'lli>>,
+    ) -> InterpResult<'tcx, ThreadId> {
+        let this = self.eval_context_mut();
+
+        let uninit_thread_id = this.machine.threads.create_uninitialized_thread();
+        let current_span = this.machine.current_span();
+        if let Some(data_race) = &mut this.machine.data_race {
+            data_race.thread_created(&this.machine.threads, uninit_thread_id, current_span);
+        }
+
+        let old_error_place = this.active_thread_mut().last_error.clone();
+
+        let prev = this.set_active_thread(uninit_thread_id);
+        let group_id = this.machine.threads.link_to_thread_group(prev, uninit_thread_id);
+
+        if let Some(current_group_id) = this.machine.threads.lli_thread_group.get() {
+            if group_id != current_group_id {
+                if let Some(ref logger) = &this.machine.llvm_logger {
+                    logger.log_flag(LLVMFlag::LLVMMultithreading)
+                }
+            }
+        }
+        this.machine.threads.lli_thread_group.set(Some(group_id));
+
+        this.active_thread_mut().last_error = old_error_place;
+
+        debug!("Created Miri thread object for Rust to LLI call, TID: {:?}", group_id);
+
+        unsafe {
+            engine.create_thread(uninit_thread_id.into(), function, args.as_slice());
+        }
+        if let Some(info) = this.get_foreign_error() {
+            return Err(info);
+        }
+        debug!("Created LLI Thread for {:?}", function.get_name());
+
+        if let Some(link_type) = link_type {
+            let link = ThreadLink::new(
+                prev,
+                uninit_thread_id,
+                link_type,
+                ThreadLinkSource::FromLLI(
+                    function.get_type().get_return_type().map(|bte| bte.as_type_ref()),
+                ),
+            );
+            this.active_thread_mut().thread_kind.set(ThreadKind::LLVM(link));
+        }
+
+        let init_thread_id = this.set_active_thread(prev);
+
+        this.join_thread(init_thread_id)?;
+        Ok(init_thread_id)
+    }
+
+    #[inline]
+    fn start_callback_thread(
+        &mut self,
+        inst: Instance<'tcx>,
+        args: &[(OpTy<'tcx, Provenance>, Option<PlaceTy<'tcx, crate::Provenance>>)],
+        dest_layout: TyAndLayout<'tcx>,
+        lli_return_type: Option<BasicTypeEnum<'static>>,
+    ) -> InterpResult<'tcx, ThreadId> {
+        let this = self.eval_context_mut();
+
+        // Create the new thread
+        let new_thread_id = this.machine.threads.create_thread({
+            let mut state = tls::TlsDtorsState::default();
+            Box::new(move |m| state.on_stack_empty(m))
+        });
+
+        let old_error_place = this.active_thread_mut().last_error.clone();
+
+        debug!("Created Miri thread object for callback, TID: {:?}", new_thread_id);
+        let current_span = this.machine.current_span();
+        if let Some(data_race) = &mut this.machine.data_race {
+            data_race.thread_created(&this.machine.threads, new_thread_id, current_span);
+        }
+
+        // Finally switch to new thread so that we can push the first stackframe.
+        // After this all accesses will be treated as occurring in the new thread.
+        let old_thread_id = this.set_active_thread(new_thread_id);
+        debug!("Switched to callback thread");
+
+        this.active_thread_mut().last_error = old_error_place;
+
+        // Note: the returned value is currently ignored (see the FIXME in
+        // pthread_join in shims/unix/thread.rs) because the Rust standard library does not use
+        // it.
+        let ret_place =
+            this.allocate(dest_layout, MemoryKind::Machine(MiriMemoryKind::LLVMInterop))?;
+
+        let link_destination = ThreadLinkDestination::ToLLI(lli_return_type);
+
+        let mut link = ThreadLink::new(
+            old_thread_id,
+            new_thread_id,
+            link_destination,
+            ThreadLinkSource::FromMiri(ret_place.clone()),
+        );
+
+        let this = self.eval_context_mut();
+        // Push frame.
+        let mir = this.load_mir(inst.def, None)?;
+
+        this.push_stack_frame(
+            inst,
+            mir,
+            &ret_place.into(),
+            StackPopCleanup::Root { cleanup: true },
+        )?;
+
+        // Initialize arguments.
+        let mut callee_args = this.frame().body.args_iter();
+        for (arg, mp) in args {
+            let local = callee_args
+                .next()
+                .ok_or_else(|| err_ub_format!("callee has fewer arguments than expected"))?;
+            this.storage_live(local)?;
+            let callee_arg = this.local_to_place(this.frame_idx(), local)?;
+            this.copy_op(arg, &callee_arg, true)?;
+            if let Some(place) = mp {
+                link.take_ownership(place.assert_mem_place())
+            }
+        }
+        // Initialize remaining locals.
+        this.storage_live_for_always_live_locals()?;
+        if callee_args.next().is_some() {
+            throw_ub_format!("callee has more arguments than expected");
+        }
+
+        this.active_thread_mut().thread_kind.set(ThreadKind::MiriLinked(link));
+
+        // Restore the old active thread frame.
+        let new_thread_id = this.set_active_thread(old_thread_id);
+        this.join_thread(new_thread_id)?;
+
+        Ok(new_thread_id)
+    }
+
     /// Start a regular (non-main) thread.
     #[inline]
     fn start_regular_thread(
@@ -826,12 +1060,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         ret_layout: TyAndLayout<'tcx>,
     ) -> InterpResult<'tcx, ThreadId> {
         let this = self.eval_context_mut();
-
         // Create the new thread
         let new_thread_id = this.machine.threads.create_thread({
             let mut state = tls::TlsDtorsState::default();
             Box::new(move |m| state.on_stack_empty(m))
         });
+
         let current_span = this.machine.current_span();
         if let Some(data_race) = &mut this.machine.data_race {
             data_race.thread_created(&this.machine.threads, new_thread_id, current_span);
@@ -1048,11 +1282,34 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             }
             match this.machine.threads.schedule(&this.machine.clock)? {
                 SchedulingAction::ExecuteStep => {
-                    if !this.step()? {
-                        // See if this thread can do something else.
-                        match this.run_on_stack_empty()? {
-                            Poll::Pending => {} // keep going
-                            Poll::Ready(()) => this.terminate_active_thread()?,
+                    let id = this.get_active_thread();
+                    if this.thread_is_lli_thread(id)? {
+                        let ready_to_terminate = this.step_lli_thread(id)?;
+                        if ready_to_terminate {
+                            if let ThreadKind::LLVM(link) =
+                                this.active_thread_mut().thread_kind.take()
+                            {
+                                this.terminate_active_thread()?;
+                                link.finalize(this)?;
+                                this.terminate_lli_thread(id);
+                            } else {
+                                panic!("Expected an LLI ThreadLink to exist for an LLI thread!")
+                            }
+                        }
+                    } else {
+                        if !this.step()? {
+                            // See if this thread can do something else.
+                            match this.run_on_stack_empty()? {
+                                Poll::Pending => {} // keep going
+                                Poll::Ready(()) => {
+                                    if let ThreadKind::MiriLinked(link) =
+                                        this.active_thread_mut().thread_kind.take()
+                                    {
+                                        link.finalize(this)?;
+                                    }
+                                    this.terminate_active_thread()?
+                                }
+                            }
                         }
                     }
                 }

@@ -5,11 +5,11 @@ use std::collections::hash_map::Entry;
 use log::trace;
 use rand::Rng;
 
+use crate::shims::llvm::logging::LLVMFlag;
+use crate::*;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_span::Span;
 use rustc_target::abi::{HasDataLayout, Size};
-
-use crate::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProvenanceMode {
@@ -65,7 +65,7 @@ impl GlobalStateInner {
 impl<'mir, 'tcx> GlobalStateInner {
     // Returns the exposed `AllocId` that corresponds to the specified addr,
     // or `None` if the addr is out of bounds
-    fn alloc_id_from_addr(ecx: &MiriInterpCx<'mir, 'tcx>, addr: u64) -> Option<AllocId> {
+    pub fn alloc_id_from_addr(ecx: &MiriInterpCx<'mir, 'tcx>, addr: u64) -> Option<AllocId> {
         let global_state = ecx.machine.intptrcast.borrow();
         assert!(global_state.provenance_mode != ProvenanceMode::Strict);
 
@@ -135,6 +135,14 @@ impl<'mir, 'tcx> GlobalStateInner {
     ) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
         trace!("Casting {:#x} to a pointer", addr);
 
+        if let Some(ref logger) = &ecx.machine.llvm_logger {
+            if ecx.active_thread_ref().is_llvm_thread() {
+                logger.log_flag(LLVMFlag::FromAddrCastLLVM);
+            } else {
+                logger.log_flag(LLVMFlag::FromAddrCastRust);
+            }
+        }
+
         let global_state = ecx.machine.intptrcast.borrow();
 
         match global_state.provenance_mode {
@@ -162,7 +170,7 @@ impl<'mir, 'tcx> GlobalStateInner {
         Ok(Pointer::new(Some(Provenance::Wildcard), Size::from_bytes(addr)))
     }
 
-    fn alloc_base_addr(
+    pub fn alloc_base_addr(
         ecx: &MiriInterpCx<'mir, 'tcx>,
         alloc_id: AllocId,
     ) -> InterpResult<'tcx, u64> {

@@ -32,8 +32,8 @@
 	shallow = true
 [submodule "src/llvm-project"]
 	path = src/llvm-project
-	url = https://github.com/rust-lang/llvm-project.git
-	branch = rustc/17.0-2023-09-19
+	url = https://github.com/icmccorm/llvm-project.git
+	branch = miri-eval
 	shallow = true
 [submodule "src/doc/embedded-book"]
 	path = src/doc/embedded-book
@@ -43,3 +43,9 @@
 	path = library/backtrace
 	url = https://github.com/rust-lang/backtrace-rs.git
 	shallow = true
+[submodule "src/inkwell"]
+	path = src/inkwell
+	url = https://github.com/icmccorm/inkwell.git
+[submodule "src/llvm-sys"]
+	path = src/llvm-sys
+	url = https://github.com/icmccorm/llvm-sys

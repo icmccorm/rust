@@ -1,9 +1,9 @@
 use colored::*;
 use regex::bytes::Regex;
+use std::env;
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::{env, process::Command};
 use ui_test::{color_eyre::Result, Config, Match, Mode, OutputConflictHandling};
 use ui_test::{status_emitter, CommandBuilder, Format, RustfixMode};
 
@@ -20,35 +20,6 @@ fn get_host() -> String {
 pub fn flagsplit(flags: &str) -> Vec<String> {
     // This code is taken from `RUSTFLAGS` handling in cargo.
     flags.split(' ').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
-}
-
-// Build the shared object file for testing external C function calls.
-fn build_so_for_c_ffi_tests() -> PathBuf {
-    let cc = option_env!("CC").unwrap_or("cc");
-    // Target directory that we can write to.
-    let so_target_dir = Path::new(&env::var_os("CARGO_TARGET_DIR").unwrap()).join("miri-extern-so");
-    // Create the directory if it does not already exist.
-    std::fs::create_dir_all(&so_target_dir)
-        .expect("Failed to create directory for shared object file");
-    let so_file_path = so_target_dir.join("libtestlib.so");
-    let cc_output = Command::new(cc)
-        .args([
-            "-shared",
-            "-o",
-            so_file_path.to_str().unwrap(),
-            "tests/extern-so/test.c",
-            // Only add the functions specified in libcode.version to the shared object file.
-            // This is to avoid automatically adding `malloc`, etc.
-            // Source: https://anadoxin.org/blog/control-over-symbol-exports-in-gcc.html/
-            "-fPIC",
-            "-Wl,--version-script=tests/extern-so/libcode.version",
-        ])
-        .output()
-        .expect("failed to generate shared object file for testing external C function calls");
-    if !cc_output.status.success() {
-        panic!("error in generating shared object file for testing external C function calls");
-    }
-    so_file_path
 }
 
 fn test_config(target: &str, path: &str, mode: Mode, with_dependencies: bool) -> Config {
@@ -68,16 +39,7 @@ fn test_config(target: &str, path: &str, mode: Mode, with_dependencies: bool) ->
     program.args.push("-Zui-testing".into());
     program.args.push("--target".into());
     program.args.push(target.into());
-
-    // If we're on linux, and we're testing the extern-so functionality,
-    // then build the shared object file for testing external C function calls
-    // and push the relevant compiler flag.
-    if cfg!(target_os = "linux") && path.starts_with("tests/extern-so/") {
-        let so_file_path = build_so_for_c_ffi_tests();
-        let mut flag = std::ffi::OsString::from("-Zmiri-extern-so-file=");
-        flag.push(so_file_path.into_os_string());
-        program.args.push(flag);
-    }
+    program.args.push("-Zmiri-disable-bc".into());
 
     let mut config = Config {
         target: Some(target.to_owned()),
@@ -181,6 +143,7 @@ regexes! {
     r"0x[0-9a-fA-F]+[0-9a-fA-F]{2,2}" => "$$HEX",
     // erase specific alignments
     "alignment [0-9]+"               => "alignment ALIGN",
+    "[0-9]+ byte alignment but found [0-9]+" => "ALIGN byte alignment but found ALIGN",
     // erase thread caller ids
     r"call [0-9]+"                  => "call ID",
     // erase platform module paths
@@ -230,11 +193,6 @@ fn main() -> Result<()> {
             return run_dep_mode(target, args);
         }
     }
-
-    // Add a test env var to do environment communication tests.
-    env::set_var("MIRI_ENV_VAR_TEST", "0");
-    // Let the tests know where to store temp files (they might run for a different target, which can make this hard to find).
-    env::set_var("MIRI_TEMP", env::temp_dir());
 
     ui(Mode::Pass, "tests/pass", &target, WithoutDependencies)?;
     ui(Mode::Pass, "tests/pass-dep", &target, WithDependencies)?;

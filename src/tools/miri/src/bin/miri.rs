@@ -12,11 +12,12 @@ extern crate rustc_interface;
 extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
-
-use std::env;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::{env, fs};
+
+use walkdir::WalkDir;
 
 use log::debug;
 
@@ -80,13 +81,23 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
                 tcx.sess.fatal("miri can only run programs that have a main function");
             };
             let mut config = self.miri_config.clone();
-
             // Add filename to `miri` arguments.
             config.args.insert(0, tcx.sess.io.input.filestem().to_string());
 
             // Adjust working directory for interpretation.
             if let Some(cwd) = env::var_os("MIRI_CWD") {
                 env::set_current_dir(cwd).unwrap();
+            }
+            if !config.disable_bc && config.external_bc_files.is_empty() && config.singular_llvm_bc_file.is_none() {
+                let cwd = env::current_dir().unwrap();
+                if cwd.exists() && cwd.is_dir() {
+                    config.external_bc_files.extend(collect_llvm_bytecode(cwd));
+                }else{
+                    tcx.sess.fatal("Unable to resolve CARGO_TARGET_DIR.");
+                }
+                if !config.external_bc_files.is_empty() {
+                    config.provenance_mode = ProvenanceMode::Permissive;
+                }
             }
 
             if tcx.sess.opts.optimize != OptLevel::No {
@@ -353,6 +364,18 @@ fn main() {
             miri_config.check_alignment = miri::AlignmentCheck::None;
         } else if arg == "-Zmiri-symbolic-alignment-check" {
             miri_config.check_alignment = miri::AlignmentCheck::Symbolic;
+        } else if arg == "-Zmiri-llvm-log" {
+            miri_config.llvm_log = Some(miri::LLVMLoggingLevel::Flags);
+        } else if arg == "-Zmiri-llvm-log-verbose" {
+            miri_config.llvm_log = Some(miri::LLVMLoggingLevel::Verbose);
+        } else if arg == "-Zmiri-llvm-zero-init" {
+            miri_config.lli_config.zero_init = true;
+        } else if arg == "-Zmiri-llvm-alignment-check" {
+            miri_config.lli_config.alignment_check = true;
+        } else if arg == "-Zmiri-llvm-alignment-check-rust" {
+            miri_config.lli_config.alignment_check_rust = true;
+        } else if arg == "-Zmiri-llvm-read-uninit" {
+            miri_config.lli_config.read_uninit = true;
         } else if arg == "-Zmiri-check-number-validity" {
             eprintln!(
                 "WARNING: the flag `-Zmiri-check-number-validity` no longer has any effect \
@@ -414,6 +437,8 @@ fn main() {
             miri_config.mute_stdout_stderr = true;
         } else if arg == "-Zmiri-retag-fields" {
             miri_config.retag_fields = RetagFields::Yes;
+        } else if arg == "-Zmiri-descriptive-ub" {
+            miri_config.descriptive_ub_error_titles = true;
         } else if let Some(retag_fields) = arg.strip_prefix("-Zmiri-retag-fields=") {
             miri_config.retag_fields = match retag_fields {
                 "all" => RetagFields::Yes,
@@ -530,6 +555,21 @@ fn main() {
                 "full" => BacktraceStyle::Full,
                 _ => show_error!("-Zmiri-backtrace may only be 0, 1, or full"),
             };
+        } else if arg == "-Zmiri-disable-bc" {
+            miri_config.disable_bc = true
+        } else if let Some(param) = arg.strip_prefix("-Zmiri-extern-bc-file=") {
+            let filename = param.to_string();
+            if std::path::Path::new(&filename).exists() {
+                if let Some(other_filename) = miri_config.singular_llvm_bc_file {
+                    show_error!(
+                        "-Zmiri-extern-bc-file= is already set to {}",
+                        other_filename.display()
+                    );
+                }
+                miri_config.singular_llvm_bc_file = Some(filename.into());
+            } else {
+                show_error!("-Zmiri-extern-bc-file `{}` does not exist", filename);
+            }
         } else if let Some(param) = arg.strip_prefix("-Zmiri-extern-so-file=") {
             let filename = param.to_string();
             if std::path::Path::new(&filename).exists() {
@@ -579,4 +619,18 @@ fn main() {
     debug!("rustc arguments: {:?}", rustc_args);
     debug!("crate arguments: {:?}", miri_config.args);
     run_compiler(rustc_args, /* target_crate: */ true, &mut MiriCompilerCalls { miri_config })
+}
+
+fn collect_llvm_bytecode(pb: PathBuf) -> Vec<PathBuf> {
+    let mut llvm_bitcode_paths = Vec::new();
+    for entry in WalkDir::new(pb).follow_links(true).into_iter().filter_map(|e| e.ok()) {
+        if entry.path().is_file() {
+            if let Some(p) = entry.path().extension() {
+                if p == "bc" {
+                    llvm_bitcode_paths.push(fs::canonicalize(entry.path()).unwrap());
+                }
+            }
+        }
+    }
+    llvm_bitcode_paths
 }

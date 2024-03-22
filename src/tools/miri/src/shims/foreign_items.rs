@@ -1,4 +1,9 @@
-use std::{collections::hash_map::Entry, io::Write, iter, path::Path};
+use std::{
+    collections::hash_map::Entry,
+    io::Write,
+    iter::{self, repeat},
+    path::Path,
+};
 
 use log::trace;
 
@@ -21,8 +26,20 @@ use rustc_target::{
     spec::abi::Abi,
 };
 
+#[derive(Eq, PartialEq, Copy, Clone, Debug)]
+#[repr(u32)]
+pub enum Whitespace {
+    Space = 0x20,
+    FormFeed = 0x0c,
+    LineFeed = 0x0a,
+    CarriageReturn = 0x0d,
+    HorizontalTab = 0x09,
+    VerticalTab = 0x0b,
+}
+
 use super::backtrace::EvalContextExt as _;
 use crate::helpers::target_os_is_unix;
+use crate::shims::llvm_ffi_support::EvalContextExt as _;
 use crate::*;
 
 /// Type of dynamic symbols (for `dlsym` et al)
@@ -261,10 +278,20 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         kind: MiriMemoryKind,
     ) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
         let this = self.eval_context_mut();
+        this.malloc_align(size, this.min_align(size, kind), zero_init, kind)
+    }
+
+    fn malloc_align(
+        &mut self,
+        size: u64,
+        align: Align,
+        zero_init: bool,
+        kind: MiriMemoryKind,
+    ) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
+        let this = self.eval_context_mut();
         if size == 0 {
             Ok(Pointer::null())
         } else {
-            let align = this.min_align(size, kind);
             let ptr = this.allocate_ptr(Size::from_bytes(size), align, kind.into())?;
             if zero_init {
                 // We just allocated this, the access is definitely in-bounds and fits into our address space.
@@ -729,7 +756,6 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                         Greater => 1,
                     }
                 };
-
                 this.write_scalar(Scalar::from_i32(result), dest)?;
             }
             "memrchr" => {
@@ -783,6 +809,17 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     this.write_null(dest)?;
                 }
             }
+            "memset" => {
+                let [ptr, val, num] =
+                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let ptr = this.read_pointer(ptr)?;
+                let val = this.read_scalar(val)?.to_i32()?;
+                let num = this.read_target_usize(num)?;
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let val = val as u8;
+                this.write_bytes_ptr(ptr, repeat(val).take(usize::try_from(num).unwrap()))?;
+                this.write_pointer(ptr, dest)?;
+            }
             "strlen" => {
                 let [ptr] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let ptr = this.read_pointer(ptr)?;
@@ -815,7 +852,26 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 )?;
                 this.write_pointer(ptr_dest, dest)?;
             }
-            "strcpy" => {
+            "__strncpy_chk" | "strncpy" => {
+                let [ptr_dest, ptr_src, num] = if link_name.as_str() == "__strncpy_chk" {
+                    let [ptr_dest, ptr_src, num, _] =
+                        this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                    [ptr_dest, ptr_src, num]
+                } else {
+                    let [ptr_dest, ptr_src, num] =
+                        this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                    [ptr_dest, ptr_src, num]
+                };
+
+                let ptr_dest = this.read_pointer(ptr_dest)?;
+                let ptr_src = this.read_pointer(ptr_src)?;
+                let num = this.read_target_usize(num)?;
+                let mut src_contents = this.read_c_str(ptr_src)?.to_vec();
+                src_contents.resize(num.try_into().unwrap(), 0);
+                this.write_bytes_ptr(ptr_dest, src_contents)?;
+                this.write_pointer(ptr_dest, dest)?;
+            }
+            "__strcpy_chk" | "strcpy" => {
                 let [ptr_dest, ptr_src] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let ptr_dest = this.read_pointer(ptr_dest)?;
@@ -838,7 +894,23 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 )?;
                 this.write_pointer(ptr_dest, dest)?;
             }
-
+            "iswspace" | "isspace" => {
+                let [wchar] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let wchar = this.read_scalar(wchar)?;
+                let wchar: u32 = wchar.to_bits(wchar.size())?.try_into().unwrap();
+                let is_ws = wchar == Whitespace::CarriageReturn as u32
+                    || wchar == Whitespace::LineFeed as u32
+                    || wchar == Whitespace::HorizontalTab as u32
+                    || wchar == Whitespace::VerticalTab as u32
+                    || wchar == Whitespace::FormFeed as u32
+                    || wchar == Whitespace::Space as u32;
+                this.write_scalar(Scalar::from_bool(is_ws), dest)?;
+            }
+            | "abs" => {
+                let [n] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let n = this.read_scalar(n)?.to_i32()?;
+                this.write_scalar(Scalar::from_i32(n.abs()), dest)?;
+            }
             // math functions (note that there are also intrinsics for some other functions)
             #[rustfmt::skip]
             | "cbrtf"
@@ -846,6 +918,8 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             | "sinhf"
             | "tanf"
             | "tanhf"
+            | "cosf"
+            | "sinf"
             | "acosf"
             | "asinf"
             | "atanf"
@@ -863,6 +937,8 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     "tanf" => f.tan(),
                     "tanhf" => f.tanh(),
                     "acosf" => f.acos(),
+                    "cosf" => f.cos(),
+                    "sinf" => f.sin(),
                     "asinf" => f.asin(),
                     "atanf" => f.atan(),
                     "log1pf" => f.ln_1p(),
@@ -905,11 +981,20 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             | "log1p"
             | "expm1"
             | "tgamma"
+            | "sin"
+            | "cos"
+            | "log10"
+            | "log2"
+            | "sqrt"
+            | "ceil"
+            | "floor"
+            | "log"
             => {
                 let [f] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 // FIXME: Using host floats.
                 let f = f64::from_bits(this.read_scalar(f)?.to_u64()?);
                 let res = match link_name.as_str() {
+                    "log" => f.ln(),
                     "cbrt" => f.cbrt(),
                     "cosh" => f.cosh(),
                     "sinh" => f.sinh(),
@@ -921,6 +1006,13 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     "log1p" => f.ln_1p(),
                     "expm1" => f.exp_m1(),
                     "tgamma" => f.gamma(),
+                    "sin" => f.sin(),
+                    "cos" => f.cos(),
+                    "log10" => f.log10(),
+                    "log2" => f.log2(),
+                    "sqrt" => f.sqrt(),
+                    "ceil" => f.ceil(),
+                    "floor" => f.floor(),
                     _ => bug!(),
                 };
                 this.write_scalar(Scalar::from_u64(res.to_bits()), dest)?;
@@ -930,6 +1022,8 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             | "hypot"
             | "atan2"
             | "fdim"
+            | "pow"
+            | "fmod"
             => {
                 let [f1, f2] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 // FIXME: Using host floats.
@@ -938,6 +1032,8 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let res = match link_name.as_str() {
                     "_hypot" | "hypot" => f1.hypot(f2),
                     "atan2" => f1.atan2(f2),
+                    "pow" => f1.powf(f2),
+                    "fmod" => f1 % f2,
                     #[allow(deprecated)]
                     "fdim" => f1.abs_sub(f2),
                     _ => bug!(),
@@ -1066,8 +1162,8 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             }
 
             // Platform-specific shims
-            _ =>
-                return match this.tcx.sess.target.os.as_ref() {
+            _ => {
+                let shim_result = match this.tcx.sess.target.os.as_ref() {
                     target_os if target_os_is_unix(target_os) =>
                         shims::unix::foreign_items::EvalContextExt::emulate_foreign_item_inner(
                             this, link_name, abi, args, dest,
@@ -1077,7 +1173,25 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                             this, link_name, abi, args, dest,
                         ),
                     _ => Ok(EmulateForeignItemResult::NotSupported),
-                },
+                };
+                if let Ok(EmulateForeignItemResult::NotSupported) = shim_result {
+                    // An Ok(false) here means that the function being called was not exported
+                    // by the specified `.bc` file; we should continue and check if it corresponds to
+                    // a provided shim.
+                    //
+                    // We only do this if we're not already executing LLVM code, because otherwise
+                    // we would end up with endless stack overflows in cases where a system call is
+                    // exposed as an LLVM function, but implemented in terms of itself.
+                    if this.has_llvm_interpreter()
+                        && !this.thread_is_lli_thread(this.get_active_thread())?
+                    {
+                        if this.call_external_llvm_fct(link_name, dest, args)? {
+                            return Ok(EmulateForeignItemResult::NeedsJumping);
+                        }
+                    }
+                }
+                return shim_result;
+            }
         };
         // We only fall through to here if we did *not* hit the `_` arm above,
         // i.e., if we actually emulated the function with one of the shims.

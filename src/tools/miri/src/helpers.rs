@@ -1,14 +1,16 @@
 use std::cmp;
 use std::iter;
 use std::num::NonZeroUsize;
-use std::time::Duration;
 
+use crate::helpers::rustc_data_structures::fx::FxHashMap;
+use crate::helpers::ty::List;
+use log::debug;
 use log::trace;
-
 use rustc_hir::def::{DefKind, Namespace};
 use rustc_hir::def_id::{DefId, CRATE_DEF_INDEX};
 use rustc_index::IndexVec;
 use rustc_middle::mir;
+use rustc_middle::ty::Instance;
 use rustc_middle::ty::{
     self,
     layout::{IntegerExt as _, LayoutOf, TyAndLayout},
@@ -17,9 +19,11 @@ use rustc_middle::ty::{
 use rustc_span::{def_id::CrateNum, sym, Span, Symbol};
 use rustc_target::abi::{Align, FieldIdx, FieldsShape, Integer, Size, Variants};
 use rustc_target::spec::abi::Abi;
+use std::time::Duration;
 
 use rand::RngCore;
 
+use crate::Provenance;
 use crate::*;
 
 // This mapping should match `decode_error_kind` in
@@ -348,13 +352,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             let callee_arg = this.local_to_place(this.frame_idx(), local)?;
             this.write_immediate(*arg, &callee_arg)?;
         }
+        // Initialize remaining locals.
+        this.storage_live_for_always_live_locals()?;
         if callee_args.next().is_some() {
             throw_ub_format!("callee has more arguments than expected");
         }
-
-        // Initialize remaining locals.
-        this.storage_live_for_always_live_locals()?;
-
         Ok(())
     }
 
@@ -730,12 +732,48 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     ) -> InterpResult<'tcx, MPlaceTy<'tcx, Provenance>> {
         let this = self.eval_context_ref();
         let op_place = this.deref_pointer_as(op, base_layout)?;
-        let offset = Size::from_bytes(offset);
+        debug!(
+            "Deref operand, have {:?}, trying to access {:?} at offset {}",
+            op_place.layout.ty, value_layout.ty, offset
+        );
+        let (underlying_size, place) = if let Some(Provenance::Concrete { alloc_id, .. }) =
+            op_place.ptr().provenance
+        {
+            let alloc_base_addr = intptrcast::GlobalStateInner::alloc_base_addr(this, alloc_id)?;
+            debug!("Base address: {}", alloc_base_addr);
 
+            let (size, _, _) = self.eval_context_ref().get_alloc_info(alloc_id);
+            debug!("Alloc size: {}", size.bytes());
+
+            debug!("Current ptr: {}", op_place.ptr().addr().bytes());
+
+            let remaining_size = size.bytes() - (op_place.ptr().addr().bytes() - alloc_base_addr);
+            debug!("Remaining size: {}", remaining_size);
+
+            let offset_pointer = op_place.ptr().offset(Size::from_bytes(offset), this)?;
+
+            (remaining_size, MPlaceTy::from_aligned_ptr(offset_pointer, value_layout))
+        } else {
+            (
+                op_place.layout.size.bytes(),
+                op_place.offset(Size::from_bytes(offset), value_layout, this)?,
+            )
+        };
+        debug!(
+            "Available underlying size: {}, required size: {}",
+            underlying_size,
+            offset + value_layout.size.bytes()
+        );
         // Ensure that the access is within bounds.
-        assert!(base_layout.size >= offset + value_layout.size);
-        let value_place = op_place.offset(offset, value_layout, this)?;
-        Ok(value_place)
+        if underlying_size < offset + value_layout.size.bytes() {
+            throw_unsup_format!(
+                "Required access to {} bytes with offset {} but place is only {} bytes long",
+                value_layout.size.bytes(),
+                offset,
+                op_place.layout.size.bytes()
+            );
+        }
+        Ok(place)
     }
 
     fn deref_pointer_and_read(
@@ -915,6 +953,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             // no_std situations
             return false;
         };
+        if this.active_thread_stack().is_empty() {
+            return false;
+        }
         let frame = this.frame();
         // Make an attempt to get at the instance of the function this is inlined from.
         let instance: Option<_> = try {
@@ -1143,6 +1184,91 @@ pub fn isolation_abort_error<'tcx>(name: &str) -> InterpResult<'tcx> {
     throw_machine_stop!(TerminationInfo::UnsupportedInIsolation(format!(
         "{name} not available when isolation is enabled",
     )))
+}
+
+/// Retrieve the list of local crates that should have been passed by cargo-miri in
+/// MIRI_LOCAL_CRATES and turn them into `CrateNum`s.
+/*
+pub fn get_llvm_extern_static_types<'tcx>(tcx: TyCtxt<'tcx>) -> FxHashMap<Symbol, TyAndLayout<'tcx>> {
+    let mut static_map = FxHashMap::default();
+    tcx.hir().items().for_each(|id| {
+        let node = tcx.hir().get(id.hir_id());
+        if let rustc_hir::Node::ForeignItem(item) = node {
+            if let rustc_hir::ForeignItemKind::Static(ty, _) = item.kind {
+                let defn_id = ty.hir_id.owner.def_id;
+                let ty = tcx.type_of(defn_id).skip_binder();
+                if let Ok(layout) = tcx.layout_of(tcx.param_env(defn_id).and(ty)) {
+                    static_map.insert(node.ident().unwrap().name, layout);
+                }
+            }
+        }
+    });
+    static_map
+}*/
+
+pub fn get_extern_functions(tcx: TyCtxt<'_>) -> FxHashMap<String, Instance<'_>> {
+    let mut cxx_map = FxHashMap::default();
+
+    tcx.hir().items().for_each(|id| {
+        let node = tcx.hir().get(id.hir_id());
+        if let rustc_hir::Node::Item(it) = node {
+            if let rustc_hir::ItemKind::Fn(..) = it.kind {
+                if let Some(cxx_name) = resolve_cxx_name(tcx, it.owner_id.to_def_id()) {
+                    let rust_name = it.ident.to_string();
+                    let type_of_it = tcx.type_of(it.owner_id.to_def_id()).skip_binder();
+                    if let ty::FnDef(did, sr) = type_of_it.kind() {
+                        if let Ok(Some(inst)) = tcx.resolve_instance(tcx.param_env(did).and((*did, sr))) {
+                            debug!("Resolved Rust instance for: {}", cxx_name);
+                            cxx_map.insert(cxx_name, inst);
+                        } else {
+                            bug!("Unable to resolve instance for {:?}", rust_name)
+                        }
+                    }else{
+                        bug!("Expected an item of kind ItemKind::Fn to have a function type, but found {:?}", type_of_it)
+                    }
+                }
+            }
+        }
+    });
+    tcx.crates(()).iter().map(|cn| tcx.exported_symbols(*cn)).for_each(|sl| {
+        sl.iter().for_each(|(exs, _sei)| {
+            let did_sr_opt = {
+                match exs {
+                    rustc_middle::middle::exported_symbols::ExportedSymbol::NonGeneric(did) =>
+                        Some((*did, List::empty())),
+                    rustc_middle::middle::exported_symbols::ExportedSymbol::Generic(did, sr) =>
+                        Some((*did, *sr)),
+                    _ => None,
+                }
+            };
+            if let Some((did, sr)) = did_sr_opt {
+                if let Some(cxx_name) = resolve_cxx_name(tcx, did) {
+                    if let Ok(Some(inst)) = tcx.resolve_instance(tcx.param_env(did).and((did, sr)))
+                    {
+                        debug!("Resolved Rust instance for: {}", cxx_name);
+                        cxx_map.insert(cxx_name, inst);
+                    } else {
+                        bug!(
+                            "Unable to resolve instance for {:?}",
+                            exs.symbol_name_for_local_instance(tcx)
+                        )
+                    }
+                }
+            }
+        })
+    });
+    cxx_map
+}
+
+fn resolve_cxx_name(tcx: TyCtxt<'_>, did: DefId) -> Option<String> {
+    if let Some(a) = tcx.get_attr(did, Symbol::intern("export_name")) {
+        if let rustc_ast::AttrKind::Normal(n) = &a.kind {
+            if let rustc_ast::AttrArgs::Eq(_, rustc_ast::AttrArgsEq::Hir(mil)) = &n.item.args {
+                return Some(mil.symbol.as_str().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Retrieve the list of local crates that should have been passed by cargo-miri in

@@ -1,5 +1,4 @@
 //! Main evaluator loop and setting up the initial stack frame.
-
 use std::ffi::{OsStr, OsString};
 use std::iter;
 use std::panic::{self, AssertUnwindSafe};
@@ -12,6 +11,7 @@ use rustc_middle::ty::Ty;
 
 use crate::borrow_tracker::RetagFields;
 use crate::diagnostics::report_leaks;
+use crate::shims::llvm::lli::{LLI, LLVM_INTERPRETER};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def::Namespace;
 use rustc_hir::def_id::DefId;
@@ -20,9 +20,8 @@ use rustc_middle::ty::{
     layout::{LayoutCx, LayoutOf},
     TyCtxt,
 };
-use rustc_target::spec::abi::Abi;
-
 use rustc_session::config::EntryFnType;
+use rustc_target::spec::abi::Abi;
 
 use crate::shims::tls;
 use crate::*;
@@ -79,6 +78,20 @@ pub enum BacktraceStyle {
     Full,
     /// Prints only the frame that the error occurs in.
     Off,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum LLVMLoggingLevel {
+    Flags,
+    Verbose,
+}
+
+#[derive(Clone, Default)]
+pub struct LLIConfig {
+    pub alignment_check_rust: bool,
+    pub alignment_check: bool,
+    pub zero_init: bool,
+    pub read_uninit: bool,
 }
 
 /// Configuration needed to spawn a Miri instance.
@@ -142,6 +155,13 @@ pub struct MiriConfig {
     pub report_progress: Option<u32>,
     /// Whether Stacked Borrows and Tree Borrows retagging should recurse into fields of datatypes.
     pub retag_fields: RetagFields,
+    /// The location of an LLVM bytecode file to load when calling external functions
+    pub external_bc_files: FxHashSet<PathBuf>,
+    /// The location of an additional directory, aside from target, to search through for
+    /// LLVM bytecode files
+    pub external_bc_dir: Option<PathBuf>,
+    /// Whether to disable the loading of LLVM bytecode files
+    pub disable_bc: bool,
     /// The location of a shared object file to load when calling external functions
     /// FIXME! consider allowing users to specify paths to multiple SO files, or to a directory
     pub external_so_file: Option<PathBuf>,
@@ -153,6 +173,13 @@ pub struct MiriConfig {
     pub page_size: Option<u64>,
     /// Whether to collect a backtrace when each allocation is created, just in case it leaks.
     pub collect_leak_backtraces: bool,
+    /// Whether to log LLVM bytecode and function calls to files
+    pub llvm_log: Option<LLVMLoggingLevel>,
+    pub singular_llvm_bc_file: Option<PathBuf>,
+    /// Runtime configuration flags for LLI
+    pub lli_config: LLIConfig,
+    /// Whether to disambiguate forms of undefined behavior in error titles.
+    pub descriptive_ub_error_titles: bool,
 }
 
 impl Default for MiriConfig {
@@ -183,12 +210,19 @@ impl Default for MiriConfig {
             mute_stdout_stderr: false,
             preemption_rate: 0.01, // 1%
             report_progress: None,
+            external_bc_files: FxHashSet::default(),
+            external_bc_dir: None,
+            disable_bc: false,
             retag_fields: RetagFields::Yes,
             external_so_file: None,
             gc_interval: 10_000,
             num_cpus: 1,
             page_size: None,
             collect_leak_backtraces: true,
+            llvm_log: None,
+            singular_llvm_bc_file: None,
+            lli_config: LLIConfig::default(),
+            descriptive_ub_error_titles: false,
         }
     }
 }
@@ -428,7 +462,6 @@ pub fn eval_entry<'tcx>(
 ) -> Option<i64> {
     // Copy setting before we move `config`.
     let ignore_leaks = config.ignore_leaks;
-
     let mut ecx = match create_ecx(tcx, entry_id, entry_type, &config) {
         Ok(v) => v,
         Err(err) => {
@@ -438,31 +471,73 @@ pub fn eval_entry<'tcx>(
         }
     };
 
-    // Perform the main execution.
-    let res: thread::Result<InterpResult<'_, !>> =
-        panic::catch_unwind(AssertUnwindSafe(|| ecx.run_threads()));
-    let res = res.unwrap_or_else(|panic_payload| {
-        ecx.handle_ice();
-        panic::resume_unwind(panic_payload)
-    });
-    let res = match res {
-        Err(res) => res,
-        // `Ok` can never happen
-        Ok(never) => match never {},
+    let llvm_error = if !config.disable_bc
+        && (!config.external_bc_files.is_empty() || config.singular_llvm_bc_file.is_some())
+    {
+        LLVM_INTERPRETER.lock().replace_with(|_| {
+            let mut interpreter = if let Some(path_buff) = config.singular_llvm_bc_file {
+                let mut set = FxHashSet::default();
+                set.insert(path_buff);
+                LLI::create(&mut ecx, &set)
+            } else {
+                LLI::create(&mut ecx, &config.external_bc_files)
+            };
+            interpreter.initialize_engine(&mut ecx).unwrap();
+            Some(interpreter)
+        });
+        let result = LLVM_INTERPRETER.lock().borrow().as_ref().unwrap().run_constructors(&mut ecx);
+        if let Err(err) = result { Some(err) } else { None }
+    } else {
+        None
+    };
+
+    let result = if let Some(result) = llvm_error {
+        result
+    } else {
+        // Perform the main execution.
+        let res: thread::Result<InterpResult<'_, !>> =
+            panic::catch_unwind(AssertUnwindSafe(|| ecx.run_threads()));
+        let res = res.unwrap_or_else(|panic_payload| {
+            ecx.handle_ice();
+            panic::resume_unwind(panic_payload)
+        });
+        match res {
+            Err(res) => res,
+            // `Ok` can never happen
+            Ok(never) => match never {},
+        }
     };
 
     // Machine cleanup. Only do this if all threads have terminated; threads that are still running
     // might cause Stacked Borrows errors (https://github.com/rust-lang/miri/issues/2396).
-    if ecx.have_all_terminated() {
+    let destructor_error = if ecx.have_all_terminated() {
+        let result = if LLVM_INTERPRETER.lock().borrow().as_ref().is_some() {
+            if let Err(err) =
+                LLVM_INTERPRETER.lock().borrow().as_ref().unwrap().run_destructors(&mut ecx)
+            {
+                Some(err)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Even if all threads have terminated, we have to beware of data races since some threads
         // might not have joined the main thread (https://github.com/rust-lang/miri/issues/2020,
         // https://github.com/rust-lang/miri/issues/2508).
         ecx.allow_data_races_all_threads_done();
         EnvVars::cleanup(&mut ecx).expect("error during env var cleanup");
-    }
+        result
+    } else {
+        None
+    };
 
     // Process the result.
-    let (return_code, leak_check) = report_error(&ecx, res)?;
+    let (return_code, leak_check) = report_error(&ecx, result)?;
+    if let Some(e) = destructor_error {
+        report_error(&ecx, e)?;
+    }
     if leak_check && !ignore_leaks {
         // Check for thread leaks.
         if !ecx.have_all_terminated() {

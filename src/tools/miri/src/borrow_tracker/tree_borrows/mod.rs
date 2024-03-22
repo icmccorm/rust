@@ -312,6 +312,10 @@ trait EvalContextPrivExt<'mir: 'ecx, 'tcx: 'mir, 'ecx>: crate::MiriInterpCxExt<'
             diagnostics::AccessCause::Reborrow,
         )?;
         // Record the parent-child pair in the tree.
+        // FIXME: We should eventually ensure that the following `assert` holds, because
+        // some "exhaustive" tests consider only the initial configurations that satisfy it.
+        // The culprit is `Permission::new_active` in `tb_protect_place`.
+        //assert!(new_perm.initial_state.is_initial());
         tree_borrows.new_child(orig_tag, new_tag, new_perm.initial_state, range, span)?;
         drop(tree_borrows);
 
