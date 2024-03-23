@@ -7,6 +7,8 @@ use crate::rustc_middle::ty::layout::LayoutOf;
 use crate::shims::llvm::logging::LLVMFlag;
 use crate::throw_unsup_llvm_type;
 use crate::throw_unsup_shim_llvm_type;
+use crate::AlignmentCheck;
+use crate::MiriInterpCx;
 use crate::{intptrcast, BorTag, Provenance, ThreadId};
 use either::Either::Right;
 use inkwell::miri::StackTrace;
@@ -23,8 +25,9 @@ use rustc_const_eval::interpret::{
 };
 use rustc_middle::mir::Mutability;
 use rustc_middle::ty::layout::{HasTyCtxt, TyAndLayout};
-use rustc_middle::ty::{self, Ty, TyKind, TypeAndMut};
+use rustc_middle::ty::{self, Ty, TypeAndMut};
 use rustc_span::FileNameDisplayPreference;
+use rustc_target::abi::Align;
 use rustc_target::abi::Size;
 use std::num::NonZeroU64;
 
@@ -288,10 +291,33 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         this.machine.foreign_error.replace(Some(info));
     }
 
-    fn is_pointer_convertible(&self, kind: &TyKind<'_>) -> bool {
-        matches!(kind, ty::FnPtr(_))
-            || matches!(kind, ty::RawPtr(_))
-            || matches!(kind, ty::Ref(_, _, _))
+    fn is_pointer_convertible(&self, layout: &TyAndLayout<'tcx>) -> bool {
+        let this = self.eval_context_ref();
+        match layout.ty.kind() {
+            ty::FnPtr(_) | ty::RawPtr(_) | ty::Ref(_, _, _) => return true,
+            _ =>
+                if layout.is_transparent::<MiriInterpCx<'_, 'tcx>>() {
+                    if let Some((_, field)) = layout.non_1zst_field(this) {
+                        return this.is_pointer_convertible(&field);
+                    }
+                },
+        };
+        false
+    }
+
+    fn is_pointer_aligned(&self, ptr: Pointer<Option<crate::Provenance>>, align: Align) -> bool {
+        let this = self.eval_context_ref();
+        match this.ptr_try_get_alloc_id(ptr) {
+            Err(addr) => addr % align.bytes() == 0,
+            Ok((alloc_id, offset, _)) => {
+                let (_, alloc_align, _) = this.get_alloc_info(alloc_id);
+                if this.machine.check_alignment == AlignmentCheck::Int {
+                    ptr.addr().bytes() % align.bytes() == 0
+                } else {
+                    alloc_align.bytes() >= align.bytes() && offset.bytes() % align.bytes() != 0
+                }
+            }
+        }
     }
 
     #[allow(clippy::arithmetic_side_effects)]

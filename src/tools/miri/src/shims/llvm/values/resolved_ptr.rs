@@ -31,12 +31,12 @@ impl ResolvedPointer {
         &'a self,
         ctx: &'a MiriInterpCx<'_, 'tcx>,
         access_size: Size,
-        _align: Align,
+        align: Align,
     ) -> InterpResult<
         'tcx,
         (AllocRef<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>>, AllocRange),
     > {
-        let (size, range) = self.get_access_size_range(ctx, access_size);
+        let (size, range) = self.get_access_size_range(ctx, access_size, align)?;
         let alloc_reference =
             unsafe { ctx.get_ptr_alloc_range(self.ptr, size, range, self.align)? };
         if let Some(ar) = alloc_reference {
@@ -51,12 +51,12 @@ impl ResolvedPointer {
         &'a self,
         ctx: &'a mut MiriInterpCx<'_, 'tcx>,
         access_size: Size,
-        _align: Align,
+        align: Align,
     ) -> InterpResult<
         'tcx,
         (AllocRefMut<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>>, AllocRange),
     > {
-        let (size, range) = self.get_access_size_range(ctx, access_size);
+        let (size, range) = self.get_access_size_range(ctx, access_size, align)?;
         let alloc_reference =
             unsafe { ctx.get_ptr_alloc_mut_range(self.ptr, size, range, self.align)? };
         if let Some(ar) = alloc_reference {
@@ -85,16 +85,31 @@ impl ResolvedPointer {
     }
     #[inline(always)]
     #[allow(clippy::arithmetic_side_effects)]
-    pub fn get_access_size_range(
+    pub fn get_access_size_range<'tcx>(
         &self,
-        ctx: &MiriInterpCx<'_, '_>,
+        ctx: &MiriInterpCx<'_, 'tcx>,
         access_size: Size,
-    ) -> (Size, AllocRange) {
+        access_alignment: Align,
+    ) -> InterpResult<'tcx, (Size, AllocRange)> {
         let this = ctx.eval_context_ref();
+        if let Some(logger) = &this.machine.llvm_logger {
+            if let Some(alloc_id) = self.alloc_id {
+                let offset_pointer = self.ptr.offset(self.offset, ctx)?;
+                let is_aligned = this.is_pointer_aligned(offset_pointer, access_alignment);
+                let is_llvm_allocation = this.is_llvm_allocation(alloc_id);
+                if !is_aligned {
+                    if is_llvm_allocation {
+                        logger.log_flag(LLVMFlag::UnalignedAccessInLLVM);
+                    } else {
+                        logger.log_flag(LLVMFlag::UnalignedAccessInLLVMRust);
+                    }
+                }
+            }
+        }
         if this.should_check_alignment_in_llvm(self.alloc_id) {
-            (access_size, alloc_range(Size::ZERO, access_size))
+            Ok((access_size, alloc_range(Size::ZERO, access_size)))
         } else {
-            (self.offset + access_size, alloc_range(self.offset, access_size))
+            Ok((self.offset + access_size, alloc_range(self.offset, access_size)))
         }
     }
 
@@ -106,8 +121,7 @@ impl ResolvedPointer {
         index: u32,
     ) -> InterpResult<'tcx, ResolvedPointer> {
         let this = ctx.eval_context_ref();
-        let (ptr, offset) = if this.should_check_alignment_in_llvm(self.alloc_id)
-        {
+        let (ptr, offset) = if this.should_check_alignment_in_llvm(self.alloc_id) {
             let ptr = self.ptr.offset(Size::from_bytes(size.bytes() * u64::from(index)), ctx)?;
             (ptr, self.offset)
         } else {

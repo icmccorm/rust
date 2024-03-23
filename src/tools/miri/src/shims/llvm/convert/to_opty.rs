@@ -346,7 +346,7 @@ fn convert_to_immty<'tcx>(
                     let converted_int = generic.as_int();
                     debug!("[GV to Op]: Int value: {:?}", converted_int);
                     let byte_width = Size::from_bytes(u64::from(generic.int_width_bytes()));
-                    if miri.is_pointer_convertible(ctx.rust_layout.ty.kind()) {
+                    if miri.is_pointer_convertible(&ctx.rust_layout) {
                         if byte_width == ctx.rust_layout.size {
                             let first_word = truncate_to_pointer_size(converted_int);
                             if let Some(logger) = &miri.machine.llvm_logger {
@@ -371,7 +371,7 @@ fn convert_to_immty<'tcx>(
                     }
                 }
                 BasicTypeEnum::PointerType(_) =>
-                    if miri.is_pointer_convertible(ctx.rust_layout.ty.kind()) {
+                    if miri.is_pointer_convertible(&ctx.rust_layout) {
                         let wrapped_pointer = generic.as_miri_pointer();
                         let mp = miri.lli_wrapped_pointer_to_maybe_pointer(wrapped_pointer);
                         debug!(
@@ -394,7 +394,7 @@ fn convert_to_immty<'tcx>(
         OpTySource::Bytes(fieldbytes) => {
             let value = fieldbytes.as_uint();
             let layout = ctx.rust_layout;
-            let scalar = if miri.is_pointer_convertible(layout.ty.kind()) {
+            let scalar = if miri.is_pointer_convertible(&layout) {
                 if let Some(logger) = &miri.machine.llvm_logger {
                     logger.log_flag(LLVMFlag::CastPointerFromLLVMAtBoundary);
                 }

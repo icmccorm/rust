@@ -20,6 +20,8 @@ pub struct LLVMLogger {
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq, Debug)]
 pub enum LLVMFlag {
+    EnumOfNonNullablePointer,
+    ADTAsPointerFromRust,
     LLVMEngaged,
     LLVMIntToPtr,
     LLVMPtrToInt,
@@ -35,8 +37,9 @@ pub enum LLVMFlag {
     ExposedPointerFromRustAtBoundary,
     CastPointerFromLLVMAtBoundary,
     AggregateAsBytes,
-    ScalarPairInSingleArg,
     VarArgFunction,
+    UnalignedAccessInLLVM,
+    UnalignedAccessInLLVMRust,
 }
 
 impl std::fmt::Display for LLVMFlag {
@@ -57,8 +60,11 @@ impl std::fmt::Display for LLVMFlag {
             LLVMFlag::ExposedPointerFromRustAtBoundary => "ExposedPointerFromRustAtBoundary",
             LLVMFlag::CastPointerFromLLVMAtBoundary => "CastPointerFromLLVMAtBoundary",
             LLVMFlag::AggregateAsBytes => "AggregateAsBytes",
-            LLVMFlag::ScalarPairInSingleArg => "ScalarPairInSingleArg",
             LLVMFlag::VarArgFunction => "VarArgFunction",
+            LLVMFlag::UnalignedAccessInLLVM => "UnalignedAccessInLLVM",
+            LLVMFlag::UnalignedAccessInLLVMRust => "UnalignedAccessInLLVMRust",
+            LLVMFlag::EnumOfNonNullablePointer => "EnumOfNonNullablePointer",
+            LLVMFlag::ADTAsPointerFromRust => "ADTAsPointerFromRust",
         };
         write!(f, "{}", string)
     }

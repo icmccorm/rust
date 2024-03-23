@@ -184,9 +184,6 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
     bte: ResolvedLLVMType<'lli>,
 ) -> InterpResult<'tcx> {
     if let Some(bte) = bte {
-        if let Some(logger) = &ctx.machine.llvm_logger {
-            logger.log_flag(LLVMFlag::ScalarPairInSingleArg);
-        }
         dest.set_type_tag(&bte);
         debug!("[Op to GV]: {:?} -> {:?}", arg.ty(), bte.print_to_string());
         match bte {
@@ -290,7 +287,13 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
             }
             BasicTypeEnum::PointerType(pt) => {
                 let pointer_opty = if let ty::Adt(adef, sr) = arg.ty().kind() {
+                    if let Some(logger) = &ctx.machine.llvm_logger {
+                        logger.log_flag(LLVMFlag::ADTAsPointerFromRust);
+                    }
                     if let Some(vidx) = is_enum_of_nonnullable_ptr(ctx, *adef, sr) {
+                        if let Some(logger) = &ctx.machine.llvm_logger {
+                            logger.log_flag(LLVMFlag::EnumOfNonNullablePointer);
+                        }
                         debug!("[Op to GV]: Enum of nonnullable pointer: {:?}", vidx);
                         let downcast_op = ctx.project_downcast(arg.opty(), vidx)?;
                         let field_op = ctx.project_field(&downcast_op, 0)?;
