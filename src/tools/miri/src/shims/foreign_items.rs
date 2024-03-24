@@ -82,68 +82,68 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     ) -> InterpResult<'tcx, Option<(&'mir mir::Body<'tcx>, ty::Instance<'tcx>)>> {
         let this = self.eval_context_mut();
         let tcx = this.tcx.tcx;
-
+        let is_in_llvm = this.active_thread_ref().is_llvm_thread();
         // First: functions that diverge.
-        let ret = match ret {
-            None =>
-                match link_name.as_str() {
-                    "miri_start_panic" => {
-                        // `check_shim` happens inside `handle_miri_start_panic`.
-                        this.handle_miri_start_panic(abi, link_name, args, unwind)?;
-                        return Ok(None);
-                    }
-                    // This matches calls to the foreign item `panic_impl`.
-                    // The implementation is provided by the function with the `#[panic_handler]` attribute.
-                    "panic_impl" => {
-                        // We don't use `check_shim` here because we are just forwarding to the lang
-                        // item. Argument count checking will be performed when the returned `Body` is
-                        // called.
-                        this.check_abi_and_shim_symbol_clash(abi, Abi::Rust, link_name)?;
-                        let panic_impl_id = tcx.lang_items().panic_impl().unwrap();
-                        let panic_impl_instance = ty::Instance::mono(tcx, panic_impl_id);
-                        return Ok(Some((
-                            this.load_mir(panic_impl_instance.def, None)?,
-                            panic_impl_instance,
-                        )));
-                    }
-                    #[rustfmt::skip]
-                    | "exit"
-                    | "ExitProcess"
-                    => {
-                        let exp_abi = if link_name.as_str() == "exit" {
-                            Abi::C { unwind: false }
-                        } else {
-                            Abi::System { unwind: false }
-                        };
-                        let [code] = this.check_shim(abi, exp_abi, link_name, args)?;
-                        // it's really u32 for ExitProcess, but we have to put it into the `Exit` variant anyway
-                        let code = this.read_scalar(code)?.to_i32()?;
-                        throw_machine_stop!(TerminationInfo::Exit { code: code.into(), leak_check: false });
-                    }
-                    "abort" => {
-                        let [] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                        throw_machine_stop!(TerminationInfo::Abort(
-                            "the program aborted execution".to_owned()
-                        ))
-                    }
-                    _ => {
-                        if let Some(body) = this.lookup_exported_symbol(link_name)? {
-                            return Ok(Some(body));
-                        }
+        if ret.is_none() {
+            match link_name.as_str() {
+                "miri_start_panic" => {
+                    // `check_shim` happens inside `handle_miri_start_panic`.
+                    this.handle_miri_start_panic(abi, link_name, args, unwind)?;
+                    return Ok(None);
+                }
+                // This matches calls to the foreign item `panic_impl`.
+                // The implementation is provided by the function with the `#[panic_handler]` attribute.
+                "panic_impl" => {
+                    // We don't use `check_shim` here because we are just forwarding to the lang
+                    // item. Argument count checking will be performed when the returned `Body` is
+                    // called.
+                    this.check_abi_and_shim_symbol_clash(abi, Abi::Rust, link_name)?;
+                    let panic_impl_id = tcx.lang_items().panic_impl().unwrap();
+                    let panic_impl_instance = ty::Instance::mono(tcx, panic_impl_id);
+                    return Ok(Some((
+                        this.load_mir(panic_impl_instance.def, None)?,
+                        panic_impl_instance,
+                    )));
+                }
+                #[rustfmt::skip]
+                | "exit"
+                | "ExitProcess"
+                => {
+                    let exp_abi = if link_name.as_str() == "exit" {
+                        Abi::C { unwind: false }
+                    } else {
+                        Abi::System { unwind: false }
+                    };
+                    let [code] = this.check_shim(abi, exp_abi, link_name, args)?;
+                    // it's really u32 for ExitProcess, but we have to put it into the `Exit` variant anyway
+                    let code = this.read_scalar(code)?.to_i32()?;
+                    throw_machine_stop!(TerminationInfo::Exit { code: code.into(), leak_check: false });
+                }
+                "abort" => {
+                    let [] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                    throw_machine_stop!(TerminationInfo::Abort(
+                        "the program aborted execution".to_owned()
+                    ))
+                }
+                _ =>
+                    if let Some(body) = this.lookup_exported_symbol(link_name)? {
+                        return Ok(Some(body));
+                    } else if !is_in_llvm {
                         this.handle_unsupported(format!(
                             "can't call (diverging) foreign function: {link_name}"
                         ))?;
                         return Ok(None);
-                    }
-                },
-            Some(p) => p,
+                    },
+            };
         };
 
         // Second: functions that return immediately.
         match this.emulate_foreign_item_inner(link_name, abi, args, dest)? {
             EmulateForeignItemResult::NeedsJumping => {
-                trace!("{:?}", this.dump_place(dest));
-                this.go_to_block(ret);
+                if let Some(ret) = ret && !is_in_llvm{
+                    trace!("{:?}", this.dump_place(dest));
+                    this.go_to_block(ret);
+                }
             }
             EmulateForeignItemResult::AlreadyJumped => (),
             EmulateForeignItemResult::NotSupported => {
