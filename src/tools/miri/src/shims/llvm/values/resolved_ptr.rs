@@ -96,12 +96,13 @@ impl ResolvedPointer {
             if let Some(alloc_id) = self.alloc_id {
                 let offset_pointer = self.ptr.offset(self.offset, ctx)?;
                 let is_aligned = this.is_pointer_aligned(offset_pointer, access_alignment);
-                let is_llvm_allocation = this.is_llvm_allocation(alloc_id);
                 if !is_aligned {
-                    if is_llvm_allocation {
-                        logger.log_flag(LLVMFlag::UnalignedAccessInLLVM);
-                    } else {
-                        logger.log_flag(LLVMFlag::UnalignedAccessInLLVMRust);
+                    if let Some(is_llvm_allocation) = this.is_llvm_allocation(alloc_id) {
+                        if is_llvm_allocation {
+                            logger.log_flag(LLVMFlag::UnalignedAccessInLLVM);
+                        } else {
+                            logger.log_flag(LLVMFlag::UnalignedAccessInLLVMRust);
+                        }
                     }
                 }
             }

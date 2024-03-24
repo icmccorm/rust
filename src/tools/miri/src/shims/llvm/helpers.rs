@@ -454,28 +454,30 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
-    fn is_llvm_allocation(&self, alloc_id: AllocId) -> bool {
+    fn is_llvm_allocation(&self, alloc_id: AllocId) -> Option<bool> {
         let this = self.eval_context_ref();
         if let Some((kind, _)) = this.memory.alloc_map().get(alloc_id) {
-            matches!(
+            Some(matches!(
                 kind,
                 rustc_const_eval::interpret::MemoryKind::Machine(
                     crate::MiriMemoryKind::LLVMStack
                         | crate::MiriMemoryKind::LLVMStatic
-                        | crate::MiriMemoryKind::C
                 )
-            )
+            ))
         } else {
-            false
+            None
         }
     }
 
     fn should_check_alignment_in_llvm(&self, alloc_id: Option<AllocId>) -> bool {
         let this = self.eval_context_ref();
         if let Some(alloc_id) = alloc_id {
-            this.machine.lli_config.alignment_check
-                || (!this.is_llvm_allocation(alloc_id)
-                    && this.machine.lli_config.alignment_check_rust)
+            if let Some(is_llvm) = this.is_llvm_allocation(alloc_id) {
+                (this.machine.lli_config.alignment_check)
+                    || (!is_llvm && this.machine.lli_config.alignment_check_rust)
+            } else {
+                this.machine.lli_config.alignment_check
+            }
         } else {
             false
         }
