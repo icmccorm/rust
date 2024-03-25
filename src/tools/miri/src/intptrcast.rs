@@ -2,11 +2,11 @@ use std::cell::RefCell;
 use std::cmp::max;
 use std::collections::hash_map::Entry;
 
-use log::trace;
-use rand::Rng;
-
+use crate::shims::llvm::helpers::EvalContextExt as _;
 use crate::shims::llvm::logging::LLVMFlag;
 use crate::*;
+use log::trace;
+use rand::Rng;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_span::Span;
 use rustc_target::abi::{HasDataLayout, Size};
@@ -136,7 +136,7 @@ impl<'mir, 'tcx> GlobalStateInner {
         trace!("Casting {:#x} to a pointer", addr);
 
         if let Some(ref logger) = &ecx.machine.llvm_logger {
-            if ecx.active_thread_ref().is_llvm_thread() {
+            if ecx.in_llvm()? {
                 logger.log_flag(LLVMFlag::FromAddrCastLLVM);
             } else {
                 logger.log_flag(LLVMFlag::FromAddrCastRust);

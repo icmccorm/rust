@@ -5,8 +5,8 @@ use std::{
     path::Path,
 };
 
+use crate::shims::llvm::helpers::EvalContextExt as _;
 use log::trace;
-
 use rustc_apfloat::Float;
 use rustc_ast::expand::allocator::AllocatorKind;
 use rustc_hir::{
@@ -82,7 +82,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     ) -> InterpResult<'tcx, Option<(&'mir mir::Body<'tcx>, ty::Instance<'tcx>)>> {
         let this = self.eval_context_mut();
         let tcx = this.tcx.tcx;
-        let is_in_llvm = this.active_thread_ref().is_llvm_thread();
+        let is_in_llvm = this.in_llvm()?;
         // First: functions that diverge.
         if ret.is_none() {
             match link_name.as_str() {
