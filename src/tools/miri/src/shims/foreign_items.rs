@@ -852,6 +852,19 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 )?;
                 this.write_pointer(ptr_dest, dest)?;
             }
+            "malloc_size" | "malloc_usable_size" => {
+                let [ptr] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let ptr = this.read_pointer(ptr)?;
+                let (alloc_id, _, _) = this.ptr_get_alloc_id(ptr)?;
+                let base_address = Size::from_bytes(intptrcast::GlobalStateInner::alloc_base_addr(this, alloc_id)?);
+                if base_address != ptr.addr() {
+                    this.write_scalar(Scalar::from_u64(0), dest)?;
+                }else{
+                    let (_, alloc) = this.memory.alloc_map().get(alloc_id).unwrap();
+                    let size = alloc.size().bytes();
+                    this.write_scalar(Scalar::from_u64(size), dest)?;
+                };
+            }
             "__strncpy_chk" | "strncpy" => {
                 let [ptr_dest, ptr_src, num] = if link_name.as_str() == "__strncpy_chk" {
                     let [ptr_dest, ptr_src, num, _] =
@@ -926,6 +939,8 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             | "log1pf"
             | "expm1f"
             | "tgammaf"
+            | "logf"
+            | "sqrtf"
             => {
                 let [f] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 // FIXME: Using host floats.
@@ -944,6 +959,8 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     "log1pf" => f.ln_1p(),
                     "expm1f" => f.exp_m1(),
                     "tgammaf" => f.gamma(),
+                    "logf" => f.ln(),
+                    "sqrtf" => f.sqrt(),
                     _ => bug!(),
                 };
                 this.write_scalar(Scalar::from_u32(res.to_bits()), dest)?;
@@ -953,6 +970,7 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             | "hypotf"
             | "atan2f"
             | "fdimf"
+            | "powf"
             => {
                 let [f1, f2] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 // underscore case for windows, here and below
@@ -965,6 +983,7 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     "atan2f" => f1.atan2(f2),
                     #[allow(deprecated)]
                     "fdimf" => f1.abs_sub(f2),
+                    "powf" => f1.powf(f2),
                     _ => bug!(),
                 };
                 this.write_scalar(Scalar::from_u32(res.to_bits()), dest)?;
@@ -979,6 +998,7 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             | "asin"
             | "atan"
             | "log1p"
+            | "exp"
             | "expm1"
             | "tgamma"
             | "sin"
@@ -1004,6 +1024,7 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     "asin" => f.asin(),
                     "atan" => f.atan(),
                     "log1p" => f.ln_1p(),
+                    "exp" => f.exp(),
                     "expm1" => f.exp_m1(),
                     "tgamma" => f.gamma(),
                     "sin" => f.sin(),
@@ -1073,7 +1094,13 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 this.write_int(sign, &signp)?;
                 this.write_scalar(Scalar::from_u64(res.to_bits()), dest)?;
             }
-
+            "tolower" => {
+                let [c] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let c = this.read_scalar(c)?;
+                let c: u32 = c.to_bits(c.size())?.try_into().unwrap();
+                let c = char::from_u32(c).unwrap_or('\0').to_lowercase().next().unwrap_or('\0');
+                this.write_scalar(Scalar::from_u32(c as u32), dest)?;
+            }
             // LLVM intrinsics
             "llvm.prefetch" => {
                 let [p, rw, loc, ty] =
