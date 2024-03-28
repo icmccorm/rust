@@ -311,14 +311,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let this = self.eval_context_ref();
         match this.ptr_try_get_alloc_id(ptr) {
             Err(addr) => addr % align.bytes() == 0,
-            Ok((alloc_id, offset, _)) => {
-                let (_, alloc_align, _) = this.get_alloc_info(alloc_id);
+            Ok((alloc_id, offset, _)) =>
                 if this.machine.check_alignment == AlignmentCheck::Int {
                     ptr.addr().bytes() % align.bytes() == 0
                 } else {
+                    let (_, alloc_align, _) = this.get_alloc_info(alloc_id);
                     alloc_align.bytes() >= align.bytes() && offset.bytes() % align.bytes() != 0
-                }
-            }
+                },
         }
     }
 
@@ -456,7 +455,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
-    fn is_llvm_allocation(&self, alloc_id: AllocId) -> Option<bool> {
+    fn is_llvm_managed_allocation(&self, alloc_id: AllocId) -> Option<bool> {
         let this = self.eval_context_ref();
         if let Some((kind, _)) = this.memory.alloc_map().get(alloc_id) {
             Some(matches!(
@@ -470,10 +469,26 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
+    fn is_foreign_allocation(&self, alloc_id: AllocId) -> Option<bool> {
+        self.is_llvm_managed_allocation(alloc_id).or(self.is_foreign_heap_allocation(alloc_id))
+    }
+
+    fn is_foreign_heap_allocation(&self, alloc_id: AllocId) -> Option<bool> {
+        let this = self.eval_context_ref();
+        if let Some((kind, _)) = this.memory.alloc_map().get(alloc_id) {
+            Some(matches!(
+                kind,
+                rustc_const_eval::interpret::MemoryKind::Machine(crate::MiriMemoryKind::C)
+            ))
+        } else {
+            None
+        }
+    }
+
     fn should_check_alignment_in_llvm(&self, alloc_id: Option<AllocId>) -> bool {
         let this = self.eval_context_ref();
         if let Some(alloc_id) = alloc_id {
-            if let Some(is_llvm) = this.is_llvm_allocation(alloc_id) {
+            if let Some(is_llvm) = this.is_foreign_allocation(alloc_id) {
                 (this.machine.lli_config.alignment_check)
                     || (!is_llvm && this.machine.lli_config.alignment_check_rust)
             } else {

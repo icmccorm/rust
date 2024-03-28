@@ -38,7 +38,7 @@ impl ResolvedPointer {
     > {
         let (size, range) = self.get_access_size_range(ctx, access_size, align)?;
         let alloc_reference =
-            unsafe { ctx.get_ptr_alloc_range(self.ptr, size, range, self.align)? };
+            unsafe { ctx.get_ptr_alloc_range(self.ptr, size, range, align)? };
         if let Some(ar) = alloc_reference {
             Ok((ar, range))
         } else {
@@ -58,7 +58,7 @@ impl ResolvedPointer {
     > {
         let (size, range) = self.get_access_size_range(ctx, access_size, align)?;
         let alloc_reference =
-            unsafe { ctx.get_ptr_alloc_mut_range(self.ptr, size, range, self.align)? };
+            unsafe { ctx.get_ptr_alloc_mut_range(self.ptr, size, range, align)? };
         if let Some(ar) = alloc_reference {
             Ok((ar, range))
         } else {
@@ -97,7 +97,7 @@ impl ResolvedPointer {
                 let offset_pointer = self.ptr.offset(self.offset, ctx)?;
                 let is_aligned = this.is_pointer_aligned(offset_pointer, access_alignment);
                 if !is_aligned {
-                    if let Some(is_llvm_allocation) = this.is_llvm_allocation(alloc_id) {
+                    if let Some(is_llvm_allocation) = this.is_foreign_allocation(alloc_id) {
                         if is_llvm_allocation {
                             logger.log_flag(LLVMFlag::UnalignedAccessInLLVM);
                         } else {
