@@ -370,10 +370,10 @@ fn main() {
             miri_config.llvm_log = Some(miri::LLVMLoggingLevel::Verbose);
         } else if arg == "-Zmiri-llvm-zero-init" {
             miri_config.lli_config.zero_init = true;
-        } else if arg == "-Zmiri-llvm-alignment-check" {
-            miri_config.lli_config.alignment_check = true;
-        } else if arg == "-Zmiri-llvm-alignment-check-rust" {
-            miri_config.lli_config.alignment_check_rust = true;
+        } else if arg == "-Zmiri-llvm-disable-alignment-check" {
+            miri_config.lli_config.alignment_check = miri::ForeignAlignmentCheckMode::Skip;
+        } else if arg == "-Zmiri-llvm-alignment-check-rust-only" {
+            miri_config.lli_config.alignment_check = miri::ForeignAlignmentCheckMode::CheckRustOnly;
         } else if arg == "-Zmiri-llvm-read-uninit" {
             miri_config.lli_config.read_uninit = true;
         } else if arg == "-Zmiri-check-number-validity" {

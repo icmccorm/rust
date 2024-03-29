@@ -7,6 +7,7 @@ use crate::rustc_const_eval::interpret::AllocMap;
 use crate::rustc_middle::ty::layout::LayoutOf;
 use crate::shims::llvm::logging::LLVMFlag;
 use crate::shims::llvm_ffi_support::EvalContextExt as _;
+use crate::eval::ForeignAlignmentCheckMode;
 use crate::throw_unsup_llvm_type;
 use crate::throw_unsup_shim_llvm_type;
 use crate::AlignmentCheck;
@@ -487,15 +488,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
     fn should_check_alignment_in_llvm(&self, alloc_id: Option<AllocId>) -> bool {
         let this = self.eval_context_ref();
-        if let Some(alloc_id) = alloc_id {
-            if let Some(is_llvm) = this.is_foreign_allocation(alloc_id) {
-                (this.machine.lli_config.alignment_check)
-                    || (!is_llvm && this.machine.lli_config.alignment_check_rust)
-            } else {
-                this.machine.lli_config.alignment_check
-            }
-        } else {
-            false
+        match this.machine.lli_config.alignment_check {
+            ForeignAlignmentCheckMode::Skip => false,
+            ForeignAlignmentCheckMode::Check => true,
+            ForeignAlignmentCheckMode::CheckRustOnly =>
+                alloc_id.map(|id| this.is_foreign_allocation(id).unwrap_or(true)).unwrap_or(true),
         }
     }
 

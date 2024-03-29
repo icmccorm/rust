@@ -115,7 +115,7 @@ pub use crate::diagnostics::{
 };
 pub use crate::eval::{
     create_ecx, eval_entry, AlignmentCheck, BacktraceStyle, IsolatedOp, LLVMLoggingLevel,
-    MiriConfig, RejectOpWith,
+    ForeignAlignmentCheckMode, MiriConfig, RejectOpWith,
 };
 pub use crate::helpers::EvalContextExt as _;
 pub use crate::intptrcast::ProvenanceMode;

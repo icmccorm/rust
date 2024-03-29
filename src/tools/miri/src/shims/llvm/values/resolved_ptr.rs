@@ -89,24 +89,9 @@ impl ResolvedPointer {
         &self,
         ctx: &MiriInterpCx<'_, 'tcx>,
         access_size: Size,
-        access_alignment: Align,
+        _access_alignment: Align,
     ) -> InterpResult<'tcx, (Size, AllocRange)> {
         let this = ctx.eval_context_ref();
-        if let Some(logger) = &this.machine.llvm_logger {
-            if let Some(alloc_id) = self.alloc_id {
-                let offset_pointer = self.ptr.offset(self.offset, ctx)?;
-                let is_aligned = this.is_pointer_aligned(offset_pointer, access_alignment);
-                if !is_aligned {
-                    if let Some(is_llvm_allocation) = this.is_foreign_allocation(alloc_id) {
-                        if is_llvm_allocation {
-                            logger.log_flag(LLVMFlag::UnalignedAccessInLLVM);
-                        } else {
-                            logger.log_flag(LLVMFlag::UnalignedAccessInLLVMRust);
-                        }
-                    }
-                }
-            }
-        }
         if this.should_check_alignment_in_llvm(self.alloc_id) {
             Ok((access_size, alloc_range(Size::ZERO, access_size)))
         } else {

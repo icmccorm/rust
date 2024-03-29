@@ -86,13 +86,25 @@ pub enum LLVMLoggingLevel {
     Verbose,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ForeignAlignmentCheckMode {
+    Check,
+    CheckRustOnly,
+    Skip,
+}
+impl Default for ForeignAlignmentCheckMode {
+    fn default() -> Self {
+        ForeignAlignmentCheckMode::Check
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct LLIConfig {
-    pub alignment_check_rust: bool,
-    pub alignment_check: bool,
+    pub alignment_check: ForeignAlignmentCheckMode,
     pub zero_init: bool,
     pub read_uninit: bool,
 }
+
 
 /// Configuration needed to spawn a Miri instance.
 #[derive(Clone)]

@@ -38,8 +38,6 @@ pub enum LLVMFlag {
     CastPointerFromLLVMAtBoundary,
     AggregateAsBytes,
     VarArgFunction,
-    UnalignedAccessInLLVM,
-    UnalignedAccessInLLVMRust,
 }
 
 impl std::fmt::Display for LLVMFlag {
@@ -61,8 +59,6 @@ impl std::fmt::Display for LLVMFlag {
             LLVMFlag::CastPointerFromLLVMAtBoundary => "CastPointerFromLLVMAtBoundary",
             LLVMFlag::AggregateAsBytes => "AggregateAsBytes",
             LLVMFlag::VarArgFunction => "VarArgFunction",
-            LLVMFlag::UnalignedAccessInLLVM => "UnalignedAccessInLLVM",
-            LLVMFlag::UnalignedAccessInLLVMRust => "UnalignedAccessInLLVMRust",
             LLVMFlag::EnumOfNonNullablePointer => "EnumOfNonNullablePointer",
             LLVMFlag::ADTAsPointerFromRust => "ADTAsPointerFromRust",
         };
