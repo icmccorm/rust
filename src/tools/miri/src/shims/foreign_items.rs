@@ -856,10 +856,12 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let [ptr] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let ptr = this.read_pointer(ptr)?;
                 let (alloc_id, _, _) = this.ptr_get_alloc_id(ptr)?;
-                let base_address = Size::from_bytes(intptrcast::GlobalStateInner::alloc_base_addr(this, alloc_id)?);
+                let base_address = Size::from_bytes(intptrcast::GlobalStateInner::alloc_base_addr(
+                    this, alloc_id,
+                )?);
                 if base_address != ptr.addr() {
                     this.write_scalar(Scalar::from_u64(0), dest)?;
-                }else{
+                } else {
                     let (_, alloc) = this.memory.alloc_map().get(alloc_id).unwrap();
                     let size = alloc.size().bytes();
                     this.write_scalar(Scalar::from_u64(size), dest)?;
@@ -1209,9 +1211,7 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     // We only do this if we're not already executing LLVM code, because otherwise
                     // we would end up with endless stack overflows in cases where a system call is
                     // exposed as an LLVM function, but implemented in terms of itself.
-                    if this.has_llvm_interpreter()
-                        && !this.thread_is_lli_thread(this.get_active_thread())?
-                    {
+                    if this.has_llvm_interpreter() && !this.in_llvm()? {
                         if this.call_external_llvm_fct(link_name, dest, args)? {
                             return Ok(EmulateForeignItemResult::NeedsJumping);
                         }

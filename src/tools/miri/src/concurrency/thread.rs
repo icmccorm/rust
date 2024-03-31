@@ -131,7 +131,7 @@ pub struct Thread<'mir, 'tcx> {
     /// Name of the thread.
     thread_name: Option<Vec<u8>>,
 
-    pub thread_kind: Cell<ThreadKind<'tcx>>,
+    thread_kind: Cell<ThreadKind<'tcx>>,
 
     /// The virtual call stack.
     stack: Vec<Frame<'mir, 'tcx, Provenance, FrameExtra<'tcx>>>,
@@ -210,14 +210,14 @@ impl<'mir, 'tcx> Thread<'mir, 'tcx> {
     }
 
     pub fn is_llvm_thread(&self) -> bool {
-        self.is_llvm.get()
+        let kind = self.thread_kind.take();
+        let result = matches!(kind, ThreadKind::LLVM(_));
+        self.thread_kind.set(kind);
+        result || self.is_llvm.get()
     }
 
-    pub fn set_thread_kind(&self, thread_kind: ThreadKind<'tcx>) {
-        if let ThreadKind::LLVM(_) = thread_kind {
-            self.is_llvm.set(true);
-        }
-        self.thread_kind.set(thread_kind);
+    pub fn set_llvm_thread(&self, is_llvm: bool) {
+        self.is_llvm.set(is_llvm);
     }
 }
 
@@ -465,12 +465,6 @@ impl<'mir, 'tcx: 'mir> ThreadManager<'mir, 'tcx> {
         &self,
     ) -> impl Iterator<Item = &[Frame<'mir, 'tcx, Provenance, FrameExtra<'tcx>>]> {
         self.threads.iter().map(|t| &t.stack[..])
-    }
-
-    fn create_uninitialized_thread(&mut self) -> ThreadId {
-        let new_thread_id = ThreadId::new(self.threads.len());
-        self.threads.push(Thread::new(None, None));
-        new_thread_id
     }
 
     /// Create a new thread and returns its id.
@@ -914,16 +908,17 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     ) -> InterpResult<'tcx, ThreadId> {
         let this = self.eval_context_mut();
 
-        let uninit_thread_id = this.machine.threads.create_uninitialized_thread();
+        // Create the new thread
+        let new_thread_id = this.machine.threads.create_thread(Box::new(|_| Ok(Poll::Ready(()))));
+
         let current_span = this.machine.current_span();
         if let Some(data_race) = &mut this.machine.data_race {
-            data_race.thread_created(&this.machine.threads, uninit_thread_id, current_span);
+            data_race.thread_created(&this.machine.threads, new_thread_id, current_span);
         }
 
         let old_error_place = this.active_thread_mut().last_error.clone();
-
-        let prev = this.set_active_thread(uninit_thread_id);
-        let group_id = this.machine.threads.link_to_thread_group(prev, uninit_thread_id);
+        let prev = this.set_active_thread(new_thread_id);
+        let group_id = this.machine.threads.link_to_thread_group(prev, new_thread_id);
 
         if let Some(current_group_id) = this.machine.threads.lli_thread_group.get() {
             if group_id != current_group_id {
@@ -939,7 +934,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         debug!("Created Miri thread object for Rust to LLI call, TID: {:?}", group_id);
 
         unsafe {
-            engine.create_thread(uninit_thread_id.into(), function, args.as_slice());
+            engine.create_thread(new_thread_id.into(), function, args.as_slice());
         }
         if let Some(info) = this.get_foreign_error() {
             return Err(info);
@@ -949,7 +944,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         if let Some(link_type) = link_type {
             let link = ThreadLink::new(
                 prev,
-                uninit_thread_id,
+                new_thread_id,
                 link_type,
                 ThreadLinkSource::FromLLI(
                     function.get_type().get_return_type().map(|bte| bte.as_type_ref()),
@@ -975,10 +970,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let this = self.eval_context_mut();
 
         // Create the new thread
-        let new_thread_id = this.machine.threads.create_thread({
-            let mut state = tls::TlsDtorsState::default();
-            Box::new(move |m| state.on_stack_empty(m))
-        });
+        let new_thread_id = this.machine.threads.create_thread(Box::new(|_| Ok(Poll::Ready(()))));
 
         let old_error_place = this.active_thread_mut().last_error.clone();
 
@@ -1283,7 +1275,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             match this.machine.threads.schedule(&this.machine.clock)? {
                 SchedulingAction::ExecuteStep => {
                     let id = this.get_active_thread();
-                    if this.thread_is_lli_thread(id)? {
+                    if this.in_llvm()? {
                         let ready_to_terminate = this.step_lli_thread(id)?;
                         if ready_to_terminate {
                             if let ThreadKind::LLVM(link) =
@@ -1302,10 +1294,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                             match this.run_on_stack_empty()? {
                                 Poll::Pending => {} // keep going
                                 Poll::Ready(()) => {
+                                    debug!("Finalizing");
                                     if let ThreadKind::MiriLinked(link) =
                                         this.active_thread_mut().thread_kind.take()
                                     {
                                         link.finalize(this)?;
+                                        this.terminate_active_thread()?
                                     }
                                     this.terminate_active_thread()?
                                 }

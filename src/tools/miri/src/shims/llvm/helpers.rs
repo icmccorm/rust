@@ -2,12 +2,11 @@ extern crate either;
 extern crate rustc_abi;
 use super::values::resolved_ptr::ResolvedPointer;
 use crate::concurrency::thread::EvalContextExt as _;
+use crate::eval::ForeignAlignmentCheckMode;
 use crate::helpers::EvalContextExt as HelperEvalExt;
 use crate::rustc_const_eval::interpret::AllocMap;
 use crate::rustc_middle::ty::layout::LayoutOf;
 use crate::shims::llvm::logging::LLVMFlag;
-use crate::shims::llvm_ffi_support::EvalContextExt as _;
-use crate::eval::ForeignAlignmentCheckMode;
 use crate::throw_unsup_llvm_type;
 use crate::throw_unsup_shim_llvm_type;
 use crate::AlignmentCheck;
@@ -498,8 +497,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
     fn in_llvm(&self) -> InterpResult<'tcx, bool> {
         let this = self.eval_context_ref();
-        Ok(this.active_thread_ref().is_llvm_thread()
-            || this.thread_is_lli_thread(this.get_active_thread())?)
+        Ok(this.active_thread_ref().is_llvm_thread())
     }
 
     fn strcmp(

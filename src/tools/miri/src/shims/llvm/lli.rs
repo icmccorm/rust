@@ -116,8 +116,9 @@ impl LLI {
 
     pub fn run_constructors<'tcx>(&self, miri: &mut MiriInterpCx<'_, 'tcx>) -> InterpResult<'tcx> {
         self.with_engine(|engine| {
+            miri.active_thread_ref().set_llvm_thread(true);
             let engine = engine.as_ref().unwrap();
-            unsafe {
+            let result = unsafe {
                 let constructors = engine.get_constructors();
                 if constructors.len() > 0 {
                     if let Some(logger) = &mut miri.eval_context_mut().machine.llvm_logger {
@@ -127,13 +128,16 @@ impl LLI {
                 constructors
                     .iter()
                     .try_for_each(|cstor| miri.run_lli_function_to_completion(engine, *cstor))
-            }
+            };
+            miri.active_thread_ref().set_llvm_thread(false);
+            result
         })
     }
     pub fn run_destructors<'tcx>(&self, miri: &mut MiriInterpCx<'_, 'tcx>) -> InterpResult<'tcx> {
         self.with_engine(|engine| {
+            miri.active_thread_ref().set_llvm_thread(true);
             let engine = engine.as_ref().unwrap();
-            unsafe {
+            let result = unsafe {
                 let destructors = engine.get_destructors();
                 if destructors.len() > 0 {
                     if let Some(logger) = &mut miri.eval_context_mut().machine.llvm_logger {
@@ -143,7 +147,9 @@ impl LLI {
                 destructors
                     .iter()
                     .try_for_each(|dstor| miri.run_lli_function_to_completion(engine, *dstor))
-            }
+            };
+            miri.active_thread_ref().set_llvm_thread(false);
+            result
         })
     }
 

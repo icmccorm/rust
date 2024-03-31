@@ -104,7 +104,7 @@ impl<'tcx, 'lli> LLVMArgumentConverter<'tcx, 'lli> {
             let mut next_llvm_type = if self.llvm_types.is_empty() && !is_var_arg {
                 self.error()?
             } else {
-                *self.peek_type().unwrap()
+                self.peek_type().map(|f| *f).flatten()
             };
             if let Some(llvm_type) = next_llvm_type {
                 if self.can_expand_aggregate(this, &current_arg, &llvm_type)? {

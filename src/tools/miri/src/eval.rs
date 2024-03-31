@@ -6,15 +6,14 @@ use std::path::PathBuf;
 use std::task::Poll;
 use std::thread;
 
-use log::info;
-use rustc_middle::ty::Ty;
-
 use crate::borrow_tracker::RetagFields;
 use crate::diagnostics::report_leaks;
-use crate::shims::llvm::lli::{LLI, LLVM_INTERPRETER};
+use crate::shims::llvm_ffi_support::EvalContextExt;
+use log::info;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def::Namespace;
 use rustc_hir::def_id::DefId;
+use rustc_middle::ty::Ty;
 use rustc_middle::ty::{
     self,
     layout::{LayoutCx, LayoutOf},
@@ -104,7 +103,6 @@ pub struct LLIConfig {
     pub zero_init: bool,
     pub read_uninit: bool,
 }
-
 
 /// Configuration needed to spawn a Miri instance.
 #[derive(Clone)]
@@ -486,19 +484,8 @@ pub fn eval_entry<'tcx>(
     let llvm_error = if !config.disable_bc
         && (!config.external_bc_files.is_empty() || config.singular_llvm_bc_file.is_some())
     {
-        LLVM_INTERPRETER.lock().replace_with(|_| {
-            let mut interpreter = if let Some(path_buff) = config.singular_llvm_bc_file {
-                let mut set = FxHashSet::default();
-                set.insert(path_buff);
-                LLI::create(&mut ecx, &set)
-            } else {
-                LLI::create(&mut ecx, &config.external_bc_files)
-            };
-            interpreter.initialize_engine(&mut ecx).unwrap();
-            Some(interpreter)
-        });
-        let result = LLVM_INTERPRETER.lock().borrow().as_ref().unwrap().run_constructors(&mut ecx);
-        if let Err(err) = result { Some(err) } else { None }
+        ecx.init_llvm_interpreter(&config);
+        MiriInterpCx::<'_, '_>::with_lli_opt(|lli| lli.run_constructors(&mut ecx).err()).flatten()
     } else {
         None
     };
@@ -523,18 +510,8 @@ pub fn eval_entry<'tcx>(
     // Machine cleanup. Only do this if all threads have terminated; threads that are still running
     // might cause Stacked Borrows errors (https://github.com/rust-lang/miri/issues/2396).
     let destructor_error = if ecx.have_all_terminated() {
-        let result = if LLVM_INTERPRETER.lock().borrow().as_ref().is_some() {
-            if let Err(err) =
-                LLVM_INTERPRETER.lock().borrow().as_ref().unwrap().run_destructors(&mut ecx)
-            {
-                Some(err)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
+        let result =
+            MiriInterpCx::<'_, '_>::with_lli_opt(|ll| ll.run_destructors(&mut ecx).err()).flatten();
         // Even if all threads have terminated, we have to beware of data races since some threads
         // might not have joined the main thread (https://github.com/rust-lang/miri/issues/2020,
         // https://github.com/rust-lang/miri/issues/2508).

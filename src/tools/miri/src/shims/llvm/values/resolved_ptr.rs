@@ -37,8 +37,7 @@ impl ResolvedPointer {
         (AllocRef<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>>, AllocRange),
     > {
         let (size, range) = self.get_access_size_range(ctx, access_size, align)?;
-        let alloc_reference =
-            unsafe { ctx.get_ptr_alloc_range(self.ptr, size, range, align)? };
+        let alloc_reference = unsafe { ctx.get_ptr_alloc_range(self.ptr, size, range, align)? };
         if let Some(ar) = alloc_reference {
             Ok((ar, range))
         } else {
@@ -57,8 +56,7 @@ impl ResolvedPointer {
         (AllocRefMut<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>>, AllocRange),
     > {
         let (size, range) = self.get_access_size_range(ctx, access_size, align)?;
-        let alloc_reference =
-            unsafe { ctx.get_ptr_alloc_mut_range(self.ptr, size, range, align)? };
+        let alloc_reference = unsafe { ctx.get_ptr_alloc_mut_range(self.ptr, size, range, align)? };
         if let Some(ar) = alloc_reference {
             Ok((ar, range))
         } else {
