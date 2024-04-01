@@ -491,7 +491,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             ForeignAlignmentCheckMode::Skip => false,
             ForeignAlignmentCheckMode::Check => true,
             ForeignAlignmentCheckMode::CheckRustOnly =>
-                alloc_id.map(|id| this.is_foreign_allocation(id).unwrap_or(true)).unwrap_or(true),
+                alloc_id.map(|id| !this.is_foreign_allocation(id).unwrap_or(false)).unwrap_or(false),
         }
     }
 
