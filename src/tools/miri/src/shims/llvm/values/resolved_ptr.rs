@@ -36,7 +36,7 @@ impl ResolvedPointer {
         'tcx,
         (AllocRef<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>>, AllocRange),
     > {
-        let (size, range) = self.get_access_size_range(ctx, access_size, align)?;
+        let (size, align, range) = self.get_access_size_range(ctx, access_size, align)?;
         let alloc_reference = unsafe { ctx.get_ptr_alloc_range(self.ptr, size, range, align)? };
         if let Some(ar) = alloc_reference {
             Ok((ar, range))
@@ -55,7 +55,7 @@ impl ResolvedPointer {
         'tcx,
         (AllocRefMut<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>>, AllocRange),
     > {
-        let (size, range) = self.get_access_size_range(ctx, access_size, align)?;
+        let (size, align, range) = self.get_access_size_range(ctx, access_size, align)?;
         let alloc_reference = unsafe { ctx.get_ptr_alloc_mut_range(self.ptr, size, range, align)? };
         if let Some(ar) = alloc_reference {
             Ok((ar, range))
@@ -87,13 +87,13 @@ impl ResolvedPointer {
         &self,
         ctx: &MiriInterpCx<'_, 'tcx>,
         access_size: Size,
-        _access_alignment: Align,
-    ) -> InterpResult<'tcx, (Size, AllocRange)> {
+        access_align: Align,
+    ) -> InterpResult<'tcx, (Size, Align, AllocRange)> {
         let this = ctx.eval_context_ref();
         if this.should_check_alignment_in_llvm(self.alloc_id) {
-            Ok((access_size, alloc_range(Size::ZERO, access_size)))
+            Ok((access_size, access_align, alloc_range(Size::ZERO, access_size)))
         } else {
-            Ok((self.offset + access_size, alloc_range(self.offset, access_size)))
+            Ok((self.offset + access_size, self.align, alloc_range(self.offset, access_size)))
         }
     }
 
