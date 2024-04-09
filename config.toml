@@ -1,29 +1,3 @@
-# Use different pre-set defaults than the global defaults.
-#
-# See `src/bootstrap/defaults` for more information.
-# Note that this has no default value (x.py uses the defaults in `config.example.toml`).
-profile = 'dist'
-
-# Keeps track of the last version of `x.py` used.
-# If `changelog-seen` does not match the version that is currently running,
-# `x.py` will prompt you to update it and to read the changelog.
-# See `src/bootstrap/CHANGELOG.md` for more information.
-changelog-seen = 2
-
-[llvm]
-
-[build]
-
-# Arguments passed to the `./configure` script, used during distcheck. You
-# probably won't fill this in but rather it's filled in by the `./configure`
-# script. Useful for debugging.
-configure-args = []
-
-[install]
-
-[rust]
-
-[target.x86_64-unknown-linux-gnu]
-
-[dist]
-
+# Includes one of the default files in src/bootstrap/defaults
+profile = "dist"
+change-id = 121754
