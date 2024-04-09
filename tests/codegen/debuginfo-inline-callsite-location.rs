@@ -1,12 +1,12 @@
-// compile-flags: -g -O
+//@ compile-flags: -g -O
 
 // Check that each inline call site for the same function uses the same "sub-program" so that LLVM
 // can correctly merge the debug info if it merges the inlined code (e.g., for merging of tail
 // calls to panic.
 
-// CHECK:       tail call void @_ZN4core9panicking5panic17h{{([0-9a-z]{16})}}E
+// CHECK:       tail call void @{{[A-Za-z0-9_]+4core6option13unwrap_failed}}
 // CHECK-SAME:  !dbg ![[#first_dbg:]]
-// CHECK:       tail call void @_ZN4core9panicking5panic17h{{([0-9a-z]{16})}}E
+// CHECK:       tail call void @{{[A-Za-z0-9_]+4core6option13unwrap_failed}}
 // CHECK-SAME:  !dbg ![[#second_dbg:]]
 
 // CHECK-DAG:   ![[#func_dbg:]] = distinct !DISubprogram(name: "unwrap<i32>"

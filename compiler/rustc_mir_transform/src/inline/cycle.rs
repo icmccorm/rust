@@ -5,6 +5,7 @@ use rustc_middle::mir::TerminatorKind;
 use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::{self, GenericArgsRef, InstanceDef, TyCtxt};
 use rustc_session::Limit;
+use rustc_span::sym;
 
 // FIXME: check whether it is cheaper to precompute the entire call graph instead of invoking
 // this query ridiculously often.
@@ -80,20 +81,22 @@ pub(crate) fn mir_callgraph_reachable<'tcx>(
                 }
                 // These have no own callable MIR.
                 InstanceDef::Intrinsic(_) | InstanceDef::Virtual(..) => continue,
-                // These have MIR and if that MIR is inlined, substituted and then inlining is run
+                // These have MIR and if that MIR is inlined, instantiated and then inlining is run
                 // again, a function item can end up getting inlined. Thus we'll be able to cause
                 // a cycle that way
                 InstanceDef::VTableShim(_)
-                | InstanceDef::ReifyShim(_)
+                | InstanceDef::ReifyShim(..)
                 | InstanceDef::FnPtrShim(..)
                 | InstanceDef::ClosureOnceShim { .. }
+                | InstanceDef::ConstructCoroutineInClosureShim { .. }
+                | InstanceDef::CoroutineKindShim { .. }
                 | InstanceDef::ThreadLocalShim { .. }
                 | InstanceDef::CloneShim(..) => {}
 
                 // This shim does not call any other functions, thus there can be no recursion.
                 InstanceDef::FnPtrAddrShim(..) => continue,
                 InstanceDef::DropGlue(..) => {
-                    // FIXME: A not fully substituted drop shim can cause ICEs if one attempts to
+                    // FIXME: A not fully instantiated drop shim can cause ICEs if one attempts to
                     // have its MIR built. Likely oli-obk just screwed up the `ParamEnv`s, so this
                     // needs some more analysis.
                     if callee.has_param() {
@@ -162,11 +165,20 @@ pub(crate) fn mir_inliner_callees<'tcx>(
     let mut calls = FxIndexSet::default();
     for bb_data in body.basic_blocks.iter() {
         let terminator = bb_data.terminator();
-        if let TerminatorKind::Call { func, .. } = &terminator.kind {
+        if let TerminatorKind::Call { func, args: call_args, .. } = &terminator.kind {
             let ty = func.ty(&body.local_decls, tcx);
-            let call = match ty.kind() {
-                ty::FnDef(def_id, args) => (*def_id, *args),
-                _ => continue,
+            let ty::FnDef(def_id, generic_args) = ty.kind() else {
+                continue;
+            };
+            let call = if tcx.is_intrinsic(*def_id, sym::const_eval_select) {
+                let func = &call_args[2].node;
+                let ty = func.ty(&body.local_decls, tcx);
+                let ty::FnDef(def_id, generic_args) = ty.kind() else {
+                    continue;
+                };
+                (*def_id, *generic_args)
+            } else {
+                (*def_id, *generic_args)
             };
             calls.insert(call);
         }

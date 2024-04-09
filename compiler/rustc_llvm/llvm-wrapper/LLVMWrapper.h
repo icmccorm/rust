@@ -1,3 +1,5 @@
+#include "SuppressLLVMWarnings.h"
+
 #include "llvm-c/BitReader.h"
 #include "llvm-c/Core.h"
 #include "llvm-c/Object.h"
@@ -25,7 +27,6 @@
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Instrumentation.h"
 #include "llvm/Transforms/Scalar.h"
-#include "llvm/Transforms/Vectorize.h"
 
 #define LLVM_VERSION_GE(major, minor)                                          \
   (LLVM_VERSION_MAJOR > (major) ||                                             \
@@ -43,11 +44,7 @@
 #include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/Linker/Linker.h"
 
-#if LLVM_VERSION_GE(16, 0)
 #include "llvm/TargetParser/Triple.h"
-#else
-#include "llvm/ADT/Triple.h"
-#endif
 
 extern "C" void LLVMRustSetLastError(const char *);
 
@@ -79,7 +76,6 @@ enum LLVMRustAttribute {
   SanitizeMemory = 22,
   NonLazyBind = 23,
   OptimizeNone = 24,
-  ReturnsTwice = 25,
   ReadNone = 26,
   SanitizeHWAddress = 28,
   WillReturn = 29,
@@ -94,6 +90,7 @@ enum LLVMRustAttribute {
   AllocatedPointer = 38,
   AllocAlign = 39,
   SanitizeSafeStack = 40,
+  FnRetThunkExtern = 41,
 };
 
 typedef struct OpaqueRustString *RustStringRef;

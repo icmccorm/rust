@@ -1,7 +1,7 @@
 // Regression tests for issue #55414, expansion happens in the value of a key-value attribute,
 // and the expanded expression is more complex than simply a macro call.
 
-// aux-build:key-value-expansion.rs
+//@ aux-build:key-value-expansion.rs
 
 #![feature(rustc_attrs)]
 
@@ -18,13 +18,13 @@ macro_rules! bug {
 
 // Any expressions containing macro call `X` that's more complex than `X` itself.
 // Parentheses will work.
-bug!((column!())); //~ ERROR unexpected expression: `(7u32)`
+bug!((column!())); //~ ERROR attribute value must be a literal
 
 // Original test case.
 
 macro_rules! bug {
     () => {
-        bug!("bug" + stringify!(found)); //~ ERROR unexpected expression: `"bug" + "found"`
+        bug!("bug" + stringify!(found)); //~ ERROR attribute value must be a literal
     };
     ($test:expr) => {
         #[doc = $test]
@@ -46,7 +46,7 @@ macro_rules! doc_comment {
 macro_rules! some_macro {
     ($t1: ty) => {
         doc_comment! {format!("{coor}", coor = stringify!($t1)).as_str()}
-        //~^ ERROR unexpected expression: `{
+        //~^ ERROR attribute value must be a literal
     };
 }
 

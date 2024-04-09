@@ -1,16 +1,18 @@
 use clippy_utils::diagnostics::{span_lint_hir, span_lint_hir_and_then};
 use clippy_utils::source::snippet_opt;
 use clippy_utils::ty::has_drop;
-use clippy_utils::{get_parent_node, is_lint_allowed, peel_blocks};
+use clippy_utils::{any_parent_is_automatically_derived, is_lint_allowed, path_to_local, peel_blocks};
 use rustc_errors::Applicability;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::{
-    is_range_literal, BinOpKind, BlockCheckMode, Expr, ExprKind, ItemKind, Node, PatKind, Stmt, StmtKind, UnsafeSource,
+    is_range_literal, BinOpKind, BlockCheckMode, Expr, ExprKind, HirId, HirIdMap, ItemKind, LocalSource, Node, PatKind,
+    Stmt, StmtKind, UnsafeSource,
 };
 use rustc_infer::infer::TyCtxtInferExt as _;
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::lint::in_external_macro;
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::impl_lint_pass;
+use rustc_span::Span;
 use std::ops::Deref;
 
 declare_clippy_lint! {
@@ -23,7 +25,7 @@ declare_clippy_lint! {
     /// readable.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// 0;
     /// ```
     #[clippy::version = "pre 1.29.0"]
@@ -40,10 +42,6 @@ declare_clippy_lint! {
     /// Unlike dead code, these bindings are actually
     /// executed. However, as they have no effect and shouldn't be used further on, all they
     /// do is make the code less readable.
-    ///
-    /// ### Known problems
-    /// Further usage of this variable is not checked, which can lead to false positives if it is
-    /// used later in the code.
     ///
     /// ### Example
     /// ```rust,ignore
@@ -74,87 +72,150 @@ declare_clippy_lint! {
     "outer expressions with no effect"
 }
 
-declare_lint_pass!(NoEffect => [NO_EFFECT, UNNECESSARY_OPERATION, NO_EFFECT_UNDERSCORE_BINDING]);
+#[derive(Default)]
+pub struct NoEffect {
+    underscore_bindings: HirIdMap<Span>,
+    local_bindings: Vec<Vec<HirId>>,
+}
+
+impl_lint_pass!(NoEffect => [NO_EFFECT, UNNECESSARY_OPERATION, NO_EFFECT_UNDERSCORE_BINDING]);
 
 impl<'tcx> LateLintPass<'tcx> for NoEffect {
     fn check_stmt(&mut self, cx: &LateContext<'tcx>, stmt: &'tcx Stmt<'_>) {
-        if check_no_effect(cx, stmt) {
+        if self.check_no_effect(cx, stmt) {
             return;
         }
         check_unnecessary_operation(cx, stmt);
     }
-}
 
-fn check_no_effect(cx: &LateContext<'_>, stmt: &Stmt<'_>) -> bool {
-    if let StmtKind::Semi(expr) = stmt.kind {
-        if has_no_effect(cx, expr) {
-            span_lint_hir_and_then(
-                cx,
-                NO_EFFECT,
-                expr.hir_id,
-                stmt.span,
-                "statement with no effect",
-                |diag| {
-                    for parent in cx.tcx.hir().parent_iter(stmt.hir_id) {
-                        if let Node::Item(item) = parent.1
-                            && let ItemKind::Fn(..) = item.kind
-                            && let Some(Node::Block(block)) = get_parent_node(cx.tcx, stmt.hir_id)
-                            && let [.., final_stmt] = block.stmts
-                            && final_stmt.hir_id == stmt.hir_id
-                        {
-                            let expr_ty = cx.typeck_results().expr_ty(expr);
-                            let mut ret_ty = cx.tcx.fn_sig(item.owner_id).instantiate_identity().output().skip_binder();
+    fn check_block(&mut self, _: &LateContext<'tcx>, _: &'tcx rustc_hir::Block<'tcx>) {
+        self.local_bindings.push(Vec::default());
+    }
 
-                            // Remove `impl Future<Output = T>` to get `T`
-                            if cx.tcx.ty_is_opaque_future(ret_ty) &&
-                                let Some(true_ret_ty) = cx.tcx.infer_ctxt().build().get_impl_future_output_ty(ret_ty)
-                            {
-                                ret_ty = true_ret_ty;
-                            }
-
-                            if !ret_ty.is_unit() && ret_ty == expr_ty {
-                                diag.span_suggestion(
-                                    stmt.span.shrink_to_lo(),
-                                    "did you mean to return it?",
-                                    "return ",
-                                    Applicability::MaybeIncorrect,
-                                );
-                            }
-                        }
-                    }
-                },
-            );
-            return true;
-        }
-    } else if let StmtKind::Local(local) = stmt.kind {
-        if_chain! {
-            if !is_lint_allowed(cx, NO_EFFECT_UNDERSCORE_BINDING, local.hir_id);
-            if let Some(init) = local.init;
-            if local.els.is_none();
-            if !local.pat.span.from_expansion();
-            if has_no_effect(cx, init);
-            if let PatKind::Binding(_, _, ident, _) = local.pat.kind;
-            if ident.name.to_ident_string().starts_with('_');
-            then {
+    fn check_block_post(&mut self, cx: &LateContext<'tcx>, _: &'tcx rustc_hir::Block<'tcx>) {
+        for hir_id in self.local_bindings.pop().unwrap() {
+            // FIXME(rust/#120456) - is `swap_remove` correct?
+            if let Some(span) = self.underscore_bindings.swap_remove(&hir_id) {
                 span_lint_hir(
                     cx,
                     NO_EFFECT_UNDERSCORE_BINDING,
-                    init.hir_id,
-                    stmt.span,
-                    "binding to `_` prefixed variable with no side-effect"
+                    hir_id,
+                    span,
+                    "binding to `_` prefixed variable with no side-effect",
                 );
-                return true;
             }
         }
     }
-    false
+
+    fn check_expr(&mut self, _: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
+        if let Some(def_id) = path_to_local(expr) {
+            // FIXME(rust/#120456) - is `swap_remove` correct?
+            self.underscore_bindings.swap_remove(&def_id);
+        }
+    }
+}
+
+impl NoEffect {
+    fn check_no_effect(&mut self, cx: &LateContext<'_>, stmt: &Stmt<'_>) -> bool {
+        if let StmtKind::Semi(expr) = stmt.kind {
+            // move `expr.span.from_expansion()` ahead
+            if expr.span.from_expansion() {
+                return false;
+            }
+            let expr = peel_blocks(expr);
+
+            if is_operator_overridden(cx, expr) {
+                // Return `true`, to prevent `check_unnecessary_operation` from
+                // linting on this statement as well.
+                return true;
+            }
+            if has_no_effect(cx, expr) {
+                span_lint_hir_and_then(
+                    cx,
+                    NO_EFFECT,
+                    expr.hir_id,
+                    stmt.span,
+                    "statement with no effect",
+                    |diag| {
+                        for parent in cx.tcx.hir().parent_iter(stmt.hir_id) {
+                            if let Node::Item(item) = parent.1
+                                && let ItemKind::Fn(..) = item.kind
+                                && let Node::Block(block) = cx.tcx.parent_hir_node(stmt.hir_id)
+                                && let [.., final_stmt] = block.stmts
+                                && final_stmt.hir_id == stmt.hir_id
+                            {
+                                let expr_ty = cx.typeck_results().expr_ty(expr);
+                                let mut ret_ty = cx
+                                    .tcx
+                                    .fn_sig(item.owner_id)
+                                    .instantiate_identity()
+                                    .output()
+                                    .skip_binder();
+
+                                // Remove `impl Future<Output = T>` to get `T`
+                                if cx.tcx.ty_is_opaque_future(ret_ty)
+                                    && let Some(true_ret_ty) =
+                                        cx.tcx.infer_ctxt().build().get_impl_future_output_ty(ret_ty)
+                                {
+                                    ret_ty = true_ret_ty;
+                                }
+
+                                if !ret_ty.is_unit() && ret_ty == expr_ty {
+                                    diag.span_suggestion(
+                                        stmt.span.shrink_to_lo(),
+                                        "did you mean to return it?",
+                                        "return ",
+                                        Applicability::MaybeIncorrect,
+                                    );
+                                }
+                            }
+                        }
+                    },
+                );
+                return true;
+            }
+        } else if let StmtKind::Let(local) = stmt.kind {
+            if !is_lint_allowed(cx, NO_EFFECT_UNDERSCORE_BINDING, local.hir_id)
+                && !matches!(local.source, LocalSource::AsyncFn)
+                && let Some(init) = local.init
+                && local.els.is_none()
+                && !local.pat.span.from_expansion()
+                && has_no_effect(cx, init)
+                && let PatKind::Binding(_, hir_id, ident, _) = local.pat.kind
+                && ident.name.to_ident_string().starts_with('_')
+                && !any_parent_is_automatically_derived(cx.tcx, local.hir_id)
+            {
+                if let Some(l) = self.local_bindings.last_mut() {
+                    l.push(hir_id);
+                    self.underscore_bindings.insert(hir_id, ident.span);
+                }
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn is_operator_overridden(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+    // It's very hard or impossible to check whether overridden operator have side-effect this lint.
+    // So, this function assume user-defined operator is overridden with an side-effect.
+    // The definition of user-defined structure here is ADT-type,
+    // Althrough this will weaken the ability of this lint, less error lint-fix happen.
+    match expr.kind {
+        ExprKind::Binary(..) | ExprKind::Unary(..) => {
+            // No need to check type of `lhs` and `rhs`
+            // because if the operator is overridden, at least one operand is ADT type
+
+            // reference: rust/compiler/rustc_middle/src/ty/typeck_results.rs: `is_method_call`.
+            // use this function to check whether operator is overridden in `ExprKind::{Binary, Unary}`.
+            cx.typeck_results().is_method_call(expr)
+        },
+        _ => false,
+    }
 }
 
 fn has_no_effect(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
-    if expr.span.from_expansion() {
-        return false;
-    }
-    match peel_blocks(expr).kind {
+    match expr.kind {
         ExprKind::Lit(..) | ExprKind::Closure { .. } => true,
         ExprKind::Path(..) => !has_drop(cx, cx.typeck_results().expr_ty(expr)),
         ExprKind::Index(a, b, _) | ExprKind::Binary(_, a, b) => has_no_effect(cx, a) && has_no_effect(cx, b),
@@ -194,63 +255,60 @@ fn has_no_effect(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
 }
 
 fn check_unnecessary_operation(cx: &LateContext<'_>, stmt: &Stmt<'_>) {
-    if_chain! {
-        if let StmtKind::Semi(expr) = stmt.kind;
-        let ctxt = stmt.span.ctxt();
-        if expr.span.ctxt() == ctxt;
-        if let Some(reduced) = reduce_expression(cx, expr);
-        if !in_external_macro(cx.sess(), stmt.span);
-        if reduced.iter().all(|e| e.span.ctxt() == ctxt);
-        then {
-            if let ExprKind::Index(..) = &expr.kind {
-                let snippet = if let (Some(arr), Some(func)) =
-                    (snippet_opt(cx, reduced[0].span), snippet_opt(cx, reduced[1].span))
-                {
+    if let StmtKind::Semi(expr) = stmt.kind
+        && let ctxt = stmt.span.ctxt()
+        && expr.span.ctxt() == ctxt
+        && let Some(reduced) = reduce_expression(cx, expr)
+        && !in_external_macro(cx.sess(), stmt.span)
+        && reduced.iter().all(|e| e.span.ctxt() == ctxt)
+    {
+        if let ExprKind::Index(..) = &expr.kind {
+            let snippet =
+                if let (Some(arr), Some(func)) = (snippet_opt(cx, reduced[0].span), snippet_opt(cx, reduced[1].span)) {
                     format!("assert!({}.len() > {});", &arr, &func)
                 } else {
                     return;
                 };
-                span_lint_hir_and_then(
-                    cx,
-                    UNNECESSARY_OPERATION,
-                    expr.hir_id,
-                    stmt.span,
-                    "unnecessary operation",
-                    |diag| {
-                        diag.span_suggestion(
-                            stmt.span,
-                            "statement can be written as",
-                            snippet,
-                            Applicability::MaybeIncorrect,
-                        );
-                    },
-                );
-            } else {
-                let mut snippet = String::new();
-                for e in reduced {
-                    if let Some(snip) = snippet_opt(cx, e.span) {
-                        snippet.push_str(&snip);
-                        snippet.push(';');
-                    } else {
-                        return;
-                    }
+            span_lint_hir_and_then(
+                cx,
+                UNNECESSARY_OPERATION,
+                expr.hir_id,
+                stmt.span,
+                "unnecessary operation",
+                |diag| {
+                    diag.span_suggestion(
+                        stmt.span,
+                        "statement can be written as",
+                        snippet,
+                        Applicability::MaybeIncorrect,
+                    );
+                },
+            );
+        } else {
+            let mut snippet = String::new();
+            for e in reduced {
+                if let Some(snip) = snippet_opt(cx, e.span) {
+                    snippet.push_str(&snip);
+                    snippet.push(';');
+                } else {
+                    return;
                 }
-                span_lint_hir_and_then(
-                    cx,
-                    UNNECESSARY_OPERATION,
-                    expr.hir_id,
-                    stmt.span,
-                    "unnecessary operation",
-                    |diag| {
-                        diag.span_suggestion(
-                            stmt.span,
-                            "statement can be reduced to",
-                            snippet,
-                            Applicability::MachineApplicable,
-                        );
-                    },
-                );
             }
+            span_lint_hir_and_then(
+                cx,
+                UNNECESSARY_OPERATION,
+                expr.hir_id,
+                stmt.span,
+                "unnecessary operation",
+                |diag| {
+                    diag.span_suggestion(
+                        stmt.span,
+                        "statement can be reduced to",
+                        snippet,
+                        Applicability::MachineApplicable,
+                    );
+                },
+            );
         }
     }
 }
@@ -298,7 +356,7 @@ fn reduce_expression<'a>(cx: &LateContext<'_>, expr: &'a Expr<'a>) -> Option<Vec
             }
         },
         ExprKind::Block(block, _) => {
-            if block.stmts.is_empty() {
+            if block.stmts.is_empty() && !block.targeted_by_break {
                 block.expr.as_ref().and_then(|e| {
                     match block.rules {
                         BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided) => None,

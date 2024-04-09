@@ -1,6 +1,4 @@
-// check-pass
-
-#![feature(ptr_from_ref)]
+//@ check-pass
 
 use std::ptr;
 

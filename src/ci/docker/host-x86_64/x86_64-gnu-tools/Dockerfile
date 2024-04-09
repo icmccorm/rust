@@ -56,10 +56,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   lsb-release \
   xdg-utils \
   wget \
+  # libgccjit dependencies
+  flex \
+  libmpfr-dev \
+  libgmp-dev \
+  libmpc3 \
+  libmpc-dev \
   && rm -rf /var/lib/apt/lists/*
 
 COPY scripts/sccache.sh /scripts/
 RUN sh /scripts/sccache.sh
+
+# Fix rustc_codegen_gcc lto issues.
+ENV GCC_EXEC_PREFIX="/usr/lib/gcc/"
 
 COPY host-x86_64/x86_64-gnu-tools/checktools.sh /tmp/
 
@@ -81,7 +90,15 @@ RUN npm install -g browser-ui-test@$(head -n 1 /tmp/browser-ui-test.version) --u
 
 ENV RUST_CONFIGURE_ARGS \
   --build=x86_64-unknown-linux-gnu \
-  --save-toolstates=/tmp/toolstate/toolstates.json
+  --save-toolstates=/tmp/toolstate/toolstates.json \
+  --enable-new-symbol-mangling
+
+ENV HOST_TARGET x86_64-unknown-linux-gnu
+
+COPY host-x86_64/dist-x86_64-linux/shared.sh /scripts/
+COPY host-x86_64/dist-x86_64-linux/build-gccjit.sh /scripts/
+
+RUN /scripts/build-gccjit.sh /scripts
 
 ENV SCRIPT /tmp/checktools.sh ../x.py && \
   NODE_PATH=`npm root -g` python3 ../x.py test tests/rustdoc-gui --stage 2 \

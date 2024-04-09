@@ -20,8 +20,7 @@ fn empty_arm_has_comment(cx: &LateContext<'_>, span: Span) -> bool {
     if let Some(ff) = get_source_text(cx, span)
         && let Some(text) = ff.as_str()
     {
-        text.as_bytes().windows(2)
-            .any(|w| w == b"//" || w == b"/*")
+        text.as_bytes().windows(2).any(|w| w == b"//" || w == b"/*")
     } else {
         false
     }
@@ -51,28 +50,20 @@ pub(crate) fn check(cx: &LateContext<'_>, ex: &Expr<'_>, arms: &[Arm<'_>], expr:
             // block with 2+ statements or 1 expr and 1+ statement
             Some(els)
         } else {
-            // not a block or an emtpy block w/ comments, don't lint
+            // not a block or an empty block w/ comments, don't lint
             return;
         };
 
         let ty = cx.typeck_results().expr_ty(ex);
-        if *ty.kind() != ty::Bool || is_lint_allowed(cx, MATCH_BOOL, ex.hir_id) {
-            check_single_pattern(cx, ex, arms, expr, els);
-            check_opt_like(cx, ex, arms, expr, ty, els);
+        if (*ty.kind() != ty::Bool || is_lint_allowed(cx, MATCH_BOOL, ex.hir_id)) &&
+            (check_single_pattern(arms) || check_opt_like(cx, arms, ty)) {
+            report_single_pattern(cx, ex, arms, expr, els);
         }
     }
 }
 
-fn check_single_pattern(
-    cx: &LateContext<'_>,
-    ex: &Expr<'_>,
-    arms: &[Arm<'_>],
-    expr: &Expr<'_>,
-    els: Option<&Expr<'_>>,
-) {
-    if is_wild(arms[1].pat) {
-        report_single_pattern(cx, ex, arms, expr, els);
-    }
+fn check_single_pattern(arms: &[Arm<'_>]) -> bool {
+    is_wild(arms[1].pat)
 }
 
 fn report_single_pattern(
@@ -90,68 +81,61 @@ fn report_single_pattern(
     });
 
     let (pat, pat_ref_count) = peel_hir_pat_refs(arms[0].pat);
-    let (msg, sugg) = if_chain! {
-        if let PatKind::Path(_) | PatKind::Lit(_) = pat.kind;
-        let (ty, ty_ref_count) = peel_mid_ty_refs(cx.typeck_results().expr_ty(ex));
-        if let Some(spe_trait_id) = cx.tcx.lang_items().structural_peq_trait();
-        if let Some(pe_trait_id) = cx.tcx.lang_items().eq_trait();
-        if ty.is_integral() || ty.is_char() || ty.is_str()
-            || (implements_trait(cx, ty, spe_trait_id, &[])
-                && implements_trait(cx, ty, pe_trait_id, &[ty.into()]));
-        then {
-            // scrutinee derives PartialEq and the pattern is a constant.
-            let pat_ref_count = match pat.kind {
-                // string literals are already a reference.
-                PatKind::Lit(Expr { kind: ExprKind::Lit(lit), .. }) if lit.node.is_str() => pat_ref_count + 1,
-                _ => pat_ref_count,
-            };
-            // References are only implicitly added to the pattern, so no overflow here.
-            // e.g. will work: match &Some(_) { Some(_) => () }
-            // will not: match Some(_) { &Some(_) => () }
-            let ref_count_diff = ty_ref_count - pat_ref_count;
+    let (msg, sugg) = if let PatKind::Path(_) | PatKind::Lit(_) = pat.kind
+        && let (ty, ty_ref_count) = peel_mid_ty_refs(cx.typeck_results().expr_ty(ex))
+        && let Some(spe_trait_id) = cx.tcx.lang_items().structural_peq_trait()
+        && let Some(pe_trait_id) = cx.tcx.lang_items().eq_trait()
+        && (ty.is_integral()
+            || ty.is_char()
+            || ty.is_str()
+            || (implements_trait(cx, ty, spe_trait_id, &[]) && implements_trait(cx, ty, pe_trait_id, &[ty.into()])))
+    {
+        // scrutinee derives PartialEq and the pattern is a constant.
+        let pat_ref_count = match pat.kind {
+            // string literals are already a reference.
+            PatKind::Lit(Expr {
+                kind: ExprKind::Lit(lit),
+                ..
+            }) if lit.node.is_str() => pat_ref_count + 1,
+            _ => pat_ref_count,
+        };
+        // References are only implicitly added to the pattern, so no overflow here.
+        // e.g. will work: match &Some(_) { Some(_) => () }
+        // will not: match Some(_) { &Some(_) => () }
+        let ref_count_diff = ty_ref_count - pat_ref_count;
 
-            // Try to remove address of expressions first.
-            let (ex, removed) = peel_n_hir_expr_refs(ex, ref_count_diff);
-            let ref_count_diff = ref_count_diff - removed;
+        // Try to remove address of expressions first.
+        let (ex, removed) = peel_n_hir_expr_refs(ex, ref_count_diff);
+        let ref_count_diff = ref_count_diff - removed;
 
-            let msg = "you seem to be trying to use `match` for an equality check. Consider using `if`";
-            let sugg = format!(
-                "if {} == {}{} {}{els_str}",
-                snippet(cx, ex.span, ".."),
-                // PartialEq for different reference counts may not exist.
-                "&".repeat(ref_count_diff),
-                snippet(cx, arms[0].pat.span, ".."),
-                expr_block(cx, arms[0].body, ctxt, "..", Some(expr.span), &mut app),
-            );
-            (msg, sugg)
-        } else {
-            let msg = "you seem to be trying to use `match` for destructuring a single pattern. Consider using `if let`";
-            let sugg = format!(
-                "if let {} = {} {}{els_str}",
-                snippet(cx, arms[0].pat.span, ".."),
-                snippet(cx, ex.span, ".."),
-                expr_block(cx, arms[0].body, ctxt, "..", Some(expr.span), &mut app),
-            );
-            (msg, sugg)
-        }
+        let msg = "you seem to be trying to use `match` for an equality check. Consider using `if`";
+        let sugg = format!(
+            "if {} == {}{} {}{els_str}",
+            snippet(cx, ex.span, ".."),
+            // PartialEq for different reference counts may not exist.
+            "&".repeat(ref_count_diff),
+            snippet(cx, arms[0].pat.span, ".."),
+            expr_block(cx, arms[0].body, ctxt, "..", Some(expr.span), &mut app),
+        );
+        (msg, sugg)
+    } else {
+        let msg = "you seem to be trying to use `match` for destructuring a single pattern. Consider using `if let`";
+        let sugg = format!(
+            "if let {} = {} {}{els_str}",
+            snippet(cx, arms[0].pat.span, ".."),
+            snippet(cx, ex.span, ".."),
+            expr_block(cx, arms[0].body, ctxt, "..", Some(expr.span), &mut app),
+        );
+        (msg, sugg)
     };
 
     span_lint_and_sugg(cx, lint, expr.span, msg, "try", sugg, app);
 }
 
-fn check_opt_like<'a>(
-    cx: &LateContext<'a>,
-    ex: &Expr<'_>,
-    arms: &[Arm<'_>],
-    expr: &Expr<'_>,
-    ty: Ty<'a>,
-    els: Option<&Expr<'_>>,
-) {
+fn check_opt_like<'a>(cx: &LateContext<'a>, arms: &[Arm<'_>], ty: Ty<'a>) -> bool {
     // We don't want to lint if the second arm contains an enum which could
     // have more variants in the future.
-    if form_exhaustive_matches(cx, ty, arms[0].pat, arms[1].pat) {
-        report_single_pattern(cx, ex, arms, expr, els);
-    }
+    form_exhaustive_matches(cx, ty, arms[0].pat, arms[1].pat)
 }
 
 /// Returns `true` if all of the types in the pattern are enums which we know

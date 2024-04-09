@@ -8,7 +8,7 @@ use rustc_ast::token::LitKind;
 use rustc_errors::Applicability;
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
 use rustc_middle::lint::in_external_macro;
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_session::impl_lint_pass;
 use rustc_span::{BytePos, Pos, Span};
 
 declare_clippy_lint! {
@@ -20,11 +20,11 @@ declare_clippy_lint! {
     /// idiomatic than a string literal, so it's opt-in.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let r = r"Hello, world!";
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// let r = "Hello, world!";
     /// ```
     #[clippy::version = "1.72.0"]
@@ -41,11 +41,11 @@ declare_clippy_lint! {
     /// necessary.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let r = r###"Hello, "world"!"###;
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// let r = r#"Hello, "world"!"#;
     /// ```
     #[clippy::version = "1.72.0"]
@@ -56,7 +56,7 @@ declare_clippy_lint! {
 impl_lint_pass!(RawStrings => [NEEDLESS_RAW_STRINGS, NEEDLESS_RAW_STRING_HASHES]);
 
 pub struct RawStrings {
-    pub needless_raw_string_hashes_allow_one: bool,
+    pub allow_one_hash_in_raw_strings: bool,
 }
 
 impl EarlyLintPass for RawStrings {
@@ -75,6 +75,7 @@ impl EarlyLintPass for RawStrings {
             if !snippet(cx, expr.span, prefix).trim().starts_with(prefix) {
                 return;
             }
+            let descr = lit.kind.descr();
 
             if !str.contains(['\\', '"']) {
                 span_lint_and_then(
@@ -89,20 +90,17 @@ impl EarlyLintPass for RawStrings {
                         let r_pos = expr.span.lo() + BytePos::from_usize(prefix.len() - 1);
                         let start = start.with_lo(r_pos);
 
-                        if end.is_empty() {
-                            diag.span_suggestion(
-                                start,
-                                "use a string literal instead",
-                                format!("\"{str}\""),
-                                Applicability::MachineApplicable,
-                            );
-                        } else {
-                            diag.multipart_suggestion(
-                                "try",
-                                vec![(start, String::new()), (end, String::new())],
-                                Applicability::MachineApplicable,
-                            );
+                        let mut remove = vec![(start, String::new())];
+                        // avoid debug ICE from empty suggestions
+                        if !end.is_empty() {
+                            remove.push((end, String::new()));
                         }
+
+                        diag.multipart_suggestion_verbose(
+                            format!("use a plain {descr} literal instead"),
+                            remove,
+                            Applicability::MachineApplicable,
+                        );
                     },
                 );
                 if !matches!(cx.get_lint_level(NEEDLESS_RAW_STRINGS), rustc_lint::Allow) {
@@ -110,7 +108,7 @@ impl EarlyLintPass for RawStrings {
                 }
             }
 
-            let req = {
+            let mut req = {
                 let mut following_quote = false;
                 let mut req = 0;
                 // `once` so a raw string ending in hashes is still checked
@@ -138,7 +136,9 @@ impl EarlyLintPass for RawStrings {
                     ControlFlow::Continue(num) | ControlFlow::Break(num) => num,
                 }
             };
-
+            if self.allow_one_hash_in_raw_strings {
+                req = req.max(1);
+            }
             if req < max {
                 span_lint_and_then(
                     cx,
@@ -149,9 +149,9 @@ impl EarlyLintPass for RawStrings {
                         let (start, end) = hash_spans(expr.span, prefix, req, max);
 
                         let message = match max - req {
-                            _ if req == 0 => "remove all the hashes around the literal".to_string(),
-                            1 => "remove one hash from both sides of the literal".to_string(),
-                            n => format!("remove {n} hashes from both sides of the literal"),
+                            _ if req == 0 => format!("remove all the hashes around the {descr} literal"),
+                            1 => format!("remove one hash from both sides of the {descr} literal"),
+                            n => format!("remove {n} hashes from both sides of the {descr} literal"),
                         };
 
                         diag.multipart_suggestion(

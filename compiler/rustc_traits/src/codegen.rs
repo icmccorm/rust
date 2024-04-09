@@ -6,7 +6,7 @@
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_infer::traits::{FulfillmentErrorCode, TraitEngineExt as _};
 use rustc_middle::traits::CodegenObligationError;
-use rustc_middle::ty::{self, TyCtxt};
+use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
 use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt;
 use rustc_trait_selection::traits::{
     ImplSource, Obligation, ObligationCause, SelectionContext, TraitEngine, TraitEngineExt,
@@ -63,7 +63,7 @@ pub fn codegen_select_candidate<'tcx>(
         // Cycle errors are the only post-monomorphization errors possible; emit them now so
         // `rustc_ty_utils::resolve_associated_item` doesn't return `None` post-monomorphization.
         for err in errors {
-            if let FulfillmentErrorCode::CodeCycle(cycle) = err.code {
+            if let FulfillmentErrorCode::Cycle(cycle) = err.code {
                 infcx.err_ctxt().report_overflow_obligation_cycle(&cycle);
             }
         }
@@ -72,6 +72,13 @@ pub fn codegen_select_candidate<'tcx>(
 
     let impl_source = infcx.resolve_vars_if_possible(impl_source);
     let impl_source = infcx.tcx.erase_regions(impl_source);
+    if impl_source.has_infer() {
+        // Unused lifetimes on an impl get replaced with inference vars, but never resolved,
+        // causing the return value of a query to contain inference vars. We do not have a concept
+        // for this and will in fact ICE in stable hashing of the return value. So bail out instead.
+        infcx.tcx.dcx().has_errors().unwrap();
+        return Err(CodegenObligationError::FulfillmentError);
+    }
 
     Ok(&*tcx.arena.alloc(impl_source))
 }

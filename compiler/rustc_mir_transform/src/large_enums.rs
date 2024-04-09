@@ -1,5 +1,4 @@
 use crate::rustc_middle::ty::util::IntTypeExt;
-use crate::MirPass;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_middle::mir::interpret::AllocId;
 use rustc_middle::mir::*;
@@ -10,7 +9,7 @@ use rustc_target::abi::{HasDataLayout, Size, TagEncoding, Variants};
 /// A pass that seeks to optimize unnecessary moves of large enum types, if there is a large
 /// enough discrepancy between them.
 ///
-/// i.e. If there is are two variants:
+/// i.e. If there are two variants:
 /// ```
 /// enum Example {
 ///   Small,
@@ -30,6 +29,9 @@ pub struct EnumSizeOpt {
 
 impl<'tcx> MirPass<'tcx> for EnumSizeOpt {
     fn is_enabled(&self, sess: &Session) -> bool {
+        // There are some differences in behavior on wasm and ARM that are not properly
+        // understood, so we conservatively treat this optimization as unsound:
+        // https://github.com/rust-lang/rust/pull/85158#issuecomment-1101836457
         sess.opts.unstable_opts.unsound_mir_opts || sess.mir_opt_level() >= 3
     }
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {

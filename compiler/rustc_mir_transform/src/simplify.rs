@@ -27,11 +27,7 @@
 //! naively generate still contains the `_a = ()` write in the unreachable block "after" the
 //! return.
 
-use crate::MirPass;
-use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
-use rustc_index::bit_set::BitSet;
 use rustc_index::{Idx, IndexSlice, IndexVec};
-use rustc_middle::mir::coverage::*;
 use rustc_middle::mir::visit::{MutVisitor, MutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
@@ -41,11 +37,14 @@ pub enum SimplifyCfg {
     Initial,
     PromoteConsts,
     RemoveFalseEdges,
-    EarlyOpt,
-    ElaborateDrops,
+    /// Runs at the beginning of "analysis to runtime" lowering, *before* drop elaboration.
+    PostAnalysis,
+    /// Runs at the end of "analysis to runtime" lowering, *after* drop elaboration.
+    /// This is before the main optimization passes on runtime MIR kick in.
+    PreOptimizations,
     Final,
     MakeShim,
-    AfterUninhabitedEnumBranching,
+    AfterUnreachableEnumBranching,
 }
 
 impl SimplifyCfg {
@@ -54,21 +53,20 @@ impl SimplifyCfg {
             SimplifyCfg::Initial => "SimplifyCfg-initial",
             SimplifyCfg::PromoteConsts => "SimplifyCfg-promote-consts",
             SimplifyCfg::RemoveFalseEdges => "SimplifyCfg-remove-false-edges",
-            SimplifyCfg::EarlyOpt => "SimplifyCfg-early-opt",
-            SimplifyCfg::ElaborateDrops => "SimplifyCfg-elaborate-drops",
+            SimplifyCfg::PostAnalysis => "SimplifyCfg-post-analysis",
+            SimplifyCfg::PreOptimizations => "SimplifyCfg-pre-optimizations",
             SimplifyCfg::Final => "SimplifyCfg-final",
             SimplifyCfg::MakeShim => "SimplifyCfg-make_shim",
-            SimplifyCfg::AfterUninhabitedEnumBranching => {
-                "SimplifyCfg-after-uninhabited-enum-branching"
+            SimplifyCfg::AfterUnreachableEnumBranching => {
+                "SimplifyCfg-after-unreachable-enum-branching"
             }
         }
     }
 }
 
-pub fn simplify_cfg<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+pub(crate) fn simplify_cfg(body: &mut Body<'_>) {
     CfgSimplifier::new(body).simplify();
-    remove_duplicate_unreachable_blocks(tcx, body);
-    remove_dead_blocks(tcx, body);
+    remove_dead_blocks(body);
 
     // FIXME: Should probably be moved into some kind of pass manager
     body.basic_blocks_mut().raw.shrink_to_fit();
@@ -76,12 +74,12 @@ pub fn simplify_cfg<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
 
 impl<'tcx> MirPass<'tcx> for SimplifyCfg {
     fn name(&self) -> &'static str {
-        &self.name()
+        self.name()
     }
 
-    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+    fn run_pass(&self, _: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         debug!("SimplifyCfg({:?}) - simplifying {:?}", self.name(), body.source);
-        simplify_cfg(tcx, body);
+        simplify_cfg(body);
     }
 }
 
@@ -292,75 +290,55 @@ pub fn simplify_duplicate_switch_targets(terminator: &mut Terminator<'_>) {
     }
 }
 
-pub fn remove_duplicate_unreachable_blocks<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-    struct OptApplier<'tcx> {
-        tcx: TyCtxt<'tcx>,
-        duplicates: FxIndexSet<BasicBlock>,
-    }
+pub(crate) fn remove_dead_blocks(body: &mut Body<'_>) {
+    let should_deduplicate_unreachable = |bbdata: &BasicBlockData<'_>| {
+        // CfgSimplifier::simplify leaves behind some unreachable basic blocks without a
+        // terminator. Those blocks will be deleted by remove_dead_blocks, but we run just
+        // before then so we need to handle missing terminators.
+        // We also need to prevent confusing cleanup and non-cleanup blocks. In practice we
+        // don't emit empty unreachable cleanup blocks, so this simple check suffices.
+        bbdata.terminator.is_some() && bbdata.is_empty_unreachable() && !bbdata.is_cleanup
+    };
 
-    impl<'tcx> MutVisitor<'tcx> for OptApplier<'tcx> {
-        fn tcx(&self) -> TyCtxt<'tcx> {
-            self.tcx
-        }
-
-        fn visit_terminator(&mut self, terminator: &mut Terminator<'tcx>, location: Location) {
-            for target in terminator.successors_mut() {
-                // We don't have to check whether `target` is a cleanup block, because have
-                // entirely excluded cleanup blocks in building the set of duplicates.
-                if self.duplicates.contains(target) {
-                    *target = self.duplicates[0];
-                }
-            }
-
-            simplify_duplicate_switch_targets(terminator);
-
-            self.super_terminator(terminator, location);
-        }
-    }
-
-    let unreachable_blocks = body
+    let reachable = traversal::reachable_as_bitset(body);
+    let empty_unreachable_blocks = body
         .basic_blocks
         .iter_enumerated()
-        .filter(|(_, bb)| {
-            // CfgSimplifier::simplify leaves behind some unreachable basic blocks without a
-            // terminator. Those blocks will be deleted by remove_dead_blocks, but we run just
-            // before then so we need to handle missing terminators.
-            // We also need to prevent confusing cleanup and non-cleanup blocks. In practice we
-            // don't emit empty unreachable cleanup blocks, so this simple check suffices.
-            bb.terminator.is_some() && bb.is_empty_unreachable() && !bb.is_cleanup
-        })
-        .map(|(block, _)| block)
-        .collect::<FxIndexSet<_>>();
+        .filter(|(bb, bbdata)| should_deduplicate_unreachable(bbdata) && reachable.contains(*bb))
+        .count();
 
-    if unreachable_blocks.len() > 1 {
-        OptApplier { tcx, duplicates: unreachable_blocks }.visit_body(body);
-    }
-}
-
-pub fn remove_dead_blocks<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-    let reachable = traversal::reachable_as_bitset(body);
     let num_blocks = body.basic_blocks.len();
-    if num_blocks == reachable.count() {
+    if num_blocks == reachable.count() && empty_unreachable_blocks <= 1 {
         return;
     }
 
     let basic_blocks = body.basic_blocks.as_mut();
-    let source_scopes = &body.source_scopes;
-    if tcx.sess.instrument_coverage() {
-        save_unreachable_coverage(basic_blocks, source_scopes, &reachable);
-    }
 
     let mut replacements: Vec<_> = (0..num_blocks).map(BasicBlock::new).collect();
     let mut orig_index = 0;
     let mut used_index = 0;
-    basic_blocks.raw.retain(|_| {
-        let keep = reachable.contains(BasicBlock::new(orig_index));
-        if keep {
-            replacements[orig_index] = BasicBlock::new(used_index);
-            used_index += 1;
+    let mut kept_unreachable = None;
+    basic_blocks.raw.retain(|bbdata| {
+        let orig_bb = BasicBlock::new(orig_index);
+        if !reachable.contains(orig_bb) {
+            orig_index += 1;
+            return false;
         }
+
+        let used_bb = BasicBlock::new(used_index);
+        if should_deduplicate_unreachable(bbdata) {
+            let kept_unreachable = *kept_unreachable.get_or_insert(used_bb);
+            if kept_unreachable != used_bb {
+                replacements[orig_index] = kept_unreachable;
+                orig_index += 1;
+                return false;
+            }
+        }
+
+        replacements[orig_index] = used_bb;
+        used_index += 1;
         orig_index += 1;
-        keep
+        true
     });
 
     for block in basic_blocks {
@@ -370,99 +348,9 @@ pub fn remove_dead_blocks<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
     }
 }
 
-/// Some MIR transforms can determine at compile time that a sequences of
-/// statements will never be executed, so they can be dropped from the MIR.
-/// For example, an `if` or `else` block that is guaranteed to never be executed
-/// because its condition can be evaluated at compile time, such as by const
-/// evaluation: `if false { ... }`.
-///
-/// Those statements are bypassed by redirecting paths in the CFG around the
-/// `dead blocks`; but with `-C instrument-coverage`, the dead blocks usually
-/// include `Coverage` statements representing the Rust source code regions to
-/// be counted at runtime. Without these `Coverage` statements, the regions are
-/// lost, and the Rust source code will show no coverage information.
-///
-/// What we want to show in a coverage report is the dead code with coverage
-/// counts of `0`. To do this, we need to save the code regions, by injecting
-/// `Unreachable` coverage statements. These are non-executable statements whose
-/// code regions are still recorded in the coverage map, representing regions
-/// with `0` executions.
-///
-/// If there are no live `Counter` `Coverage` statements remaining, we remove
-/// `Coverage` statements along with the dead blocks. Since at least one
-/// counter per function is required by LLVM (and necessary, to add the
-/// `function_hash` to the counter's call to the LLVM intrinsic
-/// `instrprof.increment()`).
-///
-/// The `generator::StateTransform` MIR pass and MIR inlining can create
-/// atypical conditions, where all live `Counter`s are dropped from the MIR.
-///
-/// With MIR inlining we can have coverage counters belonging to different
-/// instances in a single body, so the strategy described above is applied to
-/// coverage counters from each instance individually.
-fn save_unreachable_coverage(
-    basic_blocks: &mut IndexSlice<BasicBlock, BasicBlockData<'_>>,
-    source_scopes: &IndexSlice<SourceScope, SourceScopeData<'_>>,
-    reachable: &BitSet<BasicBlock>,
-) {
-    // Identify instances that still have some live coverage counters left.
-    let mut live = FxHashSet::default();
-    for bb in reachable.iter() {
-        let basic_block = &basic_blocks[bb];
-        for statement in &basic_block.statements {
-            let StatementKind::Coverage(coverage) = &statement.kind else { continue };
-            let CoverageKind::Counter { .. } = coverage.kind else { continue };
-            let instance = statement.source_info.scope.inlined_instance(source_scopes);
-            live.insert(instance);
-        }
-    }
-
-    for bb in reachable.iter() {
-        let block = &mut basic_blocks[bb];
-        for statement in &mut block.statements {
-            let StatementKind::Coverage(_) = &statement.kind else { continue };
-            let instance = statement.source_info.scope.inlined_instance(source_scopes);
-            if !live.contains(&instance) {
-                statement.make_nop();
-            }
-        }
-    }
-
-    if live.is_empty() {
-        return;
-    }
-
-    // Retain coverage for instances that still have some live counters left.
-    let mut retained_coverage = Vec::new();
-    for dead_block in basic_blocks.indices() {
-        if reachable.contains(dead_block) {
-            continue;
-        }
-        let dead_block = &basic_blocks[dead_block];
-        for statement in &dead_block.statements {
-            let StatementKind::Coverage(coverage) = &statement.kind else { continue };
-            let Some(code_region) = &coverage.code_region else { continue };
-            let instance = statement.source_info.scope.inlined_instance(source_scopes);
-            if live.contains(&instance) {
-                retained_coverage.push((statement.source_info, code_region.clone()));
-            }
-        }
-    }
-
-    let start_block = &mut basic_blocks[START_BLOCK];
-    start_block.statements.extend(retained_coverage.into_iter().map(
-        |(source_info, code_region)| Statement {
-            source_info,
-            kind: StatementKind::Coverage(Box::new(Coverage {
-                kind: CoverageKind::Unreachable,
-                code_region: Some(code_region),
-            })),
-        },
-    ));
-}
-
 pub enum SimplifyLocals {
     BeforeConstProp,
+    AfterGVN,
     Final,
 }
 
@@ -470,6 +358,7 @@ impl<'tcx> MirPass<'tcx> for SimplifyLocals {
     fn name(&self) -> &'static str {
         match &self {
             SimplifyLocals::BeforeConstProp => "SimplifyLocals-before-const-prop",
+            SimplifyLocals::AfterGVN => "SimplifyLocals-after-value-numbering",
             SimplifyLocals::Final => "SimplifyLocals-final",
         }
     }
@@ -526,7 +415,7 @@ fn make_local_map<V>(
     used_locals: &UsedLocals,
 ) -> IndexVec<Local, Option<Local>> {
     let mut map: IndexVec<Local, Option<Local>> = IndexVec::from_elem(None, local_decls);
-    let mut used = Local::new(0);
+    let mut used = Local::ZERO;
 
     for alive_index in local_decls.indices() {
         // `is_used` treats the `RETURN_PLACE` and arguments as used.

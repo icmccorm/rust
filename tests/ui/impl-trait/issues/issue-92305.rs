@@ -1,9 +1,10 @@
-// edition:2021
+//@ edition:2021
 
 use std::iter;
 
 fn f<T>(data: &[T]) -> impl Iterator<Item = Vec> {
     //~^ ERROR: missing generics for struct `Vec` [E0107]
+    //~| ERROR: missing generics for struct `Vec` [E0107]
     iter::empty()
 }
 

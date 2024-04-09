@@ -46,16 +46,24 @@ pub enum PassMode {
     ///
     /// The argument has a layout abi of `ScalarPair`.
     Pair(ArgAttributes, ArgAttributes),
-    /// Pass the argument after casting it. See the `CastTarget` docs for details. The bool
-    /// indicates if a `Reg::i32()` dummy argument is emitted before the real argument.
+    /// Pass the argument after casting it. See the `CastTarget` docs for details.
+    ///
+    /// `pad_i32` indicates if a `Reg::i32()` dummy argument is emitted before the real argument.
     Cast { pad_i32: bool, cast: Box<CastTarget> },
     /// Pass the argument indirectly via a hidden pointer.
+    ///
     /// The `meta_attrs` value, if any, is for the metadata (vtable or length) of an unsized
     /// argument. (This is the only mode that supports unsized arguments.)
+    ///
     /// `on_stack` defines that the value should be passed at a fixed stack offset in accordance to
     /// the ABI rather than passed using a pointer. This corresponds to the `byval` LLVM argument
-    /// attribute (using the Rust type of this argument). `on_stack` cannot be true for unsized
-    /// arguments, i.e., when `meta_attrs` is `Some`.
+    /// attribute. The `byval` argument will use a byte array with the same size as the Rust type
+    /// (which ensures that padding is preserved and that we do not rely on LLVM's struct layout),
+    /// and will use the alignment specified in `attrs.pointee_align` (if `Some`) or the type's
+    /// alignment (if `None`). This means that the alignment will not always
+    /// match the Rust type's alignment; see documentation of `make_indirect_byval` for more info.
+    ///
+    /// `on_stack` cannot be true for unsized arguments, i.e., when `meta_attrs` is `Some`.
     Indirect { attrs: ArgAttributes, meta_attrs: Option<ArgAttributes>, on_stack: bool },
 }
 
@@ -93,9 +101,10 @@ pub use attr_impl::ArgAttribute;
 #[allow(unused)]
 mod attr_impl {
     // The subset of llvm::Attribute needed for arguments, packed into a bitfield.
+    #[derive(Clone, Copy, Default, Hash, PartialEq, Eq, HashStable_Generic)]
+    pub struct ArgAttribute(u8);
     bitflags::bitflags! {
-        #[derive(Default, HashStable_Generic)]
-        pub struct ArgAttribute: u8 {
+        impl ArgAttribute: u8 {
             const NoAlias   = 1 << 1;
             const NoCapture = 1 << 2;
             const NonNull   = 1 << 3;
@@ -104,6 +113,7 @@ mod attr_impl {
             const NoUndef = 1 << 6;
         }
     }
+    rustc_data_structures::external_bitflags_debug! { ArgAttribute }
 }
 
 /// Sometimes an ABI requires small integers to be extended to a full or partial register. This enum
@@ -241,9 +251,9 @@ pub struct Uniform {
     /// The total size of the argument, which can be:
     /// * equal to `unit.size` (one scalar/vector),
     /// * a multiple of `unit.size` (an array of scalar/vectors),
-    /// * if `unit.kind` is `Integer`, the last element
-    ///   can be shorter, i.e., `{ i64, i64, i32 }` for
-    ///   64-bit integers with a total size of 20 bytes.
+    /// * if `unit.kind` is `Integer`, the last element can be shorter, i.e., `{ i64, i64, i32 }`
+    ///   for 64-bit integers with a total size of 20 bytes. When the argument is actually passed,
+    ///   this size will be rounded up to the nearest multiple of `unit.size`.
     pub total: Size,
 }
 
@@ -309,14 +319,17 @@ impl CastTarget {
     }
 
     pub fn size<C: HasDataLayout>(&self, _cx: &C) -> Size {
-        let mut size = self.rest.total;
-        for i in 0..self.prefix.iter().count() {
-            match self.prefix[i] {
-                Some(v) => size += v.size,
-                None => {}
-            }
-        }
-        return size;
+        // Prefix arguments are passed in specific designated registers
+        let prefix_size = self
+            .prefix
+            .iter()
+            .filter_map(|x| x.map(|reg| reg.size))
+            .fold(Size::ZERO, |acc, size| acc + size);
+        // Remaining arguments are passed in chunks of the unit size
+        let rest_size =
+            self.rest.unit.size * self.rest.total.bytes().div_ceil(self.rest.unit.size.bytes());
+
+        prefix_size + rest_size
     }
 
     pub fn align<C: HasDataLayout>(&self, cx: &C) -> Align {
@@ -382,6 +395,7 @@ impl HomogeneousAggregate {
 }
 
 impl<'a, Ty> TyAndLayout<'a, Ty> {
+    /// Returns `true` if this is an aggregate type (including a ScalarPair!)
     fn is_aggregate(&self) -> bool {
         match self.abi {
             Abi::Uninhabited | Abi::Scalar(_) | Abi::Vector { .. } => false,
@@ -409,7 +423,7 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
             Abi::Scalar(scalar) => {
                 let kind = match scalar.primitive() {
                     abi::Int(..) | abi::Pointer(_) => RegKind::Integer,
-                    abi::F32 | abi::F64 => RegKind::Float,
+                    abi::F16 | abi::F32 | abi::F64 | abi::F128 => RegKind::Float,
                 };
                 Ok(HomogeneousAggregate::Homogeneous(Reg { kind, size: self.size }))
             }
@@ -422,7 +436,7 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
                 }))
             }
 
-            Abi::ScalarPair(..) | Abi::Aggregate { .. } => {
+            Abi::ScalarPair(..) | Abi::Aggregate { sized: true } => {
                 // Helper for computing `homogeneous_aggregate`, allowing a custom
                 // starting offset (used below for handling variants).
                 let from_fields_at =
@@ -520,6 +534,7 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
                     Ok(result)
                 }
             }
+            Abi::Aggregate { sized: false } => Err(Heterogeneous),
         }
     }
 }
@@ -555,8 +570,7 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
                 scalar_attrs(&layout, b, a.size(cx).align_to(b.align(cx).abi)),
             ),
             Abi::Vector { .. } => PassMode::Direct(ArgAttributes::new()),
-            // The `Aggregate` ABI should always be adjusted later.
-            Abi::Aggregate { .. } => PassMode::Direct(ArgAttributes::new()),
+            Abi::Aggregate { .. } => Self::indirect_pass_mode(&layout),
         };
         ArgAbi { layout, mode }
     }
@@ -580,17 +594,52 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
         PassMode::Indirect { attrs, meta_attrs, on_stack: false }
     }
 
-    pub fn make_indirect(&mut self) {
+    /// Pass this argument directly instead. Should NOT be used!
+    /// Only exists because of past ABI mistakes that will take time to fix
+    /// (see <https://github.com/rust-lang/rust/issues/115666>).
+    pub fn make_direct_deprecated(&mut self) {
         match self.mode {
-            PassMode::Direct(_) | PassMode::Pair(_, _) => {}
-            PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: false } => return,
-            _ => panic!("Tried to make {:?} indirect", self.mode),
+            PassMode::Indirect { .. } => {
+                self.mode = PassMode::Direct(ArgAttributes::new());
+            }
+            PassMode::Ignore | PassMode::Direct(_) | PassMode::Pair(_, _) => return, // already direct
+            _ => panic!("Tried to make {:?} direct", self.mode),
         }
-
-        self.mode = Self::indirect_pass_mode(&self.layout);
     }
 
+    /// Pass this argument indirectly, by passing a (thin or fat) pointer to the argument instead.
+    /// This is valid for both sized and unsized arguments.
+    pub fn make_indirect(&mut self) {
+        match self.mode {
+            PassMode::Direct(_) | PassMode::Pair(_, _) => {
+                self.mode = Self::indirect_pass_mode(&self.layout);
+            }
+            PassMode::Indirect { attrs: _, meta_attrs: _, on_stack: false } => {
+                // already indirect
+                return;
+            }
+            _ => panic!("Tried to make {:?} indirect", self.mode),
+        }
+    }
+
+    /// Pass this argument indirectly, by placing it at a fixed stack offset.
+    /// This corresponds to the `byval` LLVM argument attribute.
+    /// This is only valid for sized arguments.
+    ///
+    /// `byval_align` specifies the alignment of the `byval` stack slot, which does not need to
+    /// correspond to the type's alignment. This will be `Some` if the target's ABI specifies that
+    /// stack slots used for arguments passed by-value have specific alignment requirements which
+    /// differ from the alignment used in other situations.
+    ///
+    /// If `None`, the type's alignment is used.
+    ///
+    /// If the resulting alignment differs from the type's alignment,
+    /// the argument will be copied to an alloca with sufficient alignment,
+    /// either in the caller (if the type's alignment is lower than the byval alignment)
+    /// or in the callee (if the type's alignment is higher than the byval alignment),
+    /// to ensure that Rust code never sees an underaligned pointer.
     pub fn make_indirect_byval(&mut self, byval_align: Option<Align>) {
+        assert!(!self.layout.is_unsized(), "used byval ABI for unsized layout");
         self.make_indirect();
         match self.mode {
             PassMode::Indirect { ref mut attrs, meta_attrs: _, ref mut on_stack } => {
@@ -686,7 +735,6 @@ pub enum Conv {
     X86_64SysV,
     X86_64Win64,
 
-    AmdGpuKernel,
     AvrInterrupt,
     AvrNonBlockingInterrupt,
 
@@ -796,7 +844,7 @@ impl<'a, Ty> FnAbi<'a, Ty> {
                     }
                 }
             },
-            "aarch64" => {
+            "aarch64" | "arm64ec" => {
                 let kind = if cx.target_spec().is_like_osx {
                     aarch64::AbiKind::DarwinPCS
                 } else if cx.target_spec().is_like_windows {
@@ -821,7 +869,7 @@ impl<'a, Ty> FnAbi<'a, Ty> {
             "sparc" => sparc::compute_abi_info(cx, self),
             "sparc64" => sparc64::compute_abi_info(cx, self),
             "nvptx64" => {
-                if cx.target_spec().adjust_abi(abi) == spec::abi::Abi::PtxKernel {
+                if cx.target_spec().adjust_abi(abi, self.c_variadic) == spec::abi::Abi::PtxKernel {
                     nvptx64::compute_ptx_kernel_abi_info(cx, self)
                 } else {
                     nvptx64::compute_abi_info(self)
@@ -830,13 +878,12 @@ impl<'a, Ty> FnAbi<'a, Ty> {
             "hexagon" => hexagon::compute_abi_info(self),
             "riscv32" | "riscv64" => riscv::compute_abi_info(cx, self),
             "wasm32" | "wasm64" => {
-                if cx.target_spec().adjust_abi(abi) == spec::abi::Abi::Wasm {
+                if cx.target_spec().adjust_abi(abi, self.c_variadic) == spec::abi::Abi::Wasm {
                     wasm::compute_wasm_abi_info(self)
                 } else {
                     wasm::compute_c_abi_info(cx, self)
                 }
             }
-            "asmjs" => wasm::compute_c_abi_info(cx, self),
             "bpf" => bpf::compute_abi_info(self),
             arch => {
                 return Err(AdjustForForeignAbiError::Unsupported {
@@ -869,7 +916,6 @@ impl FromStr for Conv {
             "X86VectorCall" => Ok(Conv::X86VectorCall),
             "X86_64SysV" => Ok(Conv::X86_64SysV),
             "X86_64Win64" => Ok(Conv::X86_64Win64),
-            "AmdGpuKernel" => Ok(Conv::AmdGpuKernel),
             "AvrInterrupt" => Ok(Conv::AvrInterrupt),
             "AvrNonBlockingInterrupt" => Ok(Conv::AvrNonBlockingInterrupt),
             "RiscvInterrupt(machine)" => {
@@ -884,7 +930,7 @@ impl FromStr for Conv {
 }
 
 // Some types are used a lot. Make sure they don't unintentionally get bigger.
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_pointer_width = "64"))]
 mod size_asserts {
     use super::*;
     use rustc_data_structures::static_assert_size;

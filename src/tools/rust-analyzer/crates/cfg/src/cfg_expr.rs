@@ -18,28 +18,6 @@ pub enum CfgAtom {
     KeyValue { key: SmolStr, value: SmolStr },
 }
 
-impl CfgAtom {
-    /// Returns `true` when the atom comes from the target specification.
-    ///
-    /// If this returns `true`, then changing this atom requires changing the compilation target. If
-    /// it returns `false`, the atom might come from a build script or the build system.
-    pub fn is_target_defined(&self) -> bool {
-        match self {
-            CfgAtom::Flag(flag) => matches!(&**flag, "unix" | "windows"),
-            CfgAtom::KeyValue { key, value: _ } => matches!(
-                &**key,
-                "target_arch"
-                    | "target_os"
-                    | "target_env"
-                    | "target_family"
-                    | "target_endian"
-                    | "target_pointer_width"
-                    | "target_vendor" // NOTE: `target_feature` is left out since it can be configured via `-Ctarget-feature`
-            ),
-        }
-    }
-}
-
 impl fmt::Display for CfgAtom {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -69,6 +47,7 @@ impl CfgExpr {
     pub fn parse<S>(tt: &tt::Subtree<S>) -> CfgExpr {
         next_cfg_expr(&mut tt.token_trees.iter()).unwrap_or(CfgExpr::Invalid)
     }
+
     /// Fold the cfg by querying all basic `Atom` and `KeyValue` predicates.
     pub fn fold(&self, query: &dyn Fn(&CfgAtom) -> bool) -> Option<bool> {
         match self {
@@ -84,7 +63,6 @@ impl CfgExpr {
         }
     }
 }
-
 fn next_cfg_expr<S>(it: &mut SliceIter<'_, tt::TokenTree<S>>) -> Option<CfgExpr> {
     let name = match it.next() {
         None => return None,

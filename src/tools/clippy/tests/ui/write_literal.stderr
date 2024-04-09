@@ -1,5 +1,5 @@
 error: literal with an empty format string
-  --> $DIR/write_literal.rs:31:27
+  --> tests/ui/write_literal.rs:31:27
    |
 LL |     write!(v, "Hello {}", "world");
    |                           ^^^^^^^
@@ -13,7 +13,7 @@ LL +     write!(v, "Hello world");
    |
 
 error: literal with an empty format string
-  --> $DIR/write_literal.rs:34:39
+  --> tests/ui/write_literal.rs:34:39
    |
 LL |     writeln!(v, "Hello {} {}", world, "world");
    |                                       ^^^^^^^
@@ -25,7 +25,7 @@ LL +     writeln!(v, "Hello {} world", world);
    |
 
 error: literal with an empty format string
-  --> $DIR/write_literal.rs:36:29
+  --> tests/ui/write_literal.rs:36:29
    |
 LL |     writeln!(v, "Hello {}", "world");
    |                             ^^^^^^^
@@ -37,7 +37,7 @@ LL +     writeln!(v, "Hello world");
    |
 
 error: literal with an empty format string
-  --> $DIR/write_literal.rs:38:29
+  --> tests/ui/write_literal.rs:38:29
    |
 LL |     writeln!(v, "{} {:.4}", "a literal", 5);
    |                             ^^^^^^^^^^^
@@ -49,99 +49,99 @@ LL +     writeln!(v, "a literal {:.4}", 5);
    |
 
 error: literal with an empty format string
-  --> $DIR/write_literal.rs:44:28
+  --> tests/ui/write_literal.rs:44:28
    |
 LL |     writeln!(v, "{0} {1}", "hello", "world");
-   |                            ^^^^^^^
+   |                            ^^^^^^^^^^^^^^^^
    |
 help: try
    |
 LL -     writeln!(v, "{0} {1}", "hello", "world");
-LL +     writeln!(v, "hello {1}", "world");
+LL +     writeln!(v, "hello world");
    |
 
 error: literal with an empty format string
-  --> $DIR/write_literal.rs:44:37
-   |
-LL |     writeln!(v, "{0} {1}", "hello", "world");
-   |                                     ^^^^^^^
-   |
-help: try
-   |
-LL -     writeln!(v, "{0} {1}", "hello", "world");
-LL +     writeln!(v, "{0} world", "hello");
-   |
-
-error: literal with an empty format string
-  --> $DIR/write_literal.rs:47:37
+  --> tests/ui/write_literal.rs:46:28
    |
 LL |     writeln!(v, "{1} {0}", "hello", "world");
-   |                                     ^^^^^^^
+   |                            ^^^^^^^^^^^^^^^^
    |
 help: try
    |
 LL -     writeln!(v, "{1} {0}", "hello", "world");
-LL +     writeln!(v, "world {0}", "hello");
+LL +     writeln!(v, "world hello");
    |
 
 error: literal with an empty format string
-  --> $DIR/write_literal.rs:47:28
-   |
-LL |     writeln!(v, "{1} {0}", "hello", "world");
-   |                            ^^^^^^^
-   |
-help: try
-   |
-LL -     writeln!(v, "{1} {0}", "hello", "world");
-LL +     writeln!(v, "{1} hello", "world");
-   |
-
-error: literal with an empty format string
-  --> $DIR/write_literal.rs:52:38
+  --> tests/ui/write_literal.rs:50:38
    |
 LL |     writeln!(v, "{foo} {bar}", foo = "hello", bar = "world");
-   |                                      ^^^^^^^
+   |                                      ^^^^^^^^^^^^^^^^^^^^^^
    |
 help: try
    |
 LL -     writeln!(v, "{foo} {bar}", foo = "hello", bar = "world");
-LL +     writeln!(v, "hello {bar}", bar = "world");
+LL +     writeln!(v, "hello world");
    |
 
 error: literal with an empty format string
-  --> $DIR/write_literal.rs:52:53
-   |
-LL |     writeln!(v, "{foo} {bar}", foo = "hello", bar = "world");
-   |                                                     ^^^^^^^
-   |
-help: try
-   |
-LL -     writeln!(v, "{foo} {bar}", foo = "hello", bar = "world");
-LL +     writeln!(v, "{foo} world", foo = "hello");
-   |
-
-error: literal with an empty format string
-  --> $DIR/write_literal.rs:55:53
+  --> tests/ui/write_literal.rs:52:38
    |
 LL |     writeln!(v, "{bar} {foo}", foo = "hello", bar = "world");
-   |                                                     ^^^^^^^
+   |                                      ^^^^^^^^^^^^^^^^^^^^^^
    |
 help: try
    |
 LL -     writeln!(v, "{bar} {foo}", foo = "hello", bar = "world");
-LL +     writeln!(v, "world {foo}", foo = "hello");
+LL +     writeln!(v, "world hello");
    |
 
 error: literal with an empty format string
-  --> $DIR/write_literal.rs:55:38
+  --> tests/ui/write_literal.rs:56:32
    |
-LL |     writeln!(v, "{bar} {foo}", foo = "hello", bar = "world");
-   |                                      ^^^^^^^
+LL |     writeln!(v, "{0} {1} {2}", "hello", 2, "world");
+   |                                ^^^^^^^^^^^^^^^^^^^
    |
 help: try
    |
-LL -     writeln!(v, "{bar} {foo}", foo = "hello", bar = "world");
-LL +     writeln!(v, "{bar} hello", bar = "world");
+LL -     writeln!(v, "{0} {1} {2}", "hello", 2, "world");
+LL +     writeln!(v, "hello {0} world", 2);
+   |
+
+error: literal with an empty format string
+  --> tests/ui/write_literal.rs:58:32
+   |
+LL |     writeln!(v, "{2} {1} {0}", "hello", 2, "world");
+   |                                ^^^^^^^^^^^^^^^^^^^
+   |
+help: try
+   |
+LL -     writeln!(v, "{2} {1} {0}", "hello", 2, "world");
+LL +     writeln!(v, "world {0} hello", 2);
+   |
+
+error: literal with an empty format string
+  --> tests/ui/write_literal.rs:60:39
+   |
+LL |     writeln!(v, "{0} {1} {2}, {bar}", "hello", 2, 3, bar = 4);
+   |                                       ^^^^^^^
+   |
+help: try
+   |
+LL -     writeln!(v, "{0} {1} {2}, {bar}", "hello", 2, 3, bar = 4);
+LL +     writeln!(v, "hello {0} {1}, {bar}", 2, 3, bar = 4);
+   |
+
+error: literal with an empty format string
+  --> tests/ui/write_literal.rs:62:41
+   |
+LL |     writeln!(v, "{0} {1} {2}, {3} {4}", "hello", 2, 3, "world", 4);
+   |                                         ^^^^^^^^^^^^^^^^^^^^^^
+   |
+help: try
+   |
+LL -     writeln!(v, "{0} {1} {2}, {3} {4}", "hello", 2, 3, "world", 4);
+LL +     writeln!(v, "hello {0} {1}, world {2}", 2, 3, 4);
    |
 
 error: aborting due to 12 previous errors

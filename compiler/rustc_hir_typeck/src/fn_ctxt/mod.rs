@@ -4,23 +4,24 @@ mod arg_matrix;
 mod checks;
 mod suggestions;
 
-pub use _impl::*;
-use rustc_errors::ErrorGuaranteed;
-pub use suggestions::*;
-
 use crate::coercion::DynamicCoerceMany;
-use crate::{Diverges, EnclosingBreakables, Inherited};
+use crate::fallback::DivergingFallbackBehavior;
+use crate::fn_ctxt::checks::DivergingBlockBehavior;
+use crate::{CoroutineTypes, Diverges, EnclosingBreakables, TypeckRootCtxt};
+use hir::def_id::CRATE_DEF_ID;
+use rustc_errors::{DiagCtxt, ErrorGuaranteed};
 use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir_analysis::astconv::AstConv;
+use rustc_hir_analysis::hir_ty_lowering::HirTyLowerer;
 use rustc_infer::infer;
+use rustc_infer::infer::error_reporting::sub_relations::SubRelations;
 use rustc_infer::infer::error_reporting::TypeErrCtxt;
 use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
 use rustc_middle::infer::unify_key::{ConstVariableOrigin, ConstVariableOriginKind};
 use rustc_middle::ty::{self, Const, Ty, TyCtxt, TypeVisitableExt};
 use rustc_session::Session;
 use rustc_span::symbol::Ident;
-use rustc_span::{self, Span, DUMMY_SP};
+use rustc_span::{self, sym, Span, DUMMY_SP};
 use rustc_trait_selection::traits::{ObligationCause, ObligationCauseCode, ObligationCtxt};
 
 use std::cell::{Cell, RefCell};
@@ -48,14 +49,6 @@ pub struct FnCtxt<'a, 'tcx> {
     /// eventually).
     pub(super) param_env: ty::ParamEnv<'tcx>,
 
-    /// Number of errors that had been reported when we started
-    /// checking this function. On exit, if we find that *more* errors
-    /// have been reported, we will skip regionck and other work that
-    /// expects the types within the function to be consistent.
-    // FIXME(matthewjasper) This should not exist, and it's not correct
-    // if type checking is run in parallel.
-    err_count_on_creation: usize,
-
     /// If `Some`, this stores coercion information for returned
     /// expressions. If `None`, this is in a context where return is
     /// inappropriate, such as a const expression.
@@ -71,7 +64,7 @@ pub struct FnCtxt<'a, 'tcx> {
     /// First span of a return site that we find. Used in error messages.
     pub(super) ret_coercion_span: Cell<Option<Span>>,
 
-    pub(super) resume_yield_tys: Option<(Ty<'tcx>, Ty<'tcx>)>,
+    pub(super) coroutine_types: Option<CoroutineTypes<'tcx>>,
 
     /// Whether the last checked node generates a divergence (e.g.,
     /// `return` will set this to `Always`). In general, when entering
@@ -106,34 +99,53 @@ pub struct FnCtxt<'a, 'tcx> {
     /// the diverges flag is set to something other than `Maybe`.
     pub(super) diverges: Cell<Diverges>,
 
+    /// If one of the function arguments is a never pattern, this counts as diverging code. This
+    /// affect typechecking of the function body.
+    pub(super) function_diverges_because_of_empty_arguments: Cell<Diverges>,
+
+    /// Whether the currently checked node is the whole body of the function.
+    pub(super) is_whole_body: Cell<bool>,
+
     pub(super) enclosing_breakables: RefCell<EnclosingBreakables<'tcx>>,
 
-    pub(super) inh: &'a Inherited<'tcx>,
+    pub(super) root_ctxt: &'a TypeckRootCtxt<'tcx>,
 
     pub(super) fallback_has_occurred: Cell<bool>,
+
+    pub(super) diverging_fallback_behavior: DivergingFallbackBehavior,
+    pub(super) diverging_block_behavior: DivergingBlockBehavior,
 }
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub fn new(
-        inh: &'a Inherited<'tcx>,
+        root_ctxt: &'a TypeckRootCtxt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
         body_id: LocalDefId,
     ) -> FnCtxt<'a, 'tcx> {
+        let (diverging_fallback_behavior, diverging_block_behavior) =
+            parse_never_type_options_attr(root_ctxt.tcx);
         FnCtxt {
             body_id,
             param_env,
-            err_count_on_creation: inh.tcx.sess.err_count(),
             ret_coercion: None,
             ret_coercion_span: Cell::new(None),
-            resume_yield_tys: None,
+            coroutine_types: None,
             diverges: Cell::new(Diverges::Maybe),
+            function_diverges_because_of_empty_arguments: Cell::new(Diverges::Maybe),
+            is_whole_body: Cell::new(false),
             enclosing_breakables: RefCell::new(EnclosingBreakables {
                 stack: Vec::new(),
                 by_id: Default::default(),
             }),
-            inh,
+            root_ctxt,
             fallback_has_occurred: Cell::new(false),
+            diverging_fallback_behavior,
+            diverging_block_behavior,
         }
+    }
+
+    pub(crate) fn dcx(&self) -> &'tcx DiagCtxt {
+        self.tcx.dcx()
     }
 
     pub fn cause(&self, span: Span, code: ObligationCauseCode<'tcx>) -> ObligationCause<'tcx> {
@@ -145,7 +157,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     pub fn sess(&self) -> &Session {
-        &self.tcx.sess
+        self.tcx.sess
     }
 
     /// Creates an `TypeErrCtxt` with a reference to the in-progress
@@ -154,8 +166,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ///
     /// [`InferCtxt::err_ctxt`]: infer::InferCtxt::err_ctxt
     pub fn err_ctxt(&'a self) -> TypeErrCtxt<'a, 'tcx> {
+        let mut sub_relations = SubRelations::default();
+        sub_relations.add_constraints(
+            self,
+            self.fulfillment_cx.borrow_mut().pending_obligations().iter().map(|o| o.predicate),
+        );
         TypeErrCtxt {
             infcx: &self.infcx,
+            sub_relations: RefCell::new(sub_relations),
             typeck_results: Some(self.typeck_results.borrow()),
             fallback_has_occurred: self.fallback_has_occurred.get(),
             normalize_fn_sig: Box::new(|fn_sig| {
@@ -185,24 +203,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }),
         }
     }
-
-    pub fn errors_reported_since_creation(&self) -> bool {
-        self.tcx.sess.err_count() > self.err_count_on_creation
-    }
-
-    pub fn next_root_ty_var(&self, origin: TypeVariableOrigin) -> Ty<'tcx> {
-        Ty::new_var(self.tcx, self.next_ty_var_id_in_universe(origin, ty::UniverseIndex::ROOT))
-    }
 }
 
 impl<'a, 'tcx> Deref for FnCtxt<'a, 'tcx> {
-    type Target = Inherited<'tcx>;
+    type Target = TypeckRootCtxt<'tcx>;
     fn deref(&self) -> &Self::Target {
-        &self.inh
+        self.root_ctxt
     }
 }
 
-impl<'a, 'tcx> AstConv<'tcx> for FnCtxt<'a, 'tcx> {
+impl<'a, 'tcx> HirTyLowerer<'tcx> for FnCtxt<'a, 'tcx> {
     fn tcx<'b>(&'b self) -> TyCtxt<'tcx> {
         self.tcx
     }
@@ -211,43 +221,16 @@ impl<'a, 'tcx> AstConv<'tcx> for FnCtxt<'a, 'tcx> {
         self.body_id.to_def_id()
     }
 
-    fn get_type_parameter_bounds(
-        &self,
-        _: Span,
-        def_id: LocalDefId,
-        _: Ident,
-    ) -> ty::GenericPredicates<'tcx> {
-        let tcx = self.tcx;
-        let item_def_id = tcx.hir().ty_param_owner(def_id);
-        let generics = tcx.generics_of(item_def_id);
-        let index = generics.param_def_id_to_index[&def_id.to_def_id()];
-        ty::GenericPredicates {
-            parent: None,
-            predicates: tcx.arena.alloc_from_iter(
-                self.param_env.caller_bounds().iter().filter_map(|predicate| {
-                    match predicate.kind().skip_binder() {
-                        ty::ClauseKind::Trait(data) if data.self_ty().is_param(index) => {
-                            // HACK(eddyb) should get the original `Span`.
-                            let span = tcx.def_span(def_id);
-                            Some((predicate, span))
-                        }
-                        _ => None,
-                    }
-                }),
-            ),
-        }
+    fn allow_infer(&self) -> bool {
+        true
     }
 
     fn re_infer(&self, def: Option<&ty::GenericParamDef>, span: Span) -> Option<ty::Region<'tcx>> {
         let v = match def {
-            Some(def) => infer::EarlyBoundRegion(span, def.name),
+            Some(def) => infer::RegionParameterDefinition(span, def.name),
             None => infer::MiscVariable(span),
         };
         Some(self.next_region_var(v))
-    }
-
-    fn allow_ty_infer(&self) -> bool {
-        true
     }
 
     fn ty_infer(&self, param: Option<&ty::GenericParamDef>, span: Span) -> Ty<'tcx> {
@@ -282,20 +265,47 @@ impl<'a, 'tcx> AstConv<'tcx> for FnCtxt<'a, 'tcx> {
         }
     }
 
-    fn projected_ty_from_poly_trait_ref(
+    fn probe_ty_param_bounds(
+        &self,
+        _: Span,
+        def_id: LocalDefId,
+        _: Ident,
+    ) -> ty::GenericPredicates<'tcx> {
+        let tcx = self.tcx;
+        let item_def_id = tcx.hir().ty_param_owner(def_id);
+        let generics = tcx.generics_of(item_def_id);
+        let index = generics.param_def_id_to_index[&def_id.to_def_id()];
+        // HACK(eddyb) should get the original `Span`.
+        let span = tcx.def_span(def_id);
+        ty::GenericPredicates {
+            parent: None,
+            predicates: tcx.arena.alloc_from_iter(
+                self.param_env.caller_bounds().iter().filter_map(|predicate| {
+                    match predicate.kind().skip_binder() {
+                        ty::ClauseKind::Trait(data) if data.self_ty().is_param(index) => {
+                            Some((predicate, span))
+                        }
+                        _ => None,
+                    }
+                }),
+            ),
+        }
+    }
+
+    fn lower_assoc_ty(
         &self,
         span: Span,
         item_def_id: DefId,
-        item_segment: &hir::PathSegment<'_>,
+        item_segment: &hir::PathSegment<'tcx>,
         poly_trait_ref: ty::PolyTraitRef<'tcx>,
     ) -> Ty<'tcx> {
         let trait_ref = self.instantiate_binder_with_fresh_vars(
             span,
-            infer::LateBoundRegionConversionTime::AssocTypeProjection(item_def_id),
+            infer::BoundRegionConversionTime::AssocTypeProjection(item_def_id),
             poly_trait_ref,
         );
 
-        let item_args = self.astconv().create_args_for_associated_item(
+        let item_args = self.lowerer().lower_generic_args_of_assoc_item(
             span,
             item_def_id,
             item_segment,
@@ -316,10 +326,6 @@ impl<'a, 'tcx> AstConv<'tcx> for FnCtxt<'a, 'tcx> {
             }
             _ => None,
         }
-    }
-
-    fn set_tainted_by_errors(&self, e: ErrorGuaranteed) {
-        self.infcx.set_tainted_by_errors(e)
     }
 
     fn record_ty(&self, hir_id: hir::HirId, ty: Ty<'tcx>, span: Span) {
@@ -345,16 +351,97 @@ impl<'a, 'tcx> AstConv<'tcx> for FnCtxt<'a, 'tcx> {
     fn infcx(&self) -> Option<&infer::InferCtxt<'tcx>> {
         Some(&self.infcx)
     }
+
+    fn set_tainted_by_errors(&self, e: ErrorGuaranteed) {
+        self.infcx.set_tainted_by_errors(e)
+    }
 }
 
-/// Represents a user-provided type in the raw form (never normalized).
+/// The `ty` representation of a user-provided type. Depending on the use-site
+/// we want to either use the unnormalized or the normalized form of this type.
 ///
-/// This is a bridge between the interface of `AstConv`, which outputs a raw `Ty`,
-/// and the API in this module, which expect `Ty` to be fully normalized.
+/// This is a bridge between the interface of HIR ty lowering, which outputs a raw
+/// `Ty`, and the API in this module, which expect `Ty` to be fully normalized.
 #[derive(Clone, Copy, Debug)]
-pub struct RawTy<'tcx> {
+pub struct LoweredTy<'tcx> {
+    /// The unnormalized type provided by the user.
     pub raw: Ty<'tcx>,
 
     /// The normalized form of `raw`, stored here for efficiency.
     pub normalized: Ty<'tcx>,
+}
+
+impl<'tcx> LoweredTy<'tcx> {
+    pub fn from_raw(fcx: &FnCtxt<'_, 'tcx>, span: Span, raw: Ty<'tcx>) -> LoweredTy<'tcx> {
+        // FIXME(-Znext-solver): We're still figuring out how to best handle
+        // normalization and this doesn't feel too great. We should look at this
+        // code again before stabilizing it.
+        let normalized = if fcx.next_trait_solver() {
+            fcx.try_structurally_resolve_type(span, raw)
+        } else {
+            fcx.normalize(span, raw)
+        };
+        LoweredTy { raw, normalized }
+    }
+}
+
+fn parse_never_type_options_attr(
+    tcx: TyCtxt<'_>,
+) -> (DivergingFallbackBehavior, DivergingBlockBehavior) {
+    use DivergingFallbackBehavior::*;
+
+    // Error handling is dubious here (unwraps), but that's probably fine for an internal attribute.
+    // Just don't write incorrect attributes <3
+
+    let mut fallback = None;
+    let mut block = None;
+
+    let items = tcx
+        .get_attr(CRATE_DEF_ID, sym::rustc_never_type_options)
+        .map(|attr| attr.meta_item_list().unwrap())
+        .unwrap_or_default();
+
+    for item in items {
+        if item.has_name(sym::fallback) && fallback.is_none() {
+            let mode = item.value_str().unwrap();
+            match mode {
+                sym::unit => fallback = Some(FallbackToUnit),
+                sym::niko => fallback = Some(FallbackToNiko),
+                sym::never => fallback = Some(FallbackToNever),
+                sym::no => fallback = Some(NoFallback),
+                _ => {
+                    tcx.dcx().span_err(item.span(), format!("unknown never type fallback mode: `{mode}` (supported: `unit`, `niko`, `never` and `no`)"));
+                }
+            };
+            continue;
+        }
+
+        if item.has_name(sym::diverging_block_default) && block.is_none() {
+            let default = item.value_str().unwrap();
+            match default {
+                sym::unit => block = Some(DivergingBlockBehavior::Unit),
+                sym::never => block = Some(DivergingBlockBehavior::Never),
+                _ => {
+                    tcx.dcx().span_err(item.span(), format!("unknown diverging block default: `{default}` (supported: `unit` and `never`)"));
+                }
+            };
+            continue;
+        }
+
+        tcx.dcx().span_err(
+            item.span(),
+            format!(
+                "unknown or duplicate never type option: `{}` (supported: `fallback`, `diverging_block_default`)",
+                item.name_or_empty()
+            ),
+        );
+    }
+
+    let fallback = fallback.unwrap_or_else(|| {
+        if tcx.features().never_type_fallback { FallbackToNiko } else { FallbackToUnit }
+    });
+
+    let block = block.unwrap_or_default();
+
+    (fallback, block)
 }

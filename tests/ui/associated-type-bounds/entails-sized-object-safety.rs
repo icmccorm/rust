@@ -1,6 +1,4 @@
-// build-pass (FIXME(62277): could be check-pass?)
-
-#![feature(associated_type_bounds)]
+//@ build-pass (FIXME(62277): could be check-pass?)
 
 trait Tr1: Sized { type As1; }
 trait Tr2<'a>: Sized { type As2; }

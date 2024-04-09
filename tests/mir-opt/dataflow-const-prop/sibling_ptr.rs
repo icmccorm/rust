@@ -6,14 +6,20 @@
 // used to modify `x.1` - if it did not, then it might incorrectly assume that it
 // can infer the value of `x.1` at the end of this function.
 
-// unit-test: DataflowConstProp
+//@ unit-test: DataflowConstProp
 
 // EMIT_MIR sibling_ptr.main.DataflowConstProp.diff
+
+// CHECK-LABEL: fn main(
 fn main() {
+    // CHECK: debug x1 => [[x1:_.*]];
+
     let mut x: (u8, u8) = (0, 0);
     unsafe {
         let p = std::ptr::addr_of_mut!(x.0);
         *p.add(1) = 1;
     }
+
+    // CHECK: [[x1]] = ({{_.*}}.1: u8);
     let x1 = x.1; // should not be propagated
 }

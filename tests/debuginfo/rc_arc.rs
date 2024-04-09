@@ -1,8 +1,8 @@
-// ignore-windows-gnu: pretty-printers are not loaded
-// compile-flags:-g
+//@ ignore-windows-gnu: pretty-printers are not loaded
+//@ compile-flags:-g
 
-// min-gdb-version: 8.1
-// min-cdb-version: 10.0.18317.1001
+//@ min-gdb-version: 8.1
+//@ min-cdb-version: 10.0.18317.1001
 
 // === GDB TESTS ==================================================================================
 
@@ -17,10 +17,10 @@
 
 // lldb-command:run
 
-// lldb-command:print rc
-// lldb-check:[...]$0 = strong=11, weak=1 { value = 111 }
-// lldb-command:print arc
-// lldb-check:[...]$1 = strong=21, weak=1 { data = 222 }
+// lldb-command:v rc
+// lldb-check:[...] strong=11, weak=1 { value = 111 }
+// lldb-command:v arc
+// lldb-check:[...] strong=21, weak=1 { data = 222 }
 
 // === CDB TESTS ==================================================================================
 

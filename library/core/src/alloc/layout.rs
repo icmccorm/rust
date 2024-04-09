@@ -130,6 +130,8 @@ impl Layout {
     }
 
     /// The minimum byte alignment for a memory block of this layout.
+    ///
+    /// The returned alignment is guaranteed to be a power of two.
     #[stable(feature = "alloc_layout", since = "1.28.0")]
     #[rustc_const_stable(feature = "const_alloc_layout_size_align", since = "1.50.0")]
     #[must_use = "this returns the minimum alignment, \
@@ -213,7 +215,7 @@ impl Layout {
     #[inline]
     pub const fn dangling(&self) -> NonNull<u8> {
         // SAFETY: align is guaranteed to be non-zero
-        unsafe { NonNull::new_unchecked(crate::ptr::invalid_mut::<u8>(self.align())) }
+        unsafe { NonNull::new_unchecked(crate::ptr::without_provenance_mut::<u8>(self.align())) }
     }
 
     /// Creates a layout describing the record that can hold a value
@@ -448,7 +450,11 @@ impl Layout {
                 return Err(LayoutError);
             }
 
-            let array_size = element_size * n;
+            // SAFETY: We just checked that we won't overflow `usize` when we multiply.
+            // This is a useless hint inside this function, but after inlining this helps
+            // deduplicate checks for whether the overall capacity is zero (e.g., in RawVec's
+            // allocation path) before/after this multiplication.
+            let array_size = unsafe { element_size.unchecked_mul(n) };
 
             // SAFETY: We just checked above that the `array_size` will not
             // exceed `isize::MAX` even when rounded up to the alignment.

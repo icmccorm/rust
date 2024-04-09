@@ -17,6 +17,8 @@
     test(no_crate_inject, attr(deny(warnings))),
     test(attr(allow(dead_code, deprecated, unused_variables, unused_mut)))
 )]
+#![doc(rust_logo)]
+#![feature(rustdoc_internals)]
 // This library is copied into rust-analyzer to allow loading rustc compiled proc macros.
 // Please avoid unstable features where possible to minimize the amount of changes necessary
 // to make it compile with rust-analyzer on stable.
@@ -24,6 +26,7 @@
 #![feature(staged_api)]
 #![feature(allow_internal_unstable)]
 #![feature(decl_macro)]
+#![feature(generic_nonzero)]
 #![feature(maybe_uninit_write_slice)]
 #![feature(negative_impls)]
 #![feature(new_uninit)]
@@ -33,6 +36,7 @@
 #![feature(strict_provenance)]
 #![recursion_limit = "256"]
 #![allow(internal_features)]
+#![deny(ffi_unwind_calls)]
 
 #[unstable(feature = "proc_macro_internals", issue = "27812")]
 #[doc(hidden)]
@@ -43,6 +47,7 @@ mod diagnostic;
 #[unstable(feature = "proc_macro_diagnostic", issue = "54140")]
 pub use diagnostic::{Diagnostic, Level, MultiSpan};
 
+use std::ffi::CStr;
 use std::ops::{Range, RangeBounds};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -68,7 +73,7 @@ pub fn is_available() -> bool {
 
 /// The main type provided by this crate, representing an abstract stream of
 /// tokens, or, more specifically, a sequence of token trees.
-/// The type provide interfaces for iterating over those token trees and, conversely,
+/// The type provides interfaces for iterating over those token trees and, conversely,
 /// collecting a number of token trees into one stream.
 ///
 /// This is both the input and output of `#[proc_macro]`, `#[proc_macro_attribute]`
@@ -188,8 +193,17 @@ impl ToString for TokenStream {
 /// Prints the token stream as a string that is supposed to be losslessly convertible back
 /// into the same token stream (modulo spans), except for possibly `TokenTree::Group`s
 /// with `Delimiter::None` delimiters and negative numeric literals.
+///
+/// Note: the exact form of the output is subject to change, e.g. there might
+/// be changes in the whitespace used between tokens. Therefore, you should
+/// *not* do any kind of simple substring matching on the output string (as
+/// produced by `to_string`) to implement a proc macro, because that matching
+/// might stop working if such changes happen. Instead, you should work at the
+/// `TokenTree` level, e.g. matching against `TokenTree::Ident`,
+/// `TokenTree::Punct`, or `TokenTree::Literal`.
 #[stable(feature = "proc_macro_lib", since = "1.15.0")]
 impl fmt::Display for TokenStream {
+    #[allow(clippy::recursive_format_impl)] // clippy doesn't see the specialization
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_string())
     }
@@ -755,8 +769,17 @@ impl ToString for TokenTree {
 /// Prints the token tree as a string that is supposed to be losslessly convertible back
 /// into the same token tree (modulo spans), except for possibly `TokenTree::Group`s
 /// with `Delimiter::None` delimiters and negative numeric literals.
+///
+/// Note: the exact form of the output is subject to change, e.g. there might
+/// be changes in the whitespace used between tokens. Therefore, you should
+/// *not* do any kind of simple substring matching on the output string (as
+/// produced by `to_string`) to implement a proc macro, because that matching
+/// might stop working if such changes happen. Instead, you should work at the
+/// `TokenTree` level, e.g. matching against `TokenTree::Ident`,
+/// `TokenTree::Punct`, or `TokenTree::Literal`.
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
 impl fmt::Display for TokenTree {
+    #[allow(clippy::recursive_format_impl)] // clippy doesn't see the specialization
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_string())
     }
@@ -887,6 +910,7 @@ impl ToString for Group {
 /// with `Delimiter::None` delimiters.
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
 impl fmt::Display for Group {
+    #[allow(clippy::recursive_format_impl)] // clippy doesn't see the specialization
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_string())
     }
@@ -923,13 +947,12 @@ impl !Sync for Punct {}
 pub enum Spacing {
     /// A `Punct` token can join with the following token to form a multi-character operator.
     ///
-    /// In token streams constructed using proc macro interfaces `Joint` punctuation tokens can be
-    /// followed by any other tokens. \
-    /// However, in token streams parsed from source code compiler will only set spacing to `Joint`
-    /// in the following cases:
-    /// - A `Punct` is immediately followed by another `Punct` without a whitespace. \
-    ///   E.g. `+` is `Joint` in `+=` and `++`.
-    /// - A single quote `'` is immediately followed by an identifier without a whitespace. \
+    /// In token streams constructed using proc macro interfaces, `Joint` punctuation tokens can be
+    /// followed by any other tokens. However, in token streams parsed from source code, the
+    /// compiler will only set spacing to `Joint` in the following cases.
+    /// - When a `Punct` is immediately followed by another `Punct` without a whitespace. E.g. `+`
+    ///   is `Joint` in `+=` and `++`.
+    /// - When a single quote `'` is immediately followed by an identifier without a whitespace.
     ///   E.g. `'` is `Joint` in `'lifetime`.
     ///
     /// This list may be extended in the future to enable more token combinations.
@@ -937,11 +960,10 @@ pub enum Spacing {
     Joint,
     /// A `Punct` token cannot join with the following token to form a multi-character operator.
     ///
-    /// `Alone` punctuation tokens can be followed by any other tokens. \
-    /// In token streams parsed from source code compiler will set spacing to `Alone` in all cases
-    /// not covered by the conditions for `Joint` above. \
-    /// E.g. `+` is `Alone` in `+ =`, `+ident` and `+()`.
-    /// In particular, token not followed by anything  will also be marked as `Alone`.
+    /// `Alone` punctuation tokens can be followed by any other tokens. In token streams parsed
+    /// from source code, the compiler will set spacing to `Alone` in all cases not covered by the
+    /// conditions for `Joint` above. E.g. `+` is `Alone` in `+ =`, `+ident` and `+()`. In
+    /// particular, tokens not followed by anything will be marked as `Alone`.
     #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
     Alone,
 }
@@ -976,8 +998,8 @@ impl Punct {
     }
 
     /// Returns the spacing of this punctuation character, indicating whether it can be potentially
-    /// combined into a multi-character operator with the following token (`Joint`), or the operator
-    /// has certainly ended (`Alone`).
+    /// combined into a multi-character operator with the following token (`Joint`), or whether the
+    /// operator has definitely ended (`Alone`).
     #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
     pub fn spacing(&self) -> Spacing {
         if self.0.joint { Spacing::Joint } else { Spacing::Alone }
@@ -1338,7 +1360,7 @@ impl Literal {
     }
 
     /// Byte character literal.
-    #[unstable(feature = "proc_macro_byte_character", issue = "115268")]
+    #[stable(feature = "proc_macro_byte_character", since = "CURRENT_RUSTC_VERSION")]
     pub fn byte_character(byte: u8) -> Literal {
         let string = [byte].escape_ascii().to_string();
         Literal::new(bridge::LitKind::Byte, &string, None)
@@ -1349,6 +1371,13 @@ impl Literal {
     pub fn byte_string(bytes: &[u8]) -> Literal {
         let string = bytes.escape_ascii().to_string();
         Literal::new(bridge::LitKind::ByteStr, &string, None)
+    }
+
+    /// C string literal.
+    #[stable(feature = "proc_macro_c_str_literals", since = "CURRENT_RUSTC_VERSION")]
+    pub fn c_string(string: &CStr) -> Literal {
+        let string = string.to_bytes().escape_ascii().to_string();
+        Literal::new(bridge::LitKind::CStr, &string, None)
     }
 
     /// Returns the span encompassing this literal.
@@ -1424,7 +1453,7 @@ impl Literal {
                 f(&["cr", hashes, "\"", symbol, "\"", hashes, suffix])
             }
 
-            bridge::LitKind::Integer | bridge::LitKind::Float | bridge::LitKind::Err => {
+            bridge::LitKind::Integer | bridge::LitKind::Float | bridge::LitKind::ErrWithGuar => {
                 f(&[symbol, suffix])
             }
         })
@@ -1503,7 +1532,8 @@ pub mod tracked_env {
     #[unstable(feature = "proc_macro_tracked_env", issue = "99515")]
     pub fn var<K: AsRef<OsStr> + AsRef<str>>(key: K) -> Result<String, VarError> {
         let key: &str = key.as_ref();
-        let value = env::var(key);
+        let value = crate::bridge::client::FreeFunctions::injected_env_var(key)
+            .map_or_else(|| env::var(key), Ok);
         crate::bridge::client::FreeFunctions::track_env_var(key, value.as_deref().ok());
         value
     }

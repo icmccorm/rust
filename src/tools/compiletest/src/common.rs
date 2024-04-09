@@ -8,6 +8,7 @@ use std::process::Command;
 use std::str::FromStr;
 
 use crate::util::{add_dylib_path, PathBufExt};
+use build_helper::git::GitConfig;
 use lazycell::AtomicLazyCell;
 use serde::de::{Deserialize, Deserializer, Error as _};
 use std::collections::{HashMap, HashSet};
@@ -67,7 +68,7 @@ string_enum! {
         MirOpt => "mir-opt",
         Assembly => "assembly",
         CoverageMap => "coverage-map",
-        RunCoverage => "run-coverage",
+        CoverageRun => "coverage-run",
     }
 }
 
@@ -78,11 +79,20 @@ impl Default for Mode {
 }
 
 impl Mode {
-    pub fn disambiguator(self) -> &'static str {
+    pub fn aux_dir_disambiguator(self) -> &'static str {
         // Pretty-printing tests could run concurrently, and if they do,
         // they need to keep their output segregated.
         match self {
             Pretty => ".pretty",
+            _ => "",
+        }
+    }
+
+    pub fn output_dir_disambiguator(self) -> &'static str {
+        // Coverage tests use the same test files for multiple test modes,
+        // so each mode should have a separate output directory.
+        match self {
+            CoverageMap | CoverageRun => self.to_str(),
             _ => "",
         }
     }
@@ -146,6 +156,7 @@ impl PanicStrategy {
 pub enum Sanitizer {
     Address,
     Cfi,
+    Dataflow,
     Kcfi,
     KernelAddress,
     Leak,
@@ -232,6 +243,9 @@ pub struct Config {
     /// Run ignored tests
     pub run_ignored: bool,
 
+    /// Whether to run tests with `ignore-debug` header
+    pub with_debug_assertions: bool,
+
     /// Only run tests that match these filters
     pub filters: Vec<String>,
 
@@ -252,8 +266,10 @@ pub struct Config {
     pub logfile: Option<PathBuf>,
 
     /// A command line to prefix program execution with,
-    /// for running under valgrind
-    pub runtool: Option<String>,
+    /// for running under valgrind for example.
+    ///
+    /// Similar to `CARGO_*_RUNNER` configuration.
+    pub runner: Option<String>,
 
     /// Flags to pass to the compiler when building for the host
     pub host_rustcflags: Vec<String>,
@@ -370,6 +386,14 @@ pub struct Config {
     pub target_cfgs: AtomicLazyCell<TargetCfgs>,
 
     pub nocapture: bool,
+
+    // Needed both to construct build_helper::git::GitConfig
+    pub git_repository: String,
+    pub nightly_branch: String,
+
+    /// True if the profiler runtime is enabled for this target.
+    /// Used by the "needs-profiler-support" header in test files.
+    pub profiler_support: bool,
 }
 
 impl Config {
@@ -396,9 +420,6 @@ impl Config {
 
     pub fn matches_arch(&self, arch: &str) -> bool {
         self.target_cfg().arch == arch ||
-        // Shorthand for convenience. The arch for
-        // asmjs-unknown-emscripten is actually wasm32.
-        (arch == "asmjs" && self.target.starts_with("asmjs")) ||
         // Matching all the thumb variants as one can be convenient.
         // (thumbv6m, thumbv7em, thumbv7m, etc.)
         (arch == "thumb" && self.target.starts_with("thumb"))
@@ -432,6 +453,15 @@ impl Config {
         self.target_cfg().panic == PanicStrategy::Unwind
     }
 
+    pub fn has_threads(&self) -> bool {
+        // Wasm targets don't have threads unless `-threads` is in the target
+        // name, such as `wasm32-wasip1-threads`.
+        if self.target.starts_with("wasm") {
+            return self.target.contains("threads");
+        }
+        true
+    }
+
     pub fn has_asm_support(&self) -> bool {
         static ASM_SUPPORTED_ARCHS: &[&str] = &[
             "x86", "x86_64", "arm", "aarch64", "riscv32",
@@ -440,6 +470,10 @@ impl Config {
             // "nvptx64", "hexagon", "mips", "mips64", "spirv", "wasm32",
         ];
         ASM_SUPPORTED_ARCHS.contains(&self.target_cfg().arch.as_str())
+    }
+
+    pub fn git_config(&self) -> GitConfig<'_> {
+        GitConfig { git_repository: &self.git_repository, nightly_branch: &self.nightly_branch }
     }
 }
 
@@ -461,6 +495,7 @@ impl TargetCfgs {
         let mut targets: HashMap<String, TargetCfg> = serde_json::from_str(&rustc_output(
             config,
             &["--print=all-target-specs-json", "-Zunstable-options"],
+            Default::default(),
         ))
         .unwrap();
 
@@ -473,16 +508,33 @@ impl TargetCfgs {
         let mut all_families = HashSet::new();
         let mut all_pointer_widths = HashSet::new();
 
-        // Handle custom target specs, which are not included in `--print=all-target-specs-json`.
-        if config.target.ends_with(".json") {
-            targets.insert(
-                config.target.clone(),
-                serde_json::from_str(&rustc_output(
-                    config,
-                    &["--print=target-spec-json", "-Zunstable-options", "--target", &config.target],
-                ))
-                .unwrap(),
-            );
+        // If current target is not included in the `--print=all-target-specs-json` output,
+        // we check whether it is a custom target from the user or a synthetic target from bootstrap.
+        if !targets.contains_key(&config.target) {
+            let mut envs: HashMap<String, String> = HashMap::new();
+
+            if let Ok(t) = std::env::var("RUST_TARGET_PATH") {
+                envs.insert("RUST_TARGET_PATH".into(), t);
+            }
+
+            // This returns false only when the target is neither a synthetic target
+            // nor a custom target from the user, indicating it is most likely invalid.
+            if config.target.ends_with(".json") || !envs.is_empty() {
+                targets.insert(
+                    config.target.clone(),
+                    serde_json::from_str(&rustc_output(
+                        config,
+                        &[
+                            "--print=target-spec-json",
+                            "-Zunstable-options",
+                            "--target",
+                            &config.target,
+                        ],
+                        envs,
+                    ))
+                    .unwrap(),
+                );
+            }
         }
 
         for (target, cfg) in targets.iter() {
@@ -527,7 +579,9 @@ impl TargetCfgs {
         // code below extracts them from `--print=cfg`: make sure to only override fields that can
         // actually be changed with `-C` flags.
         for config in
-            rustc_output(config, &["--print=cfg", "--target", &config.target]).trim().lines()
+            rustc_output(config, &["--print=cfg", "--target", &config.target], Default::default())
+                .trim()
+                .lines()
         {
             let (name, value) = config
                 .split_once("=\"")
@@ -606,11 +660,12 @@ pub enum Endian {
     Big,
 }
 
-fn rustc_output(config: &Config, args: &[&str]) -> String {
+fn rustc_output(config: &Config, args: &[&str], envs: HashMap<String, String>) -> String {
     let mut command = Command::new(&config.rustc_path);
     add_dylib_path(&mut command, iter::once(&config.compile_lib_path));
     command.args(&config.target_rustcflags).args(args);
     command.env("RUSTC_BOOTSTRAP", "1");
+    command.envs(envs);
 
     let output = match command.output() {
         Ok(output) => output,
@@ -661,6 +716,8 @@ pub fn expected_output_path(
 
 pub const UI_EXTENSIONS: &[&str] = &[
     UI_STDERR,
+    UI_SVG,
+    UI_WINDOWS_SVG,
     UI_STDOUT,
     UI_FIXED,
     UI_RUN_STDERR,
@@ -672,6 +729,8 @@ pub const UI_EXTENSIONS: &[&str] = &[
     UI_COVERAGE_MAP,
 ];
 pub const UI_STDERR: &str = "stderr";
+pub const UI_SVG: &str = "svg";
+pub const UI_WINDOWS_SVG: &str = "windows.svg";
 pub const UI_STDOUT: &str = "stdout";
 pub const UI_FIXED: &str = "fixed";
 pub const UI_RUN_STDERR: &str = "run.stderr";
@@ -699,6 +758,7 @@ pub fn output_testname_unique(
     let mode = config.compare_mode.as_ref().map_or("", |m| m.to_str());
     let debugger = config.debugger.as_ref().map_or("", |m| m.to_str());
     PathBuf::from(&testpaths.file.file_stem().unwrap())
+        .with_extra_extension(config.mode.output_dir_disambiguator())
         .with_extra_extension(revision.unwrap_or(""))
         .with_extra_extension(mode)
         .with_extra_extension(debugger)

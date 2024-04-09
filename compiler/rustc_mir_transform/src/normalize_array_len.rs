@@ -2,7 +2,6 @@
 //! is taken using `.len()` method. Handy to preserve information in MIR for const prop
 
 use crate::ssa::SsaLocals;
-use crate::MirPass;
 use rustc_index::IndexVec;
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
@@ -57,7 +56,9 @@ fn compute_slice_length<'tcx>(
             }
             // The length information is stored in the fat pointer, so we treat `operand` as a value.
             Rvalue::Use(operand) => {
-                if let Some(rhs) = operand.place() && let Some(rhs) = rhs.as_local() {
+                if let Some(rhs) = operand.place()
+                    && let Some(rhs) = rhs.as_local()
+                {
                     slice_lengths[local] = slice_lengths[rhs];
                 }
             }

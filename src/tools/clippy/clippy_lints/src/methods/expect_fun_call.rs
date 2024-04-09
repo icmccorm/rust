@@ -6,8 +6,8 @@ use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_lint::LateContext;
 use rustc_middle::ty;
-use rustc_span::source_map::Span;
 use rustc_span::symbol::sym;
+use rustc_span::Span;
 use std::borrow::Cow;
 
 use super::EXPECT_FUN_CALL;
@@ -91,7 +91,7 @@ pub(super) fn check<'tcx>(
             },
             hir::ExprKind::Path(ref p) => matches!(
                 cx.qpath_res(p, arg.hir_id),
-                hir::def::Res::Def(hir::def::DefKind::Const | hir::def::DefKind::Static(_), _)
+                hir::def::Res::Def(hir::def::DefKind::Const | hir::def::DefKind::Static { .. }, _)
             ),
             _ => false,
         }
@@ -142,7 +142,7 @@ pub(super) fn check<'tcx>(
                 cx,
                 EXPECT_FUN_CALL,
                 span_replace_word,
-                &format!("use of `{name}` followed by a function call"),
+                format!("use of `{name}` followed by a function call"),
                 "try",
                 format!("unwrap_or_else({closure_args} panic!({sugg}))"),
                 applicability,
@@ -160,7 +160,7 @@ pub(super) fn check<'tcx>(
         cx,
         EXPECT_FUN_CALL,
         span_replace_word,
-        &format!("use of `{name}` followed by a function call"),
+        format!("use of `{name}` followed by a function call"),
         "try",
         format!("unwrap_or_else({closure_args} {{ panic!(\"{{}}\", {arg_root_snippet}) }})"),
         applicability,

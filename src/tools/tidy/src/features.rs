@@ -15,7 +15,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use regex::Regex;
 
@@ -30,7 +30,7 @@ const FEATURE_GROUP_END_PREFIX: &str = "// feature-group-end";
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Status {
-    Stable,
+    Accepted,
     Removed,
     Unstable,
 }
@@ -38,7 +38,7 @@ pub enum Status {
 impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let as_str = match *self {
-            Status::Stable => "stable",
+            Status::Accepted => "accepted",
             Status::Unstable => "unstable",
             Status::Removed => "removed",
         };
@@ -52,6 +52,8 @@ pub struct Feature {
     pub since: Option<Version>,
     pub has_gate_test: bool,
     pub tracking_issue: Option<NonZeroU32>,
+    pub file: PathBuf,
+    pub line: usize,
 }
 impl Feature {
     fn tracking_issue_display(&self) -> impl fmt::Display {
@@ -184,23 +186,25 @@ pub fn check(
         .chain(lib_features.iter().map(|feat| (feat, "lib")));
     for ((feature_name, feature), kind) in all_features_iter {
         let since = if let Some(since) = feature.since { since } else { continue };
+        let file = feature.file.display();
+        let line = feature.line;
         if since > version && since != Version::CurrentPlaceholder {
             tidy_error!(
                 bad,
-                "The stabilization version {since} of {kind} feature `{feature_name}` is newer than the current {version}"
+                "{file}:{line}: The stabilization version {since} of {kind} feature `{feature_name}` is newer than the current {version}"
             );
         }
         if channel == "nightly" && since == version {
             tidy_error!(
                 bad,
-                "The stabilization version {since} of {kind} feature `{feature_name}` is written out but should be {}",
+                "{file}:{line}: The stabilization version {since} of {kind} feature `{feature_name}` is written out but should be {}",
                 version::VERSION_PLACEHOLDER
             );
         }
         if channel != "nightly" && since == Version::CurrentPlaceholder {
             tidy_error!(
                 bad,
-                "The placeholder use of {kind} feature `{feature_name}` is not allowed on the {channel} channel",
+                "{file}:{line}: The placeholder use of {kind} feature `{feature_name}` is not allowed on the {channel} channel",
             );
         }
     }
@@ -279,9 +283,9 @@ fn test_filen_gate(filen_underscore: &str, features: &mut Features) -> bool {
 
 pub fn collect_lang_features(base_compiler_path: &Path, bad: &mut bool) -> Features {
     let mut features = Features::new();
-    collect_lang_features_in(&mut features, base_compiler_path, "active.rs", bad);
     collect_lang_features_in(&mut features, base_compiler_path, "accepted.rs", bad);
     collect_lang_features_in(&mut features, base_compiler_path, "removed.rs", bad);
+    collect_lang_features_in(&mut features, base_compiler_path, "unstable.rs", bad);
     features
 }
 
@@ -336,11 +340,11 @@ fn collect_lang_features_in(features: &mut Features, base: &Path, file: &str, ba
 
         let mut parts = line.split(',');
         let level = match parts.next().map(|l| l.trim().trim_start_matches('(')) {
-            Some("active") => Status::Unstable,
+            Some("unstable") => Status::Unstable,
             Some("incomplete") => Status::Unstable,
             Some("internal") => Status::Unstable,
             Some("removed") => Status::Removed,
-            Some("accepted") => Status::Stable,
+            Some("accepted") => Status::Accepted,
             _ => continue,
         };
         let name = parts.next().unwrap().trim();
@@ -433,7 +437,14 @@ fn collect_lang_features_in(features: &mut Features, base: &Path, file: &str, ba
                 );
             }
             Entry::Vacant(e) => {
-                e.insert(Feature { level, since, has_gate_test: false, tracking_issue });
+                e.insert(Feature {
+                    level,
+                    since,
+                    has_gate_test: false,
+                    tracking_issue,
+                    file: path.to_path_buf(),
+                    line: line_number,
+                });
             }
         }
     }
@@ -449,7 +460,7 @@ fn get_and_check_lib_features(
         Ok((name, f)) => {
             let mut check_features = |f: &Feature, list: &Features, display: &str| {
                 if let Some(ref s) = list.get(name) {
-                    if f.tracking_issue != s.tracking_issue && f.level != Status::Stable {
+                    if f.tracking_issue != s.tracking_issue && f.level != Status::Accepted {
                         tidy_error!(
                             bad,
                             "{}:{}: `issue` \"{}\" mismatches the {} `issue` of \"{}\"",
@@ -559,6 +570,8 @@ fn map_lib_features(
                         since: None,
                         has_gate_test: false,
                         tracking_issue: find_attr_val(line, "issue").and_then(handle_issue_none),
+                        file: file.to_path_buf(),
+                        line: i + 1,
                     };
                     mf(Ok((feature_name, feature)), file, i + 1);
                     continue;
@@ -566,7 +579,7 @@ fn map_lib_features(
                 let level = if line.contains("[unstable(") {
                     Status::Unstable
                 } else if line.contains("[stable(") {
-                    Status::Stable
+                    Status::Accepted
                 } else {
                     continue;
                 };
@@ -581,14 +594,21 @@ fn map_lib_features(
                     Some(Err(_err)) => {
                         err!("malformed stability attribute: can't parse `since` key");
                     }
-                    None if level == Status::Stable => {
+                    None if level == Status::Accepted => {
                         err!("malformed stability attribute: missing the `since` key");
                     }
                     None => None,
                 };
                 let tracking_issue = find_attr_val(line, "issue").and_then(handle_issue_none);
 
-                let feature = Feature { level, since, has_gate_test: false, tracking_issue };
+                let feature = Feature {
+                    level,
+                    since,
+                    has_gate_test: false,
+                    tracking_issue,
+                    file: file.to_path_buf(),
+                    line: i + 1,
+                };
                 if line.contains(']') {
                     mf(Ok((feature_name, feature)), file, i + 1);
                 } else {

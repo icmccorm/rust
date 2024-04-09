@@ -27,7 +27,7 @@ use crate::alloc::{Allocator, Global};
 /// `BTreeSet` that observed the logic error and not result in undefined behavior. This could
 /// include panics, incorrect results, aborts, memory leaks, and non-termination.
 ///
-/// Iterators returned by [`BTreeSet::iter`] produce their items in order, and take worst-case
+/// Iterators returned by [`BTreeSet::iter`] and [`BTreeSet::into_iter`] produce their items in order, and take worst-case
 /// logarithmic and amortized constant time per item returned.
 ///
 /// [`Cell`]: core::cell::Cell
@@ -140,7 +140,7 @@ impl<T: fmt::Debug> fmt::Debug for Iter<'_, T> {
     }
 }
 
-/// An owning iterator over the items of a `BTreeSet`.
+/// An owning iterator over the items of a `BTreeSet` in ascending order.
 ///
 /// This `struct` is created by the [`into_iter`] method on [`BTreeSet`]
 /// (provided by the [`IntoIterator`] trait). See its documentation for more.
@@ -358,7 +358,7 @@ impl<T, A: Allocator + Clone> BTreeSet<T, A> {
     /// let mut set: BTreeSet<i32> = BTreeSet::new_in(Global);
     /// ```
     #[unstable(feature = "btreemap_alloc", issue = "32838")]
-    pub fn new_in(alloc: A) -> BTreeSet<T, A> {
+    pub const fn new_in(alloc: A) -> BTreeSet<T, A> {
         BTreeSet { map: BTreeMap::new_in(alloc) }
     }
 
@@ -790,6 +790,7 @@ impl<T, A: Allocator + Clone> BTreeSet<T, A> {
     /// ```
     #[must_use]
     #[stable(feature = "map_first_last", since = "1.66.0")]
+    #[rustc_confusables("front")]
     pub fn first(&self) -> Option<&T>
     where
         T: Ord,
@@ -816,6 +817,7 @@ impl<T, A: Allocator + Clone> BTreeSet<T, A> {
     /// ```
     #[must_use]
     #[stable(feature = "map_first_last", since = "1.66.0")]
+    #[rustc_confusables("back")]
     pub fn last(&self) -> Option<&T>
     where
         T: Ord,
@@ -896,6 +898,7 @@ impl<T, A: Allocator + Clone> BTreeSet<T, A> {
     /// assert_eq!(set.len(), 1);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("push", "put")]
     pub fn insert(&mut self, value: T) -> bool
     where
         T: Ord,
@@ -919,6 +922,7 @@ impl<T, A: Allocator + Clone> BTreeSet<T, A> {
     /// assert_eq!(set.get(&[][..]).unwrap().capacity(), 10);
     /// ```
     #[stable(feature = "set_recovery", since = "1.9.0")]
+    #[rustc_confusables("swap")]
     pub fn replace(&mut self, value: T) -> Option<T>
     where
         T: Ord,
@@ -1152,6 +1156,7 @@ impl<T, A: Allocator + Clone> BTreeSet<T, A> {
         issue = "71835",
         implied_by = "const_btree_new"
     )]
+    #[rustc_confusables("length", "size")]
     pub const fn len(&self) -> usize {
         self.map.len()
     }
@@ -1232,7 +1237,7 @@ impl<T, A: Allocator + Clone> IntoIterator for BTreeSet<T, A> {
     type Item = T;
     type IntoIter = IntoIter<T, A>;
 
-    /// Gets an iterator for moving out the `BTreeSet`'s contents.
+    /// Gets an iterator for moving out the `BTreeSet`'s contents in ascending order.
     ///
     /// # Examples
     ///

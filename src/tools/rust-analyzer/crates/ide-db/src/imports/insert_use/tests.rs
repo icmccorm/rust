@@ -1,6 +1,5 @@
-use base_db::fixture::WithFixture;
-use hir::PrefixKind;
 use stdx::trim_indent;
+use test_fixture::WithFixture;
 use test_utils::{assert_eq_text, CURSOR_MARKER};
 
 use super::*;
@@ -137,6 +136,16 @@ fn insert_start_indent() {
     use std::bar::B;
     use std::bar::C;",
     );
+    check_none(
+        "std::bar::r#AA",
+        r"
+    use std::bar::B;
+    use std::bar::C;",
+        r"
+    use std::bar::r#AA;
+    use std::bar::B;
+    use std::bar::C;",
+    );
 }
 
 #[test]
@@ -173,7 +182,21 @@ fn insert_middle_indent() {
     use std::bar::EE;
     use std::bar::F;
     use std::bar::G;",
-    )
+    );
+    check_none(
+        "std::bar::r#EE",
+        r"
+    use std::bar::A;
+    use std::bar::D;
+    use std::bar::F;
+    use std::bar::G;",
+        r"
+    use std::bar::A;
+    use std::bar::D;
+    use std::bar::r#EE;
+    use std::bar::F;
+    use std::bar::G;",
+    );
 }
 
 #[test]
@@ -210,7 +233,21 @@ fn insert_end_indent() {
     use std::bar::F;
     use std::bar::G;
     use std::bar::ZZ;",
-    )
+    );
+    check_none(
+        "std::bar::r#ZZ",
+        r"
+    use std::bar::A;
+    use std::bar::D;
+    use std::bar::F;
+    use std::bar::G;",
+        r"
+    use std::bar::A;
+    use std::bar::D;
+    use std::bar::F;
+    use std::bar::G;
+    use std::bar::r#ZZ;",
+    );
 }
 
 #[test]
@@ -228,7 +265,21 @@ use std::bar::EE;
 use std::bar::{D, Z}; // example of weird imports due to user
 use std::bar::F;
 use std::bar::G;",
-    )
+    );
+    check_none(
+        "std::bar::r#EE",
+        r"
+use std::bar::A;
+use std::bar::{D, Z}; // example of weird imports due to user
+use std::bar::F;
+use std::bar::G;",
+        r"
+use std::bar::A;
+use std::bar::r#EE;
+use std::bar::{D, Z}; // example of weird imports due to user
+use std::bar::F;
+use std::bar::G;",
+    );
 }
 
 #[test]
@@ -567,7 +618,9 @@ fn main() {}"#,
 
 #[test]
 fn merge_groups() {
-    check_module("std::io", r"use std::fmt;", r"use std::{fmt, io};")
+    check_module("std::io", r"use std::fmt;", r"use std::{fmt, io};");
+    check_one("std::io", r"use {std::fmt};", r"use {std::{fmt, io}};");
+    check_one("std::io", r"use std::fmt;", r"use {std::{fmt, io}};");
 }
 
 #[test]
@@ -577,12 +630,18 @@ fn merge_groups_last() {
         r"use std::fmt::{Result, Display};",
         r"use std::fmt::{Result, Display};
 use std::io;",
-    )
+    );
+    check_one(
+        "std::io",
+        r"use {std::fmt::{Result, Display}};",
+        r"use {std::{fmt::{Display, Result}, io}};",
+    );
 }
 
 #[test]
 fn merge_last_into_self() {
     check_module("foo::bar::baz", r"use foo::bar;", r"use foo::bar::{self, baz};");
+    check_one("foo::bar::baz", r"use {foo::bar};", r"use {foo::bar::{self, baz}};");
 }
 
 #[test]
@@ -590,13 +649,32 @@ fn merge_groups_full() {
     check_crate(
         "std::io",
         r"use std::fmt::{Result, Display};",
-        r"use std::{fmt::{Result, Display}, io};",
-    )
+        r"use std::{fmt::{Display, Result}, io};",
+    );
+    check_one(
+        "std::io",
+        r"use {std::fmt::{Result, Display}};",
+        r"use {std::{fmt::{Display, Result}, io}};",
+    );
 }
 
 #[test]
 fn merge_groups_long_full() {
-    check_crate("std::foo::bar::Baz", r"use std::foo::bar::Qux;", r"use std::foo::bar::{Qux, Baz};")
+    check_crate(
+        "std::foo::bar::Baz",
+        r"use std::foo::bar::Qux;",
+        r"use std::foo::bar::{Baz, Qux};",
+    );
+    check_crate(
+        "std::foo::bar::r#Baz",
+        r"use std::foo::bar::Qux;",
+        r"use std::foo::bar::{r#Baz, Qux};",
+    );
+    check_one(
+        "std::foo::bar::Baz",
+        r"use {std::foo::bar::Qux};",
+        r"use {std::foo::bar::{Baz, Qux}};",
+    );
 }
 
 #[test]
@@ -604,7 +682,7 @@ fn merge_groups_long_last() {
     check_module(
         "std::foo::bar::Baz",
         r"use std::foo::bar::Qux;",
-        r"use std::foo::bar::{Qux, Baz};",
+        r"use std::foo::bar::{Baz, Qux};",
     )
 }
 
@@ -613,8 +691,18 @@ fn merge_groups_long_full_list() {
     check_crate(
         "std::foo::bar::Baz",
         r"use std::foo::bar::{Qux, Quux};",
-        r"use std::foo::bar::{Qux, Quux, Baz};",
-    )
+        r"use std::foo::bar::{Baz, Quux, Qux};",
+    );
+    check_crate(
+        "std::foo::bar::r#Baz",
+        r"use std::foo::bar::{Qux, Quux};",
+        r"use std::foo::bar::{r#Baz, Quux, Qux};",
+    );
+    check_one(
+        "std::foo::bar::Baz",
+        r"use {std::foo::bar::{Qux, Quux}};",
+        r"use {std::foo::bar::{Baz, Quux, Qux}};",
+    );
 }
 
 #[test]
@@ -622,7 +710,7 @@ fn merge_groups_long_last_list() {
     check_module(
         "std::foo::bar::Baz",
         r"use std::foo::bar::{Qux, Quux};",
-        r"use std::foo::bar::{Qux, Quux, Baz};",
+        r"use std::foo::bar::{Baz, Quux, Qux};",
     )
 }
 
@@ -631,8 +719,18 @@ fn merge_groups_long_full_nested() {
     check_crate(
         "std::foo::bar::Baz",
         r"use std::foo::bar::{Qux, quux::{Fez, Fizz}};",
-        r"use std::foo::bar::{Qux, quux::{Fez, Fizz}, Baz};",
-    )
+        r"use std::foo::bar::{quux::{Fez, Fizz}, Baz, Qux};",
+    );
+    check_crate(
+        "std::foo::bar::r#Baz",
+        r"use std::foo::bar::{Qux, quux::{Fez, Fizz}};",
+        r"use std::foo::bar::{quux::{Fez, Fizz}, r#Baz, Qux};",
+    );
+    check_one(
+        "std::foo::bar::Baz",
+        r"use {std::foo::bar::{Qux, quux::{Fez, Fizz}}};",
+        r"use {std::foo::bar::{quux::{Fez, Fizz}, Baz, Qux}};",
+    );
 }
 
 #[test]
@@ -650,8 +748,13 @@ fn merge_groups_full_nested_deep() {
     check_crate(
         "std::foo::bar::quux::Baz",
         r"use std::foo::bar::{Qux, quux::{Fez, Fizz}};",
-        r"use std::foo::bar::{Qux, quux::{Fez, Fizz, Baz}};",
-    )
+        r"use std::foo::bar::{quux::{Baz, Fez, Fizz}, Qux};",
+    );
+    check_one(
+        "std::foo::bar::quux::Baz",
+        r"use {std::foo::bar::{Qux, quux::{Fez, Fizz}}};",
+        r"use {std::foo::bar::{quux::{Baz, Fez, Fizz}, Qux}};",
+    );
 }
 
 #[test]
@@ -659,7 +762,7 @@ fn merge_groups_full_nested_long() {
     check_crate(
         "std::foo::bar::Baz",
         r"use std::{foo::bar::Qux};",
-        r"use std::{foo::bar::{Qux, Baz}};",
+        r"use std::foo::bar::{Baz, Qux};",
     );
 }
 
@@ -668,7 +771,12 @@ fn merge_groups_last_nested_long() {
     check_crate(
         "std::foo::bar::Baz",
         r"use std::{foo::bar::Qux};",
-        r"use std::{foo::bar::{Qux, Baz}};",
+        r"use std::foo::bar::{Baz, Qux};",
+    );
+    check_one(
+        "std::foo::bar::Baz",
+        r"use {std::{foo::bar::Qux}};",
+        r"use {std::foo::bar::{Baz, Qux}};",
     );
 }
 
@@ -679,7 +787,13 @@ fn merge_groups_skip_pub() {
         r"pub use std::fmt::{Result, Display};",
         r"pub use std::fmt::{Result, Display};
 use std::io;",
-    )
+    );
+    check_one(
+        "std::io",
+        r"pub use {std::fmt::{Result, Display}};",
+        r"pub use {std::fmt::{Result, Display}};
+use {std::io};",
+    );
 }
 
 #[test]
@@ -689,7 +803,13 @@ fn merge_groups_skip_pub_crate() {
         r"pub(crate) use std::fmt::{Result, Display};",
         r"pub(crate) use std::fmt::{Result, Display};
 use std::io;",
-    )
+    );
+    check_one(
+        "std::io",
+        r"pub(crate) use {std::fmt::{Result, Display}};",
+        r"pub(crate) use {std::fmt::{Result, Display}};
+use {std::io};",
+    );
 }
 
 #[test]
@@ -703,7 +823,17 @@ fn merge_groups_skip_attributed() {
 #[cfg(feature = "gated")] use std::fmt::{Result, Display};
 use std::io;
 "#,
-    )
+    );
+    check_one(
+        "std::io",
+        r#"
+#[cfg(feature = "gated")] use {std::fmt::{Result, Display}};
+"#,
+        r#"
+#[cfg(feature = "gated")] use {std::fmt::{Result, Display}};
+use {std::io};
+"#,
+    );
 }
 
 #[test]
@@ -733,7 +863,7 @@ fn merge_mod_into_glob() {
     check_with_config(
         "token::TokenKind",
         r"use token::TokenKind::*;",
-        r"use token::TokenKind::{*, self};",
+        r"use token::TokenKind::{self, *};",
         &InsertUseConfig {
             granularity: ImportGranularity::Crate,
             enforce_granularity: true,
@@ -742,7 +872,6 @@ fn merge_mod_into_glob() {
             skip_glob_imports: false,
         },
     )
-    // FIXME: have it emit `use token::TokenKind::{self, *}`?
 }
 
 #[test]
@@ -750,7 +879,7 @@ fn merge_self_glob() {
     check_with_config(
         "self",
         r"use self::*;",
-        r"use self::{*, self};",
+        r"use self::{self, *};",
         &InsertUseConfig {
             granularity: ImportGranularity::Crate,
             enforce_granularity: true,
@@ -759,7 +888,6 @@ fn merge_self_glob() {
             skip_glob_imports: false,
         },
     )
-    // FIXME: have it emit `use {self, *}`?
 }
 
 #[test]
@@ -769,7 +897,7 @@ fn merge_glob() {
         r"
 use syntax::{SyntaxKind::*};",
         r"
-use syntax::{SyntaxKind::{*, self}};",
+use syntax::SyntaxKind::{self, *};",
     )
 }
 
@@ -778,7 +906,7 @@ fn merge_glob_nested() {
     check_crate(
         "foo::bar::quux::Fez",
         r"use foo::bar::{Baz, quux::*};",
-        r"use foo::bar::{Baz, quux::{*, Fez}};",
+        r"use foo::bar::{quux::{Fez, *}, Baz};",
     )
 }
 
@@ -787,7 +915,7 @@ fn merge_nested_considers_first_segments() {
     check_crate(
         "hir_ty::display::write_bounds_like_dyn_trait",
         r"use hir_ty::{autoderef, display::{HirDisplayError, HirFormatter}, method_resolution};",
-        r"use hir_ty::{autoderef, display::{HirDisplayError, HirFormatter, write_bounds_like_dyn_trait}, method_resolution};",
+        r"use hir_ty::{autoderef, display::{write_bounds_like_dyn_trait, HirDisplayError, HirFormatter}, method_resolution};",
     );
 }
 
@@ -867,6 +995,7 @@ fn guess_single() {
     check_guess(r"use foo::{baz::{qux, quux}, bar};", ImportGranularityGuess::Crate);
     check_guess(r"use foo::bar;", ImportGranularityGuess::Unknown);
     check_guess(r"use foo::bar::{baz, qux};", ImportGranularityGuess::CrateOrModule);
+    check_guess(r"use {foo::bar};", ImportGranularityGuess::One);
 }
 
 #[test]
@@ -959,11 +1088,46 @@ use foo::{baz::{qux, quux}, bar};
 }
 
 #[test]
+fn guess_one() {
+    check_guess(
+        r"
+use {
+    frob::bar::baz,
+    foo::{baz::{qux, quux}, bar}
+};
+",
+        ImportGranularityGuess::One,
+    );
+}
+
+#[test]
 fn guess_skips_differing_vis() {
     check_guess(
         r"
 use foo::bar::baz;
 pub use foo::bar::qux;
+",
+        ImportGranularityGuess::Unknown,
+    );
+}
+
+#[test]
+fn guess_one_differing_vis() {
+    check_guess(
+        r"
+use {foo::bar::baz};
+pub use {foo::bar::qux};
+",
+        ImportGranularityGuess::One,
+    );
+}
+
+#[test]
+fn guess_skips_multiple_one_style_same_vis() {
+    check_guess(
+        r"
+use {foo::bar::baz};
+use {foo::bar::qux};
 ",
         ImportGranularityGuess::Unknown,
     );
@@ -982,6 +1146,31 @@ pub use foo::bar::qux;
 }
 
 #[test]
+fn guess_one_differing_attrs() {
+    check_guess(
+        r"
+pub use {foo::bar::baz};
+#[doc(hidden)]
+pub use {foo::bar::qux};
+",
+        ImportGranularityGuess::One,
+    );
+}
+
+#[test]
+fn guess_skips_multiple_one_style_same_attrs() {
+    check_guess(
+        r"
+#[doc(hidden)]
+use {foo::bar::baz};
+#[doc(hidden)]
+use {foo::bar::qux};
+",
+        ImportGranularityGuess::Unknown,
+    );
+}
+
+#[test]
 fn guess_grouping_matters() {
     check_guess(
         r"
@@ -990,6 +1179,46 @@ use oof::bar::baz;
 use foo::bar::qux;
 ",
         ImportGranularityGuess::Unknown,
+    );
+}
+
+#[test]
+fn insert_with_renamed_import_simple_use() {
+    check_with_config(
+        "use self::foo::Foo",
+        r#"
+use self::foo::Foo as _;
+"#,
+        r#"
+use self::foo::Foo;
+"#,
+        &InsertUseConfig {
+            granularity: ImportGranularity::Crate,
+            prefix_kind: hir::PrefixKind::BySelf,
+            enforce_granularity: true,
+            group: true,
+            skip_glob_imports: true,
+        },
+    );
+}
+
+#[test]
+fn insert_with_renamed_import_complex_use() {
+    check_with_config(
+        "use self::foo::Foo;",
+        r#"
+use self::foo::{self, Foo as _, Bar};
+"#,
+        r#"
+use self::foo::{self, Bar, Foo};
+"#,
+        &InsertUseConfig {
+            granularity: ImportGranularity::Crate,
+            prefix_kind: hir::PrefixKind::BySelf,
+            enforce_granularity: true,
+            group: true,
+            skip_glob_imports: true,
+        },
     );
 }
 
@@ -1056,6 +1285,10 @@ fn check_module(path: &str, ra_fixture_before: &str, ra_fixture_after: &str) {
 
 fn check_none(path: &str, ra_fixture_before: &str, ra_fixture_after: &str) {
     check(path, ra_fixture_before, ra_fixture_after, ImportGranularity::Item)
+}
+
+fn check_one(path: &str, ra_fixture_before: &str, ra_fixture_after: &str) {
+    check(path, ra_fixture_before, ra_fixture_after, ImportGranularity::One)
 }
 
 fn check_merge_only_fail(ra_fixture0: &str, ra_fixture1: &str, mb: MergeBehavior) {

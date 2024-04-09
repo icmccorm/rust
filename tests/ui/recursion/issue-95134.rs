@@ -1,9 +1,8 @@
-// build-fail
-// known-bug: #95134
-// compile-flags: -Copt-level=0
-// dont-check-failure-status
-// dont-check-compiler-stderr
-// ignore-compare-mode-next-solver (hangs)
+//@ build-fail
+//@ known-bug: #95134
+//@ compile-flags: -Copt-level=0
+//@ dont-check-failure-status
+//@ dont-check-compiler-stderr
 
 pub fn encode_num<Writer: ExampleWriter>(n: u32, mut writer: Writer) -> Result<(), Writer::Error> {
     if n > 15 {

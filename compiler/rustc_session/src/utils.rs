@@ -1,7 +1,10 @@
 use crate::session::Session;
 use rustc_data_structures::profiling::VerboseTimingGuard;
 use rustc_fs_util::try_canonicalize;
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 impl Session {
     pub fn timer(&self, what: &'static str) -> VerboseTimingGuard<'_> {
@@ -124,7 +127,7 @@ pub fn extra_compiler_flags() -> Option<(Vec<String>, bool)> {
 
     const ICE_REPORT_COMPILER_FLAGS_STRIP_VALUE: &[&str] = &["incremental"];
 
-    let mut args = std::env::args_os().map(|arg| arg.to_string_lossy().to_string()).peekable();
+    let mut args = std::env::args_os().map(|arg| arg.to_string_lossy().to_string());
 
     let mut result = Vec::new();
     let mut excluded_cargo_defaults = false;
@@ -159,11 +162,17 @@ pub fn extra_compiler_flags() -> Option<(Vec<String>, bool)> {
     if !result.is_empty() { Some((result, excluded_cargo_defaults)) } else { None }
 }
 
-pub(crate) fn is_ascii_ident(string: &str) -> bool {
-    let mut chars = string.chars();
-    if let Some(start) = chars.next() && (start.is_ascii_alphabetic() || start == '_') {
-        chars.all(|char| char.is_ascii_alphanumeric() || char == '_')
-    } else {
-        false
-    }
+/// Returns whenever rustc was launched by Cargo as opposed to another build system.
+///
+/// To be used in diagnostics to avoid printing Cargo specific suggestions to other
+/// build systems (like Bazel, Buck2, Makefile, ...).
+pub fn was_invoked_from_cargo() -> bool {
+    static FROM_CARGO: OnceLock<bool> = OnceLock::new();
+
+    // To be able to detect Cargo, we use the simplest and least intrusive
+    // way: we check whenever the `CARGO_CRATE_NAME` env is set.
+    //
+    // Note that it is common in Makefiles to define the `CARGO` env even
+    // though we may not have been called by Cargo, so we avoid using it.
+    *FROM_CARGO.get_or_init(|| std::env::var_os("CARGO_CRATE_NAME").is_some())
 }

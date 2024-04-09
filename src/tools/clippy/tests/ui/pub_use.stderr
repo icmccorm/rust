@@ -1,5 +1,5 @@
 error: using `pub use`
-  --> $DIR/pub_use.rs:10:5
+  --> tests/ui/pub_use.rs:10:5
    |
 LL |     pub use inner::Test;
    |     ^^^^^^^^^^^^^^^^^^^^
@@ -8,5 +8,5 @@ LL |     pub use inner::Test;
    = note: `-D clippy::pub-use` implied by `-D warnings`
    = help: to override `-D warnings` add `#[allow(clippy::pub_use)]`
 
-error: aborting due to previous error
+error: aborting due to 1 previous error
 

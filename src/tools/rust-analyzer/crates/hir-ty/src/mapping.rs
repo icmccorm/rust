@@ -103,15 +103,15 @@ impl From<crate::db::InternedClosureId> for chalk_ir::ClosureId<Interner> {
     }
 }
 
-impl From<chalk_ir::GeneratorId<Interner>> for crate::db::InternedGeneratorId {
-    fn from(id: chalk_ir::GeneratorId<Interner>) -> Self {
+impl From<chalk_ir::CoroutineId<Interner>> for crate::db::InternedCoroutineId {
+    fn from(id: chalk_ir::CoroutineId<Interner>) -> Self {
         Self::from_intern_id(id.0)
     }
 }
 
-impl From<crate::db::InternedGeneratorId> for chalk_ir::GeneratorId<Interner> {
-    fn from(id: crate::db::InternedGeneratorId) -> Self {
-        chalk_ir::GeneratorId(id.as_intern_id())
+impl From<crate::db::InternedCoroutineId> for chalk_ir::CoroutineId<Interner> {
+    fn from(id: crate::db::InternedCoroutineId) -> Self {
+        chalk_ir::CoroutineId(id.as_intern_id())
     }
 }
 
@@ -149,6 +149,14 @@ pub fn lt_from_placeholder_idx(db: &dyn HirDatabase, idx: PlaceholderIndex) -> L
     assert_eq!(idx.ui, chalk_ir::UniverseIndex::ROOT);
     let interned_id = salsa::InternKey::from_intern_id(salsa::InternId::from(idx.idx));
     db.lookup_intern_lifetime_param_id(interned_id)
+}
+
+pub fn lt_to_placeholder_idx(db: &dyn HirDatabase, id: LifetimeParamId) -> PlaceholderIndex {
+    let interned_id = db.intern_lifetime_param_id(id);
+    PlaceholderIndex {
+        ui: chalk_ir::UniverseIndex::ROOT,
+        idx: salsa::InternKey::as_intern_id(&interned_id).as_usize(),
+    }
 }
 
 pub fn to_chalk_trait_id(id: TraitId) -> ChalkTraitId {

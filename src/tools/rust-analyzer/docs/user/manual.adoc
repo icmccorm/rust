@@ -174,7 +174,7 @@ $ rustup component add rust-analyzer
 
 The `rust-analyzer` binary can be installed from the repos or AUR (Arch User Repository):
 
-- https://www.archlinux.org/packages/community/x86_64/rust-analyzer/[`rust-analyzer`] (built from latest tagged source)
+- https://www.archlinux.org/packages/extra/x86_64/rust-analyzer/[`rust-analyzer`] (built from latest tagged source)
 - https://aur.archlinux.org/packages/rust-analyzer-git[`rust-analyzer-git`] (latest Git version)
 
 Install it with pacman, for example:
@@ -186,18 +186,13 @@ $ pacman -S rust-analyzer
 
 ==== Gentoo Linux
 
-`rust-analyzer` is available in the GURU repository:
+There are two ways to install `rust-analyzer` under Gentoo:
 
-- https://gitweb.gentoo.org/repo/proj/guru.git/tree/dev-util/rust-analyzer?id=9895cea62602cfe599bd48e0fb02127411ca6e81[`dev-util/rust-analyzer`] builds from source
-- https://gitweb.gentoo.org/repo/proj/guru.git/tree/dev-util/rust-analyzer-bin?id=9895cea62602cfe599bd48e0fb02127411ca6e81[`dev-util/rust-analyzer-bin`] installs an official binary release
+- when installing `dev-lang/rust` or `dev-lang/rust-bin`, enable the `rust-analyzer` and `rust-src` USE flags
+- use the `rust-analyzer` component in `rustup` (see instructions above)
 
-If not already, GURU must be enabled (e.g. using `app-eselect/eselect-repository`) and sync'd before running `emerge`:
-
-[source,bash]
-----
-$ eselect repository enable guru && emaint sync -r guru
-$ emerge rust-analyzer-bin
-----
+Note that in both cases, the version installed lags for a couple of months behind the official releases on GitHub.
+To obtain a newer one, you can download a binary from GitHub Releases or building from source.
 
 ==== macOS
 
@@ -237,13 +232,22 @@ To use `rust-analyzer`, you need to install and enable one of the two popular LS
 
 ==== Eglot
 
-Eglot is the more minimalistic and lightweight LSP client for Emacs, integrates well with existing Emacs functionality and will be built into Emacs starting from release 29.
+Eglot is the more minimalistic and lightweight LSP client for Emacs, integrates well with existing Emacs functionality and is built into Emacs starting from release 29.
 
 After installing Eglot, e.g. via `M-x package-install` (not needed from Emacs 29), you can enable it via the `M-x eglot` command or load it automatically in `rust-mode` via
 
 [source,emacs-lisp]
 ----
 (add-hook 'rust-mode-hook 'eglot-ensure)
+----
+
+To enable clippy, you will need to configure the initialization options to pass the `check.command` setting.
+
+[source,emacs-lisp]
+----
+(add-to-list 'eglot-server-programs
+             '((rust-ts-mode rust-mode) .
+               ("rust-analyzer" :initializationOptions (:check (:command "clippy")))))
 ----
 
 For more detailed instructions and options see the https://joaotavora.github.io/eglot[Eglot manual] (also available from Emacs via `M-x info`) and the
@@ -333,14 +337,14 @@ You can also pass LSP settings to the server:
 [source,vim]
 ----
 lua << EOF
-local nvim_lsp = require'lspconfig'
+local lspconfig = require'lspconfig'
 
 local on_attach = function(client)
     require'completion'.on_attach(client)
 end
 
-nvim_lsp.rust_analyzer.setup({
-    on_attach=on_attach,
+lspconfig.rust_analyzer.setup({
+    on_attach = on_attach,
     settings = {
         ["rust-analyzer"] = {
             imports = {
@@ -363,9 +367,22 @@ nvim_lsp.rust_analyzer.setup({
 EOF
 ----
 
+If you're running Neovim 0.10 or later, you can enable inlay hints via `on_attach`:
+
+[source,vim]
+----
+lspconfig.rust_analyzer.setup({
+    on_attach = function(client, bufnr)
+        vim.lsp.inlay_hint.enable(bufnr)
+    end
+})
+----
+
+Note that the hints are only visible after `rust-analyzer` has finished loading **and** you have to edit the file to trigger a re-render.
+
 See https://sharksforarms.dev/posts/neovim-rust/ for more tips on getting started.
 
-Check out https://github.com/simrat39/rust-tools.nvim for a batteries included rust-analyzer setup for Neovim.
+Check out https://github.com/mrcjkb/rustaceanvim for a batteries included rust-analyzer setup for Neovim.
 
 ==== vim-lsp
 
@@ -508,7 +525,8 @@ https://docs.helix-editor.com/[Helix] supports LSP by default.
 However, it won't install `rust-analyzer` automatically.
 You can follow instructions for installing <<rust-analyzer-language-server-binary,`rust-analyzer` binary>>.
 
-=== Visual Studio 2022
+[#visual-studio]
+=== [[visual-studio-2022]]Visual Studio 2022
 
 There are multiple rust-analyzer extensions for Visual Studio 2022 on Windows:
 
@@ -554,6 +572,11 @@ Unfortunately, it downloads an old version of `rust-analyzer`, but you can set t
 There is a package named `ra_ap_rust_analyzer` available on https://crates.io/crates/ra_ap_rust-analyzer[crates.io], for someone who wants to use it programmatically.
 
 For more details, see https://github.com/rust-lang/rust-analyzer/blob/master/.github/workflows/publish.yml[the publish workflow].
+
+=== Zed
+
+https://zed.dev[Zed] has native `rust-analyzer` support.
+If the LSP binary is not available, Zed can install it when opening a Rust file.
 
 == Troubleshooting
 
@@ -932,7 +955,7 @@ Or it is possible to specify vars more granularly:
 "rust-analyzer.runnables.extraEnv": [
     {
         // "mask": null, // null mask means that this rule will be applied for all runnables
-        env: {
+        "env": {
              "APP_ID": "1",
              "APP_DATA": "asdf"
         }
@@ -954,7 +977,7 @@ If needed, you can set different values for different platforms:
 "rust-analyzer.runnables.extraEnv": [
     {
         "platform": "win32", // windows only
-        env: {
+        "env": {
              "APP_DATA": "windows specific data"
         }
     },

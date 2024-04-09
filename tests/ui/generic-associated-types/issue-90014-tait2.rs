@@ -2,11 +2,10 @@
 //! without respecting its binders (which would ICE).
 //! Unfortunately we don't even reach opaque type collection, as we ICE in typeck before that.
 //! See #109281 for the original report.
-// edition:2018
-// error-pattern: expected generic lifetime parameter, found `'a`
+//@ edition:2018
+//@ error-pattern: expected generic lifetime parameter, found `'a`
 
 #![feature(type_alias_impl_trait)]
-#![allow(incomplete_features)]
 
 use std::future::Future;
 

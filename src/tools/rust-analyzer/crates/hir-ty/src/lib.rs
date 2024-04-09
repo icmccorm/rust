@@ -1,11 +1,23 @@
 //! The type system. We currently use this to infer types for completion, hover
 //! information and various assists.
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![warn(rust_2018_idioms, unused_lifetimes)]
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 
-#[allow(unused)]
-macro_rules! eprintln {
-    ($($tt:tt)*) => { stdx::eprintln!($($tt)*) };
-}
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_index;
+
+#[cfg(not(feature = "in-rust-tree"))]
+extern crate ra_ap_rustc_index as rustc_index;
+
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_abi;
+
+#[cfg(not(feature = "in-rust-tree"))]
+extern crate ra_ap_rustc_abi as rustc_abi;
+
+// Use the crates.io version unconditionally until the API settles enough that we can switch to
+// using the in-tree one.
+extern crate ra_ap_rustc_pattern_analysis as rustc_pattern_analysis;
 
 mod builder;
 mod chalk_db;
@@ -31,27 +43,28 @@ pub mod primitive;
 pub mod traits;
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod test_db;
+#[cfg(test)]
+mod tests;
 
 use std::{
-    collections::{hash_map::Entry, HashMap},
-    hash::Hash,
+    collections::hash_map::Entry,
+    hash::{BuildHasherDefault, Hash},
 };
 
+use base_db::salsa::impl_intern_value_trivial;
 use chalk_ir::{
     fold::{Shift, TypeFoldable},
     interner::HasInterner,
     visit::{TypeSuperVisitable, TypeVisitable, TypeVisitor},
-    NoSolution, TyData,
+    NoSolution,
 };
 use either::Either;
 use hir_def::{hir::ExprId, type_ref::Rawness, GeneralConstId, TypeOrConstParamId};
 use hir_expand::name;
 use la_arena::{Arena, Idx};
 use mir::{MirEvalError, VTableMap};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::ast::{make, ConstArg};
 use traits::FnTrait;
 use triomphe::Arc;
@@ -67,19 +80,20 @@ pub use builder::{ParamKind, TyBuilder};
 pub use chalk_ext::*;
 pub use infer::{
     closure::{CaptureKind, CapturedItem},
-    could_coerce, could_unify, Adjust, Adjustment, AutoBorrow, BindingMode, InferenceDiagnostic,
-    InferenceResult, OverloadedDeref, PointerCast,
+    could_coerce, could_unify, could_unify_deeply, Adjust, Adjustment, AutoBorrow, BindingMode,
+    InferenceDiagnostic, InferenceResult, OverloadedDeref, PointerCast,
 };
 pub use interner::Interner;
 pub use lower::{
-    associated_type_shorthand_candidates, CallableDefId, ImplTraitLoweringMode, TyDefId,
-    TyLoweringContext, ValueTyDefId,
+    associated_type_shorthand_candidates, CallableDefId, ImplTraitLoweringMode, ParamLoweringMode,
+    TyDefId, TyLoweringContext, ValueTyDefId,
 };
 pub use mapping::{
     from_assoc_type_id, from_chalk_trait_id, from_foreign_def_id, from_placeholder_idx,
-    lt_from_placeholder_idx, to_assoc_type_id, to_chalk_trait_id, to_foreign_def_id,
-    to_placeholder_idx,
+    lt_from_placeholder_idx, lt_to_placeholder_idx, to_assoc_type_id, to_chalk_trait_id,
+    to_foreign_def_id, to_placeholder_idx,
 };
+pub use method_resolution::check_orphan_rules;
 pub use traits::TraitEnvironment;
 pub use utils::{all_super_traits, is_fn_unsafe_to_call};
 
@@ -120,7 +134,7 @@ pub type TyKind = chalk_ir::TyKind<Interner>;
 pub type TypeFlags = chalk_ir::TypeFlags;
 pub type DynTy = chalk_ir::DynTy<Interner>;
 pub type FnPointer = chalk_ir::FnPointer<Interner>;
-// pub type FnSubst = chalk_ir::FnSubst<Interner>;
+// pub type FnSubst = chalk_ir::FnSubst<Interner>; // a re-export so we don't lose the tuple constructor
 pub use chalk_ir::FnSubst;
 pub type ProjectionTy = chalk_ir::ProjectionTy<Interner>;
 pub type AliasTy = chalk_ir::AliasTy<Interner>;
@@ -150,31 +164,63 @@ pub type DomainGoal = chalk_ir::DomainGoal<Interner>;
 pub type Goal = chalk_ir::Goal<Interner>;
 pub type AliasEq = chalk_ir::AliasEq<Interner>;
 pub type Solution = chalk_solve::Solution<Interner>;
+pub type Constraint = chalk_ir::Constraint<Interner>;
+pub type Constraints = chalk_ir::Constraints<Interner>;
 pub type ConstrainedSubst = chalk_ir::ConstrainedSubst<Interner>;
 pub type Guidance = chalk_solve::Guidance<Interner>;
 pub type WhereClause = chalk_ir::WhereClause<Interner>;
+
+pub type CanonicalVarKind = chalk_ir::CanonicalVarKind<Interner>;
+pub type GoalData = chalk_ir::GoalData<Interner>;
+pub type Goals = chalk_ir::Goals<Interner>;
+pub type ProgramClauseData = chalk_ir::ProgramClauseData<Interner>;
+pub type ProgramClause = chalk_ir::ProgramClause<Interner>;
+pub type ProgramClauses = chalk_ir::ProgramClauses<Interner>;
+pub type TyData = chalk_ir::TyData<Interner>;
+pub type Variances = chalk_ir::Variances<Interner>;
 
 /// A constant can have reference to other things. Memory map job is holding
 /// the necessary bits of memory of the const eval session to keep the constant
 /// meaningful.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct MemoryMap {
-    pub memory: HashMap<usize, Vec<u8>>,
-    pub vtable: VTableMap,
+pub enum MemoryMap {
+    #[default]
+    Empty,
+    Simple(Box<[u8]>),
+    Complex(Box<ComplexMemoryMap>),
 }
 
-impl MemoryMap {
-    fn insert(&mut self, addr: usize, x: Vec<u8>) {
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ComplexMemoryMap {
+    memory: FxHashMap<usize, Box<[u8]>>,
+    vtable: VTableMap,
+}
+
+impl ComplexMemoryMap {
+    fn insert(&mut self, addr: usize, val: Box<[u8]>) {
         match self.memory.entry(addr) {
             Entry::Occupied(mut e) => {
-                if e.get().len() < x.len() {
-                    e.insert(x);
+                if e.get().len() < val.len() {
+                    e.insert(val);
                 }
             }
             Entry::Vacant(e) => {
-                e.insert(x);
+                e.insert(val);
             }
         }
+    }
+}
+
+impl MemoryMap {
+    pub fn vtable_ty(&self, id: usize) -> Result<&Ty, MirEvalError> {
+        match self {
+            MemoryMap::Empty | MemoryMap::Simple(_) => Err(MirEvalError::InvalidVTableId(id)),
+            MemoryMap::Complex(cm) => cm.vtable.ty(id),
+        }
+    }
+
+    fn simple(v: Box<[u8]>) -> Self {
+        MemoryMap::Simple(v)
     }
 
     /// This functions convert each address by a function `f` which gets the byte intervals and assign an address
@@ -183,22 +229,35 @@ impl MemoryMap {
     fn transform_addresses(
         &self,
         mut f: impl FnMut(&[u8], usize) -> Result<usize, MirEvalError>,
-    ) -> Result<HashMap<usize, usize>, MirEvalError> {
-        self.memory
-            .iter()
-            .map(|x| {
-                let addr = *x.0;
-                let align = if addr == 0 { 64 } else { (addr - (addr & (addr - 1))).min(64) };
-                Ok((addr, f(x.1, align)?))
-            })
-            .collect()
+    ) -> Result<FxHashMap<usize, usize>, MirEvalError> {
+        let mut transform = |(addr, val): (&usize, &[u8])| {
+            let addr = *addr;
+            let align = if addr == 0 { 64 } else { (addr - (addr & (addr - 1))).min(64) };
+            f(val, align).map(|it| (addr, it))
+        };
+        match self {
+            MemoryMap::Empty => Ok(Default::default()),
+            MemoryMap::Simple(m) => transform((&0, m)).map(|(addr, val)| {
+                let mut map = FxHashMap::with_capacity_and_hasher(1, BuildHasherDefault::default());
+                map.insert(addr, val);
+                map
+            }),
+            MemoryMap::Complex(cm) => {
+                cm.memory.iter().map(|(addr, val)| transform((addr, val))).collect()
+            }
+        }
     }
 
-    fn get<'a>(&'a self, addr: usize, size: usize) -> Option<&'a [u8]> {
+    fn get(&self, addr: usize, size: usize) -> Option<&[u8]> {
         if size == 0 {
             Some(&[])
         } else {
-            self.memory.get(&addr)?.get(0..size)
+            match self {
+                MemoryMap::Empty => Some(&[]),
+                MemoryMap::Simple(m) if addr == 0 => m.get(0..size),
+                MemoryMap::Simple(_) => None,
+                MemoryMap::Complex(cm) => cm.memory.get(&addr)?.get(0..size),
+            }
         }
     }
 }
@@ -206,7 +265,7 @@ impl MemoryMap {
 /// A concrete constant value
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstScalar {
-    Bytes(Vec<u8>, MemoryMap),
+    Bytes(Box<[u8]>, MemoryMap),
     // FIXME: this is a hack to get around chalk not being able to represent unevaluatable
     // constants
     UnevaluatedConst(GeneralConstId, Substitution),
@@ -276,11 +335,23 @@ pub(crate) fn make_binders_with_count<T: HasInterner<Interner = Interner>>(
     generics: &Generics,
     value: T,
 ) -> Binders<T> {
-    let it = generics.iter_id().take(count).map(|id| match id {
-        Either::Left(_) => None,
-        Either::Right(id) => Some(db.const_param_ty(id)),
-    });
-    crate::make_type_and_const_binders(it, value)
+    let it = generics.iter_id().take(count);
+
+    Binders::new(
+        VariableKinds::from_iter(
+            Interner,
+            it.map(|x| match x {
+                hir_def::GenericParamId::ConstParamId(id) => {
+                    chalk_ir::VariableKind::Const(db.const_param_ty(id))
+                }
+                hir_def::GenericParamId::TypeParamId(_) => {
+                    chalk_ir::VariableKind::Ty(chalk_ir::TyVariableKind::General)
+                }
+                hir_def::GenericParamId::LifetimeParamId(_) => chalk_ir::VariableKind::Lifetime,
+            }),
+        ),
+        value,
+    )
 }
 
 pub(crate) fn make_binders<T: HasInterner<Interner = Interner>>(
@@ -299,9 +370,153 @@ pub struct CallableSig {
     params_and_return: Arc<[Ty]>,
     is_varargs: bool,
     safety: Safety,
+    abi: FnAbi,
 }
 
 has_interner!(CallableSig);
+
+#[derive(Debug, Copy, Clone, Eq)]
+pub enum FnAbi {
+    Aapcs,
+    AapcsUnwind,
+    AvrInterrupt,
+    AvrNonBlockingInterrupt,
+    C,
+    CCmseNonsecureCall,
+    CDecl,
+    CDeclUnwind,
+    CUnwind,
+    Efiapi,
+    Fastcall,
+    FastcallUnwind,
+    Msp430Interrupt,
+    PlatformIntrinsic,
+    PtxKernel,
+    RiscvInterruptM,
+    RiscvInterruptS,
+    Rust,
+    RustCall,
+    RustCold,
+    RustIntrinsic,
+    Stdcall,
+    StdcallUnwind,
+    System,
+    SystemUnwind,
+    Sysv64,
+    Sysv64Unwind,
+    Thiscall,
+    ThiscallUnwind,
+    Unadjusted,
+    Vectorcall,
+    VectorcallUnwind,
+    Wasm,
+    Win64,
+    Win64Unwind,
+    X86Interrupt,
+    Unknown,
+}
+
+impl PartialEq for FnAbi {
+    fn eq(&self, _other: &Self) -> bool {
+        // FIXME: Proper equality breaks `coercion::two_closures_lub` test
+        true
+    }
+}
+
+impl Hash for FnAbi {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Required because of the FIXME above and due to us implementing `Eq`, without this
+        // we would break the `Hash` + `Eq` contract
+        core::mem::discriminant(&Self::Unknown).hash(state);
+    }
+}
+
+impl FnAbi {
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> FnAbi {
+        match s {
+            "aapcs-unwind" => FnAbi::AapcsUnwind,
+            "aapcs" => FnAbi::Aapcs,
+            "avr-interrupt" => FnAbi::AvrInterrupt,
+            "avr-non-blocking-interrupt" => FnAbi::AvrNonBlockingInterrupt,
+            "C-cmse-nonsecure-call" => FnAbi::CCmseNonsecureCall,
+            "C-unwind" => FnAbi::CUnwind,
+            "C" => FnAbi::C,
+            "cdecl-unwind" => FnAbi::CDeclUnwind,
+            "cdecl" => FnAbi::CDecl,
+            "efiapi" => FnAbi::Efiapi,
+            "fastcall-unwind" => FnAbi::FastcallUnwind,
+            "fastcall" => FnAbi::Fastcall,
+            "msp430-interrupt" => FnAbi::Msp430Interrupt,
+            "platform-intrinsic" => FnAbi::PlatformIntrinsic,
+            "ptx-kernel" => FnAbi::PtxKernel,
+            "riscv-interrupt-m" => FnAbi::RiscvInterruptM,
+            "riscv-interrupt-s" => FnAbi::RiscvInterruptS,
+            "rust-call" => FnAbi::RustCall,
+            "rust-cold" => FnAbi::RustCold,
+            "rust-intrinsic" => FnAbi::RustIntrinsic,
+            "Rust" => FnAbi::Rust,
+            "stdcall-unwind" => FnAbi::StdcallUnwind,
+            "stdcall" => FnAbi::Stdcall,
+            "system-unwind" => FnAbi::SystemUnwind,
+            "system" => FnAbi::System,
+            "sysv64-unwind" => FnAbi::Sysv64Unwind,
+            "sysv64" => FnAbi::Sysv64,
+            "thiscall-unwind" => FnAbi::ThiscallUnwind,
+            "thiscall" => FnAbi::Thiscall,
+            "unadjusted" => FnAbi::Unadjusted,
+            "vectorcall-unwind" => FnAbi::VectorcallUnwind,
+            "vectorcall" => FnAbi::Vectorcall,
+            "wasm" => FnAbi::Wasm,
+            "win64-unwind" => FnAbi::Win64Unwind,
+            "win64" => FnAbi::Win64,
+            "x86-interrupt" => FnAbi::X86Interrupt,
+            _ => FnAbi::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FnAbi::Aapcs => "aapcs",
+            FnAbi::AapcsUnwind => "aapcs-unwind",
+            FnAbi::AvrInterrupt => "avr-interrupt",
+            FnAbi::AvrNonBlockingInterrupt => "avr-non-blocking-interrupt",
+            FnAbi::C => "C",
+            FnAbi::CCmseNonsecureCall => "C-cmse-nonsecure-call",
+            FnAbi::CDecl => "C-decl",
+            FnAbi::CDeclUnwind => "cdecl-unwind",
+            FnAbi::CUnwind => "C-unwind",
+            FnAbi::Efiapi => "efiapi",
+            FnAbi::Fastcall => "fastcall",
+            FnAbi::FastcallUnwind => "fastcall-unwind",
+            FnAbi::Msp430Interrupt => "msp430-interrupt",
+            FnAbi::PlatformIntrinsic => "platform-intrinsic",
+            FnAbi::PtxKernel => "ptx-kernel",
+            FnAbi::RiscvInterruptM => "riscv-interrupt-m",
+            FnAbi::RiscvInterruptS => "riscv-interrupt-s",
+            FnAbi::Rust => "Rust",
+            FnAbi::RustCall => "rust-call",
+            FnAbi::RustCold => "rust-cold",
+            FnAbi::RustIntrinsic => "rust-intrinsic",
+            FnAbi::Stdcall => "stdcall",
+            FnAbi::StdcallUnwind => "stdcall-unwind",
+            FnAbi::System => "system",
+            FnAbi::SystemUnwind => "system-unwind",
+            FnAbi::Sysv64 => "sysv64",
+            FnAbi::Sysv64Unwind => "sysv64-unwind",
+            FnAbi::Thiscall => "thiscall",
+            FnAbi::ThiscallUnwind => "thiscall-unwind",
+            FnAbi::Unadjusted => "unadjusted",
+            FnAbi::Vectorcall => "vectorcall",
+            FnAbi::VectorcallUnwind => "vectorcall-unwind",
+            FnAbi::Wasm => "wasm",
+            FnAbi::Win64 => "win64",
+            FnAbi::Win64Unwind => "win64-unwind",
+            FnAbi::X86Interrupt => "x86-interrupt",
+            FnAbi::Unknown => "unknown-abi",
+        }
+    }
+}
 
 /// A polymorphic function signature.
 pub type PolyFnSig = Binders<CallableSig>;
@@ -312,16 +527,21 @@ impl CallableSig {
         ret: Ty,
         is_varargs: bool,
         safety: Safety,
+        abi: FnAbi,
     ) -> CallableSig {
         params.push(ret);
-        CallableSig { params_and_return: params.into(), is_varargs, safety }
+        CallableSig { params_and_return: params.into(), is_varargs, safety, abi }
     }
 
+    pub fn from_def(db: &dyn HirDatabase, def: FnDefId, substs: &Substitution) -> CallableSig {
+        let callable_def = db.lookup_intern_callable_def(def.into());
+        let sig = db.callable_item_signature(callable_def);
+        sig.substitute(Interner, substs)
+    }
     pub fn from_fn_ptr(fn_ptr: &FnPointer) -> CallableSig {
         CallableSig {
             // FIXME: what to do about lifetime params? -> return PolyFnSig
-            // FIXME: use `Arc::from_iter` when it becomes available
-            params_and_return: Arc::from(
+            params_and_return: Arc::from_iter(
                 fn_ptr
                     .substitution
                     .clone()
@@ -330,18 +550,18 @@ impl CallableSig {
                     .0
                     .as_slice(Interner)
                     .iter()
-                    .map(|arg| arg.assert_ty_ref(Interner).clone())
-                    .collect::<Vec<_>>(),
+                    .map(|arg| arg.assert_ty_ref(Interner).clone()),
             ),
             is_varargs: fn_ptr.sig.variadic,
             safety: fn_ptr.sig.safety,
+            abi: fn_ptr.sig.abi,
         }
     }
 
     pub fn to_fn_ptr(&self) -> FnPointer {
         FnPointer {
             num_binders: 0,
-            sig: FnSig { abi: (), safety: self.safety, variadic: self.is_varargs },
+            sig: FnSig { abi: self.abi, safety: self.safety, variadic: self.is_varargs },
             substitution: FnSubst(Substitution::from_iter(
                 Interner,
                 self.params_and_return.iter().cloned(),
@@ -370,32 +590,39 @@ impl TypeFoldable<Interner> for CallableSig {
             params_and_return: folded.into(),
             is_varargs: self.is_varargs,
             safety: self.safety,
+            abi: self.abi,
         })
     }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub enum ImplTraitId {
-    ReturnTypeImplTrait(hir_def::FunctionId, RpitId),
+    ReturnTypeImplTrait(hir_def::FunctionId, ImplTraitIdx),
+    AssociatedTypeImplTrait(hir_def::TypeAliasId, ImplTraitIdx),
     AsyncBlockTypeImplTrait(hir_def::DefWithBodyId, ExprId),
 }
+impl_intern_value_trivial!(ImplTraitId);
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub struct ReturnTypeImplTraits {
-    pub(crate) impl_traits: Arena<ReturnTypeImplTrait>,
+pub struct ImplTraits {
+    pub(crate) impl_traits: Arena<ImplTrait>,
 }
 
-has_interner!(ReturnTypeImplTraits);
+has_interner!(ImplTraits);
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub struct ReturnTypeImplTrait {
+pub struct ImplTrait {
     pub(crate) bounds: Binders<Vec<QuantifiedWhereClause>>,
 }
 
-pub type RpitId = Idx<ReturnTypeImplTrait>;
+pub type ImplTraitIdx = Idx<ImplTrait>;
 
 pub fn static_lifetime() -> Lifetime {
     LifetimeData::Static.intern(Interner)
+}
+
+pub fn error_lifetime() -> Lifetime {
+    static_lifetime()
 }
 
 pub(crate) fn fold_free_vars<T: HasInterner<Interner = Interner> + TypeFoldable<Interner>>(
@@ -482,6 +709,55 @@ pub(crate) fn fold_tys_and_consts<T: HasInterner<Interner = Interner> + TypeFold
 
         fn fold_const(&mut self, c: Const, outer_binder: DebruijnIndex) -> Const {
             self.0(Either::Right(c), outer_binder).right().unwrap()
+        }
+    }
+    t.fold_with(&mut TyFolder(f), binders)
+}
+
+pub(crate) fn fold_generic_args<T: HasInterner<Interner = Interner> + TypeFoldable<Interner>>(
+    t: T,
+    f: impl FnMut(GenericArgData, DebruijnIndex) -> GenericArgData,
+    binders: DebruijnIndex,
+) -> T {
+    use chalk_ir::fold::{TypeFolder, TypeSuperFoldable};
+    #[derive(chalk_derive::FallibleTypeFolder)]
+    #[has_interner(Interner)]
+    struct TyFolder<F: FnMut(GenericArgData, DebruijnIndex) -> GenericArgData>(F);
+    impl<F: FnMut(GenericArgData, DebruijnIndex) -> GenericArgData> TypeFolder<Interner>
+        for TyFolder<F>
+    {
+        fn as_dyn(&mut self) -> &mut dyn TypeFolder<Interner> {
+            self
+        }
+
+        fn interner(&self) -> Interner {
+            Interner
+        }
+
+        fn fold_ty(&mut self, ty: Ty, outer_binder: DebruijnIndex) -> Ty {
+            let ty = ty.super_fold_with(self.as_dyn(), outer_binder);
+            self.0(GenericArgData::Ty(ty), outer_binder)
+                .intern(Interner)
+                .ty(Interner)
+                .unwrap()
+                .clone()
+        }
+
+        fn fold_const(&mut self, c: Const, outer_binder: DebruijnIndex) -> Const {
+            self.0(GenericArgData::Const(c), outer_binder)
+                .intern(Interner)
+                .constant(Interner)
+                .unwrap()
+                .clone()
+        }
+
+        fn fold_lifetime(&mut self, lt: Lifetime, outer_binder: DebruijnIndex) -> Lifetime {
+            let lt = lt.super_fold_with(self.as_dyn(), outer_binder);
+            self.0(GenericArgData::Lifetime(lt), outer_binder)
+                .intern(Interner)
+                .lifetime(Interner)
+                .unwrap()
+                .clone()
         }
     }
     t.fold_with(&mut TyFolder(f), binders)
@@ -654,7 +930,7 @@ pub fn callable_sig_from_fnonce(
     let params =
         args_ty.as_tuple()?.iter(Interner).map(|it| it.assert_ty_ref(Interner)).cloned().collect();
 
-    Some(CallableSig::from_params_and_return(params, ret_ty, false, Safety::Safe))
+    Some(CallableSig::from_params_and_return(params, ret_ty, false, Safety::Safe, FnAbi::RustCall))
 }
 
 struct PlaceholderCollector<'db> {

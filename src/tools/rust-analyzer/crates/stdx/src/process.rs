@@ -15,6 +15,7 @@ pub fn streaming_output(
     err: ChildStderr,
     on_stdout_line: &mut dyn FnMut(&str),
     on_stderr_line: &mut dyn FnMut(&str),
+    on_eof: &mut dyn FnMut(),
 ) -> io::Result<(Vec<u8>, Vec<u8>)> {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -23,7 +24,7 @@ pub fn streaming_output(
         let idx = if eof {
             data.len()
         } else {
-            match data.iter().rposition(|b| *b == b'\n') {
+            match data.iter().rposition(|&b| b == b'\n') {
                 Some(i) => i + 1,
                 None => return,
             }
@@ -44,6 +45,9 @@ pub fn streaming_output(
                     on_stderr_line(line);
                 }
             }
+            if eof {
+                on_eof();
+            }
         }
     })?;
 
@@ -63,6 +67,7 @@ pub fn spawn_with_streaming_output(
         child.stderr.take().unwrap(),
         on_stdout_line,
         on_stderr_line,
+        &mut || (),
     )?;
     let status = child.wait()?;
     Ok(Output { status, stdout, stderr })

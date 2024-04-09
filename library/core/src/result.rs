@@ -488,7 +488,7 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use crate::iter::{self, FromIterator, FusedIterator, TrustedLen};
+use crate::iter::{self, FusedIterator, TrustedLen};
 use crate::ops::{self, ControlFlow, Deref, DerefMut};
 use crate::{convert, fmt, hint};
 
@@ -830,13 +830,13 @@ impl<T, E> Result<T, E> {
         }
     }
 
-    /// Calls the provided closure with a reference to the contained value (if [`Ok`]).
+    /// Calls a function with a reference to the contained value if [`Ok`].
+    ///
+    /// Returns the original result.
     ///
     /// # Examples
     ///
     /// ```
-    /// #![feature(result_option_inspect)]
-    ///
     /// let x: u8 = "4"
     ///     .parse::<u8>()
     ///     .inspect(|x| println!("original: {x}"))
@@ -844,7 +844,7 @@ impl<T, E> Result<T, E> {
     ///     .expect("failed to parse number");
     /// ```
     #[inline]
-    #[unstable(feature = "result_option_inspect", issue = "91345")]
+    #[stable(feature = "result_option_inspect", since = "1.76.0")]
     pub fn inspect<F: FnOnce(&T)>(self, f: F) -> Self {
         if let Ok(ref t) = self {
             f(t);
@@ -853,13 +853,13 @@ impl<T, E> Result<T, E> {
         self
     }
 
-    /// Calls the provided closure with a reference to the contained error (if [`Err`]).
+    /// Calls a function with a reference to the contained value if [`Err`].
+    ///
+    /// Returns the original result.
     ///
     /// # Examples
     ///
     /// ```
-    /// #![feature(result_option_inspect)]
-    ///
     /// use std::{fs, io};
     ///
     /// fn read() -> io::Result<String> {
@@ -868,7 +868,7 @@ impl<T, E> Result<T, E> {
     /// }
     /// ```
     #[inline]
-    #[unstable(feature = "result_option_inspect", issue = "91345")]
+    #[stable(feature = "result_option_inspect", since = "1.76.0")]
     pub fn inspect_err<F: FnOnce(&E)>(self, f: F) -> Self {
         if let Err(ref e) = self {
             f(e);
@@ -1065,7 +1065,7 @@ impl<T, E> Result<T, E> {
     /// let x: Result<u32, &str> = Err("emergency failure");
     /// x.unwrap(); // panics with `emergency failure`
     /// ```
-    #[inline]
+    #[inline(always)]
     #[track_caller]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn unwrap(self) -> T
@@ -1315,6 +1315,7 @@ impl<T, E> Result<T, E> {
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("flat_map", "flatmap")]
     pub fn and_then<U, F: FnOnce(T) -> Result<U, E>>(self, op: F) -> Result<U, E> {
         match self {
             Ok(t) => op(t),
@@ -1422,6 +1423,7 @@ impl<T, E> Result<T, E> {
     /// assert_eq!(Err("foo").unwrap_or_else(count), 3);
     /// ```
     #[inline]
+    #[track_caller]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn unwrap_or_else<F: FnOnce(E) -> T>(self, op: F) -> T {
         match self {

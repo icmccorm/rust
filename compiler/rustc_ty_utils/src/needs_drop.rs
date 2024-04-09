@@ -66,6 +66,9 @@ fn has_significant_drop_raw<'tcx>(
 struct NeedsDropTypes<'tcx, F> {
     tcx: TyCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
+    // Whether to reveal coroutine witnesses, this is set
+    // to `false` unless we compute `needs_drop` for a coroutine witness.
+    reveal_coroutine_witnesses: bool,
     query_ty: Ty<'tcx>,
     seen_tys: FxHashSet<Ty<'tcx>>,
     /// A stack of types left to process, and the recursion depth when we
@@ -89,6 +92,7 @@ impl<'tcx, F> NeedsDropTypes<'tcx, F> {
         Self {
             tcx,
             param_env,
+            reveal_coroutine_witnesses: false,
             seen_tys,
             query_ty: ty,
             unchecked_tys: vec![(ty, 0)],
@@ -112,7 +116,7 @@ where
             if !self.recursion_limit.value_within_limit(level) {
                 // Not having a `Span` isn't great. But there's hopefully some other
                 // recursion limit error as well.
-                tcx.sess.emit_err(NeedsDropOverflow { query_ty: self.query_ty });
+                tcx.dcx().emit_err(NeedsDropOverflow { query_ty: self.query_ty });
                 return Some(Err(AlwaysRequiresDrop));
             }
 
@@ -130,17 +134,46 @@ where
 
             for component in components {
                 match *component.kind() {
-                    // The information required to determine whether a generator has drop is
+                    // The information required to determine whether a coroutine has drop is
                     // computed on MIR, while this very method is used to build MIR.
-                    // To avoid cycles, we consider that generators always require drop.
-                    ty::Generator(..) => {
-                        return Some(Err(AlwaysRequiresDrop));
+                    // To avoid cycles, we consider that coroutines always require drop.
+                    //
+                    // HACK: Because we erase regions contained in the coroutine witness, we
+                    // have to conservatively assume that every region captured by the
+                    // coroutine has to be live when dropped. This results in a lot of
+                    // undesirable borrowck errors. During borrowck, we call `needs_drop`
+                    // for the coroutine witness and check whether any of the contained types
+                    // need to be dropped, and only require the captured types to be live
+                    // if they do.
+                    ty::Coroutine(_, args) => {
+                        if self.reveal_coroutine_witnesses {
+                            queue_type(self, args.as_coroutine().witness());
+                        } else {
+                            return Some(Err(AlwaysRequiresDrop));
+                        }
+                    }
+                    ty::CoroutineWitness(def_id, args) => {
+                        if let Some(witness) = tcx.mir_coroutine_witnesses(def_id) {
+                            self.reveal_coroutine_witnesses = true;
+                            for field_ty in &witness.field_tys {
+                                queue_type(
+                                    self,
+                                    EarlyBinder::bind(field_ty.ty).instantiate(tcx, args),
+                                );
+                            }
+                        }
                     }
 
                     _ if component.is_copy_modulo_regions(tcx, self.param_env) => (),
 
                     ty::Closure(_, args) => {
                         for upvar in args.as_closure().upvar_tys() {
+                            queue_type(self, upvar);
+                        }
+                    }
+
+                    ty::CoroutineClosure(_, args) => {
+                        for upvar in args.as_coroutine_closure().upvar_tys() {
                             queue_type(self, upvar);
                         }
                     }
@@ -191,7 +224,6 @@ where
                     | ty::FnPtr(..)
                     | ty::Tuple(_)
                     | ty::Bound(..)
-                    | ty::GeneratorWitness(..)
                     | ty::Never
                     | ty::Infer(_)
                     | ty::Error(_) => {
@@ -232,9 +264,9 @@ fn drop_tys_helper<'tcx>(
     ) -> NeedsDropResult<Vec<Ty<'tcx>>> {
         iter.into_iter().try_fold(Vec::new(), |mut vec, subty| {
             match subty.kind() {
-                ty::Adt(adt_id, subst) => {
+                ty::Adt(adt_id, args) => {
                     for subty in tcx.adt_drop_tys(adt_id.did())? {
-                        vec.push(EarlyBinder::bind(subty).instantiate(tcx, subst));
+                        vec.push(EarlyBinder::bind(subty).instantiate(tcx, args));
                     }
                 }
                 _ => vec.push(subty),
@@ -268,7 +300,10 @@ fn drop_tys_helper<'tcx>(
         } else {
             let field_tys = adt_def.all_fields().map(|field| {
                 let r = tcx.type_of(field.did).instantiate(tcx, args);
-                debug!("drop_tys_helper: Subst into {:?} with {:?} getting {:?}", field, args, r);
+                debug!(
+                    "drop_tys_helper: Instantiate into {:?} with {:?} getting {:?}",
+                    field, args, r
+                );
                 r
             });
             if only_significant {
@@ -331,7 +366,7 @@ fn adt_drop_tys<'tcx>(
     .map(|components| tcx.mk_type_list(&components))
 }
 // If `def_id` refers to a generic ADT, the queries above and below act as if they had been handed
-// a `tcx.make_ty(def, identity_args)` and as such it is legal to substitute the generic parameters
+// a `tcx.make_ty(def, identity_args)` and as such it is legal to instantiate the generic parameters
 // of the ADT into the outputted `ty`s.
 fn adt_significant_drop_tys(
     tcx: TyCtxt<'_>,

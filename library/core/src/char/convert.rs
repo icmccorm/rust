@@ -1,11 +1,11 @@
 //! Character conversions.
 
 use crate::char::TryFromCharError;
-use crate::convert::TryFrom;
 use crate::error::Error;
 use crate::fmt;
 use crate::mem::transmute;
 use crate::str::FromStr;
+use crate::ub_checks::assert_unsafe_precondition;
 
 /// Converts a `u32` to a `char`. See [`char::from_u32`].
 #[must_use]
@@ -23,7 +23,14 @@ pub(super) const fn from_u32(i: u32) -> Option<char> {
 #[must_use]
 pub(super) const unsafe fn from_u32_unchecked(i: u32) -> char {
     // SAFETY: the caller must guarantee that `i` is a valid char value.
-    if cfg!(debug_assertions) { char::from_u32(i).unwrap() } else { unsafe { transmute(i) } }
+    unsafe {
+        assert_unsafe_precondition!(
+            check_language_ub,
+            "invalid value for `char`",
+            (i: u32 = i) => char_try_from_u32(i).is_ok()
+        );
+        transmute(i)
+    }
 }
 
 #[stable(feature = "char_convert", since = "1.13.0")]
@@ -115,7 +122,7 @@ impl TryFrom<char> for u8 {
 /// failing if the code point is greater than U+FFFF.
 ///
 /// This corresponds to the UCS-2 encoding, as specified in ISO/IEC 10646:2003.
-#[stable(feature = "u16_from_char", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "u16_from_char", since = "1.74.0")]
 impl TryFrom<char> for u16 {
     type Error = TryFromCharError;
 

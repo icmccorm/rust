@@ -1,6 +1,6 @@
 use super::UnmatchedDelim;
 use rustc_ast::token::Delimiter;
-use rustc_errors::Diagnostic;
+use rustc_errors::Diag;
 use rustc_span::source_map::SourceMap;
 use rustc_span::Span;
 
@@ -30,10 +30,7 @@ pub fn same_indentation_level(sm: &SourceMap, open_sp: Span, close_sp: Span) -> 
 
 // When we get a `)` or `]` for `{`, we should emit help message here
 // it's more friendly compared to report `unmatched error` in later phase
-pub fn report_missing_open_delim(
-    err: &mut Diagnostic,
-    unmatched_delims: &[UnmatchedDelim],
-) -> bool {
+pub fn report_missing_open_delim(err: &mut Diag<'_>, unmatched_delims: &[UnmatchedDelim]) -> bool {
     let mut reported_missing_open = false;
     for unmatch_brace in unmatched_delims.iter() {
         if let Some(delim) = unmatch_brace.found_delim
@@ -55,7 +52,7 @@ pub fn report_missing_open_delim(
 }
 
 pub fn report_suspicious_mismatch_block(
-    err: &mut Diagnostic,
+    err: &mut Diag<'_>,
     diag_info: &TokenTreeDiagInfo,
     sm: &SourceMap,
     delim: Delimiter,
@@ -111,9 +108,10 @@ pub fn report_suspicious_mismatch_block(
         // If there is no suspicious span, give the last properly closed block may help
         if let Some(parent) = diag_info.matching_block_spans.last()
             && diag_info.open_braces.last().is_none()
-            && diag_info.empty_block_spans.iter().all(|&sp| sp != parent.0.to(parent.1)) {
-                err.span_label(parent.0, "this opening brace...");
-                err.span_label(parent.1, "...matches this closing brace");
+            && diag_info.empty_block_spans.iter().all(|&sp| sp != parent.0.to(parent.1))
+        {
+            err.span_label(parent.0, "this opening brace...");
+            err.span_label(parent.1, "...matches this closing brace");
         }
     }
 }

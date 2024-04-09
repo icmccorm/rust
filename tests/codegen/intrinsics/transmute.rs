@@ -1,5 +1,5 @@
-// compile-flags: -O -C no-prepopulate-passes
-// only-64bit (so I don't need to worry about usize)
+//@ compile-flags: -O -C no-prepopulate-passes
+//@ only-64bit (so I don't need to worry about usize)
 
 #![crate_type = "lib"]
 #![feature(core_intrinsics)]
@@ -190,7 +190,7 @@ pub unsafe fn check_byte_from_bool(x: bool) -> u8 {
 // CHECK-LABEL: @check_to_pair(
 #[no_mangle]
 pub unsafe fn check_to_pair(x: u64) -> Option<i32> {
-    // CHECK: %_0 = alloca { i32, i32 }, align 4
+    // CHECK: %_0 = alloca %"core::option::Option<i32>", align 4
     // CHECK: store i64 %x, ptr %_0, align 4
     transmute(x)
 }
@@ -203,10 +203,10 @@ pub unsafe fn check_from_pair(x: Option<i32>) -> u64 {
     const { assert!(std::mem::align_of::<Option<i32>>() == 4) };
 
     // CHECK: %_0 = alloca i64, align 8
-    // CHECK: store i32 %x.0, ptr %0, align 8
-    // CHECK: store i32 %x.1, ptr %1, align 4
-    // CHECK: %2 = load i64, ptr %_0, align 8
-    // CHECK: ret i64 %2
+    // CHECK: store i32 %x.0, ptr %_0, align 8
+    // CHECK: store i32 %x.1, ptr %0, align 4
+    // CHECK: %[[R:.+]] = load i64, ptr %_0, align 8
+    // CHECK: ret i64 %[[R]]
     transmute(x)
 }
 
@@ -296,7 +296,7 @@ pub unsafe fn check_pair_with_bool(x: (u8, bool)) -> (bool, i8) {
 pub unsafe fn check_float_to_pointer(x: f64) -> *const () {
     // CHECK-NOT: alloca
     // CHECK: %0 = bitcast double %x to i64
-    // CHECK: %_0 = inttoptr i64 %0 to ptr
+    // CHECK: %_0 = getelementptr i8, ptr null, i64 %0
     // CHECK: ret ptr %_0
     transmute(x)
 }
@@ -371,7 +371,7 @@ pub unsafe fn check_issue_110005(x: (usize, bool)) -> Option<Box<[u8]>> {
 // CHECK-LABEL: @check_pair_to_dst_ref(
 #[no_mangle]
 pub unsafe fn check_pair_to_dst_ref<'a>(x: (usize, usize)) -> &'a [u8] {
-    // CHECK: %_0.0 = inttoptr i64 %x.0 to ptr
+    // CHECK: %_0.0 = getelementptr i8, ptr null, i64 %x.0
     // CHECK: %0 = insertvalue { ptr, i64 } poison, ptr %_0.0, 0
     // CHECK: %1 = insertvalue { ptr, i64 } %0, i64 %x.1, 1
     // CHECK: ret { ptr, i64 } %1

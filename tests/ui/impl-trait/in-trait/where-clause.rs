@@ -1,8 +1,5 @@
-// check-pass
-// edition: 2021
-
-#![feature(return_position_impl_trait_in_trait)]
-#![allow(incomplete_features)]
+//@ check-pass
+//@ edition: 2021
 
 use std::fmt::Debug;
 

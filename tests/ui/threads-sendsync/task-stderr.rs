@@ -1,6 +1,6 @@
-// run-pass
-// ignore-emscripten no threads support
-// needs-unwind
+//@ run-pass
+//@ needs-threads
+//@ needs-unwind
 
 #![feature(internal_output_capture)]
 

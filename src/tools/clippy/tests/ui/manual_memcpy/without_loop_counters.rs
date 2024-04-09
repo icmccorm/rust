@@ -1,5 +1,6 @@
-#![warn(clippy::needless_range_loop, clippy::manual_memcpy)]
-#![allow(clippy::useless_vec)]
+#![warn(clippy::manual_memcpy)]
+#![allow(clippy::assigning_clones, clippy::useless_vec, clippy::needless_range_loop)]
+
 //@no-rustfix
 const LOOP_OFFSET: usize = 5000;
 
@@ -137,6 +138,79 @@ pub fn manual_copy(src: &[i32], dst: &mut [i32], dst2: &mut [i32]) {
     let src = vec![0, 1, 2, 3, 4];
     for i in 0..dst.len() {
         dst[i] = src[i];
+    }
+
+    // Range is equal to array length
+    let src = [0, 1, 2, 3, 4];
+    let mut dst = [0; 4];
+    for i in 0..4 {
+        //~^ ERROR: it looks like you're manually copying between slices
+        dst[i] = src[i];
+    }
+
+    let mut dst = [0; 6];
+    for i in 0..5 {
+        //~^ ERROR: it looks like you're manually copying between slices
+        dst[i] = src[i];
+    }
+
+    let mut dst = [0; 5];
+    for i in 0..5 {
+        //~^ ERROR: it looks like you're manually copying between slices
+        dst[i] = src[i];
+    }
+
+    // Don't trigger lint for following multi-dimensional arrays
+    let src = [[0; 5]; 5];
+    for i in 0..4 {
+        dst[i] = src[i + 1][i];
+    }
+    for i in 0..5 {
+        dst[i] = src[i][i];
+    }
+    for i in 0..5 {
+        dst[i] = src[i][3];
+    }
+
+    let src = [0; 5];
+    let mut dst = [[0; 5]; 5];
+    for i in 0..5 {
+        dst[i][i] = src[i];
+    }
+
+    let src = [[[0; 5]; 5]; 5];
+    let mut dst = [0; 5];
+    for i in 0..5 {
+        dst[i] = src[i][i][i];
+    }
+    for i in 0..5 {
+        dst[i] = src[i][i][0];
+    }
+    for i in 0..5 {
+        dst[i] = src[i][0][i];
+    }
+    for i in 0..5 {
+        dst[i] = src[0][i][i];
+    }
+    for i in 0..5 {
+        dst[i] = src[0][i][1];
+    }
+    for i in 0..5 {
+        dst[i] = src[i][0][1];
+    }
+
+    // Trigger lint
+    let src = [[0; 5]; 5];
+    let mut dst = [0; 5];
+    for i in 0..5 {
+        //~^ ERROR: it looks like you're manually copying between slices
+        dst[i] = src[0][i];
+    }
+
+    let src = [[[0; 5]; 5]; 5];
+    for i in 0..5 {
+        //~^ ERROR: it looks like you're manually copying between slices
+        dst[i] = src[0][1][i];
     }
 }
 

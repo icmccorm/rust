@@ -11,48 +11,28 @@
 //! even if it is stabilized or removed, *do not remove it*. Instead, move the
 //! symbol to the `accepted` or `removed` modules respectively.
 
+#![allow(internal_features)]
+#![feature(generic_nonzero)]
+#![feature(rustdoc_internals)]
+#![doc(rust_logo)]
 #![feature(lazy_cell)]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
 
 mod accepted;
-mod active;
 mod builtin_attrs;
 mod removed;
+mod unstable;
 
 #[cfg(test)]
 mod tests;
 
-use rustc_span::{edition::Edition, symbol::Symbol, Span};
-use std::fmt;
-use std::num::NonZeroU32;
-
-#[derive(Clone, Copy)]
-pub enum State {
-    Accepted,
-    Active { set: fn(&mut Features, Span) },
-    Removed { reason: Option<&'static str> },
-    Stabilized { reason: Option<&'static str> },
-}
-
-impl fmt::Debug for State {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            State::Accepted { .. } => write!(f, "accepted"),
-            State::Active { .. } => write!(f, "active"),
-            State::Removed { .. } => write!(f, "removed"),
-            State::Stabilized { .. } => write!(f, "stabilized"),
-        }
-    }
-}
+use rustc_span::symbol::Symbol;
+use std::num::NonZero;
 
 #[derive(Debug, Clone)]
 pub struct Feature {
-    pub state: State,
     pub name: Symbol,
     pub since: &'static str,
-    issue: Option<NonZeroU32>,
-    pub edition: Option<Edition>,
+    issue: Option<NonZero<u32>>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -65,9 +45,9 @@ pub enum Stability {
 
 #[derive(Clone, Copy, Debug, Hash)]
 pub enum UnstableFeatures {
-    /// Hard errors for unstable features are active, as on beta/stable channels.
+    /// Disallow use of unstable features, as on beta/stable channels.
     Disallow,
-    /// Allow features to be activated, as on nightly.
+    /// Allow use of unstable features, as on nightly.
     Allow,
     /// Errors are bypassed for bootstrapping. This is required any time
     /// during the build that feature-related lints are set to warn or above
@@ -79,8 +59,8 @@ pub enum UnstableFeatures {
 impl UnstableFeatures {
     /// This takes into account `RUSTC_BOOTSTRAP`.
     ///
-    /// If `krate` is [`Some`], then setting `RUSTC_BOOTSTRAP=krate` will enable the nightly features.
-    /// Otherwise, only `RUSTC_BOOTSTRAP=1` will work.
+    /// If `krate` is [`Some`], then setting `RUSTC_BOOTSTRAP=krate` will enable the nightly
+    /// features. Otherwise, only `RUSTC_BOOTSTRAP=1` will work.
     pub fn from_environment(krate: Option<&str>) -> Self {
         // `true` if this is a feature-staged build, i.e., on the beta or stable channel.
         let disable_unstable_features =
@@ -106,38 +86,35 @@ impl UnstableFeatures {
     }
 }
 
-fn find_lang_feature_issue(feature: Symbol) -> Option<NonZeroU32> {
-    if let Some(info) = ACTIVE_FEATURES.iter().find(|t| t.name == feature) {
-        info.issue
-    } else {
-        // search in Accepted, Removed, or Stable Removed features
-        let found = ACCEPTED_FEATURES
-            .iter()
-            .chain(REMOVED_FEATURES)
-            .chain(STABLE_REMOVED_FEATURES)
-            .find(|t| t.name == feature);
-        match found {
-            Some(found) => found.issue,
-            None => panic!("feature `{feature}` is not declared anywhere"),
-        }
+fn find_lang_feature_issue(feature: Symbol) -> Option<NonZero<u32>> {
+    // Search in all the feature lists.
+    if let Some(f) = UNSTABLE_FEATURES.iter().find(|f| f.feature.name == feature) {
+        return f.feature.issue;
     }
+    if let Some(f) = ACCEPTED_FEATURES.iter().find(|f| f.name == feature) {
+        return f.issue;
+    }
+    if let Some(f) = REMOVED_FEATURES.iter().find(|f| f.feature.name == feature) {
+        return f.feature.issue;
+    }
+    panic!("feature `{feature}` is not declared anywhere");
 }
 
-const fn to_nonzero(n: Option<u32>) -> Option<NonZeroU32> {
-    // Can be replaced with `n.and_then(NonZeroU32::new)` if that is ever usable
+const fn to_nonzero(n: Option<u32>) -> Option<NonZero<u32>> {
+    // Can be replaced with `n.and_then(NonZero::new)` if that is ever usable
     // in const context. Requires https://github.com/rust-lang/rfcs/pull/2632.
     match n {
         None => None,
-        Some(n) => NonZeroU32::new(n),
+        Some(n) => NonZero::new(n),
     }
 }
 
 pub enum GateIssue {
     Language,
-    Library(Option<NonZeroU32>),
+    Library(Option<NonZero<u32>>),
 }
 
-pub fn find_feature_issue(feature: Symbol, issue: GateIssue) -> Option<NonZeroU32> {
+pub fn find_feature_issue(feature: Symbol, issue: GateIssue) -> Option<NonZero<u32>> {
     match issue {
         GateIssue::Language => find_lang_feature_issue(feature),
         GateIssue::Library(lib) => lib,
@@ -145,11 +122,11 @@ pub fn find_feature_issue(feature: Symbol, issue: GateIssue) -> Option<NonZeroU3
 }
 
 pub use accepted::ACCEPTED_FEATURES;
-pub use active::{Features, ACTIVE_FEATURES, INCOMPATIBLE_FEATURES};
 pub use builtin_attrs::AttributeDuplicates;
 pub use builtin_attrs::{
-    deprecated_attributes, find_gated_cfg, is_builtin_attr_name, is_builtin_only_local,
+    deprecated_attributes, encode_cross_crate, find_gated_cfg, is_builtin_attr_name,
     is_valid_for_get_attr, AttributeGate, AttributeTemplate, AttributeType, BuiltinAttribute,
     GatedCfg, BUILTIN_ATTRIBUTES, BUILTIN_ATTRIBUTE_MAP,
 };
-pub use removed::{REMOVED_FEATURES, STABLE_REMOVED_FEATURES};
+pub use removed::REMOVED_FEATURES;
+pub use unstable::{Features, INCOMPATIBLE_FEATURES, UNSTABLE_FEATURES};

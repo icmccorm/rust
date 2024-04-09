@@ -1,4 +1,4 @@
-use core::num::NonZeroUsize;
+use core::num::NonZero;
 use std::assert_matches::assert_matches;
 use std::collections::TryReserveErrorKind::*;
 use std::collections::{vec_deque::Drain, VecDeque};
@@ -445,9 +445,9 @@ fn test_into_iter() {
         assert_eq!(it.next_back(), Some(3));
 
         let mut it = VecDeque::from(vec![1, 2, 3, 4, 5]).into_iter();
-        assert_eq!(it.advance_by(10), Err(NonZeroUsize::new(5).unwrap()));
+        assert_eq!(it.advance_by(10), Err(NonZero::new(5).unwrap()));
         let mut it = VecDeque::from(vec![1, 2, 3, 4, 5]).into_iter();
-        assert_eq!(it.advance_back_by(10), Err(NonZeroUsize::new(5).unwrap()));
+        assert_eq!(it.advance_back_by(10), Err(NonZero::new(5).unwrap()));
     }
 }
 
@@ -1180,6 +1180,17 @@ fn test_reserve_exact_2() {
 
     v.reserve_exact(16);
     assert!(v.capacity() >= 33)
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // Miri does not support signalling OOM
+#[cfg_attr(target_os = "android", ignore)] // Android used in CI has a broken dlmalloc
+fn test_try_with_capacity() {
+    let vec: VecDeque<u32> = VecDeque::try_with_capacity(5).unwrap();
+    assert_eq!(0, vec.len());
+    assert!(vec.capacity() >= 5 && vec.capacity() <= isize::MAX as usize / 4);
+
+    assert!(VecDeque::<u16>::try_with_capacity(isize::MAX as usize + 1).is_err());
 }
 
 #[test]

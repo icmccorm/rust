@@ -5,8 +5,9 @@ use crate::errors::SymbolAlreadyDefined;
 use crate::llvm;
 use crate::type_of::LayoutLlvmExt;
 use rustc_codegen_ssa::traits::*;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
-pub use rustc_middle::mir::mono::MonoItem;
+use rustc_middle::bug;
 use rustc_middle::mir::mono::{Linkage, Visibility};
 use rustc_middle::ty::layout::{FnAbiOf, LayoutOf};
 use rustc_middle::ty::{self, Instance, TypeVisitableExt};
@@ -22,11 +23,19 @@ impl<'tcx> PreDefineMethods<'tcx> for CodegenCx<'_, 'tcx> {
         symbol_name: &str,
     ) {
         let instance = Instance::mono(self.tcx, def_id);
-        let ty = instance.ty(self.tcx, ty::ParamEnv::reveal_all());
+        let DefKind::Static { nested, .. } = self.tcx.def_kind(def_id) else { bug!() };
+        // Nested statics do not have a type, so pick a dummy type and let `codegen_static` figure out
+        // the llvm type from the actual evaluated initializer.
+        let ty = if nested {
+            self.tcx.types.unit
+        } else {
+            instance.ty(self.tcx, ty::ParamEnv::reveal_all())
+        };
         let llty = self.layout_of(ty).llvm_type(self);
 
         let g = self.define_global(symbol_name, llty).unwrap_or_else(|| {
             self.sess()
+                .dcx()
                 .emit_fatal(SymbolAlreadyDefined { span: self.tcx.def_span(def_id), symbol_name })
         });
 
@@ -123,6 +132,17 @@ impl CodegenCx<'_, '_> {
             return false;
         }
 
+        // Match clang by only supporting COFF and ELF for now.
+        if self.tcx.sess.target.is_like_osx {
+            return false;
+        }
+
+        // With pie relocation model calls of functions defined in the translation
+        // unit can use copy relocations.
+        if self.tcx.sess.relocation_model() == RelocModel::Pie && !is_declaration {
+            return true;
+        }
+
         // Thread-local variables generally don't support copy relocations.
         let is_thread_local_var = llvm::LLVMIsAGlobalVariable(llval)
             .is_some_and(|v| llvm::LLVMIsThreadLocal(v) == llvm::True);
@@ -130,18 +150,12 @@ impl CodegenCx<'_, '_> {
             return false;
         }
 
-        // Match clang by only supporting COFF and ELF for now.
-        if self.tcx.sess.target.is_like_osx {
-            return false;
+        // Respect the direct-access-external-data to override default behavior if present.
+        if let Some(direct) = self.tcx.sess.direct_access_external_data() {
+            return direct;
         }
 
         // Static relocation model should force copy relocations everywhere.
-        if self.tcx.sess.relocation_model() == RelocModel::Static {
-            return true;
-        }
-
-        // With pie relocation model calls of functions defined in the translation
-        // unit can use copy relocations.
-        self.tcx.sess.relocation_model() == RelocModel::Pie && !is_declaration
+        self.tcx.sess.relocation_model() == RelocModel::Static
     }
 }

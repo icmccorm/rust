@@ -6,6 +6,7 @@ LL | fn foo<T: Trait<m(): Send>>() {}
    |
    = note: see issue #109417 <https://github.com/rust-lang/rust/issues/109417> for more information
    = help: add `#![feature(return_type_notation)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
 
 error: parenthesized generic arguments cannot be used in associated type constraints
   --> $DIR/feature-gate-return_type_notation.rs:14:17
@@ -15,13 +16,18 @@ LL | fn foo<T: Trait<m(): Send>>() {}
    |                  |
    |                  help: remove these parentheses
 
-error[E0220]: associated type `m` not found for `Trait`
+error: expected type, found function
   --> $DIR/feature-gate-return_type_notation.rs:14:17
    |
 LL | fn foo<T: Trait<m(): Send>>() {}
-   |                 ^ associated type `m` not found
+   |                 ^ unexpected function
+   |
+note: the associated function is defined here
+  --> $DIR/feature-gate-return_type_notation.rs:10:5
+   |
+LL |     async fn m();
+   |     ^^^^^^^^^^^^^
 
 error: aborting due to 3 previous errors
 
-Some errors have detailed explanations: E0220, E0658.
-For more information about an error, try `rustc --explain E0220`.
+For more information about this error, try `rustc --explain E0658`.

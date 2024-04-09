@@ -2,15 +2,14 @@ use crate::deriving::generic::ty::*;
 use crate::deriving::generic::*;
 use crate::deriving::path_std;
 
-use ast::EnumDef;
-use rustc_ast::{self as ast, MetaItem};
+use rustc_ast::{self as ast, EnumDef, MetaItem};
 use rustc_expand::base::{Annotatable, ExtCtxt};
 use rustc_span::symbol::{sym, Ident, Symbol};
 use rustc_span::Span;
 use thin_vec::{thin_vec, ThinVec};
 
 pub fn expand_deriving_debug(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     span: Span,
     mitem: &MetaItem,
     item: &Annotatable,
@@ -33,7 +32,7 @@ pub fn expand_deriving_debug(
             explicit_self: true,
             nonself_args: vec![(fmtr, sym::f)],
             ret_ty: Path(path_std!(fmt::Result)),
-            attributes: ast::AttrVec::new(),
+            attributes: thin_vec![cx.attr_word(sym::inline, span)],
             fieldless_variants_strategy:
                 FieldlessVariantsStrategy::SpecializeIfAllVariantsFieldless,
             combine_substructure: combine_substructure(Box::new(|a, b, c| {
@@ -46,16 +45,16 @@ pub fn expand_deriving_debug(
     trait_def.expand(cx, mitem, item, push)
 }
 
-fn show_substructure(cx: &mut ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) -> BlockOrExpr {
+fn show_substructure(cx: &ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) -> BlockOrExpr {
     // We want to make sure we have the ctxt set so that we can use unstable methods
     let span = cx.with_def_site_ctxt(span);
 
     let (ident, vdata, fields) = match substr.fields {
         Struct(vdata, fields) => (substr.type_ident, *vdata, fields),
-        EnumMatching(_, _, v, fields) => (v.ident, &v.data, fields),
+        EnumMatching(_, v, fields) => (v.ident, &v.data, fields),
         AllFieldlessEnum(enum_def) => return show_fieldless_enum(cx, span, enum_def, substr),
         EnumTag(..) | StaticStruct(..) | StaticEnum(..) => {
-            cx.span_bug(span, "nonsensical .fields in `#[derive(Debug)]`")
+            cx.dcx().span_bug(span, "nonsensical .fields in `#[derive(Debug)]`")
         }
     };
 
@@ -71,7 +70,7 @@ fn show_substructure(cx: &mut ExtCtxt<'_>, span: Span, substr: &Substructure<'_>
             (false, 0)
         }
         ast::VariantData::Tuple(..) => (false, 1),
-        ast::VariantData::Struct(..) => (true, 2),
+        ast::VariantData::Struct { .. } => (true, 2),
     };
 
     // The number of fields that can be handled without an array.
@@ -210,7 +209,7 @@ fn show_substructure(cx: &mut ExtCtxt<'_>, span: Span, substr: &Substructure<'_>
 /// }
 /// ```
 fn show_fieldless_enum(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     span: Span,
     def: &EnumDef,
     substr: &Substructure<'_>,
@@ -226,7 +225,7 @@ fn show_fieldless_enum(
                     debug_assert!(fields.is_empty());
                     cx.pat_tuple_struct(span, variant_path, ThinVec::new())
                 }
-                ast::VariantData::Struct(fields, _) => {
+                ast::VariantData::Struct { fields, .. } => {
                     debug_assert!(fields.is_empty());
                     cx.pat_struct(span, variant_path, ThinVec::new())
                 }

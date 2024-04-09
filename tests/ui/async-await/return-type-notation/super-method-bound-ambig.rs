@@ -1,6 +1,6 @@
-// edition:2021
+//@ edition:2021
 
-#![feature(async_fn_in_trait, return_type_notation)]
+#![feature(return_type_notation)]
 //~^ WARN the feature `return_type_notation` is incomplete
 
 trait Super1<'a> {
@@ -23,7 +23,7 @@ impl Foo for () {}
 fn test<T>()
 where
     T: Foo<test(): Send>,
-    //~^ ERROR ambiguous associated function `test` for `Foo`
+    //~^ ERROR ambiguous associated function `test` in bounds of `Foo`
 {
 }
 

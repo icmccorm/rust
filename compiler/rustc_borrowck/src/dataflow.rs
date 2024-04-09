@@ -1,6 +1,5 @@
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
 use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::graph::WithSuccessors;
 use rustc_index::bit_set::BitSet;
 use rustc_middle::mir::{
     self, BasicBlock, Body, CallReturnPlaces, Location, Place, TerminatorEdges,
@@ -9,105 +8,93 @@ use rustc_middle::ty::RegionVid;
 use rustc_middle::ty::TyCtxt;
 use rustc_mir_dataflow::impls::{EverInitializedPlaces, MaybeUninitializedPlaces};
 use rustc_mir_dataflow::ResultsVisitable;
-use rustc_mir_dataflow::{self, fmt::DebugWithContext, GenKill};
-use rustc_mir_dataflow::{Analysis, Direction, Results};
+use rustc_mir_dataflow::{fmt::DebugWithContext, GenKill};
+use rustc_mir_dataflow::{Analysis, AnalysisDomain, Results};
 use std::fmt;
 
 use crate::{places_conflict, BorrowSet, PlaceConflictBias, PlaceExt, RegionInferenceContext};
 
-/// A tuple with named fields that can hold either the results or the transient state of the
-/// dataflow analyses used by the borrow checker.
-#[derive(Debug)]
-pub struct BorrowckAnalyses<B, U, E> {
-    pub borrows: B,
-    pub uninits: U,
-    pub ever_inits: E,
-}
-
 /// The results of the dataflow analyses used by the borrow checker.
-pub type BorrowckResults<'mir, 'tcx> = BorrowckAnalyses<
-    Results<'tcx, Borrows<'mir, 'tcx>>,
-    Results<'tcx, MaybeUninitializedPlaces<'mir, 'tcx>>,
-    Results<'tcx, EverInitializedPlaces<'mir, 'tcx>>,
->;
+pub struct BorrowckResults<'mir, 'tcx> {
+    pub(crate) borrows: Results<'tcx, Borrows<'mir, 'tcx>>,
+    pub(crate) uninits: Results<'tcx, MaybeUninitializedPlaces<'mir, 'tcx>>,
+    pub(crate) ever_inits: Results<'tcx, EverInitializedPlaces<'mir, 'tcx>>,
+}
 
 /// The transient state of the dataflow analyses used by the borrow checker.
-pub type BorrowckFlowState<'mir, 'tcx> =
-    <BorrowckResults<'mir, 'tcx> as ResultsVisitable<'tcx>>::FlowState;
-
-macro_rules! impl_visitable {
-    ( $(
-        $T:ident { $( $field:ident : $A:ident ),* $(,)? }
-    )* ) => { $(
-        impl<'tcx, $($A),*, D: Direction> ResultsVisitable<'tcx> for $T<$( Results<'tcx, $A> ),*>
-        where
-            $( $A: Analysis<'tcx, Direction = D>, )*
-        {
-            type Direction = D;
-            type FlowState = $T<$( $A::Domain ),*>;
-
-            fn new_flow_state(&self, body: &mir::Body<'tcx>) -> Self::FlowState {
-                $T {
-                    $( $field: self.$field.analysis.bottom_value(body) ),*
-                }
-            }
-
-            fn reset_to_block_entry(
-                &self,
-                state: &mut Self::FlowState,
-                block: BasicBlock,
-            ) {
-                $( state.$field.clone_from(&self.$field.entry_set_for_block(block)); )*
-            }
-
-            fn reconstruct_before_statement_effect(
-                &mut self,
-                state: &mut Self::FlowState,
-                stmt: &mir::Statement<'tcx>,
-                loc: Location,
-            ) {
-                $( self.$field.analysis
-                    .apply_before_statement_effect(&mut state.$field, stmt, loc); )*
-            }
-
-            fn reconstruct_statement_effect(
-                &mut self,
-                state: &mut Self::FlowState,
-                stmt: &mir::Statement<'tcx>,
-                loc: Location,
-            ) {
-                $( self.$field.analysis
-                    .apply_statement_effect(&mut state.$field, stmt, loc); )*
-            }
-
-            fn reconstruct_before_terminator_effect(
-                &mut self,
-                state: &mut Self::FlowState,
-                term: &mir::Terminator<'tcx>,
-                loc: Location,
-            ) {
-                $( self.$field.analysis
-                    .apply_before_terminator_effect(&mut state.$field, term, loc); )*
-            }
-
-            fn reconstruct_terminator_effect(
-                &mut self,
-                state: &mut Self::FlowState,
-                term: &mir::Terminator<'tcx>,
-                loc: Location,
-            ) {
-                $( self.$field.analysis
-                    .apply_terminator_effect(&mut state.$field, term, loc); )*
-            }
-        }
-    )* }
+#[derive(Debug)]
+pub struct BorrowckFlowState<'mir, 'tcx> {
+    pub(crate) borrows: <Borrows<'mir, 'tcx> as AnalysisDomain<'tcx>>::Domain,
+    pub(crate) uninits: <MaybeUninitializedPlaces<'mir, 'tcx> as AnalysisDomain<'tcx>>::Domain,
+    pub(crate) ever_inits: <EverInitializedPlaces<'mir, 'tcx> as AnalysisDomain<'tcx>>::Domain,
 }
 
-impl_visitable! {
-    BorrowckAnalyses { borrows: B, uninits: U, ever_inits: E }
+impl<'mir, 'tcx> ResultsVisitable<'tcx> for BorrowckResults<'mir, 'tcx> {
+    // All three analyses are forward, but we have to use just one here.
+    type Direction = <Borrows<'mir, 'tcx> as AnalysisDomain<'tcx>>::Direction;
+    type FlowState = BorrowckFlowState<'mir, 'tcx>;
+
+    fn new_flow_state(&self, body: &mir::Body<'tcx>) -> Self::FlowState {
+        BorrowckFlowState {
+            borrows: self.borrows.analysis.bottom_value(body),
+            uninits: self.uninits.analysis.bottom_value(body),
+            ever_inits: self.ever_inits.analysis.bottom_value(body),
+        }
+    }
+
+    fn reset_to_block_entry(&self, state: &mut Self::FlowState, block: BasicBlock) {
+        state.borrows.clone_from(&self.borrows.entry_set_for_block(block));
+        state.uninits.clone_from(&self.uninits.entry_set_for_block(block));
+        state.ever_inits.clone_from(&self.ever_inits.entry_set_for_block(block));
+    }
+
+    fn reconstruct_before_statement_effect(
+        &mut self,
+        state: &mut Self::FlowState,
+        stmt: &mir::Statement<'tcx>,
+        loc: Location,
+    ) {
+        self.borrows.analysis.apply_before_statement_effect(&mut state.borrows, stmt, loc);
+        self.uninits.analysis.apply_before_statement_effect(&mut state.uninits, stmt, loc);
+        self.ever_inits.analysis.apply_before_statement_effect(&mut state.ever_inits, stmt, loc);
+    }
+
+    fn reconstruct_statement_effect(
+        &mut self,
+        state: &mut Self::FlowState,
+        stmt: &mir::Statement<'tcx>,
+        loc: Location,
+    ) {
+        self.borrows.analysis.apply_statement_effect(&mut state.borrows, stmt, loc);
+        self.uninits.analysis.apply_statement_effect(&mut state.uninits, stmt, loc);
+        self.ever_inits.analysis.apply_statement_effect(&mut state.ever_inits, stmt, loc);
+    }
+
+    fn reconstruct_before_terminator_effect(
+        &mut self,
+        state: &mut Self::FlowState,
+        term: &mir::Terminator<'tcx>,
+        loc: Location,
+    ) {
+        self.borrows.analysis.apply_before_terminator_effect(&mut state.borrows, term, loc);
+        self.uninits.analysis.apply_before_terminator_effect(&mut state.uninits, term, loc);
+        self.ever_inits.analysis.apply_before_terminator_effect(&mut state.ever_inits, term, loc);
+    }
+
+    fn reconstruct_terminator_effect(
+        &mut self,
+        state: &mut Self::FlowState,
+        term: &mir::Terminator<'tcx>,
+        loc: Location,
+    ) {
+        self.borrows.analysis.apply_terminator_effect(&mut state.borrows, term, loc);
+        self.uninits.analysis.apply_terminator_effect(&mut state.uninits, term, loc);
+        self.ever_inits.analysis.apply_terminator_effect(&mut state.ever_inits, term, loc);
+    }
 }
 
 rustc_index::newtype_index! {
+    #[orderable]
     #[debug_format = "bw{}"]
     pub struct BorrowIndex {}
 }
@@ -119,24 +106,24 @@ rustc_index::newtype_index! {
 /// `BorrowIndex`, and maps each such index to a `BorrowData`
 /// describing the borrow. These indexes are used for representing the
 /// borrows in compact bitvectors.
-pub struct Borrows<'a, 'tcx> {
+pub struct Borrows<'mir, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    body: &'a Body<'tcx>,
+    body: &'mir Body<'tcx>,
 
-    borrow_set: &'a BorrowSet<'tcx>,
+    borrow_set: &'mir BorrowSet<'tcx>,
     borrows_out_of_scope_at_location: FxIndexMap<Location, Vec<BorrowIndex>>,
 }
 
-struct OutOfScopePrecomputer<'a, 'tcx> {
+struct OutOfScopePrecomputer<'mir, 'tcx> {
     visited: BitSet<mir::BasicBlock>,
     visit_stack: Vec<mir::BasicBlock>,
-    body: &'a Body<'tcx>,
-    regioncx: &'a RegionInferenceContext<'tcx>,
+    body: &'mir Body<'tcx>,
+    regioncx: &'mir RegionInferenceContext<'tcx>,
     borrows_out_of_scope_at_location: FxIndexMap<Location, Vec<BorrowIndex>>,
 }
 
-impl<'a, 'tcx> OutOfScopePrecomputer<'a, 'tcx> {
-    fn new(body: &'a Body<'tcx>, regioncx: &'a RegionInferenceContext<'tcx>) -> Self {
+impl<'mir, 'tcx> OutOfScopePrecomputer<'mir, 'tcx> {
+    fn new(body: &'mir Body<'tcx>, regioncx: &'mir RegionInferenceContext<'tcx>) -> Self {
         OutOfScopePrecomputer {
             visited: BitSet::new_empty(body.basic_blocks.len()),
             visit_stack: vec![],
@@ -222,6 +209,7 @@ impl<'tcx> OutOfScopePrecomputer<'_, 'tcx> {
     }
 }
 
+// This is `pub` because it's used by unstable external borrowck data users, see `consumers.rs`.
 pub fn calculate_borrows_out_of_scope_at_location<'tcx>(
     body: &Body<'tcx>,
     regioncx: &RegionInferenceContext<'tcx>,
@@ -238,15 +226,204 @@ pub fn calculate_borrows_out_of_scope_at_location<'tcx>(
     prec.borrows_out_of_scope_at_location
 }
 
-impl<'a, 'tcx> Borrows<'a, 'tcx> {
+struct PoloniusOutOfScopePrecomputer<'mir, 'tcx> {
+    visited: BitSet<mir::BasicBlock>,
+    visit_stack: Vec<mir::BasicBlock>,
+    body: &'mir Body<'tcx>,
+    regioncx: &'mir RegionInferenceContext<'tcx>,
+
+    loans_out_of_scope_at_location: FxIndexMap<Location, Vec<BorrowIndex>>,
+}
+
+impl<'mir, 'tcx> PoloniusOutOfScopePrecomputer<'mir, 'tcx> {
+    fn new(body: &'mir Body<'tcx>, regioncx: &'mir RegionInferenceContext<'tcx>) -> Self {
+        Self {
+            visited: BitSet::new_empty(body.basic_blocks.len()),
+            visit_stack: vec![],
+            body,
+            regioncx,
+            loans_out_of_scope_at_location: FxIndexMap::default(),
+        }
+    }
+}
+
+impl<'tcx> PoloniusOutOfScopePrecomputer<'_, 'tcx> {
+    /// Loans are in scope while they are live: whether they are contained within any live region.
+    /// In the location-insensitive analysis, a loan will be contained in a region if the issuing
+    /// region can reach it in the subset graph. So this is a reachability problem.
+    fn precompute_loans_out_of_scope(
+        &mut self,
+        loan_idx: BorrowIndex,
+        issuing_region: RegionVid,
+        loan_issued_at: Location,
+    ) {
+        let sccs = self.regioncx.constraint_sccs();
+        let universal_regions = self.regioncx.universal_regions();
+
+        // We first handle the cases where the loan doesn't go out of scope, depending on the issuing
+        // region's successors.
+        for successor in self.regioncx.region_graph().depth_first_search(issuing_region) {
+            // 1. Via applied member constraints
+            //
+            // The issuing region can flow into the choice regions, and they are either:
+            // - placeholders or free regions themselves,
+            // - or also transitively outlive a free region.
+            //
+            // That is to say, if there are applied member constraints here, the loan escapes the
+            // function and cannot go out of scope. We could early return here.
+            //
+            // For additional insurance via fuzzing and crater, we verify that the constraint's min
+            // choice indeed escapes the function. In the future, we could e.g. turn this check into
+            // a debug assert and early return as an optimization.
+            let scc = sccs.scc(successor);
+            for constraint in self.regioncx.applied_member_constraints(scc) {
+                if universal_regions.is_universal_region(constraint.min_choice) {
+                    return;
+                }
+            }
+
+            // 2. Via regions that are live at all points: placeholders and free regions.
+            //
+            // If the issuing region outlives such a region, its loan escapes the function and
+            // cannot go out of scope. We can early return.
+            if self.regioncx.is_region_live_at_all_points(successor) {
+                return;
+            }
+        }
+
+        let first_block = loan_issued_at.block;
+        let first_bb_data = &self.body.basic_blocks[first_block];
+
+        // The first block we visit is the one where the loan is issued, starting from the statement
+        // where the loan is issued: at `loan_issued_at`.
+        let first_lo = loan_issued_at.statement_index;
+        let first_hi = first_bb_data.statements.len();
+
+        if let Some(kill_location) =
+            self.loan_kill_location(loan_idx, loan_issued_at, first_block, first_lo, first_hi)
+        {
+            debug!("loan {:?} gets killed at {:?}", loan_idx, kill_location);
+            self.loans_out_of_scope_at_location.entry(kill_location).or_default().push(loan_idx);
+
+            // The loan dies within the first block, we're done and can early return.
+            return;
+        }
+
+        // The loan is not dead. Add successor BBs to the work list, if necessary.
+        for succ_bb in first_bb_data.terminator().successors() {
+            if self.visited.insert(succ_bb) {
+                self.visit_stack.push(succ_bb);
+            }
+        }
+
+        // We may end up visiting `first_block` again. This is not an issue: we know at this point
+        // that the loan is not killed in the `first_lo..=first_hi` range, so checking the
+        // `0..first_lo` range and the `0..first_hi` range gives the same result.
+        while let Some(block) = self.visit_stack.pop() {
+            let bb_data = &self.body[block];
+            let num_stmts = bb_data.statements.len();
+            if let Some(kill_location) =
+                self.loan_kill_location(loan_idx, loan_issued_at, block, 0, num_stmts)
+            {
+                debug!("loan {:?} gets killed at {:?}", loan_idx, kill_location);
+                self.loans_out_of_scope_at_location
+                    .entry(kill_location)
+                    .or_default()
+                    .push(loan_idx);
+
+                // The loan dies within this block, so we don't need to visit its successors.
+                continue;
+            }
+
+            // Add successor BBs to the work list, if necessary.
+            for succ_bb in bb_data.terminator().successors() {
+                if self.visited.insert(succ_bb) {
+                    self.visit_stack.push(succ_bb);
+                }
+            }
+        }
+
+        self.visited.clear();
+        assert!(self.visit_stack.is_empty(), "visit stack should be empty");
+    }
+
+    /// Returns the lowest statement in `start..=end`, where the loan goes out of scope, if any.
+    /// This is the statement where the issuing region can't reach any of the regions that are live
+    /// at this point.
+    fn loan_kill_location(
+        &self,
+        loan_idx: BorrowIndex,
+        loan_issued_at: Location,
+        block: BasicBlock,
+        start: usize,
+        end: usize,
+    ) -> Option<Location> {
+        for statement_index in start..=end {
+            let location = Location { block, statement_index };
+
+            // Check whether the issuing region can reach local regions that are live at this point:
+            // - a loan is always live at its issuing location because it can reach the issuing
+            // region, which is always live at this location.
+            if location == loan_issued_at {
+                continue;
+            }
+
+            // - the loan goes out of scope at `location` if it's not contained within any regions
+            // live at this point.
+            //
+            // FIXME: if the issuing region `i` can reach a live region `r` at point `p`, and `r` is
+            // live at point `q`, then it's guaranteed that `i` would reach `r` at point `q`.
+            // Reachability is location-insensitive, and we could take advantage of that, by jumping
+            // to a further point than just the next statement: we can jump to the furthest point
+            // within the block where `r` is live.
+            if self.regioncx.is_loan_live_at(loan_idx, location) {
+                continue;
+            }
+
+            // No live region is reachable from the issuing region: the loan is killed at this
+            // point.
+            return Some(location);
+        }
+
+        None
+    }
+}
+
+impl<'mir, 'tcx> Borrows<'mir, 'tcx> {
     pub fn new(
         tcx: TyCtxt<'tcx>,
-        body: &'a Body<'tcx>,
-        nonlexical_regioncx: &'a RegionInferenceContext<'tcx>,
-        borrow_set: &'a BorrowSet<'tcx>,
+        body: &'mir Body<'tcx>,
+        regioncx: &'mir RegionInferenceContext<'tcx>,
+        borrow_set: &'mir BorrowSet<'tcx>,
     ) -> Self {
-        let borrows_out_of_scope_at_location =
-            calculate_borrows_out_of_scope_at_location(body, nonlexical_regioncx, borrow_set);
+        let mut borrows_out_of_scope_at_location =
+            calculate_borrows_out_of_scope_at_location(body, regioncx, borrow_set);
+
+        // The in-tree polonius analysis computes loans going out of scope using the set-of-loans
+        // model, and makes sure they're identical to the existing computation of the set-of-points
+        // model.
+        if tcx.sess.opts.unstable_opts.polonius.is_next_enabled() {
+            let mut polonius_prec = PoloniusOutOfScopePrecomputer::new(body, regioncx);
+            for (loan_idx, loan_data) in borrow_set.iter_enumerated() {
+                let issuing_region = loan_data.region;
+                let loan_issued_at = loan_data.reserve_location;
+
+                polonius_prec.precompute_loans_out_of_scope(
+                    loan_idx,
+                    issuing_region,
+                    loan_issued_at,
+                );
+            }
+
+            assert_eq!(
+                borrows_out_of_scope_at_location, polonius_prec.loans_out_of_scope_at_location,
+                "polonius loan scopes differ from NLL borrow scopes, for body {:?}",
+                body.span,
+            );
+
+            borrows_out_of_scope_at_location = polonius_prec.loans_out_of_scope_at_location;
+        }
+
         Borrows { tcx, body, borrow_set, borrows_out_of_scope_at_location }
     }
 
@@ -333,6 +510,13 @@ impl<'tcx> rustc_mir_dataflow::AnalysisDomain<'tcx> for Borrows<'_, 'tcx> {
     }
 }
 
+/// Forward dataflow computation of the set of borrows that are in scope at a particular location.
+/// - we gen the introduced loans
+/// - we kill loans on locals going out of (regular) scope
+/// - we kill the loans going out of their region's NLL scope: in NLL terms, the frontier where a
+///   region stops containing the CFG points reachable from the issuing location.
+/// - we also kill loans of conflicting places when overwriting a shared path: e.g. borrows of
+///   `a.b.c` when `a` is overwritten.
 impl<'tcx> rustc_mir_dataflow::GenKillAnalysis<'tcx> for Borrows<'_, 'tcx> {
     type Idx = BorrowIndex;
 
@@ -399,7 +583,7 @@ impl<'tcx> rustc_mir_dataflow::GenKillAnalysis<'tcx> for Borrows<'_, 'tcx> {
 
     fn before_terminator_effect(
         &mut self,
-        trans: &mut impl GenKill<Self::Idx>,
+        trans: &mut Self::Domain,
         _terminator: &mir::Terminator<'tcx>,
         location: Location,
     ) {
@@ -426,7 +610,7 @@ impl<'tcx> rustc_mir_dataflow::GenKillAnalysis<'tcx> for Borrows<'_, 'tcx> {
 
     fn call_return_effect(
         &mut self,
-        _trans: &mut impl GenKill<Self::Idx>,
+        _trans: &mut Self::Domain,
         _block: mir::BasicBlock,
         _return_places: CallReturnPlaces<'_, 'tcx>,
     ) {

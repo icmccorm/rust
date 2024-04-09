@@ -8,7 +8,6 @@
 //! this via an attribute on the crate like `#![recursion_limit="22"]`. This pass
 //! just peeks and looks for that attribute.
 
-use crate::bug;
 use crate::error::LimitInvalid;
 use crate::query::Providers;
 use rustc_ast::Attribute;
@@ -41,6 +40,13 @@ pub fn get_recursion_limit(krate_attrs: &[Attribute], sess: &Session) -> Limit {
 }
 
 fn get_limit(krate_attrs: &[Attribute], sess: &Session, name: Symbol, default: usize) -> Limit {
+    match get_limit_size(krate_attrs, sess, name) {
+        Some(size) => Limit::new(size),
+        None => Limit::new(default),
+    }
+}
+
+pub fn get_limit_size(krate_attrs: &[Attribute], sess: &Session, name: Symbol) -> Option<usize> {
     for attr in krate_attrs {
         if !attr.has_name(name) {
             continue;
@@ -48,7 +54,7 @@ fn get_limit(krate_attrs: &[Attribute], sess: &Session, name: Symbol, default: u
 
         if let Some(s) = attr.value_str() {
             match s.as_str().parse() {
-                Ok(n) => return Limit::new(n),
+                Ok(n) => return Some(n),
                 Err(e) => {
                     let value_span = attr
                         .meta()
@@ -65,10 +71,10 @@ fn get_limit(krate_attrs: &[Attribute], sess: &Session, name: Symbol, default: u
                         IntErrorKind::Zero => bug!("zero is a valid `limit`"),
                         kind => bug!("unimplemented IntErrorKind variant: {:?}", kind),
                     };
-                    sess.emit_err(LimitInvalid { span: attr.span, value_span, error_str });
+                    sess.dcx().emit_err(LimitInvalid { span: attr.span, value_span, error_str });
                 }
             }
         }
     }
-    return Limit::new(default);
+    None
 }

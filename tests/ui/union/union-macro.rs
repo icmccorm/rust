@@ -1,6 +1,4 @@
-// run-pass
-// revisions: mirunsafeck thirunsafeck
-// [thirunsafeck]compile-flags: -Z thir-unsafeck
+//@ run-pass
 
 #![allow(unused_variables)]
 
@@ -17,6 +15,7 @@ macro_rules! duplicate {
 
 duplicate! {
     pub union U {
+        #[allow(dead_code)]
         pub a: u8
     }
 }

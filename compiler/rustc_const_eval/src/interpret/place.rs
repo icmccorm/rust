@@ -7,22 +7,21 @@ use std::assert_matches::assert_matches;
 use either::{Either, Left, Right};
 
 use rustc_ast::Mutability;
-use rustc_index::IndexSlice;
 use rustc_middle::mir;
 use rustc_middle::ty;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::Ty;
-use rustc_target::abi::{Abi, Align, FieldIdx, HasDataLayout, Size, FIRST_VARIANT};
+use rustc_target::abi::{Abi, Align, HasDataLayout, Size};
 
 use super::{
-    alloc_range, mir_assign_valid_types, AllocId, AllocRef, AllocRefMut, CheckInAllocMsg, ImmTy,
-    Immediate, InterpCx, InterpResult, Machine, MemoryKind, OpTy, Operand, Pointer,
-    PointerArithmetic, Projectable, Provenance, Readable, Scalar,
+    alloc_range, mir_assign_valid_types, AllocRef, AllocRefMut, CheckAlignMsg, CtfeProvenance,
+    ImmTy, Immediate, InterpCx, InterpResult, Machine, MemoryKind, Misalignment, OffsetMode, OpTy,
+    Operand, Pointer, PointerArithmetic, Projectable, Provenance, Readable, Scalar,
 };
 
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
 /// Information required for the sound usage of a `MemPlace`.
-pub enum MemPlaceMeta<Prov: Provenance = AllocId> {
+pub enum MemPlaceMeta<Prov: Provenance = CtfeProvenance> {
     /// The unsized payload (e.g. length for slices or vtable pointer for trait objects).
     Meta(Scalar<Prov>),
     /// `Sized` types or unsized `extern type`
@@ -50,68 +49,60 @@ impl<Prov: Provenance> MemPlaceMeta<Prov> {
 }
 
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
-pub(super) struct MemPlace<Prov: Provenance = AllocId> {
+pub(super) struct MemPlace<Prov: Provenance = CtfeProvenance> {
     /// The pointer can be a pure integer, with the `None` provenance.
     pub ptr: Pointer<Option<Prov>>,
     /// Metadata for unsized places. Interpretation is up to the type.
     /// Must not be present for sized types, but can be missing for unsized types
     /// (e.g., `extern type`).
     pub meta: MemPlaceMeta<Prov>,
+    /// Stores whether this place was created based on a sufficiently aligned pointer.
+    misaligned: Option<Misalignment>,
 }
 
 impl<Prov: Provenance> MemPlace<Prov> {
-    #[inline(always)]
-    pub fn from_ptr(ptr: Pointer<Option<Prov>>) -> Self {
-        MemPlace { ptr, meta: MemPlaceMeta::None }
-    }
-
-    #[inline(always)]
-    pub fn from_ptr_with_meta(ptr: Pointer<Option<Prov>>, meta: MemPlaceMeta<Prov>) -> Self {
-        MemPlace { ptr, meta }
-    }
-
     /// Adjust the provenance of the main pointer (metadata is unaffected).
-    pub fn map_provenance(self, f: impl FnOnce(Option<Prov>) -> Option<Prov>) -> Self {
-        MemPlace { ptr: self.ptr.map_provenance(f), ..self }
+    pub fn map_provenance(self, f: impl FnOnce(Prov) -> Prov) -> Self {
+        MemPlace { ptr: self.ptr.map_provenance(|p| p.map(f)), ..self }
     }
 
     /// Turn a mplace into a (thin or wide) pointer, as a reference, pointing to the same space.
     #[inline]
     pub fn to_ref(self, cx: &impl HasDataLayout) -> Immediate<Prov> {
-        match self.meta {
-            MemPlaceMeta::None => Immediate::from(Scalar::from_maybe_pointer(self.ptr, cx)),
-            MemPlaceMeta::Meta(meta) => {
-                Immediate::ScalarPair(Scalar::from_maybe_pointer(self.ptr, cx), meta)
-            }
-        }
+        Immediate::new_pointer_with_meta(self.ptr, self.meta, cx)
     }
 
     #[inline]
     // Not called `offset_with_meta` to avoid confusion with the trait method.
-    fn offset_with_meta_<'tcx>(
+    fn offset_with_meta_<'mir, 'tcx, M: Machine<'mir, 'tcx, Provenance = Prov>>(
         self,
         offset: Size,
+        mode: OffsetMode,
         meta: MemPlaceMeta<Prov>,
-        cx: &impl HasDataLayout,
+        ecx: &InterpCx<'mir, 'tcx, M>,
     ) -> InterpResult<'tcx, Self> {
         debug_assert!(
             !meta.has_meta() || self.meta.has_meta(),
             "cannot use `offset_with_meta` to add metadata to a place"
         );
-        Ok(MemPlace { ptr: self.ptr.offset(offset, cx)?, meta })
+        if offset > ecx.data_layout().max_size_of_val() {
+            throw_ub!(PointerArithOverflow);
+        }
+        let ptr = match mode {
+            OffsetMode::Inbounds => {
+                ecx.ptr_offset_inbounds(self.ptr, offset.bytes().try_into().unwrap())?
+            }
+            OffsetMode::Wrapping => self.ptr.wrapping_offset(offset, ecx),
+        };
+        Ok(MemPlace { ptr, meta, misaligned: self.misaligned })
     }
 }
 
 /// A MemPlace with its layout. Constructing it is only possible in this module.
 #[derive(Clone, Hash, Eq, PartialEq)]
-pub struct MPlaceTy<'tcx, Prov: Provenance = AllocId> {
+pub struct MPlaceTy<'tcx, Prov: Provenance = CtfeProvenance> {
     mplace: MemPlace<Prov>,
     pub layout: TyAndLayout<'tcx>,
-    /// rustc does not have a proper way to represent the type of a field of a `repr(packed)` struct:
-    /// it needs to have a different alignment than the field type would usually have.
-    /// So we represent this here with a separate field that "overwrites" `layout.align`.
-    /// This means `layout.align` should never be used for a `MPlaceTy`!
-    pub align: Align,
 }
 
 impl<Prov: Provenance> std::fmt::Debug for MPlaceTy<'_, Prov> {
@@ -133,29 +124,11 @@ impl<'tcx, Prov: Provenance> MPlaceTy<'tcx, Prov> {
         assert!(layout.is_zst());
         let align = layout.align.abi;
         let ptr = Pointer::from_addr_invalid(align.bytes()); // no provenance, absolute address
-        MPlaceTy { mplace: MemPlace { ptr, meta: MemPlaceMeta::None }, layout, align }
-    }
-
-    #[inline]
-    pub fn from_aligned_ptr(ptr: Pointer<Option<Prov>>, layout: TyAndLayout<'tcx>) -> Self {
-        MPlaceTy { mplace: MemPlace::from_ptr(ptr), layout, align: layout.align.abi }
-    }
-
-    #[inline]
-    pub fn from_aligned_ptr_with_meta(
-        ptr: Pointer<Option<Prov>>,
-        layout: TyAndLayout<'tcx>,
-        meta: MemPlaceMeta<Prov>,
-    ) -> Self {
-        MPlaceTy {
-            mplace: MemPlace::from_ptr_with_meta(ptr, meta),
-            layout,
-            align: layout.align.abi,
-        }
+        MPlaceTy { mplace: MemPlace { ptr, meta: MemPlaceMeta::None, misaligned: None }, layout }
     }
 
     /// Adjust the provenance of the main pointer (metadata is unaffected).
-    pub fn map_provenance(self, f: impl FnOnce(Option<Prov>) -> Option<Prov>) -> Self {
+    pub fn map_provenance(self, f: impl FnOnce(Prov) -> Prov) -> Self {
         MPlaceTy { mplace: self.mplace.map_provenance(f), ..self }
     }
 
@@ -189,15 +162,12 @@ impl<'tcx, Prov: Provenance> Projectable<'tcx, Prov> for MPlaceTy<'tcx, Prov> {
     fn offset_with_meta<'mir, M: Machine<'mir, 'tcx, Provenance = Prov>>(
         &self,
         offset: Size,
+        mode: OffsetMode,
         meta: MemPlaceMeta<Prov>,
         layout: TyAndLayout<'tcx>,
         ecx: &InterpCx<'mir, 'tcx, M>,
     ) -> InterpResult<'tcx, Self> {
-        Ok(MPlaceTy {
-            mplace: self.mplace.offset_with_meta_(offset, meta, ecx)?,
-            align: self.align.restrict_for_offset(offset),
-            layout,
-        })
+        Ok(MPlaceTy { mplace: self.mplace.offset_with_meta_(offset, mode, meta, ecx)?, layout })
     }
 
     fn to_op<'mir, M: Machine<'mir, 'tcx, Provenance = Prov>>(
@@ -209,7 +179,7 @@ impl<'tcx, Prov: Provenance> Projectable<'tcx, Prov> for MPlaceTy<'tcx, Prov> {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub(super) enum Place<Prov: Provenance = AllocId> {
+pub(super) enum Place<Prov: Provenance = CtfeProvenance> {
     /// A place referring to a value allocated in the `Memory` system.
     Ptr(MemPlace<Prov>),
 
@@ -217,22 +187,25 @@ pub(super) enum Place<Prov: Provenance = AllocId> {
     /// where in the local this place is located; if it is `None`, no projection has been applied.
     /// Such projections are meaningful even if the offset is 0, since they can change layouts.
     /// (Without that optimization, we'd just always be a `MemPlace`.)
-    /// Note that this only stores the frame index, not the thread this frame belongs to -- that is
-    /// implicit. This means a `Place` must never be moved across interpreter thread boundaries!
+    /// `Local` places always refer to the current stack frame, so they are unstable under
+    /// function calls/returns and switching betweens stacks of different threads!
+    /// We carry around the address of the `locals` buffer of the correct stack frame as a sanity
+    /// chec to be able to catch some cases of using a dangling `Place`.
     ///
     /// This variant shall not be used for unsized types -- those must always live in memory.
-    Local { frame: usize, local: mir::Local, offset: Option<Size> },
+    Local { local: mir::Local, offset: Option<Size>, locals_addr: usize },
 }
 
+/// An evaluated place, together with its type.
+///
+/// This may reference a stack frame by its index, so `PlaceTy` should generally not be kept around
+/// for longer than a single operation. Popping and then pushing a stack frame can make `PlaceTy`
+/// point to the wrong destination. If the interpreter has multiple stacks, stack switching will
+/// also invalidate a `PlaceTy`.
 #[derive(Clone)]
-pub struct PlaceTy<'tcx, Prov: Provenance = AllocId> {
+pub struct PlaceTy<'tcx, Prov: Provenance = CtfeProvenance> {
     place: Place<Prov>, // Keep this private; it helps enforce invariants.
     pub layout: TyAndLayout<'tcx>,
-    /// rustc does not have a proper way to represent the type of a field of a `repr(packed)` struct:
-    /// it needs to have a different alignment than the field type would usually have.
-    /// So we represent this here with a separate field that "overwrites" `layout.align`.
-    /// This means `layout.align` should never be used for a `PlaceTy`!
-    pub align: Align,
 }
 
 impl<Prov: Provenance> std::fmt::Debug for PlaceTy<'_, Prov> {
@@ -248,7 +221,7 @@ impl<Prov: Provenance> std::fmt::Debug for PlaceTy<'_, Prov> {
 impl<'tcx, Prov: Provenance> From<MPlaceTy<'tcx, Prov>> for PlaceTy<'tcx, Prov> {
     #[inline(always)]
     fn from(mplace: MPlaceTy<'tcx, Prov>) -> Self {
-        PlaceTy { place: Place::Ptr(mplace.mplace), layout: mplace.layout, align: mplace.align }
+        PlaceTy { place: Place::Ptr(mplace.mplace), layout: mplace.layout }
     }
 }
 
@@ -262,10 +235,10 @@ impl<'tcx, Prov: Provenance> PlaceTy<'tcx, Prov> {
     #[inline(always)]
     pub fn as_mplace_or_local(
         &self,
-    ) -> Either<MPlaceTy<'tcx, Prov>, (usize, mir::Local, Option<Size>)> {
+    ) -> Either<MPlaceTy<'tcx, Prov>, (mir::Local, Option<Size>, usize)> {
         match self.place {
-            Place::Ptr(mplace) => Left(MPlaceTy { mplace, layout: self.layout, align: self.align }),
-            Place::Local { frame, local, offset } => Right((frame, local, offset)),
+            Place::Ptr(mplace) => Left(MPlaceTy { mplace, layout: self.layout }),
+            Place::Local { local, offset, locals_addr } => Right((local, offset, locals_addr)),
         }
     }
 
@@ -301,25 +274,28 @@ impl<'tcx, Prov: Provenance> Projectable<'tcx, Prov> for PlaceTy<'tcx, Prov> {
     fn offset_with_meta<'mir, M: Machine<'mir, 'tcx, Provenance = Prov>>(
         &self,
         offset: Size,
+        mode: OffsetMode,
         meta: MemPlaceMeta<Prov>,
         layout: TyAndLayout<'tcx>,
         ecx: &InterpCx<'mir, 'tcx, M>,
     ) -> InterpResult<'tcx, Self> {
         Ok(match self.as_mplace_or_local() {
-            Left(mplace) => mplace.offset_with_meta(offset, meta, layout, ecx)?.into(),
-            Right((frame, local, old_offset)) => {
+            Left(mplace) => mplace.offset_with_meta(offset, mode, meta, layout, ecx)?.into(),
+            Right((local, old_offset, locals_addr)) => {
                 debug_assert!(layout.is_sized(), "unsized locals should live in memory");
                 assert_matches!(meta, MemPlaceMeta::None); // we couldn't store it anyway...
-                let new_offset = ecx
-                    .data_layout()
-                    .offset(old_offset.unwrap_or(Size::ZERO).bytes(), offset.bytes())?;
+                // `Place::Local` are always in-bounds of their surrounding local, so we can just
+                // check directly if this remains in-bounds. This cannot actually be violated since
+                // projections are type-checked and bounds-checked.
+                assert!(offset + layout.size <= self.layout.size);
+
+                let new_offset = Size::from_bytes(
+                    ecx.data_layout()
+                        .offset(old_offset.unwrap_or(Size::ZERO).bytes(), offset.bytes())?,
+                );
+
                 PlaceTy {
-                    place: Place::Local {
-                        frame,
-                        local,
-                        offset: Some(Size::from_bytes(new_offset)),
-                    },
-                    align: self.align.restrict_for_offset(offset),
+                    place: Place::Local { local, offset: Some(new_offset), locals_addr },
                     layout,
                 }
             }
@@ -339,9 +315,7 @@ impl<'tcx, Prov: Provenance> OpTy<'tcx, Prov> {
     #[inline(always)]
     pub fn as_mplace_or_imm(&self) -> Either<MPlaceTy<'tcx, Prov>, ImmTy<'tcx, Prov>> {
         match self.op() {
-            Operand::Indirect(mplace) => {
-                Left(MPlaceTy { mplace: *mplace, layout: self.layout, align: self.align.unwrap() })
-            }
+            Operand::Indirect(mplace) => Left(MPlaceTy { mplace: *mplace, layout: self.layout }),
             Operand::Immediate(imm) => Right(ImmTy::from_immediate(*imm, self.layout)),
         }
     }
@@ -362,7 +336,7 @@ impl<'tcx, Prov: Provenance> OpTy<'tcx, Prov> {
 pub trait Writeable<'tcx, Prov: Provenance>: Projectable<'tcx, Prov> {
     fn as_mplace_or_local(
         &self,
-    ) -> Either<MPlaceTy<'tcx, Prov>, (usize, mir::Local, Option<Size>, Align, TyAndLayout<'tcx>)>;
+    ) -> Either<MPlaceTy<'tcx, Prov>, (mir::Local, Option<Size>, usize, TyAndLayout<'tcx>)>;
 
     fn force_mplace<'mir, M: Machine<'mir, 'tcx, Provenance = Prov>>(
         &self,
@@ -374,10 +348,9 @@ impl<'tcx, Prov: Provenance> Writeable<'tcx, Prov> for PlaceTy<'tcx, Prov> {
     #[inline(always)]
     fn as_mplace_or_local(
         &self,
-    ) -> Either<MPlaceTy<'tcx, Prov>, (usize, mir::Local, Option<Size>, Align, TyAndLayout<'tcx>)>
-    {
+    ) -> Either<MPlaceTy<'tcx, Prov>, (mir::Local, Option<Size>, usize, TyAndLayout<'tcx>)> {
         self.as_mplace_or_local()
-            .map_right(|(frame, local, offset)| (frame, local, offset, self.align, self.layout))
+            .map_right(|(local, offset, locals_addr)| (local, offset, locals_addr, self.layout))
     }
 
     #[inline(always)]
@@ -393,8 +366,7 @@ impl<'tcx, Prov: Provenance> Writeable<'tcx, Prov> for MPlaceTy<'tcx, Prov> {
     #[inline(always)]
     fn as_mplace_or_local(
         &self,
-    ) -> Either<MPlaceTy<'tcx, Prov>, (usize, mir::Local, Option<Size>, Align, TyAndLayout<'tcx>)>
-    {
+    ) -> Either<MPlaceTy<'tcx, Prov>, (mir::Local, Option<Size>, usize, TyAndLayout<'tcx>)> {
         Left(self.clone())
     }
 
@@ -413,6 +385,25 @@ where
     Prov: Provenance,
     M: Machine<'mir, 'tcx, Provenance = Prov>,
 {
+    pub fn ptr_with_meta_to_mplace(
+        &self,
+        ptr: Pointer<Option<M::Provenance>>,
+        meta: MemPlaceMeta<M::Provenance>,
+        layout: TyAndLayout<'tcx>,
+    ) -> MPlaceTy<'tcx, M::Provenance> {
+        let misaligned = self.is_ptr_misaligned(ptr, layout.align.abi);
+        MPlaceTy { mplace: MemPlace { ptr, meta, misaligned }, layout }
+    }
+
+    pub fn ptr_to_mplace(
+        &self,
+        ptr: Pointer<Option<M::Provenance>>,
+        layout: TyAndLayout<'tcx>,
+    ) -> MPlaceTy<'tcx, M::Provenance> {
+        assert!(layout.is_sized());
+        self.ptr_with_meta_to_mplace(ptr, MemPlaceMeta::None, layout)
+    }
+
     /// Take a value, which represents a (thin or wide) reference, and make it a place.
     /// Alignment is just based on the type. This is the inverse of `mplace_to_ref()`.
     ///
@@ -426,15 +417,12 @@ where
         let pointee_type =
             val.layout.ty.builtin_deref(true).expect("`ref_to_mplace` called on non-ptr type").ty;
         let layout = self.layout_of(pointee_type)?;
-        let (ptr, meta) = match **val {
-            Immediate::Scalar(ptr) => (ptr, MemPlaceMeta::None),
-            Immediate::ScalarPair(ptr, meta) => (ptr, MemPlaceMeta::Meta(meta)),
-            Immediate::Uninit => throw_ub!(InvalidUninitBytes(None)),
-        };
+        let (ptr, meta) = val.to_scalar_and_meta();
 
         // `ref_to_mplace` is called on raw pointers even if they don't actually get dereferenced;
         // we hence can't call `size_and_align_of` since that asserts more validity than we want.
-        Ok(MPlaceTy::from_aligned_ptr_with_meta(ptr.to_pointer(self)?, layout, meta))
+        let ptr = ptr.to_pointer(self)?;
+        Ok(self.ptr_with_meta_to_mplace(ptr, meta, layout))
     }
 
     /// Turn a mplace into a (thin or wide) mutable raw pointer, pointing to the same space.
@@ -460,11 +448,11 @@ where
         trace!("deref to {} on {:?}", val.layout.ty, *val);
 
         if val.layout.ty.is_box() {
+            // Derefer should have removed all Box derefs
             bug!("dereferencing {}", val.layout.ty);
         }
 
         let mplace = self.ref_to_mplace(&val)?;
-        self.check_mplace(&mplace)?;
         Ok(mplace)
     }
 
@@ -475,10 +463,13 @@ where
     ) -> InterpResult<'tcx, Option<AllocRef<'_, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
     {
         let (size, _align) = self
-            .size_and_align_of_mplace(&mplace)?
+            .size_and_align_of_mplace(mplace)?
             .unwrap_or((mplace.layout.size, mplace.layout.align.abi));
-        // Due to packed places, only `mplace.align` matters.
-        self.get_ptr_alloc(mplace.ptr(), size, mplace.align)
+        // We check alignment separately, and *after* checking everything else.
+        // If an access is both OOB and misaligned, we want to see the bounds error.
+        let a = self.get_ptr_alloc(mplace.ptr(), size)?;
+        self.check_misalign(mplace.mplace.misaligned, CheckAlignMsg::BasedOn)?;
+        Ok(a)
     }
 
     #[inline]
@@ -488,22 +479,15 @@ where
     ) -> InterpResult<'tcx, Option<AllocRefMut<'_, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
     {
         let (size, _align) = self
-            .size_and_align_of_mplace(&mplace)?
+            .size_and_align_of_mplace(mplace)?
             .unwrap_or((mplace.layout.size, mplace.layout.align.abi));
-        // Due to packed places, only `mplace.align` matters.
-        self.get_ptr_alloc_mut(mplace.ptr(), size, mplace.align)
-    }
-
-    /// Check if this mplace is dereferenceable and sufficiently aligned.
-    pub fn check_mplace(&self, mplace: &MPlaceTy<'tcx, M::Provenance>) -> InterpResult<'tcx> {
-        let (size, _align) = self
-            .size_and_align_of_mplace(&mplace)?
-            .unwrap_or((mplace.layout.size, mplace.layout.align.abi));
-        // Due to packed places, only `mplace.align` matters.
-        let align =
-            if M::enforce_alignment(self).should_check() { mplace.align } else { Align::ONE };
-        self.check_ptr_access_align(mplace.ptr(), size, align, CheckInAllocMsg::DerefTest)?;
-        Ok(())
+        // We check alignment separately, and raise that error *after* checking everything else.
+        // If an access is both OOB and misaligned, we want to see the bounds error.
+        // However we have to call `check_misalign` first to make the borrow checker happy.
+        let misalign_err = self.check_misalign(mplace.mplace.misaligned, CheckAlignMsg::BasedOn);
+        let a = self.get_ptr_alloc_mut(mplace.ptr(), size)?;
+        misalign_err?;
+        Ok(a)
     }
 
     /// Converts a repr(simd) place into a place where `place_index` accesses the SIMD elements.
@@ -518,44 +502,30 @@ where
         let (len, e_ty) = mplace.layout.ty.simd_size_and_type(*self.tcx);
         let array = Ty::new_array(self.tcx.tcx, e_ty, len);
         let layout = self.layout_of(array)?;
-        assert_eq!(layout.size, mplace.layout.size);
-        Ok((MPlaceTy { layout, ..*mplace }, len))
+        let mplace = mplace.transmute(layout, self)?;
+        Ok((mplace, len))
     }
 
-    /// Converts a repr(simd) place into a place where `place_index` accesses the SIMD elements.
-    /// Also returns the number of elements.
-    pub fn place_to_simd(
-        &mut self,
-        place: &PlaceTy<'tcx, M::Provenance>,
-    ) -> InterpResult<'tcx, (MPlaceTy<'tcx, M::Provenance>, u64)> {
-        let mplace = self.force_allocation(place)?;
-        self.mplace_to_simd(&mplace)
-    }
-
+    /// Turn a local in the current frame into a place.
     pub fn local_to_place(
         &self,
-        frame: usize,
         local: mir::Local,
     ) -> InterpResult<'tcx, PlaceTy<'tcx, M::Provenance>> {
         // Other parts of the system rely on `Place::Local` never being unsized.
         // So we eagerly check here if this local has an MPlace, and if yes we use it.
-        let frame_ref = &self.stack()[frame];
-        let layout = self.layout_of_local(frame_ref, local, None)?;
+        let frame = self.frame();
+        let layout = self.layout_of_local(frame, local, None)?;
         let place = if layout.is_sized() {
             // We can just always use the `Local` for sized values.
-            Place::Local { frame, local, offset: None }
+            Place::Local { local, offset: None, locals_addr: frame.locals_addr() }
         } else {
             // Unsized `Local` isn't okay (we cannot store the metadata).
-            match frame_ref.locals[local].access()? {
-                Operand::Immediate(_) => {
-                    // ConstProp marks *all* locals as `Immediate::Uninit` since it cannot
-                    // efficiently check whether they are sized. We have to catch that case here.
-                    throw_inval!(ConstPropNonsense);
-                }
+            match frame.locals[local].access()? {
+                Operand::Immediate(_) => bug!(),
                 Operand::Indirect(mplace) => Place::Ptr(*mplace),
             }
         };
-        Ok(PlaceTy { place, layout, align: layout.align.abi })
+        Ok(PlaceTy { place, layout })
     }
 
     /// Computes a place. You should only use this if you intend to write into this
@@ -565,7 +535,7 @@ where
         &self,
         mir_place: mir::Place<'tcx>,
     ) -> InterpResult<'tcx, PlaceTy<'tcx, M::Provenance>> {
-        let mut place = self.local_to_place(self.frame_idx(), mir_place.local)?;
+        let mut place = self.local_to_place(mir_place.local)?;
         // Using `try_fold` turned out to be bad for performance, hence the loop.
         for elem in mir_place.projection.iter() {
             place = self.project(&place, elem)?
@@ -573,19 +543,25 @@ where
 
         trace!("{:?}", self.dump_place(&place));
         // Sanity-check the type we ended up with.
-        debug_assert!(
-            mir_assign_valid_types(
+        if cfg!(debug_assertions) {
+            let normalized_place_ty = self
+                .instantiate_from_current_frame_and_normalize_erasing_regions(
+                    mir_place.ty(&self.frame().body.local_decls, *self.tcx).ty,
+                )?;
+            if !mir_assign_valid_types(
                 *self.tcx,
                 self.param_env,
-                self.layout_of(self.subst_from_current_frame_and_normalize_erasing_regions(
-                    mir_place.ty(&self.frame().body.local_decls, *self.tcx).ty
-                )?)?,
+                self.layout_of(normalized_place_ty)?,
                 place.layout,
-            ),
-            "eval_place of a MIR place with type {:?} produced an interpreter place with type {}",
-            mir_place.ty(&self.frame().body.local_decls, *self.tcx).ty,
-            place.layout.ty,
-        );
+            ) {
+                span_bug!(
+                    self.cur_span(),
+                    "eval_place of a MIR place with type {} produced an interpreter place with type {}",
+                    normalized_place_ty,
+                    place.layout.ty,
+                )
+            }
+        }
         Ok(place)
     }
 
@@ -640,15 +616,15 @@ where
         // See if we can avoid an allocation. This is the counterpart to `read_immediate_raw`,
         // but not factored as a separate function.
         let mplace = match dest.as_mplace_or_local() {
-            Right((frame, local, offset, align, layout)) => {
+            Right((local, offset, locals_addr, layout)) => {
                 if offset.is_some() {
                     // This has been projected to a part of this local. We could have complicated
                     // logic to still keep this local as an `Operand`... but it's much easier to
                     // just fall back to the indirect path.
                     dest.force_mplace(self)?
                 } else {
-                    M::before_access_local_mut(self, frame, local)?;
-                    match self.stack_mut()[frame].locals[local].access_mut()? {
+                    debug_assert_eq!(locals_addr, self.frame().locals_addr());
+                    match self.frame_mut().locals[local].access_mut()? {
                         Operand::Immediate(local_val) => {
                             // Local can be updated in-place.
                             *local_val = src;
@@ -656,7 +632,7 @@ where
                             // (*After* doing the update for borrow checker reasons.)
                             if cfg!(debug_assertions) {
                                 let local_layout =
-                                    self.layout_of_local(&self.stack()[frame], local, None)?;
+                                    self.layout_of_local(&self.frame(), local, None)?;
                                 match (src, local_layout.abi) {
                                     (Immediate::Scalar(scalar), Abi::Scalar(s)) => {
                                         assert_eq!(scalar.size(), s.size(self))
@@ -681,7 +657,7 @@ where
                         }
                         Operand::Indirect(mplace) => {
                             // The local is in memory, go on below.
-                            MPlaceTy { mplace: *mplace, align, layout }
+                            MPlaceTy { mplace: *mplace, layout }
                         }
                     }
                 }
@@ -690,7 +666,7 @@ where
         };
 
         // This is already in memory, write there.
-        self.write_immediate_to_mplace_no_validate(src, mplace.layout, mplace.align, mplace.mplace)
+        self.write_immediate_to_mplace_no_validate(src, mplace.layout, mplace.mplace)
     }
 
     /// Write an immediate to memory.
@@ -700,7 +676,6 @@ where
         &mut self,
         value: Immediate<M::Provenance>,
         layout: TyAndLayout<'tcx>,
-        align: Align,
         dest: MemPlace<M::Provenance>,
     ) -> InterpResult<'tcx> {
         // Note that it is really important that the type here is the right one, and matches the
@@ -709,9 +684,7 @@ where
         // wrong type.
 
         let tcx = *self.tcx;
-        let Some(mut alloc) =
-            self.get_place_alloc_mut(&MPlaceTy { mplace: dest, layout, align })?
-        else {
+        let Some(mut alloc) = self.get_place_alloc_mut(&MPlaceTy { mplace: dest, layout })? else {
             // zero-sized access
             return Ok(());
         };
@@ -729,9 +702,6 @@ where
                 alloc.write_scalar(alloc_range(Size::ZERO, size), scalar)
             }
             Immediate::ScalarPair(a_val, b_val) => {
-                // We checked `ptr_align` above, so all fields will have the alignment they need.
-                // We would anyway check against `ptr_align.restrict_for_offset(b_offset)`,
-                // which `ptr.offset(b_offset)` cannot possibly fail to satisfy.
                 let Abi::ScalarPair(a, b) = layout.abi else {
                     span_bug!(
                         self.cur_span(),
@@ -760,7 +730,7 @@ where
     ) -> InterpResult<'tcx> {
         let mplace = match dest.as_mplace_or_local() {
             Left(mplace) => mplace,
-            Right((frame, local, offset, align, layout)) => {
+            Right((local, offset, locals_addr, layout)) => {
                 if offset.is_some() {
                     // This has been projected to a part of this local. We could have complicated
                     // logic to still keep this local as an `Operand`... but it's much easier to
@@ -768,15 +738,15 @@ where
                     // FIXME: share the logic with `write_immediate_no_validate`.
                     dest.force_mplace(self)?
                 } else {
-                    M::before_access_local_mut(self, frame, local)?;
-                    match self.stack_mut()[frame].locals[local].access_mut()? {
+                    debug_assert_eq!(locals_addr, self.frame().locals_addr());
+                    match self.frame_mut().locals[local].access_mut()? {
                         Operand::Immediate(local) => {
                             *local = Immediate::Uninit;
                             return Ok(());
                         }
                         Operand::Indirect(mplace) => {
                             // The local is in memory, go on below.
-                            MPlaceTy { mplace: *mplace, layout, align }
+                            MPlaceTy { mplace: *mplace, layout }
                         }
                     }
                 }
@@ -791,14 +761,57 @@ where
     }
 
     /// Copies the data from an operand to a place.
-    /// `allow_transmute` indicates whether the layouts may disagree.
+    /// The layouts of the `src` and `dest` may disagree.
+    /// Does not perform validation of the destination.
+    /// The only known use case for this function is checking the return
+    /// value of a static during stack frame popping.
     #[inline(always)]
-    #[instrument(skip(self), level = "debug")]
+    pub(super) fn copy_op_no_dest_validation(
+        &mut self,
+        src: &impl Readable<'tcx, M::Provenance>,
+        dest: &impl Writeable<'tcx, M::Provenance>,
+    ) -> InterpResult<'tcx> {
+        self.copy_op_inner(
+            src, dest, /* allow_transmute */ true, /* validate_dest */ false,
+        )
+    }
+
+    /// Copies the data from an operand to a place.
+    /// The layouts of the `src` and `dest` may disagree.
+    #[inline(always)]
+    pub fn copy_op_allow_transmute(
+        &mut self,
+        src: &impl Readable<'tcx, M::Provenance>,
+        dest: &impl Writeable<'tcx, M::Provenance>,
+    ) -> InterpResult<'tcx> {
+        self.copy_op_inner(
+            src, dest, /* allow_transmute */ true, /* validate_dest */ true,
+        )
+    }
+
+    /// Copies the data from an operand to a place.
+    /// `src` and `dest` must have the same layout and the copied value will be validated.
+    #[inline(always)]
     pub fn copy_op(
         &mut self,
         src: &impl Readable<'tcx, M::Provenance>,
         dest: &impl Writeable<'tcx, M::Provenance>,
+    ) -> InterpResult<'tcx> {
+        self.copy_op_inner(
+            src, dest, /* allow_transmute */ false, /* validate_dest */ true,
+        )
+    }
+
+    /// Copies the data from an operand to a place.
+    /// `allow_transmute` indicates whether the layouts may disagree.
+    #[inline(always)]
+    #[instrument(skip(self), level = "debug")]
+    fn copy_op_inner(
+        &mut self,
+        src: &impl Readable<'tcx, M::Provenance>,
+        dest: &impl Writeable<'tcx, M::Provenance>,
         allow_transmute: bool,
+        validate_dest: bool,
     ) -> InterpResult<'tcx> {
         // Generally for transmutation, data must be valid both at the old and new type.
         // But if the types are the same, the 2nd validation below suffices.
@@ -809,7 +822,7 @@ where
         // Do the actual copy.
         self.copy_op_no_validate(src, dest, allow_transmute)?;
 
-        if M::enforce_validity(self, dest.layout()) {
+        if validate_dest && M::enforce_validity(self, dest.layout()) {
             // Data got changed, better make sure it matches the type!
             self.validate_operand(&dest.to_op(self)?)?;
         }
@@ -845,17 +858,8 @@ where
         // avoid force_allocation.
         let src = match self.read_immediate_raw(src)? {
             Right(src_val) => {
-                // FIXME(const_prop): Const-prop can possibly evaluate an
-                // unsized copy operation when it thinks that the type is
-                // actually sized, due to a trivially false where-clause
-                // predicate like `where Self: Sized` with `Self = dyn Trait`.
-                // See #102553 for an example of such a predicate.
-                if src.layout().is_unsized() {
-                    throw_inval!(ConstPropNonsense);
-                }
-                if dest.layout().is_unsized() {
-                    throw_inval!(ConstPropNonsense);
-                }
+                assert!(!src.layout().is_unsized());
+                assert!(!dest.layout().is_unsized());
                 assert_eq!(src.layout().size, dest.layout().size);
                 // Yay, we got a value that we can write directly.
                 return if layout_compat {
@@ -869,7 +873,6 @@ where
                     self.write_immediate_to_mplace_no_validate(
                         *src_val,
                         src.layout(),
-                        dest_mem.align,
                         dest_mem.mplace,
                     )
                 };
@@ -896,14 +899,12 @@ where
         // type does not have Scalar/ScalarPair layout.
         // (Or as the `Assign` docs put it, assignments "not producing primitives" must be
         // non-overlapping.)
-        self.mem_copy(
-            src.ptr(),
-            src.align,
-            dest.ptr(),
-            dest.align,
-            dest_size,
-            /*nonoverlapping*/ true,
-        )
+        // We check alignment separately, and *after* checking everything else.
+        // If an access is both OOB and misaligned, we want to see the bounds error.
+        self.mem_copy(src.ptr(), dest.ptr(), dest_size, /*nonoverlapping*/ true)?;
+        self.check_misalign(src.mplace.misaligned, CheckAlignMsg::BasedOn)?;
+        self.check_misalign(dest.mplace.misaligned, CheckAlignMsg::BasedOn)?;
+        Ok(())
     }
 
     /// Ensures that a place is in memory, and returns where it is.
@@ -916,17 +917,16 @@ where
         place: &PlaceTy<'tcx, M::Provenance>,
     ) -> InterpResult<'tcx, MPlaceTy<'tcx, M::Provenance>> {
         let mplace = match place.place {
-            Place::Local { frame, local, offset } => {
-                M::before_access_local_mut(self, frame, local)?;
-                let whole_local = match self.stack_mut()[frame].locals[local].access_mut()? {
+            Place::Local { local, offset, locals_addr } => {
+                debug_assert_eq!(locals_addr, self.frame().locals_addr());
+                let whole_local = match self.frame_mut().locals[local].access_mut()? {
                     &mut Operand::Immediate(local_val) => {
                         // We need to make an allocation.
 
                         // We need the layout of the local. We can NOT use the layout we got,
                         // that might e.g., be an inner field of a struct with `Scalar` layout,
                         // that has different alignment than the outer field.
-                        let local_layout =
-                            self.layout_of_local(&self.stack()[frame], local, None)?;
+                        let local_layout = self.layout_of_local(&self.frame(), local, None)?;
                         assert!(local_layout.is_sized(), "unsized locals cannot be immediate");
                         let mplace = self.allocate(local_layout, MemoryKind::Stack)?;
                         // Preserve old value. (As an optimization, we can skip this if it was uninit.)
@@ -937,22 +937,27 @@ where
                             self.write_immediate_to_mplace_no_validate(
                                 local_val,
                                 local_layout,
-                                local_layout.align.abi,
                                 mplace.mplace,
                             )?;
                         }
-                        M::after_local_allocated(self, frame, local, &mplace)?;
+                        M::after_local_allocated(self, local, &mplace)?;
                         // Now we can call `access_mut` again, asserting it goes well, and actually
                         // overwrite things. This points to the entire allocation, not just the part
                         // the place refers to, i.e. we do this before we apply `offset`.
-                        *self.stack_mut()[frame].locals[local].access_mut().unwrap() =
+                        *self.frame_mut().locals[local].access_mut().unwrap() =
                             Operand::Indirect(mplace.mplace);
                         mplace.mplace
                     }
                     &mut Operand::Indirect(mplace) => mplace, // this already was an indirect local
                 };
                 if let Some(offset) = offset {
-                    whole_local.offset_with_meta_(offset, MemPlaceMeta::None, self)?
+                    // This offset is always inbounds, no need to check it again.
+                    whole_local.offset_with_meta_(
+                        offset,
+                        OffsetMode::Wrapping,
+                        MemPlaceMeta::None,
+                        self,
+                    )?
                 } else {
                     // Preserve wide place metadata, do not call `offset`.
                     whole_local
@@ -961,7 +966,7 @@ where
             Place::Ptr(mplace) => mplace,
         };
         // Return with the original layout and align, so that the caller can go on
-        Ok(MPlaceTy { mplace, layout: place.layout, align: place.align })
+        Ok(MPlaceTy { mplace, layout: place.layout })
     }
 
     pub fn allocate_dyn(
@@ -974,7 +979,7 @@ where
             span_bug!(self.cur_span(), "cannot allocate space for `extern` type, size is not known")
         };
         let ptr = self.allocate_ptr(size, align, kind)?;
-        Ok(MPlaceTy::from_aligned_ptr_with_meta(ptr.into(), layout, meta))
+        Ok(self.ptr_with_meta_to_mplace(ptr.into(), meta, layout))
     }
 
     pub fn allocate(
@@ -986,7 +991,7 @@ where
         self.allocate_dyn(layout, kind, MemPlaceMeta::None)
     }
 
-    /// Returns a wide MPlace of type `&'static [mut] str` to a new 1-aligned allocation.
+    /// Returns a wide MPlace of type `str` to a new 1-aligned allocation.
     pub fn allocate_str(
         &mut self,
         str: &str,
@@ -995,43 +1000,8 @@ where
     ) -> InterpResult<'tcx, MPlaceTy<'tcx, M::Provenance>> {
         let ptr = self.allocate_bytes_ptr(str.as_bytes(), Align::ONE, kind, mutbl)?;
         let meta = Scalar::from_target_usize(u64::try_from(str.len()).unwrap(), self);
-        let mplace = MemPlace { ptr: ptr.into(), meta: MemPlaceMeta::Meta(meta) };
-
-        let ty = Ty::new_ref(
-            self.tcx.tcx,
-            self.tcx.lifetimes.re_static,
-            ty::TypeAndMut { ty: self.tcx.types.str_, mutbl },
-        );
-        let layout = self.layout_of(ty).unwrap();
-        Ok(MPlaceTy { mplace, layout, align: layout.align.abi })
-    }
-
-    /// Writes the aggregate to the destination.
-    #[instrument(skip(self), level = "trace")]
-    pub fn write_aggregate(
-        &mut self,
-        kind: &mir::AggregateKind<'tcx>,
-        operands: &IndexSlice<FieldIdx, mir::Operand<'tcx>>,
-        dest: &PlaceTy<'tcx, M::Provenance>,
-    ) -> InterpResult<'tcx> {
-        self.write_uninit(dest)?;
-        let (variant_index, variant_dest, active_field_index) = match *kind {
-            mir::AggregateKind::Adt(_, variant_index, _, _, active_field_index) => {
-                let variant_dest = self.project_downcast(dest, variant_index)?;
-                (variant_index, variant_dest, active_field_index)
-            }
-            _ => (FIRST_VARIANT, dest.clone(), None),
-        };
-        if active_field_index.is_some() {
-            assert_eq!(operands.len(), 1);
-        }
-        for (field_index, operand) in operands.iter_enumerated() {
-            let field_index = active_field_index.unwrap_or(field_index);
-            let field_dest = self.project_field(&variant_dest, field_index.as_usize())?;
-            let op = self.eval_operand(operand, Some(field_dest.layout))?;
-            self.copy_op(&op, &field_dest, /*allow_transmute*/ false)?;
-        }
-        self.write_discriminant(variant_index, dest)
+        let layout = self.layout_of(self.tcx.types.str_).unwrap();
+        Ok(self.ptr_with_meta_to_mplace(ptr.into(), MemPlaceMeta::Meta(meta), layout))
     }
 
     pub fn raw_const_to_mplace(
@@ -1042,7 +1012,7 @@ where
         let _ = self.tcx.global_alloc(raw.alloc_id);
         let ptr = self.global_base_pointer(Pointer::from(raw.alloc_id))?;
         let layout = self.layout_of(raw.ty)?;
-        Ok(MPlaceTy::from_aligned_ptr(ptr.into(), layout))
+        Ok(self.ptr_to_mplace(ptr.into(), layout))
     }
 
     /// Turn a place with a `dyn Trait` type into a place with the actual dynamic type.
@@ -1058,12 +1028,10 @@ where
         let vtable = mplace.meta().unwrap_meta().to_pointer(self)?;
         let (ty, _) = self.get_ptr_vtable(vtable)?;
         let layout = self.layout_of(ty)?;
-
-        let mplace = MPlaceTy {
-            mplace: MemPlace { meta: MemPlaceMeta::None, ..mplace.mplace },
-            layout,
-            align: layout.align.abi,
-        };
+        // This is a kind of transmute, from a place with unsized type and metadata to
+        // a place with sized type and no metadata.
+        let mplace =
+            MPlaceTy { mplace: MemPlace { meta: MemPlaceMeta::None, ..mplace.mplace }, layout };
         Ok((mplace, vtable))
     }
 
@@ -1090,15 +1058,15 @@ where
 }
 
 // Some nodes are used a lot. Make sure they don't unintentionally get bigger.
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_pointer_width = "64"))]
 mod size_asserts {
     use super::*;
     use rustc_data_structures::static_assert_size;
     // tidy-alphabetical-start
-    static_assert_size!(MemPlace, 40);
+    static_assert_size!(MemPlace, 48);
     static_assert_size!(MemPlaceMeta, 24);
     static_assert_size!(MPlaceTy<'_>, 64);
-    static_assert_size!(Place, 40);
+    static_assert_size!(Place, 48);
     static_assert_size!(PlaceTy<'_>, 64);
     // tidy-alphabetical-end
 }

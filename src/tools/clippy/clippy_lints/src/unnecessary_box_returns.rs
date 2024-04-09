@@ -4,7 +4,7 @@ use rustc_errors::Applicability;
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::{FnDecl, FnRetTy, ImplItemKind, Item, ItemKind, Node, TraitItem, TraitItemKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_session::impl_lint_pass;
 use rustc_span::Symbol;
 
 declare_clippy_lint! {
@@ -22,13 +22,13 @@ declare_clippy_lint! {
     /// `Box<T>` been dropped.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// fn foo() -> Box<String> {
     ///     Box::new(String::from("Hello, world!"))
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// fn foo() -> String {
     ///     String::from("Hello, world!")
     /// }
@@ -71,7 +71,7 @@ impl UnnecessaryBoxReturns {
 
         let return_ty = cx
             .tcx
-            .erase_late_bound_regions(cx.tcx.fn_sig(def_id).skip_binder())
+            .instantiate_bound_regions_with_erased(cx.tcx.fn_sig(def_id).skip_binder())
             .output();
 
         if !return_ty.is_box() {
@@ -88,7 +88,7 @@ impl UnnecessaryBoxReturns {
                 cx,
                 UNNECESSARY_BOX_RETURNS,
                 return_ty_hir.span,
-                format!("boxed return of the sized type `{boxed_ty}`").as_str(),
+                format!("boxed return of the sized type `{boxed_ty}`"),
                 |diagnostic| {
                     diagnostic.span_suggestion(
                         return_ty_hir.span,
@@ -116,7 +116,7 @@ impl LateLintPass<'_> for UnnecessaryBoxReturns {
     fn check_impl_item(&mut self, cx: &LateContext<'_>, item: &rustc_hir::ImplItem<'_>) {
         // Ignore implementations of traits, because the lint should be on the
         // trait, not on the implementation of it.
-        let Node::Item(parent) = cx.tcx.hir().get_parent(item.hir_id()) else {
+        let Node::Item(parent) = cx.tcx.parent_hir_node(item.hir_id()) else {
             return;
         };
         let ItemKind::Impl(parent) = parent.kind else { return };

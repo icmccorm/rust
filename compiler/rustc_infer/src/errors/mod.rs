@@ -1,7 +1,7 @@
 use hir::GenericParamKind;
 use rustc_errors::{
-    AddToDiagnostic, Applicability, Diagnostic, DiagnosticMessage, DiagnosticStyledString,
-    IntoDiagnosticArg, MultiSpan, SubdiagnosticMessage,
+    codes::*, Applicability, Diag, DiagMessage, DiagStyledString, EmissionGuarantee, IntoDiagArg,
+    MultiSpan, SubdiagMessageOp, Subdiagnostic,
 };
 use rustc_hir as hir;
 use rustc_hir::FnRetTy;
@@ -33,7 +33,7 @@ pub struct OpaqueHiddenTypeDiag {
 }
 
 #[derive(Diagnostic)]
-#[diag(infer_type_annotations_needed, code = "E0282")]
+#[diag(infer_type_annotations_needed, code = E0282)]
 pub struct AnnotationRequired<'a> {
     #[primary_span]
     pub span: Span,
@@ -51,7 +51,7 @@ pub struct AnnotationRequired<'a> {
 
 // Copy of `AnnotationRequired` for E0283
 #[derive(Diagnostic)]
-#[diag(infer_type_annotations_needed, code = "E0283")]
+#[diag(infer_type_annotations_needed, code = E0283)]
 pub struct AmbiguousImpl<'a> {
     #[primary_span]
     pub span: Span,
@@ -69,7 +69,7 @@ pub struct AmbiguousImpl<'a> {
 
 // Copy of `AnnotationRequired` for E0284
 #[derive(Diagnostic)]
-#[diag(infer_type_annotations_needed, code = "E0284")]
+#[diag(infer_type_annotations_needed, code = E0284)]
 pub struct AmbiguousReturn<'a> {
     #[primary_span]
     pub span: Span,
@@ -194,13 +194,13 @@ impl<'a> SourceKindMultiSuggestion<'a> {
         data: &'a FnRetTy<'a>,
         should_wrap_expr: Option<Span>,
     ) -> Self {
-        let (arrow, post) = match data {
-            FnRetTy::DefaultReturn(_) => ("-> ", " "),
-            _ => ("", ""),
+        let arrow = match data {
+            FnRetTy::DefaultReturn(_) => " -> ",
+            _ => "",
         };
         let (start_span, start_span_code, end_span) = match should_wrap_expr {
-            Some(end_span) => (data.span(), format!("{arrow}{ty_info}{post}{{ "), Some(end_span)),
-            None => (data.span(), format!("{arrow}{ty_info}{post}"), None),
+            Some(end_span) => (data.span(), format!("{arrow}{ty_info} {{"), Some(end_span)),
+            None => (data.span(), format!("{arrow}{ty_info}"), None),
         };
         Self::ClosureReturn { start_span, start_span_code, end_span }
     }
@@ -209,27 +209,28 @@ impl<'a> SourceKindMultiSuggestion<'a> {
 pub enum RegionOriginNote<'a> {
     Plain {
         span: Span,
-        msg: DiagnosticMessage,
+        msg: DiagMessage,
     },
     WithName {
         span: Span,
-        msg: DiagnosticMessage,
+        msg: DiagMessage,
         name: &'a str,
         continues: bool,
     },
     WithRequirement {
         span: Span,
         requirement: ObligationCauseAsDiagArg<'a>,
-        expected_found: Option<(DiagnosticStyledString, DiagnosticStyledString)>,
+        expected_found: Option<(DiagStyledString, DiagStyledString)>,
     },
 }
 
-impl AddToDiagnostic for RegionOriginNote<'_> {
-    fn add_to_diagnostic_with<F>(self, diag: &mut Diagnostic, _: F)
-    where
-        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
-    {
-        let mut label_or_note = |span, msg: DiagnosticMessage| {
+impl Subdiagnostic for RegionOriginNote<'_> {
+    fn add_to_diag_with<G: EmissionGuarantee, F: SubdiagMessageOp<G>>(
+        self,
+        diag: &mut Diag<'_, G>,
+        _f: F,
+    ) {
+        let mut label_or_note = |span, msg: DiagMessage| {
             let sub_count = diag.children.iter().filter(|d| d.span.is_dummy()).count();
             let expanded_sub_count = diag.children.iter().filter(|d| !d.span.is_dummy()).count();
             let span_is_primary = diag.span.primary_spans().iter().all(|&sp| sp == span);
@@ -247,8 +248,8 @@ impl AddToDiagnostic for RegionOriginNote<'_> {
             }
             RegionOriginNote::WithName { span, msg, name, continues } => {
                 label_or_note(span, msg);
-                diag.set_arg("name", name);
-                diag.set_arg("continues", continues);
+                diag.arg("name", name);
+                diag.arg("continues", continues);
             }
             RegionOriginNote::WithRequirement {
                 span,
@@ -256,7 +257,7 @@ impl AddToDiagnostic for RegionOriginNote<'_> {
                 expected_found: Some((expected, found)),
             } => {
                 label_or_note(span, fluent::infer_subtype);
-                diag.set_arg("requirement", requirement);
+                diag.arg("requirement", requirement);
 
                 diag.note_expected_found(&"", expected, &"", found);
             }
@@ -265,7 +266,7 @@ impl AddToDiagnostic for RegionOriginNote<'_> {
                 // handling of region checking when type errors are present is
                 // *terrible*.
                 label_or_note(span, fluent::infer_subtype_2);
-                diag.set_arg("requirement", requirement);
+                diag.arg("requirement", requirement);
             }
         };
     }
@@ -288,18 +289,19 @@ pub enum LifetimeMismatchLabels {
     },
 }
 
-impl AddToDiagnostic for LifetimeMismatchLabels {
-    fn add_to_diagnostic_with<F>(self, diag: &mut Diagnostic, _: F)
-    where
-        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
-    {
+impl Subdiagnostic for LifetimeMismatchLabels {
+    fn add_to_diag_with<G: EmissionGuarantee, F: SubdiagMessageOp<G>>(
+        self,
+        diag: &mut Diag<'_, G>,
+        _f: F,
+    ) {
         match self {
             LifetimeMismatchLabels::InRet { param_span, ret_span, span, label_var1 } => {
                 diag.span_label(param_span, fluent::infer_declared_different);
                 diag.span_label(ret_span, fluent::infer_nothing);
                 diag.span_label(span, fluent::infer_data_returned);
-                diag.set_arg("label_var1_exists", label_var1.is_some());
-                diag.set_arg("label_var1", label_var1.map(|x| x.to_string()).unwrap_or_default());
+                diag.arg("label_var1_exists", label_var1.is_some());
+                diag.arg("label_var1", label_var1.map(|x| x.to_string()).unwrap_or_default());
             }
             LifetimeMismatchLabels::Normal {
                 hir_equal,
@@ -317,16 +319,10 @@ impl AddToDiagnostic for LifetimeMismatchLabels {
                     diag.span_label(ty_sup, fluent::infer_types_declared_different);
                     diag.span_label(ty_sub, fluent::infer_nothing);
                     diag.span_label(span, fluent::infer_data_flows);
-                    diag.set_arg("label_var1_exists", label_var1.is_some());
-                    diag.set_arg(
-                        "label_var1",
-                        label_var1.map(|x| x.to_string()).unwrap_or_default(),
-                    );
-                    diag.set_arg("label_var2_exists", label_var2.is_some());
-                    diag.set_arg(
-                        "label_var2",
-                        label_var2.map(|x| x.to_string()).unwrap_or_default(),
-                    );
+                    diag.arg("label_var1_exists", label_var1.is_some());
+                    diag.arg("label_var1", label_var1.map(|x| x.to_string()).unwrap_or_default());
+                    diag.arg("label_var2_exists", label_var2.is_some());
+                    diag.arg("label_var2", label_var2.map(|x| x.to_string()).unwrap_or_default());
                 }
             }
         }
@@ -341,11 +337,12 @@ pub struct AddLifetimeParamsSuggestion<'a> {
     pub add_note: bool,
 }
 
-impl AddToDiagnostic for AddLifetimeParamsSuggestion<'_> {
-    fn add_to_diagnostic_with<F>(self, diag: &mut Diagnostic, _: F)
-    where
-        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
-    {
+impl Subdiagnostic for AddLifetimeParamsSuggestion<'_> {
+    fn add_to_diag_with<G: EmissionGuarantee, F: SubdiagMessageOp<G>>(
+        self,
+        diag: &mut Diag<'_, G>,
+        _f: F,
+    ) {
         let mut mk_suggestion = || {
             let (
                 hir::Ty { kind: hir::TyKind::Ref(lifetime_sub, _), .. },
@@ -363,9 +360,7 @@ impl AddToDiagnostic for AddLifetimeParamsSuggestion<'_> {
                 return false;
             };
 
-            let hir_id = self.tcx.hir().local_def_id_to_hir_id(anon_reg.def_id);
-
-            let node = self.tcx.hir().get(hir_id);
+            let node = self.tcx.hir_node_by_def_id(anon_reg.def_id);
             let is_impl = matches!(&node, hir::Node::ImplItem(_));
             let generics = match node {
                 hir::Node::Item(&hir::Item {
@@ -419,7 +414,7 @@ impl AddToDiagnostic for AddLifetimeParamsSuggestion<'_> {
                 suggestions,
                 Applicability::MaybeIncorrect,
             );
-            diag.set_arg("is_impl", is_impl);
+            diag.arg("is_impl", is_impl);
             true
         };
         if mk_suggestion() && self.add_note {
@@ -429,7 +424,7 @@ impl AddToDiagnostic for AddLifetimeParamsSuggestion<'_> {
 }
 
 #[derive(Diagnostic)]
-#[diag(infer_lifetime_mismatch, code = "E0623")]
+#[diag(infer_lifetime_mismatch, code = E0623)]
 pub struct LifetimeMismatch<'a> {
     #[primary_span]
     pub span: Span,
@@ -444,11 +439,12 @@ pub struct IntroducesStaticBecauseUnmetLifetimeReq {
     pub binding_span: Span,
 }
 
-impl AddToDiagnostic for IntroducesStaticBecauseUnmetLifetimeReq {
-    fn add_to_diagnostic_with<F>(mut self, diag: &mut Diagnostic, _: F)
-    where
-        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
-    {
+impl Subdiagnostic for IntroducesStaticBecauseUnmetLifetimeReq {
+    fn add_to_diag_with<G: EmissionGuarantee, F: SubdiagMessageOp<G>>(
+        mut self,
+        diag: &mut Diag<'_, G>,
+        _f: F,
+    ) {
         self.unmet_requirements
             .push_span_label(self.binding_span, fluent::infer_msl_introduces_static);
         diag.span_note(self.unmet_requirements, fluent::infer_msl_unmet_req);
@@ -503,7 +499,7 @@ pub struct MismatchedStaticLifetime<'a> {
 
 #[derive(Diagnostic)]
 pub enum ExplicitLifetimeRequired<'a> {
-    #[diag(infer_explicit_lifetime_required_with_ident, code = "E0621")]
+    #[diag(infer_explicit_lifetime_required_with_ident, code = E0621)]
     WithIdent {
         #[primary_span]
         #[label]
@@ -519,7 +515,7 @@ pub enum ExplicitLifetimeRequired<'a> {
         #[skip_arg]
         new_ty: Ty<'a>,
     },
-    #[diag(infer_explicit_lifetime_required_with_param_type, code = "E0621")]
+    #[diag(infer_explicit_lifetime_required_with_param_type, code = E0621)]
     WithParamType {
         #[primary_span]
         #[label]
@@ -541,11 +537,11 @@ pub enum TyOrSig<'tcx> {
     ClosureSig(Highlighted<'tcx, Binder<'tcx, FnSig<'tcx>>>),
 }
 
-impl IntoDiagnosticArg for TyOrSig<'_> {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
+impl IntoDiagArg for TyOrSig<'_> {
+    fn into_diag_arg(self) -> rustc_errors::DiagArgValue {
         match self {
-            TyOrSig::Ty(ty) => ty.into_diagnostic_arg(),
-            TyOrSig::ClosureSig(sig) => sig.into_diagnostic_arg(),
+            TyOrSig::Ty(ty) => ty.into_diag_arg(),
+            TyOrSig::ClosureSig(sig) => sig.into_diag_arg(),
         }
     }
 }
@@ -762,14 +758,15 @@ pub struct ConsiderBorrowingParamHelp {
     pub spans: Vec<Span>,
 }
 
-impl AddToDiagnostic for ConsiderBorrowingParamHelp {
-    fn add_to_diagnostic_with<F>(self, diag: &mut Diagnostic, f: F)
-    where
-        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
-    {
+impl Subdiagnostic for ConsiderBorrowingParamHelp {
+    fn add_to_diag_with<G: EmissionGuarantee, F: SubdiagMessageOp<G>>(
+        self,
+        diag: &mut Diag<'_, G>,
+        f: F,
+    ) {
         let mut type_param_span: MultiSpan = self.spans.clone().into();
         for &span in &self.spans {
-            // Seems like we can't call f() here as Into<DiagnosticMessage> is required
+            // Seems like we can't call f() here as Into<DiagMessage> is required
             type_param_span.push_span_label(span, fluent::infer_tid_consider_borrowing);
         }
         let msg = f(diag, fluent::infer_tid_param_help.into());
@@ -806,11 +803,12 @@ pub struct DynTraitConstraintSuggestion {
     pub ident: Ident,
 }
 
-impl AddToDiagnostic for DynTraitConstraintSuggestion {
-    fn add_to_diagnostic_with<F>(self, diag: &mut Diagnostic, f: F)
-    where
-        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
-    {
+impl Subdiagnostic for DynTraitConstraintSuggestion {
+    fn add_to_diag_with<G: EmissionGuarantee, F: SubdiagMessageOp<G>>(
+        self,
+        diag: &mut Diag<'_, G>,
+        f: F,
+    ) {
         let mut multi_span: MultiSpan = vec![self.span].into();
         multi_span.push_span_label(self.span, fluent::infer_dtcs_has_lifetime_req_label);
         multi_span.push_span_label(self.ident.span, fluent::infer_dtcs_introduces_requirement);
@@ -827,7 +825,7 @@ impl AddToDiagnostic for DynTraitConstraintSuggestion {
 }
 
 #[derive(Diagnostic)]
-#[diag(infer_but_calling_introduces, code = "E0772")]
+#[diag(infer_but_calling_introduces, code = E0772)]
 pub struct ButCallingIntroduces {
     #[label(infer_label1)]
     pub param_ty_span: Span,
@@ -852,11 +850,12 @@ pub struct ReqIntroducedLocations {
     pub add_label: bool,
 }
 
-impl AddToDiagnostic for ReqIntroducedLocations {
-    fn add_to_diagnostic_with<F>(mut self, diag: &mut Diagnostic, f: F)
-    where
-        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
-    {
+impl Subdiagnostic for ReqIntroducedLocations {
+    fn add_to_diag_with<G: EmissionGuarantee, F: SubdiagMessageOp<G>>(
+        mut self,
+        diag: &mut Diag<'_, G>,
+        f: F,
+    ) {
         for sp in self.spans {
             self.span.push_span_label(sp, fluent::infer_ril_introduced_here);
         }
@@ -874,19 +873,20 @@ pub struct MoreTargeted {
     pub ident: Symbol,
 }
 
-impl AddToDiagnostic for MoreTargeted {
-    fn add_to_diagnostic_with<F>(self, diag: &mut Diagnostic, _f: F)
-    where
-        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
-    {
-        diag.code(rustc_errors::error_code!(E0772));
-        diag.set_primary_message(fluent::infer_more_targeted);
-        diag.set_arg("ident", self.ident);
+impl Subdiagnostic for MoreTargeted {
+    fn add_to_diag_with<G: EmissionGuarantee, F: SubdiagMessageOp<G>>(
+        self,
+        diag: &mut Diag<'_, G>,
+        _f: F,
+    ) {
+        diag.code(E0772);
+        diag.primary_message(fluent::infer_more_targeted);
+        diag.arg("ident", self.ident);
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(infer_but_needs_to_satisfy, code = "E0759")]
+#[diag(infer_but_needs_to_satisfy, code = E0759)]
 pub struct ButNeedsToSatisfy {
     #[primary_span]
     pub sp: Span,
@@ -912,7 +912,7 @@ pub struct ButNeedsToSatisfy {
 }
 
 #[derive(Diagnostic)]
-#[diag(infer_outlives_content, code = "E0312")]
+#[diag(infer_outlives_content, code = E0312)]
 pub struct OutlivesContent<'a> {
     #[primary_span]
     pub span: Span,
@@ -921,7 +921,7 @@ pub struct OutlivesContent<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(infer_outlives_bound, code = "E0476")]
+#[diag(infer_outlives_bound, code = E0476)]
 pub struct OutlivesBound<'a> {
     #[primary_span]
     pub span: Span,
@@ -930,7 +930,7 @@ pub struct OutlivesBound<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(infer_fulfill_req_lifetime, code = "E0477")]
+#[diag(infer_fulfill_req_lifetime, code = E0477)]
 pub struct FulfillReqLifetime<'a> {
     #[primary_span]
     pub span: Span,
@@ -940,7 +940,7 @@ pub struct FulfillReqLifetime<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(infer_lf_bound_not_satisfied, code = "E0478")]
+#[diag(infer_lf_bound_not_satisfied, code = E0478)]
 pub struct LfBoundNotSatisfied<'a> {
     #[primary_span]
     pub span: Span,
@@ -949,7 +949,7 @@ pub struct LfBoundNotSatisfied<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(infer_ref_longer_than_data, code = "E0491")]
+#[diag(infer_ref_longer_than_data, code = E0491)]
 pub struct RefLongerThanData<'a> {
     #[primary_span]
     pub span: Span,
@@ -1125,7 +1125,7 @@ pub enum PlaceholderRelationLfNotSatisfied {
 }
 
 #[derive(Diagnostic)]
-#[diag(infer_opaque_captures_lifetime, code = "E0700")]
+#[diag(infer_opaque_captures_lifetime, code = E0700)]
 pub struct OpaqueCapturesLifetime<'tcx> {
     #[primary_span]
     pub span: Span,
@@ -1263,24 +1263,6 @@ pub enum SuggestAccessingField<'a> {
 }
 
 #[derive(Subdiagnostic)]
-pub enum SuggestBoxingForReturnImplTrait {
-    #[multipart_suggestion(infer_sbfrit_change_return_type, applicability = "maybe-incorrect")]
-    ChangeReturnType {
-        #[suggestion_part(code = "Box<dyn")]
-        start_sp: Span,
-        #[suggestion_part(code = ">")]
-        end_sp: Span,
-    },
-    #[multipart_suggestion(infer_sbfrit_box_return_expr, applicability = "maybe-incorrect")]
-    BoxReturnExpr {
-        #[suggestion_part(code = "Box::new(")]
-        starts: Vec<Span>,
-        #[suggestion_part(code = ")")]
-        ends: Vec<Span>,
-    },
-}
-
-#[derive(Subdiagnostic)]
 #[multipart_suggestion(infer_stp_wrap_one, applicability = "maybe-incorrect")]
 pub struct SuggestTuplePatternOne {
     pub variant: String,
@@ -1296,12 +1278,13 @@ pub struct SuggestTuplePatternMany {
     pub compatible_variants: Vec<String>,
 }
 
-impl AddToDiagnostic for SuggestTuplePatternMany {
-    fn add_to_diagnostic_with<F>(self, diag: &mut rustc_errors::Diagnostic, f: F)
-    where
-        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
-    {
-        diag.set_arg("path", self.path);
+impl Subdiagnostic for SuggestTuplePatternMany {
+    fn add_to_diag_with<G: EmissionGuarantee, F: SubdiagMessageOp<G>>(
+        self,
+        diag: &mut Diag<'_, G>,
+        f: F,
+    ) {
+        diag.arg("path", self.path);
         let message = f(diag, crate::fluent_generated::infer_stp_wrap_many.into());
         diag.multipart_suggestions(
             message,
@@ -1338,15 +1321,12 @@ pub enum TypeErrorAdditionalDiags {
         span: Span,
         code: String,
     },
-    #[suggestion(
-        infer_meant_str_literal,
-        code = "\"{code}\"",
-        applicability = "machine-applicable"
-    )]
+    #[multipart_suggestion(infer_meant_str_literal, applicability = "machine-applicable")]
     MeantStrLiteral {
-        #[primary_span]
-        span: Span,
-        code: String,
+        #[suggestion_part(code = "\"")]
+        start: Span,
+        #[suggestion_part(code = "\"")]
+        end: Span,
     },
     #[suggestion(
         infer_consider_specifying_length,
@@ -1386,73 +1366,73 @@ pub enum TypeErrorAdditionalDiags {
 
 #[derive(Diagnostic)]
 pub enum ObligationCauseFailureCode {
-    #[diag(infer_oc_method_compat, code = "E0308")]
+    #[diag(infer_oc_method_compat, code = E0308)]
     MethodCompat {
         #[primary_span]
         span: Span,
         #[subdiagnostic]
         subdiags: Vec<TypeErrorAdditionalDiags>,
     },
-    #[diag(infer_oc_type_compat, code = "E0308")]
+    #[diag(infer_oc_type_compat, code = E0308)]
     TypeCompat {
         #[primary_span]
         span: Span,
         #[subdiagnostic]
         subdiags: Vec<TypeErrorAdditionalDiags>,
     },
-    #[diag(infer_oc_const_compat, code = "E0308")]
+    #[diag(infer_oc_const_compat, code = E0308)]
     ConstCompat {
         #[primary_span]
         span: Span,
         #[subdiagnostic]
         subdiags: Vec<TypeErrorAdditionalDiags>,
     },
-    #[diag(infer_oc_try_compat, code = "E0308")]
+    #[diag(infer_oc_try_compat, code = E0308)]
     TryCompat {
         #[primary_span]
         span: Span,
         #[subdiagnostic]
         subdiags: Vec<TypeErrorAdditionalDiags>,
     },
-    #[diag(infer_oc_match_compat, code = "E0308")]
+    #[diag(infer_oc_match_compat, code = E0308)]
     MatchCompat {
         #[primary_span]
         span: Span,
         #[subdiagnostic]
         subdiags: Vec<TypeErrorAdditionalDiags>,
     },
-    #[diag(infer_oc_if_else_different, code = "E0308")]
+    #[diag(infer_oc_if_else_different, code = E0308)]
     IfElseDifferent {
         #[primary_span]
         span: Span,
         #[subdiagnostic]
         subdiags: Vec<TypeErrorAdditionalDiags>,
     },
-    #[diag(infer_oc_no_else, code = "E0317")]
+    #[diag(infer_oc_no_else, code = E0317)]
     NoElse {
         #[primary_span]
         span: Span,
     },
-    #[diag(infer_oc_no_diverge, code = "E0308")]
+    #[diag(infer_oc_no_diverge, code = E0308)]
     NoDiverge {
         #[primary_span]
         span: Span,
         #[subdiagnostic]
         subdiags: Vec<TypeErrorAdditionalDiags>,
     },
-    #[diag(infer_oc_fn_main_correct_type, code = "E0580")]
+    #[diag(infer_oc_fn_main_correct_type, code = E0580)]
     FnMainCorrectType {
         #[primary_span]
         span: Span,
     },
-    #[diag(infer_oc_fn_start_correct_type, code = "E0308")]
+    #[diag(infer_oc_fn_start_correct_type, code = E0308)]
     FnStartCorrectType {
         #[primary_span]
         span: Span,
         #[subdiagnostic]
         subdiags: Vec<TypeErrorAdditionalDiags>,
     },
-    #[diag(infer_oc_fn_lang_correct_type, code = "E0308")]
+    #[diag(infer_oc_fn_lang_correct_type, code = E0308)]
     FnLangCorrectType {
         #[primary_span]
         span: Span,
@@ -1460,33 +1440,33 @@ pub enum ObligationCauseFailureCode {
         subdiags: Vec<TypeErrorAdditionalDiags>,
         lang_item_name: Symbol,
     },
-    #[diag(infer_oc_intrinsic_correct_type, code = "E0308")]
+    #[diag(infer_oc_intrinsic_correct_type, code = E0308)]
     IntrinsicCorrectType {
         #[primary_span]
         span: Span,
         #[subdiagnostic]
         subdiags: Vec<TypeErrorAdditionalDiags>,
     },
-    #[diag(infer_oc_method_correct_type, code = "E0308")]
+    #[diag(infer_oc_method_correct_type, code = E0308)]
     MethodCorrectType {
         #[primary_span]
         span: Span,
         #[subdiagnostic]
         subdiags: Vec<TypeErrorAdditionalDiags>,
     },
-    #[diag(infer_oc_closure_selfref, code = "E0644")]
+    #[diag(infer_oc_closure_selfref, code = E0644)]
     ClosureSelfref {
         #[primary_span]
         span: Span,
     },
-    #[diag(infer_oc_cant_coerce, code = "E0308")]
+    #[diag(infer_oc_cant_coerce, code = E0308)]
     CantCoerce {
         #[primary_span]
         span: Span,
         #[subdiagnostic]
         subdiags: Vec<TypeErrorAdditionalDiags>,
     },
-    #[diag(infer_oc_generic, code = "E0308")]
+    #[diag(infer_oc_generic, code = E0308)]
     Generic {
         #[primary_span]
         span: Span,

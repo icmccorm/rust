@@ -6,8 +6,7 @@ mod utils;
 
 use diagnostic::{DiagnosticDerive, LintDiagnosticDerive};
 use proc_macro2::TokenStream;
-use quote::format_ident;
-use subdiagnostic::SubdiagnosticDeriveBuilder;
+use subdiagnostic::SubdiagnosticDerive;
 use synstructure::Structure;
 
 /// Implements `#[derive(Diagnostic)]`, which allows for errors to be specified as a struct,
@@ -21,7 +20,7 @@ use synstructure::Structure;
 /// # extern crate rust_middle;
 /// # use rustc_middle::ty::Ty;
 /// #[derive(Diagnostic)]
-/// #[diag(borrowck_move_out_of_borrow, code = "E0505")]
+/// #[diag(borrowck_move_out_of_borrow, code = E0505)]
 /// pub struct MoveOutOfBorrowError<'tcx> {
 ///     pub name: Ident,
 ///     pub ty: Ty<'tcx>,
@@ -56,8 +55,9 @@ use synstructure::Structure;
 ///
 /// See rustc dev guide for more examples on using the `#[derive(Diagnostic)]`:
 /// <https://rustc-dev-guide.rust-lang.org/diagnostics/diagnostic-structs.html>
-pub fn session_diagnostic_derive(s: Structure<'_>) -> TokenStream {
-    DiagnosticDerive::new(format_ident!("diag"), format_ident!("handler"), s).into_tokens()
+pub fn diagnostic_derive(mut s: Structure<'_>) -> TokenStream {
+    s.underscore_const(true);
+    DiagnosticDerive::new(s).into_tokens()
 }
 
 /// Implements `#[derive(LintDiagnostic)]`, which allows for lints to be specified as a struct,
@@ -91,7 +91,7 @@ pub fn session_diagnostic_derive(s: Structure<'_>) -> TokenStream {
 /// Then, later, to emit the error:
 ///
 /// ```ignore (rust)
-/// cx.struct_span_lint(INVALID_ATOMIC_ORDERING, fail_order_arg_span, AtomicOrderingInvalidLint {
+/// cx.span_lint(INVALID_ATOMIC_ORDERING, fail_order_arg_span, AtomicOrderingInvalidLint {
 ///     method,
 ///     success_ordering,
 ///     fail_ordering,
@@ -102,8 +102,9 @@ pub fn session_diagnostic_derive(s: Structure<'_>) -> TokenStream {
 ///
 /// See rustc dev guide for more examples on using the `#[derive(LintDiagnostic)]`:
 /// <https://rustc-dev-guide.rust-lang.org/diagnostics/diagnostic-structs.html#reference>
-pub fn lint_diagnostic_derive(s: Structure<'_>) -> TokenStream {
-    LintDiagnosticDerive::new(format_ident!("diag"), s).into_tokens()
+pub fn lint_diagnostic_derive(mut s: Structure<'_>) -> TokenStream {
+    s.underscore_const(true);
+    LintDiagnosticDerive::new(s).into_tokens()
 }
 
 /// Implements `#[derive(Subdiagnostic)]`, which allows for labels, notes, helps and
@@ -152,6 +153,7 @@ pub fn lint_diagnostic_derive(s: Structure<'_>) -> TokenStream {
 ///
 /// diag.subdiagnostic(RawIdentifierSuggestion { span, applicability, ident });
 /// ```
-pub fn session_subdiagnostic_derive(s: Structure<'_>) -> TokenStream {
-    SubdiagnosticDeriveBuilder::new().into_tokens(s)
+pub fn subdiagnostic_derive(mut s: Structure<'_>) -> TokenStream {
+    s.underscore_const(true);
+    SubdiagnosticDerive::new().into_tokens(s)
 }

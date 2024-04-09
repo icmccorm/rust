@@ -95,7 +95,7 @@ use rustc_span::Span;
 use thin_vec::{thin_vec, ThinVec};
 
 pub fn expand_deriving_rustc_encodable(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     span: Span,
     mitem: &MetaItem,
     item: &Annotatable,
@@ -147,7 +147,7 @@ pub fn expand_deriving_rustc_encodable(
 }
 
 fn encodable_substructure(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     trait_span: Span,
     substr: &Substructure<'_>,
     krate: Symbol,
@@ -226,7 +226,7 @@ fn encodable_substructure(
             BlockOrExpr::new_expr(expr)
         }
 
-        EnumMatching(idx, _, variant, fields) => {
+        EnumMatching(idx, variant, fields) => {
             // We're not generating an AST that the borrow checker is expecting,
             // so we need to generate a unique local variable to take the
             // mutable loan out on, otherwise we get conflicts which don't
@@ -296,6 +296,6 @@ fn encodable_substructure(
             BlockOrExpr::new_mixed(thin_vec![me], Some(expr))
         }
 
-        _ => cx.bug("expected Struct or EnumMatching in derive(Encodable)"),
+        _ => cx.dcx().bug("expected Struct or EnumMatching in derive(Encodable)"),
     }
 }

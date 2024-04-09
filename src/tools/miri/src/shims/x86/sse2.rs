@@ -1,14 +1,10 @@
-use rustc_apfloat::{
-    ieee::{Double, Single},
-    Float as _,
-};
-use rustc_middle::mir;
+use rustc_apfloat::ieee::Double;
 use rustc_middle::ty::layout::LayoutOf as _;
 use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
 use rustc_target::spec::abi::Abi;
 
-use super::{bin_op_simd_float_all, bin_op_simd_float_first, FloatBinOp, FloatCmpOp};
+use super::{bin_op_simd_float_all, bin_op_simd_float_first, convert_float_to_int, FloatBinOp};
 use crate::*;
 use shims::foreign_items::EmulateForeignItemResult;
 
@@ -21,9 +17,10 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
         link_name: Symbol,
         abi: Abi,
         args: &[OpTy<'tcx, Provenance>],
-        dest: &PlaceTy<'tcx, Provenance>,
+        dest: &MPlaceTy<'tcx, Provenance>,
     ) -> InterpResult<'tcx, EmulateForeignItemResult> {
         let this = self.eval_context_mut();
+        this.expect_target_feature_for_intrinsic(link_name, "sse2")?;
         // Prefix should have already been checked.
         let unprefixed_name = link_name.as_str().strip_prefix("llvm.x86.sse2.").unwrap();
 
@@ -39,49 +36,6 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
         // Intrinsincs sufixed with "epiX" or "epuX" operate with X-bit signed or unsigned
         // vectors.
         match unprefixed_name {
-            // Used to implement the _mm_avg_epu8 and _mm_avg_epu16 functions.
-            // Averages packed unsigned 8/16-bit integers in `left` and `right`.
-            "pavg.b" | "pavg.w" => {
-                let [left, right] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-
-                let (left, left_len) = this.operand_to_simd(left)?;
-                let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
-
-                assert_eq!(dest_len, left_len);
-                assert_eq!(dest_len, right_len);
-
-                for i in 0..dest_len {
-                    let left = this.read_immediate(&this.project_index(&left, i)?)?;
-                    let right = this.read_immediate(&this.project_index(&right, i)?)?;
-                    let dest = this.project_index(&dest, i)?;
-
-                    // Widen the operands to avoid overflow
-                    let twice_wide = this.layout_of(this.get_twice_wide_int_ty(left.layout.ty))?;
-                    let left = this.int_to_int_or_float(&left, twice_wide)?;
-                    let right = this.int_to_int_or_float(&right, twice_wide)?;
-
-                    // Calculate left + right + 1
-                    let added = this.wrapping_binary_op(mir::BinOp::Add, &left, &right)?;
-                    let added = this.wrapping_binary_op(
-                        mir::BinOp::Add,
-                        &added,
-                        &ImmTy::from_uint(1u32, twice_wide),
-                    )?;
-
-                    // Calculate (left + right + 1) / 2
-                    let divided = this.wrapping_binary_op(
-                        mir::BinOp::Div,
-                        &added,
-                        &ImmTy::from_uint(2u32, twice_wide),
-                    )?;
-
-                    // Narrow back to the original type
-                    let res = this.int_to_int_or_float(&divided, dest.layout)?;
-                    this.write_immediate(*res, &dest)?;
-                }
-            }
             // Used to implement the _mm_madd_epi16 function.
             // Multiplies packed signed 16-bit integers in `left` and `right`, producing
             // intermediate signed 32-bit integers. Horizontally add adjacent pairs of
@@ -92,7 +46,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(left_len, right_len);
                 assert_eq!(dest_len.checked_mul(2).unwrap(), left_len);
@@ -118,70 +72,6 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
                     this.write_scalar(Scalar::from_i32(res), &dest)?;
                 }
             }
-            // Used to implement the _mm_mulhi_epi16 and _mm_mulhi_epu16 functions.
-            "pmulh.w" | "pmulhu.w" => {
-                let [left, right] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-
-                let (left, left_len) = this.operand_to_simd(left)?;
-                let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
-
-                assert_eq!(dest_len, left_len);
-                assert_eq!(dest_len, right_len);
-
-                for i in 0..dest_len {
-                    let left = this.read_immediate(&this.project_index(&left, i)?)?;
-                    let right = this.read_immediate(&this.project_index(&right, i)?)?;
-                    let dest = this.project_index(&dest, i)?;
-
-                    // Widen the operands to avoid overflow
-                    let twice_wide = this.layout_of(this.get_twice_wide_int_ty(left.layout.ty))?;
-                    let left = this.int_to_int_or_float(&left, twice_wide)?;
-                    let right = this.int_to_int_or_float(&right, twice_wide)?;
-
-                    // Multiply
-                    let multiplied = this.wrapping_binary_op(mir::BinOp::Mul, &left, &right)?;
-                    // Keep the high half
-                    let high = this.wrapping_binary_op(
-                        mir::BinOp::Shr,
-                        &multiplied,
-                        &ImmTy::from_uint(dest.layout.size.bits(), twice_wide),
-                    )?;
-
-                    // Narrow back to the original type
-                    let res = this.int_to_int_or_float(&high, dest.layout)?;
-                    this.write_immediate(*res, &dest)?;
-                }
-            }
-            // Used to implement the _mm_mul_epu32 function.
-            // Multiplies the the low unsigned 32-bit integers from each packed
-            // 64-bit element and stores the result as 64-bit unsigned integers.
-            "pmulu.dq" => {
-                let [left, right] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-
-                let (left, left_len) = this.operand_to_simd(left)?;
-                let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
-
-                // left and right are u32x4, dest is u64x2
-                assert_eq!(left_len, 4);
-                assert_eq!(right_len, 4);
-                assert_eq!(dest_len, 2);
-
-                for i in 0..dest_len {
-                    let op_i = i.checked_mul(2).unwrap();
-                    let left = this.read_scalar(&this.project_index(&left, op_i)?)?.to_u32()?;
-                    let right = this.read_scalar(&this.project_index(&right, op_i)?)?.to_u32()?;
-                    let dest = this.project_index(&dest, i)?;
-
-                    // The multiplication will not overflow because stripping the
-                    // operands are expanded from 32-bit to 64-bit.
-                    let res = u64::from(left).checked_mul(u64::from(right)).unwrap();
-                    this.write_scalar(Scalar::from_u64(res), &dest)?;
-                }
-            }
             // Used to implement the _mm_sad_epu8 function.
             // Computes the absolute differences of packed unsigned 8-bit integers in `a`
             // and `b`, then horizontally sum each consecutive 8 differences to produce
@@ -195,7 +85,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 // left and right are u8x16, dest is u64x2
                 assert_eq!(left_len, right_len);
@@ -232,7 +122,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, left_len);
                 assert_eq!(dest_len, right_len);
@@ -282,7 +172,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, left_len);
                 assert_eq!(dest_len, right_len);
@@ -333,7 +223,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, left_len);
                 assert_eq!(dest_len, right_len);
@@ -370,56 +260,42 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
                     this.write_scalar(Scalar::from_u64(res), &dest)?;
                 }
             }
-            // Used to implement the _mm_cvtepi32_ps function.
-            // Converts packed i32 to packed f32.
-            // FIXME: Can we get rid of this intrinsic and just use simd_as?
-            "cvtdq2ps" => {
+            // Used to implement the _mm_cvtps_epi32, _mm_cvttps_epi32, _mm_cvtpd_epi32
+            // and _mm_cvttpd_epi32 functions.
+            // Converts packed f32/f64 to packed i32.
+            "cvtps2dq" | "cvttps2dq" | "cvtpd2dq" | "cvttpd2dq" => {
                 let [op] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
 
-                let (op, op_len) = this.operand_to_simd(op)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
-
-                assert_eq!(dest_len, op_len);
-
-                for i in 0..dest_len {
-                    let op = this.read_scalar(&this.project_index(&op, i)?)?.to_i32()?;
-                    let dest = this.project_index(&dest, i)?;
-
-                    let res = Scalar::from_f32(Single::from_i128(op.into()).value);
-                    this.write_scalar(res, &dest)?;
+                let (op_len, _) = op.layout.ty.simd_size_and_type(*this.tcx);
+                let (dest_len, _) = dest.layout.ty.simd_size_and_type(*this.tcx);
+                match unprefixed_name {
+                    "cvtps2dq" | "cvttps2dq" => {
+                        // f32x4 to i32x4 conversion
+                        assert_eq!(op_len, 4);
+                        assert_eq!(dest_len, op_len);
+                    }
+                    "cvtpd2dq" | "cvttpd2dq" => {
+                        // f64x2 to i32x4 conversion
+                        // the last two values are filled with zeros
+                        assert_eq!(op_len, 2);
+                        assert_eq!(dest_len, 4);
+                    }
+                    _ => unreachable!(),
                 }
-            }
-            // Used to implement the _mm_cvtps_epi32 and _mm_cvttps_epi32 functions.
-            // Converts packed f32 to packed i32.
-            "cvtps2dq" | "cvttps2dq" => {
-                let [op] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-
-                let (op, op_len) = this.operand_to_simd(op)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
-
-                assert_eq!(dest_len, op_len);
 
                 let rnd = match unprefixed_name {
                     // "current SSE rounding mode", assume nearest
                     // https://www.felixcloutier.com/x86/cvtps2dq
-                    "cvtps2dq" => rustc_apfloat::Round::NearestTiesToEven,
+                    // https://www.felixcloutier.com/x86/cvtpd2dq
+                    "cvtps2dq" | "cvtpd2dq" => rustc_apfloat::Round::NearestTiesToEven,
                     // always truncate
                     // https://www.felixcloutier.com/x86/cvttps2dq
-                    "cvttps2dq" => rustc_apfloat::Round::TowardZero,
+                    // https://www.felixcloutier.com/x86/cvttpd2dq
+                    "cvttps2dq" | "cvttpd2dq" => rustc_apfloat::Round::TowardZero,
                     _ => unreachable!(),
                 };
 
-                for i in 0..dest_len {
-                    let op = this.read_scalar(&this.project_index(&op, i)?)?.to_f32()?;
-                    let dest = this.project_index(&dest, i)?;
-
-                    let res =
-                        this.float_to_int_checked(op, dest.layout, rnd).unwrap_or_else(|| {
-                            // Fallback to minimum acording to SSE2 semantics.
-                            ImmTy::from_int(i32::MIN, this.machine.layouts.i32)
-                        });
-                    this.write_immediate(*res, &dest)?;
-                }
+                convert_float_to_int(this, op, rnd, dest)?;
             }
             // Used to implement the _mm_packs_epi16 function.
             // Converts two 16-bit integer vectors to a single 8-bit integer
@@ -430,7 +306,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 // left and right are i16x8, dest is i8x16
                 assert_eq!(left_len, 8);
@@ -461,7 +337,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 // left and right are i16x8, dest is u8x16
                 assert_eq!(left_len, 8);
@@ -491,7 +367,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 // left and right are i32x4, dest is i16x8
                 assert_eq!(left_len, 4);
@@ -554,7 +430,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
                 let [op] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
 
                 let (op, op_len) = this.operand_to_simd(op)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, op_len);
 
@@ -564,11 +440,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
                 this.write_scalar(res0, &this.project_index(&dest, 0)?)?;
 
                 for i in 1..dest_len {
-                    this.copy_op(
-                        &this.project_index(&op, i)?,
-                        &this.project_index(&dest, i)?,
-                        /*allow_transmute*/ false,
-                    )?;
+                    this.copy_op(&this.project_index(&op, i)?, &this.project_index(&dest, i)?)?;
                 }
             }
             // Used to implement _mm_sqrt_pd functions.
@@ -577,7 +449,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
                 let [op] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
 
                 let (op, op_len) = this.operand_to_simd(op)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, op_len);
 
@@ -591,18 +463,20 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
                     this.write_scalar(res, &dest)?;
                 }
             }
-            // Used to implement the _mm_cmp*_sd function.
+            // Used to implement the _mm_cmp*_sd functions.
             // Performs a comparison operation on the first component of `left`
             // and `right`, returning 0 if false or `u64::MAX` if true. The remaining
             // components are copied from `left`.
+            // _mm_cmp_sd is actually an AVX function where the operation is specified
+            // by a const parameter.
+            // _mm_cmp{eq,lt,le,gt,ge,neq,nlt,nle,ngt,nge,ord,unord}_sd are SSE2 functions
+            // with hard-coded operations.
             "cmp.sd" => {
                 let [left, right, imm] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
 
-                let which = FloatBinOp::Cmp(FloatCmpOp::from_intrinsic_imm(
-                    this.read_scalar(imm)?.to_i8()?,
-                    "llvm.x86.sse2.cmp.sd",
-                )?);
+                let which =
+                    FloatBinOp::cmp_from_imm(this, this.read_scalar(imm)?.to_i8()?, link_name)?;
 
                 bin_op_simd_float_first::<Double>(this, which, left, right, dest)?;
             }
@@ -610,14 +484,16 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
             // Performs a comparison operation on each component of `left`
             // and `right`. For each component, returns 0 if false or `u64::MAX`
             // if true.
+            // _mm_cmp_pd is actually an AVX function where the operation is specified
+            // by a const parameter.
+            // _mm_cmp{eq,lt,le,gt,ge,neq,nlt,nle,ngt,nge,ord,unord}_pd are SSE2 functions
+            // with hard-coded operations.
             "cmp.pd" => {
                 let [left, right, imm] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
 
-                let which = FloatBinOp::Cmp(FloatCmpOp::from_intrinsic_imm(
-                    this.read_scalar(imm)?.to_i8()?,
-                    "llvm.x86.sse2.cmp.pd",
-                )?);
+                let which =
+                    FloatBinOp::cmp_from_imm(this, this.read_scalar(imm)?.to_i8()?, link_name)?;
 
                 bin_op_simd_float_all::<Double>(this, which, left, right, dest)?;
             }
@@ -652,70 +528,6 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
                 };
                 this.write_scalar(Scalar::from_i32(i32::from(res)), dest)?;
             }
-            // Used to implement the _mm_cvtpd_ps and _mm_cvtps_pd functions.
-            // Converts packed f32/f64 to packed f64/f32.
-            "cvtpd2ps" | "cvtps2pd" => {
-                let [op] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-
-                let (op, op_len) = this.operand_to_simd(op)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
-
-                // For cvtpd2ps: op is f64x2, dest is f32x4
-                // For cvtps2pd: op is f32x4, dest is f64x2
-                // In either case, the two first values are converted
-                for i in 0..op_len.min(dest_len) {
-                    let op = this.read_immediate(&this.project_index(&op, i)?)?;
-                    let dest = this.project_index(&dest, i)?;
-
-                    let res = this.float_to_float_or_int(&op, dest.layout)?;
-                    this.write_immediate(*res, &dest)?;
-                }
-                // For f32 -> f64, ignore the remaining
-                // For f64 -> f32, fill the remaining with zeros
-                for i in op_len..dest_len {
-                    let dest = this.project_index(&dest, i)?;
-                    this.write_scalar(Scalar::from_int(0, dest.layout.size), &dest)?;
-                }
-            }
-            // Used to implement the _mm_cvtpd_epi32 and _mm_cvttpd_epi32 functions.
-            // Converts packed f64 to packed i32.
-            "cvtpd2dq" | "cvttpd2dq" => {
-                let [op] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-
-                let (op, op_len) = this.operand_to_simd(op)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
-
-                // op is f64x2, dest is i32x4
-                assert_eq!(op_len, 2);
-                assert_eq!(dest_len, 4);
-
-                let rnd = match unprefixed_name {
-                    // "current SSE rounding mode", assume nearest
-                    // https://www.felixcloutier.com/x86/cvtpd2dq
-                    "cvtpd2dq" => rustc_apfloat::Round::NearestTiesToEven,
-                    // always truncate
-                    // https://www.felixcloutier.com/x86/cvttpd2dq
-                    "cvttpd2dq" => rustc_apfloat::Round::TowardZero,
-                    _ => unreachable!(),
-                };
-
-                for i in 0..op_len {
-                    let op = this.read_scalar(&this.project_index(&op, i)?)?.to_f64()?;
-                    let dest = this.project_index(&dest, i)?;
-
-                    let res =
-                        this.float_to_int_checked(op, dest.layout, rnd).unwrap_or_else(|| {
-                            // Fallback to minimum acording to SSE2 semantics.
-                            ImmTy::from_int(i32::MIN, this.machine.layouts.i32)
-                        });
-                    this.write_immediate(*res, &dest)?;
-                }
-                // Fill the remaining with zeros
-                for i in op_len..dest_len {
-                    let dest = this.project_index(&dest, i)?;
-                    this.write_scalar(Scalar::from_i32(0), &dest)?;
-                }
-            }
             // Use to implement the _mm_cvtsd_si32, _mm_cvttsd_si32,
             // _mm_cvtsd_si64 and _mm_cvttsd_si64 functions.
             // Converts the first component of `op` from f64 to i32/i64.
@@ -723,7 +535,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
                 let [op] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let (op, _) = this.operand_to_simd(op)?;
 
-                let op = this.read_scalar(&this.project_index(&op, 0)?)?.to_f64()?;
+                let op = this.read_immediate(&this.project_index(&op, 0)?)?;
 
                 let rnd = match unprefixed_name {
                     // "current SSE rounding mode", assume nearest
@@ -735,7 +547,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
                     _ => unreachable!(),
                 };
 
-                let res = this.float_to_int_checked(op, dest.layout, rnd).unwrap_or_else(|| {
+                let res = this.float_to_int_checked(&op, dest.layout, rnd)?.unwrap_or_else(|| {
                     // Fallback to minimum acording to SSE semantics.
                     ImmTy::from_int(dest.layout.size.signed_int_min(), dest.layout)
                 });
@@ -751,7 +563,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, _) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, left_len);
 
@@ -765,37 +577,8 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 // Copy remianing from `left`
                 for i in 1..dest_len {
-                    this.copy_op(
-                        &this.project_index(&left, i)?,
-                        &this.project_index(&dest, i)?,
-                        /*allow_transmute*/ false,
-                    )?;
+                    this.copy_op(&this.project_index(&left, i)?, &this.project_index(&dest, i)?)?;
                 }
-            }
-            // Used to implement the _mm_movemask_pd function.
-            // Returns a scalar integer where the i-th bit is the highest
-            // bit of the i-th component of `op`.
-            // https://www.felixcloutier.com/x86/movmskpd
-            "movmsk.pd" => {
-                let [op] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let (op, op_len) = this.operand_to_simd(op)?;
-
-                let mut res = 0;
-                for i in 0..op_len {
-                    let op = this.read_scalar(&this.project_index(&op, i)?)?;
-                    let op = op.to_u64()?;
-
-                    // Extract the highest bit of `op` and place it in the `i`-th bit of `res`
-                    res |= (op >> 63) << i;
-                }
-
-                this.write_scalar(Scalar::from_u32(res.try_into().unwrap()), dest)?;
-            }
-            // Used to implement the `_mm_pause` function.
-            // The intrinsic is used to hint the processor that the code is in a spin-loop.
-            "pause" => {
-                let [] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                this.yield_active_thread();
             }
             _ => return Ok(EmulateForeignItemResult::NotSupported),
         }

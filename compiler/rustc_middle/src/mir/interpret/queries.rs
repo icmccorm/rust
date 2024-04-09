@@ -1,7 +1,7 @@
 use super::{ErrorHandled, EvalToConstValueResult, EvalToValTreeResult, GlobalId};
 
 use crate::mir;
-use crate::query::{TyCtxtAt, TyCtxtEnsure};
+use crate::query::TyCtxtEnsure;
 use crate::ty::visit::TypeVisitableExt;
 use crate::ty::GenericArgs;
 use crate::ty::{self, TyCtxt};
@@ -11,28 +11,28 @@ use rustc_session::lint;
 use rustc_span::{Span, DUMMY_SP};
 
 impl<'tcx> TyCtxt<'tcx> {
-    /// Evaluates a constant without providing any substitutions. This is useful to evaluate consts
+    /// Evaluates a constant without providing any generic parameters. This is useful to evaluate consts
     /// that can't take any generic arguments like statics, const items or enum discriminants. If a
     /// generic parameter is used within the constant `ErrorHandled::ToGeneric` will be returned.
     #[instrument(skip(self), level = "debug")]
     pub fn const_eval_poly(self, def_id: DefId) -> EvalToConstValueResult<'tcx> {
-        // In some situations def_id will have substitutions within scope, but they aren't allowed
-        // to be used. So we can't use `Instance::mono`, instead we feed unresolved substitutions
+        // In some situations def_id will have generic parameters within scope, but they aren't allowed
+        // to be used. So we can't use `Instance::mono`, instead we feed unresolved generic parameters
         // into `const_eval` which will return `ErrorHandled::ToGeneric` if any of them are
         // encountered.
         let args = GenericArgs::identity_for_item(self, def_id);
         let instance = ty::Instance::new(def_id, args);
         let cid = GlobalId { instance, promoted: None };
         let param_env = self.param_env(def_id).with_reveal_all_normalized(self);
-        self.const_eval_global_id(param_env, cid, None)
+        self.const_eval_global_id(param_env, cid, DUMMY_SP)
     }
     /// Resolves and evaluates a constant.
     ///
     /// The constant can be located on a trait like `<A as B>::C`, in which case the given
-    /// substitutions and environment are used to resolve the constant. Alternatively if the
-    /// constant has generic parameters in scope the substitutions are used to evaluate the value of
+    /// generic parameters and environment are used to resolve the constant. Alternatively if the
+    /// constant has generic parameters in scope the generic parameters are used to evaluate the value of
     /// the constant. For example in `fn foo<T>() { let _ = [0; bar::<T>()]; }` the repeat count
-    /// constant `bar::<T>()` requires a substitution for `T`, if the substitution for `T` is still
+    /// constant `bar::<T>()` requires a instantiation for `T`, if the instantiation for `T` is still
     /// too generic for the constant to be evaluated then `Err(ErrorHandled::TooGeneric)` is
     /// returned.
     #[instrument(level = "debug", skip(self))]
@@ -40,7 +40,7 @@ impl<'tcx> TyCtxt<'tcx> {
         self,
         param_env: ty::ParamEnv<'tcx>,
         ct: mir::UnevaluatedConst<'tcx>,
-        span: Option<Span>,
+        span: Span,
     ) -> EvalToConstValueResult<'tcx> {
         // Cannot resolve `Unevaluated` constants that contain inference
         // variables. We reject those here since `resolve`
@@ -73,7 +73,7 @@ impl<'tcx> TyCtxt<'tcx> {
         self,
         param_env: ty::ParamEnv<'tcx>,
         ct: ty::UnevaluatedConst<'tcx>,
-        span: Option<Span>,
+        span: Span,
     ) -> EvalToValTreeResult<'tcx> {
         // Cannot resolve `Unevaluated` constants that contain inference
         // variables. We reject those here since `resolve`
@@ -108,12 +108,12 @@ impl<'tcx> TyCtxt<'tcx> {
                         let mir_body = self.mir_for_ctfe(instance.def_id());
                         if mir_body.is_polymorphic {
                             let Some(local_def_id) = ct.def.as_local() else { return };
-                            self.struct_span_lint_hir(
+                            self.node_span_lint(
                                 lint::builtin::CONST_EVALUATABLE_UNCHECKED,
-                                self.hir().local_def_id_to_hir_id(local_def_id),
+                                self.local_def_id_to_hir_id(local_def_id),
                                 self.def_span(ct.def),
                                 "cannot use constants which depend on generic parameters in types",
-                                |err| err,
+                                |_| {},
                             )
                         }
                     }
@@ -130,7 +130,7 @@ impl<'tcx> TyCtxt<'tcx> {
         self,
         param_env: ty::ParamEnv<'tcx>,
         instance: ty::Instance<'tcx>,
-        span: Option<Span>,
+        span: Span,
     ) -> EvalToConstValueResult<'tcx> {
         self.const_eval_global_id(param_env, GlobalId { instance, promoted: None }, span)
     }
@@ -141,12 +141,12 @@ impl<'tcx> TyCtxt<'tcx> {
         self,
         param_env: ty::ParamEnv<'tcx>,
         cid: GlobalId<'tcx>,
-        span: Option<Span>,
+        span: Span,
     ) -> EvalToConstValueResult<'tcx> {
         // Const-eval shouldn't depend on lifetimes at all, so we can erase them, which should
         // improve caching of queries.
-        let inputs = self.erase_regions(param_env.and(cid));
-        if let Some(span) = span {
+        let inputs = self.erase_regions(param_env.with_reveal_all_normalized(self).and(cid));
+        if !span.is_dummy() {
             // The query doesn't know where it is being invoked, so we need to fix the span.
             self.at(span).eval_to_const_value_raw(inputs).map_err(|e| e.with_span(span))
         } else {
@@ -160,67 +160,29 @@ impl<'tcx> TyCtxt<'tcx> {
         self,
         param_env: ty::ParamEnv<'tcx>,
         cid: GlobalId<'tcx>,
-        span: Option<Span>,
+        span: Span,
     ) -> EvalToValTreeResult<'tcx> {
         // Const-eval shouldn't depend on lifetimes at all, so we can erase them, which should
         // improve caching of queries.
-        let inputs = self.erase_regions(param_env.and(cid));
+        let inputs = self.erase_regions(param_env.with_reveal_all_normalized(self).and(cid));
         debug!(?inputs);
-        if let Some(span) = span {
+        if !span.is_dummy() {
             // The query doesn't know where it is being invoked, so we need to fix the span.
             self.at(span).eval_to_valtree(inputs).map_err(|e| e.with_span(span))
         } else {
             self.eval_to_valtree(inputs)
         }
     }
-
-    /// Evaluate a static's initializer, returning the allocation of the initializer's memory.
-    #[inline(always)]
-    pub fn eval_static_initializer(
-        self,
-        def_id: DefId,
-    ) -> Result<mir::ConstAllocation<'tcx>, ErrorHandled> {
-        self.at(DUMMY_SP).eval_static_initializer(def_id)
-    }
-}
-
-impl<'tcx> TyCtxtAt<'tcx> {
-    /// Evaluate a static's initializer, returning the allocation of the initializer's memory.
-    ///
-    /// The span is entirely ignored here, but still helpful for better query cycle errors.
-    pub fn eval_static_initializer(
-        self,
-        def_id: DefId,
-    ) -> Result<mir::ConstAllocation<'tcx>, ErrorHandled> {
-        trace!("eval_static_initializer: Need to compute {:?}", def_id);
-        assert!(self.is_static(def_id));
-        let instance = ty::Instance::mono(*self, def_id);
-        let gid = GlobalId { instance, promoted: None };
-        self.eval_to_allocation(gid, ty::ParamEnv::reveal_all())
-    }
-
-    /// Evaluate anything constant-like, returning the allocation of the final memory.
-    ///
-    /// The span is entirely ignored here, but still helpful for better query cycle errors.
-    fn eval_to_allocation(
-        self,
-        gid: GlobalId<'tcx>,
-        param_env: ty::ParamEnv<'tcx>,
-    ) -> Result<mir::ConstAllocation<'tcx>, ErrorHandled> {
-        trace!("eval_to_allocation: Need to compute {:?}", gid);
-        let raw_const = self.eval_to_allocation_raw(param_env.and(gid))?;
-        Ok(self.global_alloc(raw_const.alloc_id).unwrap_memory())
-    }
 }
 
 impl<'tcx> TyCtxtEnsure<'tcx> {
-    /// Evaluates a constant without providing any substitutions. This is useful to evaluate consts
+    /// Evaluates a constant without providing any generic parameters. This is useful to evaluate consts
     /// that can't take any generic arguments like statics, const items or enum discriminants. If a
     /// generic parameter is used within the constant `ErrorHandled::ToGeneric` will be returned.
     #[instrument(skip(self), level = "debug")]
     pub fn const_eval_poly(self, def_id: DefId) {
-        // In some situations def_id will have substitutions within scope, but they aren't allowed
-        // to be used. So we can't use `Instance::mono`, instead we feed unresolved substitutions
+        // In some situations def_id will have generic parameters within scope, but they aren't allowed
+        // to be used. So we can't use `Instance::mono`, instead we feed unresolved generic parameters
         // into `const_eval` which will return `ErrorHandled::ToGeneric` if any of them are
         // encountered.
         let args = GenericArgs::identity_for_item(self.tcx, def_id);
@@ -231,16 +193,5 @@ impl<'tcx> TyCtxtEnsure<'tcx> {
         // improve caching of queries.
         let inputs = self.tcx.erase_regions(param_env.and(cid));
         self.eval_to_const_value_raw(inputs)
-    }
-
-    /// Evaluate a static's initializer, returning the allocation of the initializer's memory.
-    pub fn eval_static_initializer(self, def_id: DefId) {
-        trace!("eval_static_initializer: Need to compute {:?}", def_id);
-        assert!(self.tcx.is_static(def_id));
-        let instance = ty::Instance::mono(self.tcx, def_id);
-        let gid = GlobalId { instance, promoted: None };
-        let param_env = ty::ParamEnv::reveal_all();
-        trace!("eval_to_allocation: Need to compute {:?}", gid);
-        self.eval_to_allocation_raw(param_env.and(gid))
     }
 }

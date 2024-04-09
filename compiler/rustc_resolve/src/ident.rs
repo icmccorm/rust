@@ -1,21 +1,22 @@
 use rustc_ast::{self as ast, NodeId};
+use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::{DefKind, Namespace, NonMacroAttrKind, PartialRes, PerNS};
 use rustc_middle::bug;
 use rustc_middle::ty;
 use rustc_session::lint::builtin::PROC_MACRO_DERIVE_RESOLUTION_FALLBACK;
-use rustc_session::lint::BuiltinLintDiagnostics;
+use rustc_session::lint::BuiltinLintDiag;
+use rustc_session::parse::feature_err;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::hygiene::{ExpnId, ExpnKind, LocalExpnId, MacroKind, SyntaxContext};
+use rustc_span::sym;
 use rustc_span::symbol::{kw, Ident};
 use rustc_span::Span;
 
 use crate::errors::{ParamKindInEnumDiscriminant, ParamKindInNonTrivialAnonConst};
-use crate::late::{
-    ConstantHasGenerics, HasGenericParams, NoConstantGenericsReason, PathSource, Rib, RibKind,
-};
+use crate::late::{ConstantHasGenerics, NoConstantGenericsReason, PathSource, Rib, RibKind};
 use crate::macros::{sub_namespace_match, MacroRulesScope};
-use crate::BindingKey;
 use crate::{errors, AmbiguityError, AmbiguityErrorMisc, AmbiguityKind, Determinacy, Finalize};
+use crate::{BindingKey, Used};
 use crate::{ImportKind, LexicalScopeBinding, Module, ModuleKind, ModuleOrUniformRoot};
 use crate::{NameBinding, NameBindingKind, ParentScope, PathResult, PrivacyError, Res};
 use crate::{ResolutionError, Resolver, Scope, ScopeSet, Segment, ToNameBinding, Weak};
@@ -24,6 +25,18 @@ use Determinacy::*;
 use Namespace::*;
 
 type Visibility = ty::Visibility<LocalDefId>;
+
+#[derive(Copy, Clone)]
+pub enum UsePrelude {
+    No,
+    Yes,
+}
+
+impl From<UsePrelude> for bool {
+    fn from(up: UsePrelude) -> bool {
+        matches!(up, UsePrelude::Yes)
+    }
+}
 
 impl<'a, 'tcx> Resolver<'a, 'tcx> {
     /// A generic scope visitor.
@@ -34,12 +47,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         scope_set: ScopeSet<'a>,
         parent_scope: &ParentScope<'a>,
         ctxt: SyntaxContext,
-        mut visitor: impl FnMut(
-            &mut Self,
-            Scope<'a>,
-            /*use_prelude*/ bool,
-            SyntaxContext,
-        ) -> Option<T>,
+        mut visitor: impl FnMut(&mut Self, Scope<'a>, UsePrelude, SyntaxContext) -> Option<T>,
     ) -> Option<T> {
         // General principles:
         // 1. Not controlled (user-defined) names should have higher priority than controlled names
@@ -135,6 +143,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             };
 
             if visit {
+                let use_prelude = if use_prelude { UsePrelude::Yes } else { UsePrelude::No };
                 if let break_result @ Some(..) = visitor(self, scope, use_prelude, ctxt) {
                     return break_result;
                 }
@@ -240,7 +249,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                 {
                     // The macro is a proc macro derive
                     if let Some(def_id) = module.expansion.expn_data().macro_def_id {
-                        let ext = self.get_macro_by_def_id(def_id).ext;
+                        let ext = &self.get_macro_by_def_id(def_id).ext;
                         if ext.builtin_name.is_none()
                             && ext.macro_kind() == MacroKind::Derive
                             && parent.expansion.outer_expn_is_descendant_of(*ctxt)
@@ -341,7 +350,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                 ident,
                 ns,
                 parent_scope,
-                finalize,
+                finalize.map(|finalize| Finalize { used: Used::Scope, ..finalize }),
                 ignore_binding,
             );
             if let Ok(binding) = item {
@@ -377,6 +386,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         ignore_binding: Option<NameBinding<'a>>,
     ) -> Result<NameBinding<'a>, Determinacy> {
         bitflags::bitflags! {
+            #[derive(Clone, Copy)]
             struct Flags: u8 {
                 const MACRO_RULES          = 1 << 0;
                 const MODULE               = 1 << 1;
@@ -507,7 +517,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                             ns,
                             adjusted_parent_scope,
                             !matches!(scope_set, ScopeSet::Late(..)),
-                            finalize,
+                            finalize.map(|finalize| Finalize { used: Used::Scope, ..finalize }),
                             ignore_binding,
                         );
                         match binding {
@@ -522,7 +532,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                                             ns.descr(),
                                             ident
                                         ),
-                                        BuiltinLintDiagnostics::ProcMacroDeriveResolutionFallback(
+                                        BuiltinLintDiag::ProcMacroDeriveResolutionFallback(
                                             orig_ident.span,
                                         ),
                                     );
@@ -580,7 +590,9 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                                 None,
                                 ignore_binding,
                             ) {
-                                if use_prelude || this.is_builtin_macro(binding.res()) {
+                                if matches!(use_prelude, UsePrelude::Yes)
+                                    || this.is_builtin_macro(binding.res())
+                                {
                                     result = Ok((binding, Flags::MISC_FROM_PRELUDE));
                                 }
                             }
@@ -588,7 +600,37 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                         result
                     }
                     Scope::BuiltinTypes => match this.builtin_types_bindings.get(&ident.name) {
-                        Some(binding) => Ok((*binding, Flags::empty())),
+                        Some(binding) => {
+                            if matches!(ident.name, sym::f16)
+                                && !this.tcx.features().f16
+                                && !ident.span.allows_unstable(sym::f16)
+                                && finalize.is_some()
+                                && innermost_result.is_none()
+                            {
+                                feature_err(
+                                    this.tcx.sess,
+                                    sym::f16,
+                                    ident.span,
+                                    "the type `f16` is unstable",
+                                )
+                                .emit();
+                            }
+                            if matches!(ident.name, sym::f128)
+                                && !this.tcx.features().f128
+                                && !ident.span.allows_unstable(sym::f128)
+                                && finalize.is_some()
+                                && innermost_result.is_none()
+                            {
+                                feature_err(
+                                    this.tcx.sess,
+                                    sym::f128,
+                                    ident.span,
+                                    "the type `f128` is unstable",
+                                )
+                                .emit();
+                            }
+                            Ok((*binding, Flags::empty()))
+                        }
                         None => Err(Determinacy::Determined),
                     },
                 };
@@ -858,7 +900,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             .into_iter()
             .find_map(|binding| if binding == ignore_binding { None } else { binding });
 
-        if let Some(Finalize { path_span, report_private, .. }) = finalize {
+        if let Some(Finalize { path_span, report_private, used, root_span, .. }) = finalize {
             let Some(binding) = binding else {
                 return Err((Determined, Weak::No));
             };
@@ -871,6 +913,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                         dedup_span: path_span,
                         outermost_res: None,
                         parent_scope: *parent_scope,
+                        single_nested: path_span != root_span,
                     });
                 } else {
                     return Err((Determined, Weak::No));
@@ -896,12 +939,13 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
 
             if !restricted_shadowing && binding.expansion != LocalExpnId::ROOT {
                 if let NameBindingKind::Import { import, .. } = binding.kind
-                    && matches!(import.kind, ImportKind::MacroExport) {
+                    && matches!(import.kind, ImportKind::MacroExport)
+                {
                     self.macro_expanded_macro_export_errors.insert((path_span, binding.span));
                 }
             }
 
-            self.record_use(ident, binding, restricted_shadowing);
+            self.record_use(ident, binding, used);
             return Ok(binding);
         }
 
@@ -928,9 +972,10 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             if !self.is_accessible_from(import_vis, parent_scope.module) {
                 continue;
             }
-            if let Some(ignored) = ignore_binding &&
-                let NameBindingKind::Import { import, .. } = ignored.kind &&
-                import == *single_import {
+            if let Some(ignored) = ignore_binding
+                && let NameBindingKind::Import { import, .. } = ignored.kind
+                && import == *single_import
+            {
                 // Ignore not just the binding itself, but if it has a shadowed_glob,
                 // ignore that, too, because this loop is supposed to only process
                 // named imports.
@@ -1055,7 +1100,6 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         original_rib_ident_def: Ident,
         all_ribs: &[Rib<'a>],
     ) -> Res {
-        const CG_BUG_STR: &str = "min_const_generics resolve check didn't stop compilation";
         debug!("validate_res_from_ribs({:?})", res);
         let ribs = &all_ribs[rib_index + 1..];
 
@@ -1081,13 +1125,13 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                 for rib in ribs {
                     match rib.kind {
                         RibKind::Normal
-                        | RibKind::ClosureOrAsync
+                        | RibKind::FnOrCoroutine
                         | RibKind::Module(..)
                         | RibKind::MacroDefinition(..)
                         | RibKind::ForwardGenericParamBan => {
                             // Nothing to do. Continue.
                         }
-                        RibKind::Item(_) | RibKind::AssocItem => {
+                        RibKind::Item(..) | RibKind::AssocItem => {
                             // This was an attempt to access an upvar inside a
                             // named function item. This is not allowed, so we
                             // report an error.
@@ -1152,9 +1196,9 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             }
             Res::Def(DefKind::TyParam, _) | Res::SelfTyParam { .. } | Res::SelfTyAlias { .. } => {
                 for rib in ribs {
-                    let has_generic_params: HasGenericParams = match rib.kind {
+                    let (has_generic_params, def_kind) = match rib.kind {
                         RibKind::Normal
-                        | RibKind::ClosureOrAsync
+                        | RibKind::FnOrCoroutine
                         | RibKind::Module(..)
                         | RibKind::MacroDefinition(..)
                         | RibKind::InlineAsmSym
@@ -1198,8 +1242,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                                                 }
                                             }
                                         };
-                                        self.report_error(span, error);
-                                        self.tcx.sess.delay_span_bug(span, CG_BUG_STR);
+                                        let _: ErrorGuaranteed = self.report_error(span, error);
                                     }
 
                                     return Res::Err;
@@ -1210,7 +1253,9 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                         }
 
                         // This was an attempt to use a type parameter outside its scope.
-                        RibKind::Item(has_generic_params) => has_generic_params,
+                        RibKind::Item(has_generic_params, def_kind) => {
+                            (has_generic_params, def_kind)
+                        }
                         RibKind::ConstParamTy => {
                             if let Some(span) = finalize {
                                 self.report_error(
@@ -1228,7 +1273,11 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                     if let Some(span) = finalize {
                         self.report_error(
                             span,
-                            ResolutionError::GenericParamsFromOuterItem(res, has_generic_params),
+                            ResolutionError::GenericParamsFromOuterItem(
+                                res,
+                                has_generic_params,
+                                def_kind,
+                            ),
                         );
                     }
                     return Res::Err;
@@ -1236,9 +1285,9 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             }
             Res::Def(DefKind::ConstParam, _) => {
                 for rib in ribs {
-                    let has_generic_params = match rib.kind {
+                    let (has_generic_params, def_kind) = match rib.kind {
                         RibKind::Normal
-                        | RibKind::ClosureOrAsync
+                        | RibKind::FnOrCoroutine
                         | RibKind::Module(..)
                         | RibKind::MacroDefinition(..)
                         | RibKind::InlineAsmSym
@@ -1273,7 +1322,9 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                             continue;
                         }
 
-                        RibKind::Item(has_generic_params) => has_generic_params,
+                        RibKind::Item(has_generic_params, def_kind) => {
+                            (has_generic_params, def_kind)
+                        }
                         RibKind::ConstParamTy => {
                             if let Some(span) = finalize {
                                 self.report_error(
@@ -1292,7 +1343,11 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                     if let Some(span) = finalize {
                         self.report_error(
                             span,
-                            ResolutionError::GenericParamsFromOuterItem(res, has_generic_params),
+                            ResolutionError::GenericParamsFromOuterItem(
+                                res,
+                                has_generic_params,
+                                def_kind,
+                            ),
                         );
                     }
                     return Res::Err;
@@ -1378,13 +1433,9 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                             continue;
                         }
                     }
-                    return PathResult::failed(
-                        ident.span,
-                        false,
-                        finalize.is_some(),
-                        module,
-                        || ("there are too many leading `super` keywords".to_string(), None),
-                    );
+                    return PathResult::failed(ident, false, finalize.is_some(), module, || {
+                        ("there are too many leading `super` keywords".to_string(), None)
+                    });
                 }
                 if segment_idx == 0 {
                     if name == kw::SelfLower {
@@ -1416,7 +1467,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
 
             // Report special messages for path segment keywords in wrong positions.
             if ident.is_path_segment_keyword() && segment_idx != 0 {
-                return PathResult::failed(ident.span, false, finalize.is_some(), module, || {
+                return PathResult::failed(ident, false, finalize.is_some(), module, || {
                     let name_str = if name == kw::PathRoot {
                         "crate root".to_string()
                     } else {
@@ -1440,7 +1491,9 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                     finalize,
                     ignore_binding,
                 )
-            } else if let Some(ribs) = ribs && let Some(TypeNS | ValueNS) = opt_ns {
+            } else if let Some(ribs) = ribs
+                && let Some(TypeNS | ValueNS) = opt_ns
+            {
                 match self.resolve_ident_in_lexical_scope(
                     ident,
                     ns,
@@ -1492,7 +1545,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                         record_segment_res(self, res);
                     } else if res == Res::ToolMod && !is_last && opt_ns.is_some() {
                         if binding.is_import() {
-                            self.tcx.sess.emit_err(errors::ToolModuleImported {
+                            self.dcx().emit_err(errors::ToolModuleImported {
                                 span: ident.span,
                                 import: binding.span,
                             });
@@ -1510,7 +1563,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                         ));
                     } else {
                         return PathResult::failed(
-                            ident.span,
+                            ident,
                             is_last,
                             finalize.is_some(),
                             module,
@@ -1536,24 +1589,18 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                         }
                     }
 
-                    return PathResult::failed(
-                        ident.span,
-                        is_last,
-                        finalize.is_some(),
-                        module,
-                        || {
-                            self.report_path_resolution_error(
-                                path,
-                                opt_ns,
-                                parent_scope,
-                                ribs,
-                                ignore_binding,
-                                module,
-                                segment_idx,
-                                ident,
-                            )
-                        },
-                    );
+                    return PathResult::failed(ident, is_last, finalize.is_some(), module, || {
+                        self.report_path_resolution_error(
+                            path,
+                            opt_ns,
+                            parent_scope,
+                            ribs,
+                            ignore_binding,
+                            module,
+                            segment_idx,
+                            ident,
+                        )
+                    });
                 }
             }
         }

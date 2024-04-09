@@ -9,10 +9,13 @@ use log::{debug, trace};
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
 use std::num::TryFromIntError;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
+use either::Either;
+
+use rustc_const_eval::CTRL_C_RECEIVED;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec};
@@ -41,8 +44,17 @@ enum SchedulingAction {
     Sleep(Duration),
 }
 
+/// What to do with TLS allocations from terminated threads
+pub enum TlsAllocAction {
+    /// Deallocate backing memory of thread-local statics as usual
+    Deallocate,
+    /// Skip deallocating backing memory of thread-local statics and consider all memory reachable
+    /// from them as "allowed to leak" (like global `static`s).
+    Leak,
+}
+
 /// Trait for callbacks that can be executed when some event happens, such as after a timeout.
-pub trait MachineCallback<'mir, 'tcx>: VisitTags {
+pub trait MachineCallback<'mir, 'tcx>: VisitProvenance {
     fn call(&self, ecx: &mut InterpCx<'mir, 'tcx, MiriMachine<'mir, 'tcx>>) -> InterpResult<'tcx>;
 }
 
@@ -153,7 +165,7 @@ pub struct Thread<'mir, 'tcx> {
     join_status: ThreadJoinStatus,
 
     /// Stack of active panic payloads for the current thread. Used for storing
-    /// the argument of the call to `miri_start_panic` (the panic payload) when unwinding.
+    /// the argument of the call to `miri_start_unwind` (the panic payload) when unwinding.
     /// This is pointer-sized, and matches the `Payload` type in `src/libpanic_unwind/miri.rs`.
     ///
     /// In real unwinding, the payload gets passed as an argument to the landing pad,
@@ -170,9 +182,18 @@ pub type StackEmptyCallback<'mir, 'tcx> =
     Box<dyn FnMut(&mut MiriInterpCx<'mir, 'tcx>) -> InterpResult<'tcx, Poll<()>>>;
 
 impl<'mir, 'tcx> Thread<'mir, 'tcx> {
-    /// Get the name of the current thread, or `<unnamed>` if it was not set.
-    fn thread_name(&self) -> &[u8] {
-        if let Some(ref thread_name) = self.thread_name { thread_name } else { b"<unnamed>" }
+    /// Get the name of the current thread if it was set.
+    fn thread_name(&self) -> Option<&[u8]> {
+        self.thread_name.as_deref()
+    }
+
+    /// Get the name of the current thread for display purposes; will include thread ID if not set.
+    fn thread_display_name(&self, id: ThreadId) -> String {
+        if let Some(ref thread_name) = self.thread_name {
+            String::from_utf8_lossy(thread_name).into_owned()
+        } else {
+            format!("unnamed-{}", id.index())
+        }
     }
 
     /// Return the top user-relevant frame, if there is one.
@@ -226,7 +247,7 @@ impl<'mir, 'tcx> std::fmt::Debug for Thread<'mir, 'tcx> {
         write!(
             f,
             "{}({:?}, {:?})",
-            String::from_utf8_lossy(self.thread_name()),
+            String::from_utf8_lossy(self.thread_name().unwrap_or(b"<unnamed>")),
             self.state,
             self.join_status
         )
@@ -250,8 +271,8 @@ impl<'mir, 'tcx> Thread<'mir, 'tcx> {
     }
 }
 
-impl VisitTags for Thread<'_, '_> {
-    fn visit_tags(&self, visit: &mut dyn FnMut(BorTag)) {
+impl VisitProvenance for Thread<'_, '_> {
+    fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
         let Thread {
             panic_payloads: panic_payload,
             last_error,
@@ -266,17 +287,17 @@ impl VisitTags for Thread<'_, '_> {
         } = self;
 
         for payload in panic_payload {
-            payload.visit_tags(visit);
+            payload.visit_provenance(visit);
         }
-        last_error.visit_tags(visit);
+        last_error.visit_provenance(visit);
         for frame in stack {
-            frame.visit_tags(visit)
+            frame.visit_provenance(visit)
         }
     }
 }
 
-impl VisitTags for Frame<'_, '_, Provenance, FrameExtra<'_>> {
-    fn visit_tags(&self, visit: &mut dyn FnMut(BorTag)) {
+impl VisitProvenance for Frame<'_, '_, Provenance, FrameExtra<'_>> {
+    fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
         let Frame {
             return_place,
             locals,
@@ -290,22 +311,22 @@ impl VisitTags for Frame<'_, '_, Provenance, FrameExtra<'_>> {
         } = self;
 
         // Return place.
-        return_place.visit_tags(visit);
+        return_place.visit_provenance(visit);
         // Locals.
         for local in locals.iter() {
             match local.as_mplace_or_imm() {
                 None => {}
                 Some(Either::Left((ptr, meta))) => {
-                    ptr.visit_tags(visit);
-                    meta.visit_tags(visit);
+                    ptr.visit_provenance(visit);
+                    meta.visit_provenance(visit);
                 }
                 Some(Either::Right(imm)) => {
-                    imm.visit_tags(visit);
+                    imm.visit_provenance(visit);
                 }
             }
         }
 
-        extra.visit_tags(visit);
+        extra.visit_provenance(visit);
     }
 }
 
@@ -366,8 +387,8 @@ pub struct ThreadManager<'mir, 'tcx> {
     thread_groups: FxHashMap<ThreadId, ThreadId>,
 }
 
-impl VisitTags for ThreadManager<'_, '_> {
-    fn visit_tags(&self, visit: &mut dyn FnMut(BorTag)) {
+impl VisitProvenance for ThreadManager<'_, '_> {
+    fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
         let ThreadManager {
             threads,
             thread_local_alloc_ids,
@@ -380,15 +401,15 @@ impl VisitTags for ThreadManager<'_, '_> {
         } = self;
 
         for thread in threads {
-            thread.visit_tags(visit);
+            thread.visit_provenance(visit);
         }
         for ptr in thread_local_alloc_ids.borrow().values() {
-            ptr.visit_tags(visit);
+            ptr.visit_provenance(visit);
         }
         for callback in timeout_callbacks.values() {
-            callback.callback.visit_tags(visit);
+            callback.callback.visit_provenance(visit);
         }
-        sync.visit_tags(visit);
+        sync.visit_provenance(visit);
     }
 }
 
@@ -476,10 +497,13 @@ impl<'mir, 'tcx: 'mir> ThreadManager<'mir, 'tcx> {
 
     /// Set an active thread and return the id of the thread that was active before.
     fn set_active_thread_id(&mut self, id: ThreadId) -> ThreadId {
-        let active_thread_id = self.active_thread;
-        self.active_thread = id;
-        assert!(self.active_thread.index() < self.threads.len());
-        active_thread_id
+        assert!(id.index() < self.threads.len());
+        info!(
+            "---------- Now executing on thread `{}` (previous: `{}`) ----------------------------------------",
+            self.get_thread_display_name(id),
+            self.get_thread_display_name(self.active_thread)
+        );
+        std::mem::replace(&mut self.active_thread, id)
     }
 
     /// Get the id of the currently active thread.
@@ -613,8 +637,12 @@ impl<'mir, 'tcx: 'mir> ThreadManager<'mir, 'tcx> {
     }
 
     /// Get the name of the given thread.
-    pub fn get_thread_name(&self, thread: ThreadId) -> &[u8] {
+    pub fn get_thread_name(&self, thread: ThreadId) -> Option<&[u8]> {
         self.threads[thread].thread_name()
+    }
+
+    pub fn get_thread_display_name(&self, thread: ThreadId) -> String {
+        self.threads[thread].thread_display_name(thread)
     }
 
     /// Put the thread into the blocked state.
@@ -771,6 +799,11 @@ impl<'mir, 'tcx: 'mir> ThreadManager<'mir, 'tcx> {
         for (id, thread) in threads {
             debug_assert_ne!(self.active_thread, id);
             if thread.state == ThreadState::Enabled {
+                info!(
+                    "---------- Now executing on thread `{}` (previous: `{}`) ----------------------------------------",
+                    self.get_thread_display_name(id),
+                    self.get_thread_display_name(self.active_thread)
+                );
                 self.active_thread = id;
                 break;
             }
@@ -860,8 +893,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             if tcx.is_foreign_item(def_id) {
                 throw_unsup_format!("foreign thread-local statics are not supported");
             }
-            // We don't give a span -- statics don't need that, they cannot be generic or associated.
-            let allocation = this.ctfe_query(None, |tcx| tcx.eval_static_initializer(def_id))?;
+            let allocation = this.ctfe_query(|tcx| tcx.eval_static_initializer(def_id))?;
             let mut allocation = allocation.inner().clone();
             // This allocation will be deallocated when the thread dies, so it is not in read-only memory.
             allocation.mutability = Mutability::Mut;
@@ -1088,7 +1120,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             instance,
             start_abi,
             &[*func_arg],
-            Some(&ret_place.into()),
+            Some(&ret_place),
             StackPopCleanup::Root { cleanup: true },
         )?;
 
@@ -1188,18 +1220,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     }
 
     #[inline]
-    fn set_thread_name_wide(&mut self, thread: ThreadId, new_thread_name: &[u16]) {
-        let this = self.eval_context_mut();
-
-        // The Windows `GetThreadDescription` shim to get the thread name isn't implemented, so being lossy is okay.
-        // This is only read by diagnostics, which already use `from_utf8_lossy`.
-        this.machine
-            .threads
-            .set_thread_name(thread, String::from_utf16_lossy(new_thread_name).into_bytes());
-    }
-
-    #[inline]
-    fn get_thread_name<'c>(&'c self, thread: ThreadId) -> &'c [u8]
+    fn get_thread_name<'c>(&'c self, thread: ThreadId) -> Option<&[u8]>
     where
         'mir: 'c,
     {
@@ -1254,21 +1275,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     /// Run the core interpreter loop. Returns only when an interrupt occurs (an error or program
     /// termination).
     fn run_threads(&mut self) -> InterpResult<'tcx, !> {
-        static SIGNALED: AtomicBool = AtomicBool::new(false);
-        ctrlc::set_handler(move || {
-            // Indicate that we have ben signaled to stop. If we were already signaled, exit
-            // immediately. In our interpreter loop we try to consult this value often, but if for
-            // whatever reason we don't get to that check or the cleanup we do upon finding that
-            // this bool has become true takes a long time, the exit here will promptly exit the
-            // process on the second Ctrl-C.
-            if SIGNALED.swap(true, Relaxed) {
-                std::process::exit(1);
-            }
-        })
-        .unwrap();
         let this = self.eval_context_mut();
         loop {
-            if SIGNALED.load(Relaxed) {
+            if CTRL_C_RECEIVED.load(Relaxed) {
                 this.machine.handle_abnormal_termination();
                 std::process::exit(1);
             }
@@ -1299,9 +1308,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                                         this.active_thread_mut().thread_kind.take()
                                     {
                                         link.finalize(this)?;
-                                        this.terminate_active_thread()?
+                                        this.terminate_active_thread(TlsAllocAction::Deallocate)?
                                     }
-                                    this.terminate_active_thread()?
+                                    this.terminate_active_thread(TlsAllocAction::Deallocate)?
                                 }
                             }
                         }
@@ -1318,21 +1327,29 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     }
 
     /// Handles thread termination of the active thread: wakes up threads joining on this one,
-    /// and deallocated thread-local statics.
+    /// and deals with the thread's thread-local statics according to `tls_alloc_action`.
     ///
     /// This is called by the eval loop when a thread's on_stack_empty returns `Ready`.
     #[inline]
-    fn terminate_active_thread(&mut self) -> InterpResult<'tcx> {
+    fn terminate_active_thread(&mut self, tls_alloc_action: TlsAllocAction) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let thread = this.active_thread_mut();
         assert!(thread.stack.is_empty(), "only threads with an empty stack can be terminated");
         thread.state = ThreadState::Terminated;
 
         let current_span = this.machine.current_span();
-        for ptr in
-            this.machine.threads.thread_terminated(this.machine.data_race.as_mut(), current_span)
-        {
-            this.deallocate_ptr(ptr.into(), None, MiriMemoryKind::Tls.into())?;
+        let thread_local_allocations =
+            this.machine.threads.thread_terminated(this.machine.data_race.as_mut(), current_span);
+        for ptr in thread_local_allocations {
+            match tls_alloc_action {
+                TlsAllocAction::Deallocate =>
+                    this.deallocate_ptr(ptr.into(), None, MiriMemoryKind::Tls.into())?,
+                TlsAllocAction::Leak =>
+                    if let Some(alloc) = ptr.provenance.get_alloc_id() {
+                        trace!("Thread-local static leaked and stored as static root: {:?}", alloc);
+                        this.machine.static_roots.push(alloc);
+                    },
+            }
         }
         Ok(())
     }

@@ -1,14 +1,15 @@
-// unit-test: AddRetag
+// skip-filecheck
+//@ unit-test: AddRetag
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
 // ignore-tidy-linelength
-// compile-flags: -Z mir-emit-retag -Z mir-opt-level=0 -Z span_free_formats
+//@ compile-flags: -Z mir-emit-retag -Z mir-opt-level=0 -Z span_free_formats
 
 #![allow(unused)]
 
 struct Test(i32);
 
-// EMIT_MIR retag.{impl#0}-foo.SimplifyCfg-elaborate-drops.after.mir
-// EMIT_MIR retag.{impl#0}-foo_shr.SimplifyCfg-elaborate-drops.after.mir
+// EMIT_MIR retag.{impl#0}-foo.SimplifyCfg-pre-optimizations.after.mir
+// EMIT_MIR retag.{impl#0}-foo_shr.SimplifyCfg-pre-optimizations.after.mir
 impl Test {
     // Make sure we run the pass on a method, not just on bare functions.
     fn foo<'x>(&self, x: &'x mut i32) -> &'x mut i32 {
@@ -25,9 +26,9 @@ impl Drop for Test {
     fn drop(&mut self) {}
 }
 
-// EMIT_MIR retag.main.SimplifyCfg-elaborate-drops.after.mir
-// EMIT_MIR retag.main-{closure#0}.SimplifyCfg-elaborate-drops.after.mir
-fn main() {
+// EMIT_MIR retag.main.SimplifyCfg-pre-optimizations.after.mir
+// EMIT_MIR retag.main-{closure#0}.SimplifyCfg-pre-optimizations.after.mir
+pub fn main() {
     let mut x = 0;
     {
         let v = Test(0).foo(&mut x); // just making sure we do not panic when there is a tuple struct ctor
@@ -54,7 +55,7 @@ fn main() {
 }
 
 /// Casting directly to an array should also go through `&raw` and thus add appropriate retags.
-// EMIT_MIR retag.array_casts.SimplifyCfg-elaborate-drops.after.mir
+// EMIT_MIR retag.array_casts.SimplifyCfg-pre-optimizations.after.mir
 fn array_casts() {
     let mut x: [usize; 2] = [0, 0];
     let p = &mut x as *mut usize;
@@ -63,4 +64,9 @@ fn array_casts() {
     let x: [usize; 2] = [0, 1];
     let p = &x as *const usize;
     assert_eq!(unsafe { *p.add(1) }, 1);
+}
+
+// EMIT_MIR retag.box_to_raw_mut.SimplifyCfg-pre-optimizations.after.mir
+fn box_to_raw_mut(x: &mut Box<i32>) -> *mut i32 {
+    std::ptr::addr_of_mut!(**x)
 }

@@ -1,7 +1,7 @@
 // Require a gdb that can read DW_TAG_variant_part.
-// min-gdb-version: 8.2
+//@ min-gdb-version: 8.2
 
-// compile-flags:-g -Z thinlto
+//@ compile-flags:-g -Z thinlto
 
 // === GDB TESTS ===================================================================================
 
@@ -14,8 +14,8 @@
 
 // lldb-command:run
 
-// lldb-command:print *abc
-// lldbg-check:(enum_thinlto::ABC) $0 =
+// lldb-command:v *abc
+// lldbg-check:(enum_thinlto::ABC) *abc =
 // lldbr-check:(enum_thinlto::ABC) *abc = (x = 0, y = 8970181431921507452)
 
 #![allow(unused_variables)]

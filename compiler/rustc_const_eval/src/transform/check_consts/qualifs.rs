@@ -10,7 +10,7 @@ use rustc_middle::mir::*;
 use rustc_middle::traits::BuiltinImplSource;
 use rustc_middle::ty::{self, AdtDef, GenericArgsRef, Ty};
 use rustc_trait_selection::traits::{
-    self, ImplSource, Obligation, ObligationCause, ObligationCtxt, SelectionContext,
+    ImplSource, Obligation, ObligationCause, ObligationCtxt, SelectionContext,
 };
 
 use super::ConstCx;
@@ -23,9 +23,7 @@ pub fn in_any_value_of_ty<'tcx>(
     ConstQualifs {
         has_mut_interior: HasMutInterior::in_any_value_of_ty(cx, ty),
         needs_drop: NeedsDrop::in_any_value_of_ty(cx, ty),
-        // FIXME(effects)
-        needs_non_const_drop: NeedsDrop::in_any_value_of_ty(cx, ty),
-        custom_eq: CustomEq::in_any_value_of_ty(cx, ty),
+        needs_non_const_drop: NeedsNonConstDrop::in_any_value_of_ty(cx, ty),
         tainted_by_errors,
     }
 }
@@ -76,6 +74,13 @@ pub trait Qualif {
         adt: AdtDef<'tcx>,
         args: GenericArgsRef<'tcx>,
     ) -> bool;
+
+    /// Returns `true` if this `Qualif` behaves sructurally for pointers and references:
+    /// the pointer/reference qualifies if and only if the pointee qualifies.
+    ///
+    /// (This is currently `false` for all our instances, but that may change in the future. Also,
+    /// by keeping it abstract, the handling of `Deref` in `in_place` becomes more clear.)
+    fn deref_structural<'tcx>(cx: &ConstCx<'_, 'tcx>) -> bool;
 }
 
 /// Constant containing interior mutability (`UnsafeCell<T>`).
@@ -105,6 +110,10 @@ impl Qualif for HasMutInterior {
         // It arises structurally for all other types.
         adt.is_unsafe_cell()
     }
+
+    fn deref_structural<'tcx>(_cx: &ConstCx<'_, 'tcx>) -> bool {
+        false
+    }
 }
 
 /// Constant containing an ADT that implements `Drop`.
@@ -133,6 +142,10 @@ impl Qualif for NeedsDrop {
     ) -> bool {
         adt.has_dtor(cx.tcx)
     }
+
+    fn deref_structural<'tcx>(_cx: &ConstCx<'_, 'tcx>) -> bool {
+        false
+    }
 }
 
 /// Constant containing an ADT that implements non-const `Drop`.
@@ -155,12 +168,25 @@ impl Qualif for NeedsNonConstDrop {
             return false;
         }
 
-        // FIXME(effects) constness
+        // FIXME(effects): If `destruct` is not a `const_trait`,
+        // or effects are disabled in this crate, then give up.
+        let destruct_def_id = cx.tcx.require_lang_item(LangItem::Destruct, Some(cx.body.span));
+        if !cx.tcx.has_host_param(destruct_def_id) || !cx.tcx.features().effects {
+            return NeedsDrop::in_any_value_of_ty(cx, ty);
+        }
+
         let obligation = Obligation::new(
             cx.tcx,
             ObligationCause::dummy_with_span(cx.body.span),
             cx.param_env,
-            ty::TraitRef::from_lang_item(cx.tcx, LangItem::Destruct, cx.body.span, [ty]),
+            ty::TraitRef::new(
+                cx.tcx,
+                destruct_def_id,
+                [
+                    ty::GenericArg::from(ty),
+                    ty::GenericArg::from(cx.tcx.expected_host_effect_param_for_body(cx.def_id())),
+                ],
+            ),
         );
 
         let infcx = cx.tcx.infer_ctxt().build();
@@ -199,34 +225,9 @@ impl Qualif for NeedsNonConstDrop {
     ) -> bool {
         adt.has_non_const_dtor(cx.tcx)
     }
-}
 
-/// A constant that cannot be used as part of a pattern in a `match` expression.
-pub struct CustomEq;
-
-impl Qualif for CustomEq {
-    const ANALYSIS_NAME: &'static str = "flow_custom_eq";
-
-    fn in_qualifs(qualifs: &ConstQualifs) -> bool {
-        qualifs.custom_eq
-    }
-
-    fn in_any_value_of_ty<'tcx>(cx: &ConstCx<'_, 'tcx>, ty: Ty<'tcx>) -> bool {
-        // If *any* component of a composite data type does not implement `Structural{Partial,}Eq`,
-        // we know that at least some values of that type are not structural-match. I say "some"
-        // because that component may be part of an enum variant (e.g.,
-        // `Option::<NonStructuralMatchTy>::Some`), in which case some values of this type may be
-        // structural-match (`Option::None`).
-        traits::search_for_structural_match_violation(cx.body.span, cx.tcx, ty).is_some()
-    }
-
-    fn in_adt_inherently<'tcx>(
-        cx: &ConstCx<'_, 'tcx>,
-        def: AdtDef<'tcx>,
-        args: GenericArgsRef<'tcx>,
-    ) -> bool {
-        let ty = Ty::new_adt(cx.tcx, def, args);
-        !ty.is_structural_eq_shallow(cx.tcx)
+    fn deref_structural<'tcx>(_cx: &ConstCx<'_, 'tcx>) -> bool {
+        false
     }
 }
 
@@ -283,6 +284,7 @@ where
                 if Q::in_adt_inherently(cx, def, args) {
                     return true;
                 }
+                // Don't do any value-based reasoning for unions.
                 if def.is_union() && Q::in_any_value_of_ty(cx, rvalue.ty(cx.body, cx.tcx)) {
                     return true;
                 }
@@ -306,6 +308,7 @@ where
             ProjectionElem::Index(index) if in_local(index) => return true,
 
             ProjectionElem::Deref
+            | ProjectionElem::Subtype(_)
             | ProjectionElem::Field(_, _)
             | ProjectionElem::OpaqueCast(_)
             | ProjectionElem::ConstantIndex { .. }
@@ -318,6 +321,11 @@ where
         let proj_ty = base_ty.projection_ty(cx.tcx, elem).ty;
         if !Q::in_any_value_of_ty(cx, proj_ty) {
             return false;
+        }
+
+        if matches!(elem, ProjectionElem::Deref) && !Q::deref_structural(cx) {
+            // We have to assume that this qualifies.
+            return true;
         }
 
         place = place_base;

@@ -61,14 +61,14 @@ impl rustc_driver::Callbacks for CompilerCalls {
         compiler: &Compiler,
         queries: &'tcx Queries<'tcx>,
     ) -> Compilation {
-        compiler.session().abort_if_errors();
+        compiler.sess.dcx().abort_if_errors();
         queries.global_ctxt().unwrap().enter(|tcx| {
             // Collect definition ids of MIR bodies.
             let hir = tcx.hir();
             let mut bodies = Vec::new();
 
             let crate_items = tcx.hir_crate_items(());
-            for id in crate_items.items() {
+            for id in crate_items.free_items() {
                 if matches!(tcx.def_kind(id.owner_id), DefKind::Fn) {
                     bodies.push(id.owner_id);
                 }

@@ -28,10 +28,11 @@ pub enum SimplifiedType {
     MarkerTraitObject,
     Trait(DefId),
     Closure(DefId),
-    Generator(DefId),
-    GeneratorWitness(DefId),
+    Coroutine(DefId),
+    CoroutineWitness(DefId),
     Function(usize),
     Placeholder,
+    Error,
 }
 
 /// Generic parameters are pretty much just bound variables, e.g.
@@ -62,7 +63,7 @@ pub enum TreatParams {
     ///
     /// N.B. during deep rejection, this acts identically to `ForLookup`.
     ///
-    /// FIXME(-Ztrait-solver=next): Remove this variant and cleanup
+    /// FIXME(-Znext-solver): Remove this variant and cleanup
     /// the code.
     NextSolverLookup,
 }
@@ -119,7 +120,7 @@ pub fn simplify_type<'tcx>(
         ty::Str => Some(SimplifiedType::Str),
         ty::Array(..) => Some(SimplifiedType::Array),
         ty::Slice(..) => Some(SimplifiedType::Slice),
-        ty::RawPtr(ptr) => Some(SimplifiedType::Ptr(ptr.mutbl)),
+        ty::RawPtr(_, mutbl) => Some(SimplifiedType::Ptr(mutbl)),
         ty::Dynamic(trait_info, ..) => match trait_info.principal_def_id() {
             Some(principal_def_id) if !tcx.trait_is_auto(principal_def_id) => {
                 Some(SimplifiedType::Trait(principal_def_id))
@@ -127,9 +128,11 @@ pub fn simplify_type<'tcx>(
             _ => Some(SimplifiedType::MarkerTraitObject),
         },
         ty::Ref(_, _, mutbl) => Some(SimplifiedType::Ref(mutbl)),
-        ty::FnDef(def_id, _) | ty::Closure(def_id, _) => Some(SimplifiedType::Closure(def_id)),
-        ty::Generator(def_id, _, _) => Some(SimplifiedType::Generator(def_id)),
-        ty::GeneratorWitness(def_id, _) => Some(SimplifiedType::GeneratorWitness(def_id)),
+        ty::FnDef(def_id, _) | ty::Closure(def_id, _) | ty::CoroutineClosure(def_id, _) => {
+            Some(SimplifiedType::Closure(def_id))
+        }
+        ty::Coroutine(def_id, _) => Some(SimplifiedType::Coroutine(def_id)),
+        ty::CoroutineWitness(def_id, _) => Some(SimplifiedType::CoroutineWitness(def_id)),
         ty::Never => Some(SimplifiedType::Never),
         ty::Tuple(tys) => Some(SimplifiedType::Tuple(tys.len())),
         ty::FnPtr(f) => Some(SimplifiedType::Function(f.skip_binder().inputs().len())),
@@ -153,7 +156,8 @@ pub fn simplify_type<'tcx>(
             TreatParams::ForLookup | TreatParams::AsCandidateKey => None,
         },
         ty::Foreign(def_id) => Some(SimplifiedType::Foreign(def_id)),
-        ty::Bound(..) | ty::Infer(_) | ty::Error(_) => None,
+        ty::Error(_) => Some(SimplifiedType::Error),
+        ty::Bound(..) | ty::Infer(_) => None,
     }
 }
 
@@ -164,8 +168,8 @@ impl SimplifiedType {
             | SimplifiedType::Foreign(d)
             | SimplifiedType::Trait(d)
             | SimplifiedType::Closure(d)
-            | SimplifiedType::Generator(d)
-            | SimplifiedType::GeneratorWitness(d) => Some(d),
+            | SimplifiedType::Coroutine(d)
+            | SimplifiedType::CoroutineWitness(d) => Some(d),
             _ => None,
         }
     }
@@ -189,14 +193,14 @@ pub struct DeepRejectCtxt {
 }
 
 impl DeepRejectCtxt {
-    pub fn args_refs_may_unify<'tcx>(
+    pub fn args_may_unify<'tcx>(
         self,
         obligation_args: GenericArgsRef<'tcx>,
         impl_args: GenericArgsRef<'tcx>,
     ) -> bool {
         iter::zip(obligation_args, impl_args).all(|(obl, imp)| {
             match (obl.unpack(), imp.unpack()) {
-                // We don't fast reject based on regions for now.
+                // We don't fast reject based on regions.
                 (GenericArgKind::Lifetime(_), GenericArgKind::Lifetime(_)) => true,
                 (GenericArgKind::Type(obl), GenericArgKind::Type(imp)) => {
                     self.types_may_unify(obl, imp)
@@ -231,11 +235,12 @@ impl DeepRejectCtxt {
             | ty::Never
             | ty::Tuple(..)
             | ty::FnPtr(..)
-            | ty::Foreign(..) => {}
+            | ty::Foreign(..) => debug_assert!(impl_ty.is_known_rigid()),
             ty::FnDef(..)
             | ty::Closure(..)
-            | ty::Generator(..)
-            | ty::GeneratorWitness(..)
+            | ty::CoroutineClosure(..)
+            | ty::Coroutine(..)
+            | ty::CoroutineWitness(..)
             | ty::Placeholder(..)
             | ty::Bound(..)
             | ty::Infer(_) => bug!("unexpected impl_ty: {impl_ty}"),
@@ -260,7 +265,7 @@ impl DeepRejectCtxt {
             },
             ty::Adt(obl_def, obl_args) => match k {
                 &ty::Adt(impl_def, impl_args) => {
-                    obl_def == impl_def && self.args_refs_may_unify(obl_args, impl_args)
+                    obl_def == impl_def && self.args_may_unify(obl_args, impl_args)
                 }
                 _ => false,
             },
@@ -281,8 +286,10 @@ impl DeepRejectCtxt {
                 }
                 _ => false,
             },
-            ty::RawPtr(obl) => match k {
-                ty::RawPtr(imp) => obl.mutbl == imp.mutbl && self.types_may_unify(obl.ty, imp.ty),
+            ty::RawPtr(obl_ty, obl_mutbl) => match *k {
+                ty::RawPtr(imp_ty, imp_mutbl) => {
+                    obl_mutbl == imp_mutbl && self.types_may_unify(obl_ty, imp_ty)
+                }
                 _ => false,
             },
             ty::Dynamic(obl_preds, ..) => {
@@ -310,7 +317,7 @@ impl DeepRejectCtxt {
             },
 
             // Impls cannot contain these types as these cannot be named directly.
-            ty::FnDef(..) | ty::Closure(..) | ty::Generator(..) => false,
+            ty::FnDef(..) | ty::Closure(..) | ty::CoroutineClosure(..) | ty::Coroutine(..) => false,
 
             // Placeholder types don't unify with anything on their own
             ty::Placeholder(..) | ty::Bound(..) => false,
@@ -337,7 +344,7 @@ impl DeepRejectCtxt {
 
             ty::Error(_) => true,
 
-            ty::GeneratorWitness(..) => {
+            ty::CoroutineWitness(..) => {
                 bug!("unexpected obligation type: {:?}", obligation_ty)
             }
         }

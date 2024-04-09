@@ -1,10 +1,11 @@
+use crate::assert_module_sources::CguReuse;
 use crate::back::link::are_upstream_rust_objects_already_included;
 use crate::back::metadata::create_compressed_metadata_file;
 use crate::back::write::{
     compute_per_cgu_lto_type, start_async_codegen, submit_codegened_module_to_llvm,
     submit_post_lto_module_to_llvm, submit_pre_lto_module_to_llvm, ComputedLtoType, OngoingCodegen,
 };
-use crate::common::{IntPredicate, RealPredicate, TypeKind};
+use crate::common::{self, IntPredicate, RealPredicate, TypeKind};
 use crate::errors;
 use crate::meth;
 use crate::mir;
@@ -15,9 +16,10 @@ use crate::{CachedModuleCodegen, CompiledModule, CrateInfo, MemFlags, ModuleCode
 
 use rustc_ast::expand::allocator::{global_fn_name, AllocatorKind, ALLOCATOR_METHODS};
 use rustc_attr as attr;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
 use rustc_data_structures::profiling::{get_resident_set_size, print_time_passes_entry};
 use rustc_data_structures::sync::par_map;
+use rustc_data_structures::unord::UnordMap;
 use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::lang_items::LangItem;
@@ -31,8 +33,7 @@ use rustc_middle::mir::mono::{CodegenUnit, CodegenUnitNameBuilder, MonoItem};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
-use rustc_session::cgu_reuse_tracker::CguReuse;
-use rustc_session::config::{self, CrateType, EntryFnType, OutputType};
+use rustc_session::config::{self, CrateType, EntryFnType, OptLevel, OutputType};
 use rustc_session::Session;
 use rustc_span::symbol::sym;
 use rustc_span::Symbol;
@@ -148,10 +149,9 @@ pub fn unsized_info<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         (&ty::Array(_, len), &ty::Slice(_)) => {
             cx.const_usize(len.eval_target_usize(cx.tcx(), ty::ParamEnv::reveal_all()))
         }
-        (
-            &ty::Dynamic(ref data_a, _, src_dyn_kind),
-            &ty::Dynamic(ref data_b, _, target_dyn_kind),
-        ) if src_dyn_kind == target_dyn_kind => {
+        (&ty::Dynamic(data_a, _, src_dyn_kind), &ty::Dynamic(data_b, _, target_dyn_kind))
+            if src_dyn_kind == target_dyn_kind =>
+        {
             let old_info =
                 old_info.expect("unsized_info: missing old info for trait upcasting coercion");
             if data_a.principal_def_id() == data_b.principal_def_id() {
@@ -165,14 +165,11 @@ pub fn unsized_info<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
                 cx.tcx().vtable_trait_upcasting_coercion_new_vptr_slot((source, target));
 
             if let Some(entry_idx) = vptr_entry_idx {
-                let ptr_ty = cx.type_ptr();
-                let ptr_align = cx.tcx().data_layout.pointer_align.abi;
-                let gep = bx.inbounds_gep(
-                    ptr_ty,
-                    old_info,
-                    &[bx.const_usize(u64::try_from(entry_idx).unwrap())],
-                );
-                let new_vptr = bx.load(ptr_ty, gep, ptr_align);
+                let ptr_size = bx.data_layout().pointer_size;
+                let ptr_align = bx.data_layout().pointer_align.abi;
+                let vtable_byte_offset = u64::try_from(entry_idx).unwrap() * ptr_size.bytes();
+                let gep = bx.inbounds_ptradd(old_info, bx.const_usize(vtable_byte_offset));
+                let new_vptr = bx.load(bx.type_ptr(), gep, ptr_align);
                 bx.nonnull_metadata(new_vptr);
                 // VTable loads are invariant.
                 bx.set_invariant_load(new_vptr);
@@ -196,8 +193,8 @@ pub fn unsize_ptr<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 ) -> (Bx::Value, Bx::Value) {
     debug!("unsize_ptr: {:?} => {:?}", src_ty, dst_ty);
     match (src_ty.kind(), dst_ty.kind()) {
-        (&ty::Ref(_, a, _), &ty::Ref(_, b, _) | &ty::RawPtr(ty::TypeAndMut { ty: b, .. }))
-        | (&ty::RawPtr(ty::TypeAndMut { ty: a, .. }), &ty::RawPtr(ty::TypeAndMut { ty: b, .. })) => {
+        (&ty::Ref(_, a, _), &ty::Ref(_, b, _) | &ty::RawPtr(b, _))
+        | (&ty::RawPtr(a, _), &ty::RawPtr(b, _)) => {
             assert_eq!(bx.cx().type_is_sized(a), old_info.is_none());
             (src, unsized_info(bx, a, b, old_info))
         }
@@ -303,14 +300,35 @@ pub fn coerce_unsized_into<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     }
 }
 
-pub fn cast_shift_expr_rhs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
+/// Returns `rhs` sufficiently masked, truncated, and/or extended so that
+/// it can be used to shift `lhs`.
+///
+/// Shifts in MIR are all allowed to have mismatched LHS & RHS types.
+/// The shift methods in `BuilderMethods`, however, are fully homogeneous
+/// (both parameters and the return type are all the same type).
+///
+/// If `is_unchecked` is false, this masks the RHS to ensure it stays in-bounds,
+/// as the `BuilderMethods` shifts are UB for out-of-bounds shift amounts.
+/// For 32- and 64-bit types, this matches the semantics
+/// of Java. (See related discussion on #1877 and #10183.)
+///
+/// If `is_unchecked` is true, this does no masking, and adds sufficient `assume`
+/// calls or operation flags to preserve as much freedom to optimize as possible.
+pub fn build_shift_expr_rhs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     bx: &mut Bx,
     lhs: Bx::Value,
-    rhs: Bx::Value,
+    mut rhs: Bx::Value,
+    is_unchecked: bool,
 ) -> Bx::Value {
     // Shifts may have any size int on the rhs
     let mut rhs_llty = bx.cx().val_ty(rhs);
     let mut lhs_llty = bx.cx().val_ty(lhs);
+
+    let mask = common::shift_mask_val(bx, lhs_llty, rhs_llty, false);
+    if !is_unchecked {
+        rhs = bx.and(rhs, mask);
+    }
+
     if bx.cx().type_kind(rhs_llty) == TypeKind::Vector {
         rhs_llty = bx.cx().element_type(rhs_llty)
     }
@@ -320,10 +338,21 @@ pub fn cast_shift_expr_rhs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     let rhs_sz = bx.cx().int_width(rhs_llty);
     let lhs_sz = bx.cx().int_width(lhs_llty);
     if lhs_sz < rhs_sz {
+        if is_unchecked && bx.sess().opts.optimize != OptLevel::No {
+            // FIXME: Use `trunc nuw` once that's available
+            let inrange = bx.icmp(IntPredicate::IntULE, rhs, mask);
+            bx.assume(inrange);
+        }
+
         bx.trunc(rhs, lhs_llty)
     } else if lhs_sz > rhs_sz {
-        // FIXME (#1877: If in the future shifting by negative
-        // values is no longer undefined then this is wrong.
+        // We zero-extend even if the RHS is signed. So e.g. `(x: i32) << -1i8` will zero-extend the
+        // RHS to `255i32`. But then we mask the shift amount to be within the size of the LHS
+        // anyway so the result is `31` as it should be. All the extra bits introduced by zext
+        // are masked off so their value does not matter.
+        // FIXME: if we ever support 512bit integers, this will be wrong! For such large integers,
+        // the extra bits introduced by zext are *not* all masked away any more.
+        assert!(lhs_sz <= 256);
         bx.zext(rhs, lhs_llty)
     } else {
         rhs
@@ -444,17 +473,15 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         let Some(llfn) = cx.declare_c_main(llfty) else {
             // FIXME: We should be smart and show a better diagnostic here.
             let span = cx.tcx().def_span(rust_main_def_id);
-            cx.sess().emit_err(errors::MultipleMainFunctions { span });
-            cx.sess().abort_if_errors();
-            bug!();
+            cx.tcx().dcx().emit_fatal(errors::MultipleMainFunctions { span });
         };
 
         // `main` should respect same config for frame pointer elimination as rest of code
         cx.set_frame_pointer_type(llfn);
         cx.apply_target_cpu_attr(llfn);
 
-        let llbb = Bx::append_block(&cx, llfn, "top");
-        let mut bx = Bx::build(&cx, llbb);
+        let llbb = Bx::append_block(cx, llfn, "top");
+        let mut bx = Bx::build(cx, llbb);
 
         bx.insert_reference_to_gdb_debug_scripts_section_global();
 
@@ -462,31 +489,34 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         let ptr_ty = cx.type_ptr();
         let (arg_argc, arg_argv) = get_argc_argv(cx, &mut bx);
 
-        let (start_fn, start_ty, args) = if let EntryFnType::Main { sigpipe } = entry_type {
+        let (start_fn, start_ty, args, instance) = if let EntryFnType::Main { sigpipe } = entry_type
+        {
             let start_def_id = cx.tcx().require_lang_item(LangItem::Start, None);
-            let start_fn = cx.get_fn_addr(
-                ty::Instance::resolve(
-                    cx.tcx(),
-                    ty::ParamEnv::reveal_all(),
-                    start_def_id,
-                    cx.tcx().mk_args(&[main_ret_ty.into()]),
-                )
-                .unwrap()
-                .unwrap(),
+            let start_instance = ty::Instance::expect_resolve(
+                cx.tcx(),
+                ty::ParamEnv::reveal_all(),
+                start_def_id,
+                cx.tcx().mk_args(&[main_ret_ty.into()]),
             );
+            let start_fn = cx.get_fn_addr(start_instance);
 
             let i8_ty = cx.type_i8();
             let arg_sigpipe = bx.const_u8(sigpipe);
 
             let start_ty = cx.type_func(&[cx.val_ty(rust_main), isize_ty, ptr_ty, i8_ty], isize_ty);
-            (start_fn, start_ty, vec![rust_main, arg_argc, arg_argv, arg_sigpipe])
+            (
+                start_fn,
+                start_ty,
+                vec![rust_main, arg_argc, arg_argv, arg_sigpipe],
+                Some(start_instance),
+            )
         } else {
             debug!("using user-defined start fn");
             let start_ty = cx.type_func(&[isize_ty, ptr_ty], isize_ty);
-            (rust_main, start_ty, vec![arg_argc, arg_argv])
+            (rust_main, start_ty, vec![arg_argc, arg_argv], None)
         };
 
-        let result = bx.call(start_ty, None, None, start_fn, &args, None);
+        let result = bx.call(start_ty, None, None, start_fn, &args, None, instance);
         if cx.sess().target.os.contains("uefi") {
             bx.ret(result);
         } else {
@@ -507,11 +537,13 @@ fn get_argc_argv<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         // Params for UEFI
         let param_handle = bx.get_param(0);
         let param_system_table = bx.get_param(1);
+        let ptr_size = bx.tcx().data_layout.pointer_size;
+        let ptr_align = bx.tcx().data_layout.pointer_align.abi;
         let arg_argc = bx.const_int(cx.type_isize(), 2);
-        let arg_argv = bx.alloca(cx.type_array(cx.type_ptr(), 2), Align::ONE);
-        bx.store(param_handle, arg_argv, Align::ONE);
-        let arg_argv_el1 = bx.gep(cx.type_ptr(), arg_argv, &[bx.const_int(cx.type_int(), 1)]);
-        bx.store(param_system_table, arg_argv_el1, Align::ONE);
+        let arg_argv = bx.alloca(cx.type_array(cx.type_ptr(), 2), ptr_align);
+        bx.store(param_handle, arg_argv, ptr_align);
+        let arg_argv_el1 = bx.inbounds_ptradd(arg_argv, bx.const_usize(ptr_size.bytes()));
+        bx.store(param_system_table, arg_argv_el1, ptr_align);
         (arg_argc, arg_argv)
     } else if cx.sess().target.main_needs_argc_argv {
         // Params from native `main()` used as args for rust start function
@@ -616,7 +648,7 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
                 &exported_symbols::metadata_symbol_name(tcx),
             );
             if let Err(error) = std::fs::write(&file_name, data) {
-                tcx.sess.emit_fatal(errors::MetadataObjectFileWrite { error });
+                tcx.dcx().emit_fatal(errors::MetadataObjectFileWrite { error });
             }
             CompiledModule {
                 name: metadata_cgu_name,
@@ -680,7 +712,14 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
 
     // Calculate the CGU reuse
     let cgu_reuse = tcx.sess.time("find_cgu_reuse", || {
-        codegen_units.iter().map(|cgu| determine_cgu_reuse(tcx, &cgu)).collect::<Vec<_>>()
+        codegen_units.iter().map(|cgu| determine_cgu_reuse(tcx, cgu)).collect::<Vec<_>>()
+    });
+
+    crate::assert_module_sources::assert_module_sources(tcx, &|cgu_reuse_tracker| {
+        for (i, cgu) in codegen_units.iter().enumerate() {
+            let cgu_reuse = cgu_reuse[i];
+            cgu_reuse_tracker.set_actual_reuse(cgu.name().as_str(), cgu_reuse);
+        }
     });
 
     let mut total_codegen_time = Duration::new(0, 0);
@@ -727,7 +766,6 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
         ongoing_codegen.check_for_errors(tcx.sess);
 
         let cgu_reuse = cgu_reuse[i];
-        tcx.sess.cgu_reuse_tracker.set_actual_reuse(cgu.name().as_str(), cgu_reuse);
 
         match cgu_reuse {
             CguReuse::No => {
@@ -742,7 +780,7 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
                 // This will unwind if there are errors, which triggers our `AbortCodegenOnDrop`
                 // guard. Unfortunately, just skipping the `submit_codegened_module_to_llvm` makes
                 // compilation hang on post-monomorphization errors.
-                tcx.sess.abort_if_errors();
+                tcx.dcx().abort_if_errors();
 
                 submit_codegened_module_to_llvm(
                     &backend,
@@ -809,7 +847,7 @@ impl CrateInfo {
         let subsystem = attr::first_attr_value_str_by_name(crate_attrs, sym::windows_subsystem);
         let windows_subsystem = subsystem.map(|subsystem| {
             if subsystem != sym::windows && subsystem != sym::console {
-                tcx.sess.emit_fatal(errors::InvalidWindowsSubsystem { subsystem });
+                tcx.dcx().emit_fatal(errors::InvalidWindowsSubsystem { subsystem });
             }
             subsystem.to_string()
         });
@@ -840,6 +878,8 @@ impl CrateInfo {
         // `compiler_builtins` are always placed last to ensure that they're linked correctly.
         used_crates.extend(compiler_builtins);
 
+        let crates = tcx.crates(());
+        let n_crates = crates.len();
         let mut info = CrateInfo {
             target_cpu,
             crate_types,
@@ -851,19 +891,15 @@ impl CrateInfo {
             is_no_builtins: Default::default(),
             native_libraries: Default::default(),
             used_libraries: tcx.native_libraries(LOCAL_CRATE).iter().map(Into::into).collect(),
-            crate_name: Default::default(),
+            crate_name: UnordMap::with_capacity(n_crates),
             used_crates,
-            used_crate_source: Default::default(),
+            used_crate_source: UnordMap::with_capacity(n_crates),
             dependency_formats: tcx.dependency_formats(()).clone(),
             windows_subsystem,
             natvis_debugger_visualizers: Default::default(),
         };
-        let crates = tcx.crates(());
 
-        let n_crates = crates.len();
         info.native_libraries.reserve(n_crates);
-        info.crate_name.reserve(n_crates);
-        info.used_crate_source.reserve(n_crates);
 
         for &cnum in crates.iter() {
             info.native_libraries
@@ -890,7 +926,7 @@ impl CrateInfo {
         // by the compiler, but that's ok because all this stuff is unstable anyway.
         let target = &tcx.sess.target;
         if !are_upstream_rust_objects_already_included(tcx.sess) {
-            let missing_weak_lang_items: FxHashSet<Symbol> = info
+            let missing_weak_lang_items: FxIndexSet<Symbol> = info
                 .used_crates
                 .iter()
                 .flat_map(|&cnum| tcx.missing_lang_items(cnum))
@@ -900,18 +936,27 @@ impl CrateInfo {
                     lang_items::required(tcx, l).then_some(name)
                 })
                 .collect();
-            let prefix = if target.is_like_windows && target.arch == "x86" { "_" } else { "" };
+            let prefix = match (target.is_like_windows, target.arch.as_ref()) {
+                (true, "x86") => "_",
+                (true, "arm64ec") => "#",
+                _ => "",
+            };
+
+            // This loop only adds new items to values of the hash map, so the order in which we
+            // iterate over the values is not important.
+            #[allow(rustc::potential_query_instability)]
             info.linked_symbols
                 .iter_mut()
                 .filter(|(crate_type, _)| {
                     !matches!(crate_type, CrateType::Rlib | CrateType::Staticlib)
                 })
                 .for_each(|(_, linked_symbols)| {
-                    linked_symbols.extend(
-                        missing_weak_lang_items
-                            .iter()
-                            .map(|item| (format!("{prefix}{item}"), SymbolExportKind::Text)),
-                    );
+                    let mut symbols = missing_weak_lang_items
+                        .iter()
+                        .map(|item| (format!("{prefix}{item}"), SymbolExportKind::Text))
+                        .collect::<Vec<_>>();
+                    symbols.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    linked_symbols.extend(symbols);
                     if tcx.allocator_kind(()).is_some() {
                         // At least one crate needs a global allocator. This crate may be placed
                         // after the crate that defines it in the linker order, in which case some
@@ -994,7 +1039,7 @@ pub fn provide(providers: &mut Providers) {
     };
 }
 
-fn determine_cgu_reuse<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> CguReuse {
+pub fn determine_cgu_reuse<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> CguReuse {
     if !tcx.dep_graph.is_fully_enabled() {
         return CguReuse::No;
     }

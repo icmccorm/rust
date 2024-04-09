@@ -11,6 +11,14 @@ LL |     assert_eq!(<() as Tr>::B, 0);    // causes the error above
    |                ^^^^^^^^^^^^^
 
 note: erroneous constant encountered
+  --> $DIR/defaults-not-assumed-fail.rs:33:16
+   |
+LL |     assert_eq!(<() as Tr>::B, 0);    // causes the error above
+   |                ^^^^^^^^^^^^^
+   |
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
+note: erroneous constant encountered
   --> $DIR/defaults-not-assumed-fail.rs:33:5
    |
 LL |     assert_eq!(<() as Tr>::B, 0);    // causes the error above
@@ -24,8 +32,9 @@ note: erroneous constant encountered
 LL |     assert_eq!(<() as Tr>::B, 0);    // causes the error above
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
    = note: this note originates in the macro `assert_eq` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error: aborting due to previous error
+error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0080`.

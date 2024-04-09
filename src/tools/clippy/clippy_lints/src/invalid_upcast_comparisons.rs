@@ -2,7 +2,7 @@ use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_middle::ty::{self, IntTy, UintTy};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 use rustc_span::Span;
 
 use clippy_utils::comparisons;
@@ -26,7 +26,7 @@ declare_clippy_lint! {
     /// https://github.com/rust-lang/rust-clippy/issues/886
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let x: u8 = 1;
     /// (x as u32) > 300;
     /// ```
@@ -76,7 +76,7 @@ fn err_upcast_comparison(cx: &LateContext<'_>, span: Span, expr: &Expr<'_>, alwa
             cx,
             INVALID_UPCAST_COMPARISONS,
             span,
-            &format!(
+            format!(
                 "because of the numeric bounds on `{}` prior to casting, this expression is always {}",
                 snippet(cx, cast_val.span, "the expression"),
                 if always { "true" } else { "false" },
@@ -88,7 +88,7 @@ fn err_upcast_comparison(cx: &LateContext<'_>, span: Span, expr: &Expr<'_>, alwa
 fn upcast_comparison_bounds_err<'tcx>(
     cx: &LateContext<'tcx>,
     span: Span,
-    rel: comparisons::Rel,
+    rel: Rel,
     lhs_bounds: Option<(FullInt, FullInt)>,
     lhs: &'tcx Expr<'_>,
     rhs: &'tcx Expr<'_>,

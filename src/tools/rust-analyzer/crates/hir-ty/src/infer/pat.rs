@@ -93,7 +93,7 @@ impl InferenceContext<'_> {
             ty.as_adt().map(|(_, s)| s.clone()).unwrap_or_else(|| Substitution::empty(Interner));
 
         match def {
-            _ if subs.len() == 0 => {}
+            _ if subs.is_empty() => {}
             Some(def) => {
                 let field_types = self.db.field_types(def);
                 let variant_data = def.variant_data(self.db.upcast());
@@ -223,17 +223,16 @@ impl InferenceContext<'_> {
     ) -> Ty {
         let expected = self.resolve_ty_shallow(expected);
         let expectations = match expected.as_tuple() {
-            Some(parameters) => &*parameters.as_slice(Interner),
+            Some(parameters) => parameters.as_slice(Interner),
             _ => &[],
         };
 
         let ((pre, post), n_uncovered_patterns) = match ellipsis {
             Some(idx) => (subs.split_at(idx), expectations.len().saturating_sub(subs.len())),
-            None => ((&subs[..], &[][..]), 0),
+            None => ((subs, &[][..]), 0),
         };
         let mut expectations_iter = expectations
             .iter()
-            .cloned()
             .map(|a| a.assert_ty_ref(Interner).clone())
             .chain(repeat_with(|| self.table.new_type_var()));
 
@@ -262,7 +261,7 @@ impl InferenceContext<'_> {
     fn infer_pat(&mut self, pat: PatId, expected: &Ty, mut default_bm: BindingMode) -> Ty {
         let mut expected = self.resolve_ty_shallow(expected);
 
-        if is_non_ref_pat(self.body, pat) {
+        if self.is_non_ref_pat(self.body, pat) {
             let mut pat_adjustments = Vec::new();
             while let Some((inner, _lifetime, mutability)) = expected.as_reference() {
                 pat_adjustments.push(expected.clone());
@@ -336,7 +335,7 @@ impl InferenceContext<'_> {
             &Pat::Lit(expr) => {
                 // Don't emit type mismatches again, the expression lowering already did that.
                 let ty = self.infer_lit_pat(expr, &expected);
-                self.write_pat_ty(pat, ty.clone());
+                self.write_pat_ty(pat, ty);
                 return self.pat_ty_after_adjustment(pat);
             }
             Pat::Box { inner } => match self.resolve_boxed_box() {
@@ -421,10 +420,10 @@ impl InferenceContext<'_> {
         } else {
             BindingMode::convert(mode)
         };
-        self.result.binding_modes.insert(binding, mode);
+        self.result.binding_modes.insert(pat, mode);
 
         let inner_ty = match subpat {
-            Some(subpat) => self.infer_pat(subpat, &expected, default_bm),
+            Some(subpat) => self.infer_pat(subpat, expected, default_bm),
             None => expected.clone(),
         };
         let inner_ty = self.insert_type_vars_shallow(inner_ty);
@@ -437,7 +436,7 @@ impl InferenceContext<'_> {
         };
         self.write_pat_ty(pat, inner_ty.clone());
         self.write_binding_ty(binding, bound_ty);
-        return inner_ty;
+        inner_ty
     }
 
     fn infer_slice_pat(
@@ -496,24 +495,28 @@ impl InferenceContext<'_> {
 
         self.infer_expr(expr, &Expectation::has_type(expected.clone()))
     }
-}
 
-fn is_non_ref_pat(body: &hir_def::body::Body, pat: PatId) -> bool {
-    match &body[pat] {
-        Pat::Tuple { .. }
-        | Pat::TupleStruct { .. }
-        | Pat::Record { .. }
-        | Pat::Range { .. }
-        | Pat::Slice { .. } => true,
-        Pat::Or(pats) => pats.iter().all(|p| is_non_ref_pat(body, *p)),
-        // FIXME: ConstBlock/Path/Lit might actually evaluate to ref, but inference is unimplemented.
-        Pat::Path(..) => true,
-        Pat::ConstBlock(..) => true,
-        Pat::Lit(expr) => !matches!(
-            body[*expr],
-            Expr::Literal(Literal::String(..) | Literal::CString(..) | Literal::ByteString(..))
-        ),
-        Pat::Wild | Pat::Bind { .. } | Pat::Ref { .. } | Pat::Box { .. } | Pat::Missing => false,
+    fn is_non_ref_pat(&mut self, body: &hir_def::body::Body, pat: PatId) -> bool {
+        match &body[pat] {
+            Pat::Tuple { .. }
+            | Pat::TupleStruct { .. }
+            | Pat::Record { .. }
+            | Pat::Range { .. }
+            | Pat::Slice { .. } => true,
+            Pat::Or(pats) => pats.iter().all(|p| self.is_non_ref_pat(body, *p)),
+            Pat::Path(p) => {
+                let v = self.resolve_value_path_inner(p, pat.into());
+                v.is_some_and(|x| !matches!(x.0, hir_def::resolver::ValueNs::ConstId(_)))
+            }
+            Pat::ConstBlock(..) => false,
+            Pat::Lit(expr) => !matches!(
+                body[*expr],
+                Expr::Literal(Literal::String(..) | Literal::CString(..) | Literal::ByteString(..))
+            ),
+            Pat::Wild | Pat::Bind { .. } | Pat::Ref { .. } | Pat::Box { .. } | Pat::Missing => {
+                false
+            }
+        }
     }
 }
 

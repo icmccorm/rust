@@ -9,11 +9,6 @@ note: ...which requires const-evaluating + checking `Foo::bytes::{constant#0}`..
    |
 LL |     bytes: [u8; unsafe { intrinsics::size_of::<Foo>() }],
    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-note: ...which requires const-evaluating + checking `Foo::bytes::{constant#0}`...
-  --> $DIR/issue-44415.rs:6:17
-   |
-LL |     bytes: [u8; unsafe { intrinsics::size_of::<Foo>() }],
-   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = note: ...which requires computing layout of `Foo`...
    = note: ...which requires computing layout of `[u8; unsafe { intrinsics::size_of::<Foo>() }]`...
    = note: ...which requires normalizing `[u8; unsafe { intrinsics::size_of::<Foo>() }]`...
@@ -25,6 +20,6 @@ LL | struct Foo {
    | ^^^^^^^^^^
    = note: see https://rustc-dev-guide.rust-lang.org/overview.html#queries and https://rustc-dev-guide.rust-lang.org/query.html for more information
 
-error: aborting due to previous error
+error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0391`.

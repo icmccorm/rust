@@ -1,7 +1,6 @@
-// check-pass
+//@ check-pass
 
-#![feature(return_position_impl_trait_in_trait, lint_reasons)]
-#![allow(incomplete_features)]
+#![feature(lint_reasons)]
 
 pub struct Wrapper<T>(T);
 

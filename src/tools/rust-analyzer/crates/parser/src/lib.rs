@@ -17,18 +17,24 @@
 //!
 //! [`Parser`]: crate::parser::Parser
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![warn(rust_2018_idioms, unused_lifetimes)]
 #![allow(rustdoc::private_intra_doc_links)]
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 
-mod lexed_str;
-mod token_set;
-mod syntax_kind;
+#[cfg(not(feature = "in-rust-tree"))]
+extern crate ra_ap_rustc_lexer as rustc_lexer;
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_lexer;
+
 mod event;
-mod parser;
 mod grammar;
 mod input;
+mod lexed_str;
 mod output;
+mod parser;
 mod shortcuts;
+mod syntax_kind;
+mod token_set;
 
 #[cfg(test)]
 mod tests;
@@ -81,6 +87,7 @@ pub enum TopEntryPoint {
 
 impl TopEntryPoint {
     pub fn parse(&self, input: &Input) -> Output {
+        let _p = tracing::span!(tracing::Level::INFO, "TopEntryPoint::parse", ?self).entered();
         let entry_point: fn(&'_ mut parser::Parser<'_>) = match self {
             TopEntryPoint::SourceFile => grammar::entry::top::source_file,
             TopEntryPoint::MacroStmts => grammar::entry::top::macro_stmts,

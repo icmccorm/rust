@@ -1,11 +1,8 @@
 //! Lowers intrinsic calls
 
-use crate::MirPass;
 use rustc_middle::mir::*;
-use rustc_middle::ty::GenericArgsRef;
-use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_span::symbol::{sym, Symbol};
-use rustc_target::abi::{FieldIdx, VariantIdx};
+use rustc_middle::ty::{self, TyCtxt};
+use rustc_span::symbol::sym;
 
 pub struct LowerIntrinsics;
 
@@ -16,15 +13,23 @@ impl<'tcx> MirPass<'tcx> for LowerIntrinsics {
             let terminator = block.terminator.as_mut().unwrap();
             if let TerminatorKind::Call { func, args, destination, target, .. } =
                 &mut terminator.kind
+                && let ty::FnDef(def_id, generic_args) = *func.ty(local_decls, tcx).kind()
+                && let Some(intrinsic) = tcx.intrinsic(def_id)
             {
-                let func_ty = func.ty(local_decls, tcx);
-                let Some((intrinsic_name, generic_args)) = resolve_rust_intrinsic(tcx, func_ty)
-                else {
-                    continue;
-                };
-                match intrinsic_name {
+                match intrinsic.name {
                     sym::unreachable => {
                         terminator.kind = TerminatorKind::Unreachable;
+                    }
+                    sym::ub_checks => {
+                        let target = target.unwrap();
+                        block.statements.push(Statement {
+                            source_info: terminator.source_info,
+                            kind: StatementKind::Assign(Box::new((
+                                *destination,
+                                Rvalue::NullaryOp(NullOp::UbChecks, tcx.types.bool),
+                            ))),
+                        });
+                        terminator.kind = TerminatorKind::Goto { target };
                     }
                     sym::forget => {
                         if let Some(target) = *target {
@@ -50,9 +55,9 @@ impl<'tcx> MirPass<'tcx> for LowerIntrinsics {
                             kind: StatementKind::Intrinsic(Box::new(
                                 NonDivergingIntrinsic::CopyNonOverlapping(
                                     rustc_middle::mir::CopyNonOverlapping {
-                                        src: args.next().unwrap(),
-                                        dst: args.next().unwrap(),
-                                        count: args.next().unwrap(),
+                                        src: args.next().unwrap().node,
+                                        dst: args.next().unwrap().node,
+                                        count: args.next().unwrap().node,
                                     },
                                 ),
                             )),
@@ -71,7 +76,7 @@ impl<'tcx> MirPass<'tcx> for LowerIntrinsics {
                         block.statements.push(Statement {
                             source_info: terminator.source_info,
                             kind: StatementKind::Intrinsic(Box::new(
-                                NonDivergingIntrinsic::Assume(args.next().unwrap()),
+                                NonDivergingIntrinsic::Assume(args.next().unwrap().node),
                             )),
                         });
                         assert_eq!(
@@ -85,6 +90,7 @@ impl<'tcx> MirPass<'tcx> for LowerIntrinsics {
                     sym::wrapping_add
                     | sym::wrapping_sub
                     | sym::wrapping_mul
+                    | sym::three_way_compare
                     | sym::unchecked_add
                     | sym::unchecked_sub
                     | sym::unchecked_mul
@@ -100,10 +106,11 @@ impl<'tcx> MirPass<'tcx> for LowerIntrinsics {
                             lhs = args.next().unwrap();
                             rhs = args.next().unwrap();
                         }
-                        let bin_op = match intrinsic_name {
+                        let bin_op = match intrinsic.name {
                             sym::wrapping_add => BinOp::Add,
                             sym::wrapping_sub => BinOp::Sub,
                             sym::wrapping_mul => BinOp::Mul,
+                            sym::three_way_compare => BinOp::Cmp,
                             sym::unchecked_add => BinOp::AddUnchecked,
                             sym::unchecked_sub => BinOp::SubUnchecked,
                             sym::unchecked_mul => BinOp::MulUnchecked,
@@ -117,7 +124,7 @@ impl<'tcx> MirPass<'tcx> for LowerIntrinsics {
                             source_info: terminator.source_info,
                             kind: StatementKind::Assign(Box::new((
                                 *destination,
-                                Rvalue::BinaryOp(bin_op, Box::new((lhs, rhs))),
+                                Rvalue::BinaryOp(bin_op, Box::new((lhs.node, rhs.node))),
                             ))),
                         });
                         terminator.kind = TerminatorKind::Goto { target };
@@ -131,7 +138,7 @@ impl<'tcx> MirPass<'tcx> for LowerIntrinsics {
                                 lhs = args.next().unwrap();
                                 rhs = args.next().unwrap();
                             }
-                            let bin_op = match intrinsic_name {
+                            let bin_op = match intrinsic.name {
                                 sym::add_with_overflow => BinOp::Add,
                                 sym::sub_with_overflow => BinOp::Sub,
                                 sym::mul_with_overflow => BinOp::Mul,
@@ -141,7 +148,7 @@ impl<'tcx> MirPass<'tcx> for LowerIntrinsics {
                                 source_info: terminator.source_info,
                                 kind: StatementKind::Assign(Box::new((
                                     *destination,
-                                    Rvalue::CheckedBinaryOp(bin_op, Box::new((lhs, rhs))),
+                                    Rvalue::CheckedBinaryOp(bin_op, Box::new((lhs.node, rhs.node))),
                                 ))),
                             });
                             terminator.kind = TerminatorKind::Goto { target };
@@ -150,7 +157,7 @@ impl<'tcx> MirPass<'tcx> for LowerIntrinsics {
                     sym::size_of | sym::min_align_of => {
                         if let Some(target) = *target {
                             let tp_ty = generic_args.type_at(0);
-                            let null_op = match intrinsic_name {
+                            let null_op = match intrinsic.name {
                                 sym::size_of => NullOp::SizeOf,
                                 sym::min_align_of => NullOp::AlignOf,
                                 _ => bug!("unexpected intrinsic"),
@@ -169,12 +176,16 @@ impl<'tcx> MirPass<'tcx> for LowerIntrinsics {
                         let [arg] = args.as_slice() else {
                             span_bug!(terminator.source_info.span, "Wrong number of arguments");
                         };
-                        let derefed_place =
-                            if let Some(place) = arg.place() && let Some(local) = place.as_local() {
-                                tcx.mk_place_deref(local.into())
-                            } else {
-                                span_bug!(terminator.source_info.span, "Only passing a local is supported");
-                            };
+                        let derefed_place = if let Some(place) = arg.node.place()
+                            && let Some(local) = place.as_local()
+                        {
+                            tcx.mk_place_deref(local.into())
+                        } else {
+                            span_bug!(
+                                terminator.source_info.span,
+                                "Only passing a local is supported"
+                            );
+                        };
                         // Add new statement at the end of the block that does the read, and patch
                         // up the terminator.
                         block.statements.push(Statement {
@@ -201,23 +212,27 @@ impl<'tcx> MirPass<'tcx> for LowerIntrinsics {
                                 "Wrong number of arguments for write_via_move intrinsic",
                             );
                         };
-                        let derefed_place =
-                            if let Some(place) = ptr.place() && let Some(local) = place.as_local() {
-                                tcx.mk_place_deref(local.into())
-                            } else {
-                                span_bug!(terminator.source_info.span, "Only passing a local is supported");
-                            };
+                        let derefed_place = if let Some(place) = ptr.node.place()
+                            && let Some(local) = place.as_local()
+                        {
+                            tcx.mk_place_deref(local.into())
+                        } else {
+                            span_bug!(
+                                terminator.source_info.span,
+                                "Only passing a local is supported"
+                            );
+                        };
                         block.statements.push(Statement {
                             source_info: terminator.source_info,
                             kind: StatementKind::Assign(Box::new((
                                 derefed_place,
-                                Rvalue::Use(val),
+                                Rvalue::Use(val.node),
                             ))),
                         });
                         terminator.kind = TerminatorKind::Goto { target };
                     }
                     sym::discriminant_value => {
-                        if let (Some(target), Some(arg)) = (*target, args[0].place()) {
+                        if let (Some(target), Some(arg)) = (*target, args[0].node.place()) {
                             let arg = tcx.mk_place_deref(arg);
                             block.statements.push(Statement {
                                 source_info: terminator.source_info,
@@ -241,41 +256,10 @@ impl<'tcx> MirPass<'tcx> for LowerIntrinsics {
                             source_info: terminator.source_info,
                             kind: StatementKind::Assign(Box::new((
                                 *destination,
-                                Rvalue::BinaryOp(BinOp::Offset, Box::new((ptr, delta))),
+                                Rvalue::BinaryOp(BinOp::Offset, Box::new((ptr.node, delta.node))),
                             ))),
                         });
                         terminator.kind = TerminatorKind::Goto { target };
-                    }
-                    sym::option_payload_ptr => {
-                        if let (Some(target), Some(arg)) = (*target, args[0].place()) {
-                            let ty::RawPtr(ty::TypeAndMut { ty: dest_ty, .. }) =
-                                destination.ty(local_decls, tcx).ty.kind()
-                            else {
-                                bug!();
-                            };
-
-                            block.statements.push(Statement {
-                                source_info: terminator.source_info,
-                                kind: StatementKind::Assign(Box::new((
-                                    *destination,
-                                    Rvalue::AddressOf(
-                                        Mutability::Not,
-                                        arg.project_deeper(
-                                            &[
-                                                PlaceElem::Deref,
-                                                PlaceElem::Downcast(
-                                                    Some(sym::Some),
-                                                    VariantIdx::from_u32(1),
-                                                ),
-                                                PlaceElem::Field(FieldIdx::from_u32(0), *dest_ty),
-                                            ],
-                                            tcx,
-                                        ),
-                                    ),
-                                ))),
-                            });
-                            terminator.kind = TerminatorKind::Goto { target };
-                        }
                     }
                     sym::transmute | sym::transmute_unchecked => {
                         let dst_ty = destination.ty(local_decls, tcx).ty;
@@ -293,7 +277,7 @@ impl<'tcx> MirPass<'tcx> for LowerIntrinsics {
                             source_info: terminator.source_info,
                             kind: StatementKind::Assign(Box::new((
                                 *destination,
-                                Rvalue::Cast(CastKind::Transmute, arg, dst_ty),
+                                Rvalue::Cast(CastKind::Transmute, arg.node, dst_ty),
                             ))),
                         });
 
@@ -308,16 +292,4 @@ impl<'tcx> MirPass<'tcx> for LowerIntrinsics {
             }
         }
     }
-}
-
-fn resolve_rust_intrinsic<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    func_ty: Ty<'tcx>,
-) -> Option<(Symbol, GenericArgsRef<'tcx>)> {
-    if let ty::FnDef(def_id, args) = *func_ty.kind() {
-        if tcx.is_intrinsic(def_id) {
-            return Some((tcx.item_name(def_id), args));
-        }
-    }
-    None
 }

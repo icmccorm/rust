@@ -1,5 +1,6 @@
+// skip-filecheck
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
-// compile-flags: -C overflow-checks=on
+//@ compile-flags: -C overflow-checks=on
 
 struct Point {
     x: u32,
@@ -8,7 +9,7 @@ struct Point {
 
 // EMIT_MIR_FOR_EACH_BIT_WIDTH
 // EMIT_MIR optimizes_into_variable.main.ScalarReplacementOfAggregates.diff
-// EMIT_MIR optimizes_into_variable.main.ConstProp.diff
+// EMIT_MIR optimizes_into_variable.main.GVN.diff
 // EMIT_MIR optimizes_into_variable.main.SimplifyLocals-final.after.mir
 // EMIT_MIR optimizes_into_variable.main.PreCodegen.after.mir
 fn main() {

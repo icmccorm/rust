@@ -1,5 +1,5 @@
 error: call to `set_readonly` with argument `false`
-  --> $DIR/permissions_set_readonly_false.rs:19:5
+  --> tests/ui/permissions_set_readonly_false.rs:19:5
    |
 LL |     permissions.set_readonly(false);
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -10,5 +10,5 @@ LL |     permissions.set_readonly(false);
    = note: `-D clippy::permissions-set-readonly-false` implied by `-D warnings`
    = help: to override `-D warnings` add `#[allow(clippy::permissions_set_readonly_false)]`
 
-error: aborting due to previous error
+error: aborting due to 1 previous error
 

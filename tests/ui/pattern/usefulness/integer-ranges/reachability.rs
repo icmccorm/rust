@@ -1,5 +1,6 @@
 #![feature(exclusive_range_pattern)]
 #![allow(overlapping_range_endpoints)]
+#![allow(non_contiguous_range_endpoints)]
 #![deny(unreachable_patterns)]
 
 macro_rules! m {
@@ -9,9 +10,10 @@ macro_rules! m {
             $t2 => {}
             _ => {}
         }
-    }
+    };
 }
 
+#[rustfmt::skip]
 fn main() {
     m!(0u8, 42, 41);
     m!(0u8, 42, 42); //~ ERROR unreachable pattern
@@ -85,7 +87,7 @@ fn main() {
     match 'a' {
         '\u{0}'..='\u{D7FF}' => {},
         '\u{E000}'..='\u{10_FFFF}' => {},
-        '\u{D7FF}'..='\u{E000}' => {}, // FIXME should be unreachable
+        '\u{D7FF}'..='\u{E000}' => {}, //~ ERROR unreachable pattern
     }
 
     match (0u8, true) {

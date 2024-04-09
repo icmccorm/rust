@@ -3,11 +3,15 @@
 
 use std::sync;
 
-use base_db::{impl_intern_key, salsa, CrateId, Upcast};
+use base_db::{
+    impl_intern_key,
+    salsa::{self, impl_intern_value_trivial},
+    CrateId, Upcast,
+};
 use hir_def::{
     db::DefDatabase, hir::ExprId, layout::TargetDataLayout, AdtId, BlockId, ConstParamId,
     DefWithBodyId, EnumVariantId, FunctionId, GeneralConstId, GenericDefId, ImplId,
-    LifetimeParamId, LocalFieldId, StaticId, TypeOrConstParamId, VariantId,
+    LifetimeParamId, LocalFieldId, StaticId, TypeAliasId, TypeOrConstParamId, VariantId,
 };
 use la_arena::ArenaMap;
 use smallvec::SmallVec;
@@ -19,20 +23,18 @@ use crate::{
     layout::{Layout, LayoutError},
     method_resolution::{InherentImpls, TraitImpls, TyFingerprint},
     mir::{BorrowckResult, MirBody, MirLowerError},
-    Binders, CallableDefId, ClosureId, Const, FnDefId, GenericArg, ImplTraitId, InferenceResult,
-    Interner, PolyFnSig, QuantifiedWhereClause, ReturnTypeImplTraits, Substitution, TraitRef, Ty,
-    TyDefId, ValueTyDefId,
+    Binders, CallableDefId, ClosureId, Const, FnDefId, GenericArg, ImplTraitId, ImplTraits,
+    InferenceResult, Interner, PolyFnSig, QuantifiedWhereClause, Substitution, TraitEnvironment,
+    TraitRef, Ty, TyDefId, ValueTyDefId,
 };
 use hir_expand::name::Name;
 
 #[salsa::query_group(HirDatabaseStorage)]
 pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
-    #[salsa::invoke(infer_wait)]
-    #[salsa::transparent]
+    #[salsa::invoke(crate::infer::infer_query)]
     fn infer(&self, def: DefWithBodyId) -> Arc<InferenceResult>;
 
-    #[salsa::invoke(crate::infer::infer_query)]
-    fn infer_query(&self, def: DefWithBodyId) -> Arc<InferenceResult>;
+    // region:mir
 
     #[salsa::invoke(crate::mir::mir_body_query)]
     #[salsa::cycle(crate::mir::mir_body_recover)]
@@ -47,7 +49,7 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
         &self,
         def: DefWithBodyId,
         subst: Substitution,
-        env: Arc<crate::TraitEnvironment>,
+        env: Arc<TraitEnvironment>,
     ) -> Result<Arc<MirBody>, MirLowerError>;
 
     #[salsa::invoke(crate::mir::monomorphized_mir_body_for_closure_query)]
@@ -55,25 +57,11 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
         &self,
         def: ClosureId,
         subst: Substitution,
-        env: Arc<crate::TraitEnvironment>,
+        env: Arc<TraitEnvironment>,
     ) -> Result<Arc<MirBody>, MirLowerError>;
 
     #[salsa::invoke(crate::mir::borrowck_query)]
     fn borrowck(&self, def: DefWithBodyId) -> Result<Arc<[BorrowckResult]>, MirLowerError>;
-
-    #[salsa::invoke(crate::lower::ty_query)]
-    #[salsa::cycle(crate::lower::ty_recover)]
-    fn ty(&self, def: TyDefId) -> Binders<Ty>;
-
-    #[salsa::invoke(crate::lower::value_ty_query)]
-    fn value_ty(&self, def: ValueTyDefId) -> Binders<Ty>;
-
-    #[salsa::invoke(crate::lower::impl_self_ty_query)]
-    #[salsa::cycle(crate::lower::impl_self_ty_recover)]
-    fn impl_self_ty(&self, def: ImplId) -> Binders<Ty>;
-
-    #[salsa::invoke(crate::lower::const_param_ty_query)]
-    fn const_param_ty(&self, def: ConstParamId) -> Ty;
 
     #[salsa::invoke(crate::consteval::const_eval_query)]
     #[salsa::cycle(crate::consteval::const_eval_recover)]
@@ -81,7 +69,7 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
         &self,
         def: GeneralConstId,
         subst: Substitution,
-        trait_env: Option<Arc<crate::TraitEnvironment>>,
+        trait_env: Option<Arc<TraitEnvironment>>,
     ) -> Result<Const, ConstEvalError>;
 
     #[salsa::invoke(crate::consteval::const_eval_static_query)]
@@ -91,6 +79,24 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
     #[salsa::invoke(crate::consteval::const_eval_discriminant_variant)]
     #[salsa::cycle(crate::consteval::const_eval_discriminant_recover)]
     fn const_eval_discriminant(&self, def: EnumVariantId) -> Result<i128, ConstEvalError>;
+
+    // endregion:mir
+
+    #[salsa::invoke(crate::lower::ty_query)]
+    #[salsa::cycle(crate::lower::ty_recover)]
+    fn ty(&self, def: TyDefId) -> Binders<Ty>;
+
+    /// Returns the type of the value of the given constant, or `None` if the `ValueTyDefId` is
+    /// a `StructId` or `EnumVariantId` with a record constructor.
+    #[salsa::invoke(crate::lower::value_ty_query)]
+    fn value_ty(&self, def: ValueTyDefId) -> Option<Binders<Ty>>;
+
+    #[salsa::invoke(crate::lower::impl_self_ty_query)]
+    #[salsa::cycle(crate::lower::impl_self_ty_recover)]
+    fn impl_self_ty(&self, def: ImplId) -> Binders<Ty>;
+
+    #[salsa::invoke(crate::lower::const_param_ty_query)]
+    fn const_param_ty(&self, def: ConstParamId) -> Ty;
 
     #[salsa::invoke(crate::lower::impl_trait_query)]
     fn impl_trait(&self, def: ImplId) -> Option<Binders<TraitRef>>;
@@ -104,24 +110,20 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
         &self,
         def: AdtId,
         subst: Substitution,
-        env: Arc<crate::TraitEnvironment>,
+        env: Arc<TraitEnvironment>,
     ) -> Result<Arc<Layout>, LayoutError>;
 
     #[salsa::invoke(crate::layout::layout_of_ty_query)]
     #[salsa::cycle(crate::layout::layout_of_ty_recover)]
-    fn layout_of_ty(
-        &self,
-        ty: Ty,
-        env: Arc<crate::TraitEnvironment>,
-    ) -> Result<Arc<Layout>, LayoutError>;
+    fn layout_of_ty(&self, ty: Ty, env: Arc<TraitEnvironment>) -> Result<Arc<Layout>, LayoutError>;
 
     #[salsa::invoke(crate::layout::target_data_layout_query)]
-    fn target_data_layout(&self, krate: CrateId) -> Option<Arc<TargetDataLayout>>;
+    fn target_data_layout(&self, krate: CrateId) -> Result<Arc<TargetDataLayout>, Arc<str>>;
 
     #[salsa::invoke(crate::method_resolution::lookup_impl_method_query)]
     fn lookup_impl_method(
         &self,
-        env: Arc<crate::TraitEnvironment>,
+        env: Arc<TraitEnvironment>,
         func: FunctionId,
         fn_subst: Substitution,
     ) -> (FunctionId, Substitution);
@@ -130,10 +132,10 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
     fn callable_item_signature(&self, def: CallableDefId) -> PolyFnSig;
 
     #[salsa::invoke(crate::lower::return_type_impl_traits)]
-    fn return_type_impl_traits(
-        &self,
-        def: FunctionId,
-    ) -> Option<Arc<Binders<ReturnTypeImplTraits>>>;
+    fn return_type_impl_traits(&self, def: FunctionId) -> Option<Arc<Binders<ImplTraits>>>;
+
+    #[salsa::invoke(crate::lower::type_alias_impl_traits)]
+    fn type_alias_impl_traits(&self, def: TypeAliasId) -> Option<Arc<Binders<ImplTraits>>>;
 
     #[salsa::invoke(crate::lower::generic_predicates_for_param_query)]
     #[salsa::cycle(crate::lower::generic_predicates_for_param_recover)]
@@ -149,10 +151,10 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
 
     #[salsa::invoke(crate::lower::trait_environment_for_body_query)]
     #[salsa::transparent]
-    fn trait_environment_for_body(&self, def: DefWithBodyId) -> Arc<crate::TraitEnvironment>;
+    fn trait_environment_for_body(&self, def: DefWithBodyId) -> Arc<TraitEnvironment>;
 
     #[salsa::invoke(crate::lower::trait_environment_query)]
-    fn trait_environment(&self, def: GenericDefId) -> Arc<crate::TraitEnvironment>;
+    fn trait_environment(&self, def: GenericDefId) -> Arc<TraitEnvironment>;
 
     #[salsa::invoke(crate::lower::generic_defaults_query)]
     #[salsa::cycle(crate::lower::generic_defaults_recover)]
@@ -162,7 +164,7 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
     fn inherent_impls_in_crate(&self, krate: CrateId) -> Arc<InherentImpls>;
 
     #[salsa::invoke(InherentImpls::inherent_impls_in_block_query)]
-    fn inherent_impls_in_block(&self, block: BlockId) -> Arc<InherentImpls>;
+    fn inherent_impls_in_block(&self, block: BlockId) -> Option<Arc<InherentImpls>>;
 
     /// Collects all crates in the dependency graph that have impls for the
     /// given fingerprint. This is only used for primitive types and types
@@ -179,7 +181,7 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
     fn trait_impls_in_crate(&self, krate: CrateId) -> Arc<TraitImpls>;
 
     #[salsa::invoke(TraitImpls::trait_impls_in_block_query)]
-    fn trait_impls_in_block(&self, block: BlockId) -> Arc<TraitImpls>;
+    fn trait_impls_in_block(&self, block: BlockId) -> Option<Arc<TraitImpls>>;
 
     #[salsa::invoke(TraitImpls::trait_impls_in_deps_query)]
     fn trait_impls_in_deps(&self, krate: CrateId) -> Arc<[Arc<TraitImpls>]>;
@@ -197,9 +199,9 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
     #[salsa::interned]
     fn intern_impl_trait_id(&self, id: ImplTraitId) -> InternedOpaqueTyId;
     #[salsa::interned]
-    fn intern_closure(&self, id: (DefWithBodyId, ExprId)) -> InternedClosureId;
+    fn intern_closure(&self, id: InternedClosure) -> InternedClosureId;
     #[salsa::interned]
-    fn intern_generator(&self, id: (DefWithBodyId, ExprId)) -> InternedGeneratorId;
+    fn intern_coroutine(&self, id: InternedCoroutine) -> InternedCoroutineId;
 
     #[salsa::invoke(chalk_db::associated_ty_data_query)]
     fn associated_ty_data(
@@ -214,12 +216,12 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
         trait_id: chalk_db::TraitId,
     ) -> sync::Arc<chalk_db::TraitDatum>;
 
-    #[salsa::invoke(chalk_db::struct_datum_query)]
-    fn struct_datum(
+    #[salsa::invoke(chalk_db::adt_datum_query)]
+    fn adt_datum(
         &self,
         krate: CrateId,
         struct_id: chalk_db::AdtId,
-    ) -> sync::Arc<chalk_db::StructDatum>;
+    ) -> sync::Arc<chalk_db::AdtDatum>;
 
     #[salsa::invoke(chalk_db::impl_datum_query)]
     fn impl_datum(
@@ -249,20 +251,11 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
     fn normalize_projection(
         &self,
         projection: crate::ProjectionTy,
-        env: Arc<crate::TraitEnvironment>,
+        env: Arc<TraitEnvironment>,
     ) -> Ty;
 
-    #[salsa::invoke(trait_solve_wait)]
-    #[salsa::transparent]
-    fn trait_solve(
-        &self,
-        krate: CrateId,
-        block: Option<BlockId>,
-        goal: crate::Canonical<crate::InEnvironment<crate::Goal>>,
-    ) -> Option<crate::Solution>;
-
     #[salsa::invoke(crate::traits::trait_solve_query)]
-    fn trait_solve_query(
+    fn trait_solve(
         &self,
         krate: CrateId,
         block: Option<BlockId>,
@@ -276,37 +269,6 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
         block: Option<BlockId>,
         env: chalk_ir::Environment<Interner>,
     ) -> chalk_ir::ProgramClauses<Interner>;
-}
-
-fn infer_wait(db: &dyn HirDatabase, def: DefWithBodyId) -> Arc<InferenceResult> {
-    let _p = profile::span("infer:wait").detail(|| match def {
-        DefWithBodyId::FunctionId(it) => db.function_data(it).name.display(db.upcast()).to_string(),
-        DefWithBodyId::StaticId(it) => {
-            db.static_data(it).name.clone().display(db.upcast()).to_string()
-        }
-        DefWithBodyId::ConstId(it) => db
-            .const_data(it)
-            .name
-            .clone()
-            .unwrap_or_else(Name::missing)
-            .display(db.upcast())
-            .to_string(),
-        DefWithBodyId::VariantId(it) => {
-            db.enum_data(it.parent).variants[it.local_id].name.display(db.upcast()).to_string()
-        }
-        DefWithBodyId::InTypeConstId(it) => format!("in type const {it:?}"),
-    });
-    db.infer_query(def)
-}
-
-fn trait_solve_wait(
-    db: &dyn HirDatabase,
-    krate: CrateId,
-    block: Option<BlockId>,
-    goal: crate::Canonical<crate::InEnvironment<crate::Goal>>,
-) -> Option<crate::Solution> {
-    let _p = profile::span("trait_solve::wait");
-    db.trait_solve_query(krate, block, goal)
 }
 
 #[test]
@@ -335,8 +297,16 @@ pub struct InternedClosureId(salsa::InternId);
 impl_intern_key!(InternedClosureId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct InternedGeneratorId(salsa::InternId);
-impl_intern_key!(InternedGeneratorId);
+pub struct InternedClosure(pub DefWithBodyId, pub ExprId);
+impl_intern_value_trivial!(InternedClosure);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InternedCoroutineId(salsa::InternId);
+impl_intern_key!(InternedCoroutineId);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InternedCoroutine(pub DefWithBodyId, pub ExprId);
+impl_intern_value_trivial!(InternedCoroutine);
 
 /// This exists just for Chalk, because Chalk just has a single `FnDefId` where
 /// we have different IDs for struct and enum variant constructors.

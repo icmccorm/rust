@@ -7,12 +7,11 @@
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/borrow_check.html
 
 use crate::ty::TyCtxt;
-use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::unord::UnordMap;
 use rustc_hir as hir;
 use rustc_hir::{HirIdMap, Node};
 use rustc_macros::HashStable;
-use rustc_query_system::ich::StableHashingContext;
 use rustc_span::{Span, DUMMY_SP};
 
 use std::fmt;
@@ -77,7 +76,7 @@ use std::ops::Deref;
 /// picture, but rather the ending point.
 //
 // FIXME(pnkfelix): this currently derives `PartialOrd` and `Ord` to
-// placate the same deriving in `ty::FreeRegion`, but we may want to
+// placate the same deriving in `ty::LateParamRegion`, but we may want to
 // actually attach a more meaningful ordering to scopes than the one
 // generated via deriving here.
 #[derive(Clone, PartialEq, PartialOrd, Eq, Ord, Hash, Copy, TyEncodable, TyDecodable)]
@@ -148,6 +147,8 @@ rustc_index::newtype_index! {
     /// * The subscope with `first_statement_index == 1` is scope of `c`,
     ///   and thus does not include EXPR_2, but covers the `...`.
     #[derive(HashStable)]
+    #[encodable]
+    #[orderable]
     pub struct FirstStatementIndex {}
 }
 
@@ -178,7 +179,7 @@ impl Scope {
         };
         let span = tcx.hir().span(hir_id);
         if let ScopeData::Remainder(first_statement_index) = self.data {
-            if let Node::Block(ref blk) = tcx.hir().get(hir_id) {
+            if let Node::Block(blk) = tcx.hir_node(hir_id) {
                 // Want span for scope starting after the
                 // indexed statement and ending at end of
                 // `blk`; reuse span of `blk` and shift `lo`
@@ -203,7 +204,7 @@ impl Scope {
 pub type ScopeDepth = u32;
 
 /// The region scope tree encodes information about region relationships.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, HashStable)]
 pub struct ScopeTree {
     /// If not empty, this body is the root of this region hierarchy.
     pub root_body: Option<hir::HirId>,
@@ -219,9 +220,6 @@ pub struct ScopeTree {
     /// Maps from a variable or binding ID to the block in which that
     /// variable is declared.
     var_map: FxIndexMap<hir::ItemLocalId, Scope>,
-
-    /// Maps from a `NodeId` to the associated destruction scope (if any).
-    destruction_scopes: FxIndexMap<hir::ItemLocalId, Scope>,
 
     /// Identifies expressions which, if captured into a temporary, ought to
     /// have a temporary whose lifetime extends to the end of the enclosing *block*,
@@ -304,12 +302,7 @@ pub struct ScopeTree {
     /// The reason is that semantically, until the `box` expression returns,
     /// the values are still owned by their containing expressions. So
     /// we'll see that `&x`.
-    pub yield_in_scope: FxHashMap<Scope, Vec<YieldData>>,
-
-    /// The number of visit_expr and visit_pat calls done in the body.
-    /// Used to sanity check visit_expr/visit_pat call count when
-    /// calculating generator interiors.
-    pub body_expr_count: FxHashMap<hir::BodyId, usize>,
+    pub yield_in_scope: UnordMap<Scope, Vec<YieldData>>,
 }
 
 /// Identifies the reason that a given expression is an rvalue candidate
@@ -340,15 +333,6 @@ impl ScopeTree {
             let prev = self.parent_map.insert(child, p);
             assert!(prev.is_none());
         }
-
-        // Record the destruction scopes for later so we can query them.
-        if let ScopeData::Destruction = child.data {
-            self.destruction_scopes.insert(child.item_local_id(), child);
-        }
-    }
-
-    pub fn opt_destruction_scope(&self, n: hir::ItemLocalId) -> Option<Scope> {
-        self.destruction_scopes.get(&n).cloned()
     }
 
     pub fn record_var_scope(&mut self, var: hir::ItemLocalId, lifetime: Scope) {
@@ -409,34 +393,5 @@ impl ScopeTree {
     /// returns `Some(YieldData)`. If not, returns `None`.
     pub fn yield_in_scope(&self, scope: Scope) -> Option<&[YieldData]> {
         self.yield_in_scope.get(&scope).map(Deref::deref)
-    }
-
-    /// Gives the number of expressions visited in a body.
-    /// Used to sanity check visit_expr call count when
-    /// calculating generator interiors.
-    pub fn body_expr_count(&self, body_id: hir::BodyId) -> Option<usize> {
-        self.body_expr_count.get(&body_id).copied()
-    }
-}
-
-impl<'a> HashStable<StableHashingContext<'a>> for ScopeTree {
-    fn hash_stable(&self, hcx: &mut StableHashingContext<'a>, hasher: &mut StableHasher) {
-        let ScopeTree {
-            root_body,
-            ref body_expr_count,
-            ref parent_map,
-            ref var_map,
-            ref destruction_scopes,
-            ref rvalue_candidates,
-            ref yield_in_scope,
-        } = *self;
-
-        root_body.hash_stable(hcx, hasher);
-        body_expr_count.hash_stable(hcx, hasher);
-        parent_map.hash_stable(hcx, hasher);
-        var_map.hash_stable(hcx, hasher);
-        destruction_scopes.hash_stable(hcx, hasher);
-        rvalue_candidates.hash_stable(hcx, hasher);
-        yield_in_scope.hash_stable(hcx, hasher);
     }
 }

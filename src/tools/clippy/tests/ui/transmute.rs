@@ -1,4 +1,9 @@
-#![allow(dead_code, clippy::borrow_as_ptr, clippy::needless_lifetimes)]
+#![allow(
+    dead_code,
+    clippy::borrow_as_ptr,
+    clippy::needless_lifetimes,
+    clippy::missing_transmute_annotations
+)]
 //@no-rustfix
 extern crate core;
 
@@ -100,19 +105,6 @@ fn crosspointer() {
         let _: *mut Usize = core::intrinsics::transmute(my_int());
         //~^ ERROR: transmute from a type (`Usize`) to a pointer to that type (`*mut Usize
     }
-}
-
-#[warn(clippy::transmute_int_to_char)]
-fn int_to_char() {
-    let _: char = unsafe { std::mem::transmute(0_u32) };
-    //~^ ERROR: transmute from a `u32` to a `char`
-    //~| NOTE: `-D clippy::transmute-int-to-char` implied by `-D warnings`
-    let _: char = unsafe { std::mem::transmute(0_i32) };
-    //~^ ERROR: transmute from a `i32` to a `char`
-
-    // These shouldn't warn
-    const _: char = unsafe { std::mem::transmute(0_u32) };
-    const _: char = unsafe { std::mem::transmute(0_i32) };
 }
 
 #[warn(clippy::transmute_int_to_bool)]

@@ -88,11 +88,10 @@
 //! DefPaths which are much more robust in the face of changes to the code base.
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(never_type)]
-#![recursion_limit = "256"]
-#![allow(rustc::potential_query_instability)]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
+#![doc(rust_logo)]
+#![feature(rustdoc_internals)]
+#![feature(let_chains)]
+#![allow(internal_features)]
 
 #[macro_use]
 extern crate rustc_middle;
@@ -100,8 +99,6 @@ extern crate rustc_middle;
 #[macro_use]
 extern crate tracing;
 
-use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
-use rustc_fluent_macro::fluent_messages;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
@@ -111,14 +108,13 @@ use rustc_middle::query::Providers;
 use rustc_middle::ty::{self, Instance, TyCtxt};
 use rustc_session::config::SymbolManglingVersion;
 
+mod hashed;
 mod legacy;
 mod v0;
 
 pub mod errors;
 pub mod test;
 pub mod typeid;
-
-fluent_messages! { "../messages.ftl" }
 
 /// This function computes the symbol name for the given `instance` and the
 /// given instantiating crate. That is, if you know that instance X is
@@ -235,7 +231,7 @@ fn compute_symbol_name<'tcx>(
     // and we want to be sure to avoid any symbol conflicts here.
     let is_globally_shared_function = matches!(
         tcx.def_kind(instance.def_id()),
-        DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::Generator | DefKind::Ctor(..)
+        DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::Ctor(..)
     ) && matches!(
         MonoItem::Fn(instance).instantiation_mode(tcx),
         InstantiationMode::GloballyShared { may_conflict: true }
@@ -267,6 +263,9 @@ fn compute_symbol_name<'tcx>(
     let symbol = match mangling_version {
         SymbolManglingVersion::Legacy => legacy::mangle(tcx, instance, instantiating_crate),
         SymbolManglingVersion::V0 => v0::mangle(tcx, instance, instantiating_crate),
+        SymbolManglingVersion::Hashed => hashed::mangle(tcx, instance, instantiating_crate, || {
+            v0::mangle(tcx, instance, instantiating_crate)
+        }),
     };
 
     debug_assert!(

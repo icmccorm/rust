@@ -12,24 +12,27 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-tracing = "0.1.35"
-rustc-hash = "1.1.0"
-cargo_metadata = "0.15.0"
-semver = "1.0.14"
+anyhow.workspace = true
+cargo_metadata.workspace = true
+rustc-hash.workspace = true
+semver.workspace = true
 serde_json.workspace = true
 serde.workspace = true
+tracing.workspace = true
 triomphe.workspace = true
-anyhow = "1.0.62"
 la-arena.workspace = true
-itertools = "0.10.5"
+itertools.workspace = true
 
 # local deps
 base-db.workspace = true
+span.workspace = true
 cfg.workspace = true
-paths.workspace = true
-profile.workspace = true
+paths = { workspace = true, features = ["serde1"] }
 stdx.workspace = true
 toolchain.workspace = true
 
 [dev-dependencies]
 expect-test = "1.4.0"
+
+[lints]
+workspace = true

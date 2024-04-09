@@ -1,4 +1,5 @@
-// unit-test: MatchBranchSimplification
+// skip-filecheck
+//@ unit-test: MatchBranchSimplification
 
 
 // EMIT_MIR matches_reduce_branches.foo.MatchBranchSimplification.diff

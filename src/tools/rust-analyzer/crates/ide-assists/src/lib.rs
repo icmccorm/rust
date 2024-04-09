@@ -58,12 +58,7 @@
 //! See also this post:
 //! <https://rust-analyzer.github.io/blog/2020/09/28/how-to-make-a-light-bulb.html>
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
-
-#[allow(unused)]
-macro_rules! eprintln {
-    ($($tt:tt)*) => { stdx::eprintln!($($tt)*) };
-}
+#![warn(rust_2018_idioms, unused_lifetimes)]
 
 mod assist_config;
 mod assist_context;
@@ -111,10 +106,13 @@ mod handlers {
     mod add_label_to_loop;
     mod add_lifetime_to_type;
     mod add_missing_impl_members;
+    mod add_missing_match_arms;
+    mod add_return_type;
     mod add_turbo_fish;
     mod apply_demorgan;
     mod auto_import;
     mod bind_unused_param;
+    mod bool_to_enum;
     mod change_visibility;
     mod convert_bool_then;
     mod convert_comment_block;
@@ -123,14 +121,16 @@ mod handlers {
     mod convert_iter_for_each_to_for;
     mod convert_let_else_to_match;
     mod convert_match_to_let_else;
-    mod convert_nested_function_to_closure;
-    mod convert_tuple_struct_to_named_struct;
     mod convert_named_struct_to_tuple_struct;
+    mod convert_nested_function_to_closure;
     mod convert_to_guarded_return;
+    mod convert_tuple_return_type_to_struct;
+    mod convert_tuple_struct_to_named_struct;
     mod convert_two_arm_bool_match_to_matches_macro;
     mod convert_while_to_loop;
-    mod desugar_doc_comment;
+    mod destructure_struct_binding;
     mod destructure_tuple_binding;
+    mod desugar_doc_comment;
     mod expand_glob_import;
     mod extract_expressions_from_format_string;
     mod extract_function;
@@ -138,7 +138,7 @@ mod handlers {
     mod extract_struct_from_enum_variant;
     mod extract_type_alias;
     mod extract_variable;
-    mod add_missing_match_arms;
+    mod fill_record_pattern_fields;
     mod fix_visibility;
     mod flip_binexpr;
     mod flip_comma;
@@ -146,6 +146,7 @@ mod handlers {
     mod generate_constant;
     mod generate_default_from_enum_variant;
     mod generate_default_from_new;
+    mod generate_delegate_methods;
     mod generate_delegate_trait;
     mod generate_deref;
     mod generate_derive;
@@ -158,61 +159,64 @@ mod handlers {
     mod generate_getter_or_setter;
     mod generate_impl;
     mod generate_is_empty_from_len;
+    mod generate_mut_trait_impl;
     mod generate_new;
-    mod generate_delegate_methods;
     mod generate_trait_from_impl;
-    mod add_return_type;
     mod inline_call;
     mod inline_const_as_literal;
     mod inline_local_variable;
     mod inline_macro;
     mod inline_type_alias;
+    mod into_to_qualified_from;
+    mod introduce_named_generic;
     mod introduce_named_lifetime;
     mod invert_if;
     mod merge_imports;
     mod merge_match_arms;
+    mod merge_nested_if;
     mod move_bounds;
     mod move_const_to_impl;
+    mod move_from_mod_rs;
     mod move_guard;
     mod move_module_to_file;
     mod move_to_mod_rs;
-    mod move_from_mod_rs;
+    mod normalize_import;
     mod number_representation;
     mod promote_local_to_const;
     mod pull_assignment_up;
-    mod qualify_path;
     mod qualify_method_call;
+    mod qualify_path;
     mod raw_string;
     mod remove_dbg;
     mod remove_mut;
+    mod remove_parentheses;
     mod remove_unused_imports;
     mod remove_unused_param;
-    mod remove_parentheses;
     mod reorder_fields;
     mod reorder_impl_items;
-    mod replace_try_expr_with_match;
+    mod replace_arith_op;
     mod replace_derive_with_manual_impl;
     mod replace_if_let_with_match;
-    mod replace_method_eager_lazy;
-    mod replace_arith_op;
-    mod introduce_named_generic;
+    mod replace_is_method_with_if_let_method;
     mod replace_let_with_if_let;
+    mod replace_method_eager_lazy;
     mod replace_named_generic_with_impl;
     mod replace_qualified_name_with_use;
     mod replace_string_with_char;
+    mod replace_try_expr_with_match;
     mod replace_turbofish_with_explicit_type;
-    mod split_import;
-    mod unmerge_match_arm;
-    mod unwrap_tuple;
     mod sort_items;
+    mod split_import;
+    mod term_search;
     mod toggle_ignore;
+    mod unmerge_match_arm;
     mod unmerge_use;
     mod unnecessary_async;
+    mod unqualify_method_call;
     mod unwrap_block;
     mod unwrap_result_return_type;
-    mod unqualify_method_call;
+    mod unwrap_tuple;
     mod wrap_return_type_in_result;
-    mod into_to_qualified_from;
 
     pub(crate) fn all() -> &'static [Handler] {
         &[
@@ -225,8 +229,10 @@ mod handlers {
             add_return_type::add_return_type,
             add_turbo_fish::add_turbo_fish,
             apply_demorgan::apply_demorgan,
+            apply_demorgan::apply_demorgan_iterator,
             auto_import::auto_import,
             bind_unused_param::bind_unused_param,
+            bool_to_enum::bool_to_enum,
             change_visibility::change_visibility,
             convert_bool_then::convert_bool_then_to_if,
             convert_bool_then::convert_if_to_bool_then,
@@ -237,6 +243,7 @@ mod handlers {
             convert_iter_for_each_to_for::convert_for_loop_with_for_each,
             convert_let_else_to_match::convert_let_else_to_match,
             convert_match_to_let_else::convert_match_to_let_else,
+            convert_tuple_return_type_to_struct::convert_tuple_return_type_to_struct,
             convert_named_struct_to_tuple_struct::convert_named_struct_to_tuple_struct,
             convert_nested_function_to_closure::convert_nested_function_to_closure,
             convert_to_guarded_return::convert_to_guarded_return,
@@ -245,10 +252,12 @@ mod handlers {
             convert_while_to_loop::convert_while_to_loop,
             desugar_doc_comment::desugar_doc_comment,
             destructure_tuple_binding::destructure_tuple_binding,
+            destructure_struct_binding::destructure_struct_binding,
             expand_glob_import::expand_glob_import,
             extract_expressions_from_format_string::extract_expressions_from_format_string,
             extract_struct_from_enum_variant::extract_struct_from_enum_variant,
             extract_type_alias::extract_type_alias,
+            fill_record_pattern_fields::fill_record_pattern_fields,
             fix_visibility::fix_visibility,
             flip_binexpr::flip_binexpr,
             flip_comma::flip_comma,
@@ -268,6 +277,7 @@ mod handlers {
             generate_function::generate_function,
             generate_impl::generate_impl,
             generate_impl::generate_trait_impl,
+            generate_mut_trait_impl::generate_mut_trait_impl,
             generate_is_empty_from_len::generate_is_empty_from_len,
             generate_new::generate_new,
             generate_trait_from_impl::generate_trait_from_impl,
@@ -283,6 +293,7 @@ mod handlers {
             invert_if::invert_if,
             merge_imports::merge_imports,
             merge_match_arms::merge_match_arms,
+            merge_nested_if::merge_nested_if,
             move_bounds::move_bounds_to_where_clause,
             move_const_to_impl::move_const_to_impl,
             move_guard::move_arm_cond_to_match_guard,
@@ -290,6 +301,7 @@ mod handlers {
             move_module_to_file::move_module_to_file,
             move_to_mod_rs::move_to_mod_rs,
             move_from_mod_rs::move_from_mod_rs,
+            normalize_import::normalize_import,
             number_representation::reformat_number_literal,
             pull_assignment_up::pull_assignment_up,
             promote_local_to_const::promote_local_to_const,
@@ -308,6 +320,7 @@ mod handlers {
             replace_derive_with_manual_impl::replace_derive_with_manual_impl,
             replace_if_let_with_match::replace_if_let_with_match,
             replace_if_let_with_match::replace_match_with_if_let,
+            replace_is_method_with_if_let_method::replace_is_method_with_if_let_method,
             replace_let_with_if_let::replace_let_with_if_let,
             replace_method_eager_lazy::replace_with_eager_method,
             replace_method_eager_lazy::replace_with_lazy_method,
@@ -319,6 +332,7 @@ mod handlers {
             replace_arith_op::replace_arith_with_saturating,
             sort_items::sort_items,
             split_import::split_import,
+            term_search::term_search,
             toggle_ignore::toggle_ignore,
             unmerge_match_arm::unmerge_match_arm,
             unmerge_use::unmerge_use,

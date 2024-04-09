@@ -1,5 +1,6 @@
 //@aux-build:proc_macros.rs
 #![allow(irrefutable_let_patterns, nonstandard_style, unused)]
+#![allow(clippy::struct_field_names)]
 #![warn(clippy::min_ident_chars)]
 
 extern crate proc_macros;
@@ -35,6 +36,12 @@ struct Vec4 {
 }
 
 struct AA<T, E>(T, E);
+
+trait Trait {
+    const A: u32 = 0;
+    type A;
+    fn a() {}
+}
 
 fn main() {
     // Allowed idents

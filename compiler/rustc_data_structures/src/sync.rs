@@ -20,6 +20,7 @@
 //! | ----------------------- | ------------------- | ------------------------------- |
 //! | `Lrc<T>`                | `rc::Rc<T>`         | `sync::Arc<T>`                  |
 //! |` Weak<T>`               | `rc::Weak<T>`       | `sync::Weak<T>`                 |
+//! | `LRef<'a, T>` [^2]      | `&'a mut T`         | `&'a T`                         |
 //! |                         |                     |                                 |
 //! | `AtomicBool`            | `Cell<bool>`        | `atomic::AtomicBool`            |
 //! | `AtomicU32`             | `Cell<u32>`         | `atomic::AtomicU32`             |
@@ -38,12 +39,11 @@
 //! of a `RefCell`. This is appropriate when interior mutability is not
 //! required.
 //!
-//! [^2] `MTLockRef` is a typedef.
+//! [^2] `MTRef`, `MTLockRef` are type aliases.
 
 pub use crate::marker::*;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash};
-use std::ops::{Deref, DerefMut};
 
 mod lock;
 pub use lock::{Lock, LockGuard, Mode};
@@ -54,10 +54,7 @@ pub use worker_local::{Registry, WorkerLocal};
 mod parallel;
 #[cfg(parallel_compiler)]
 pub use parallel::scope;
-pub use parallel::{join, par_for_each_in, par_map, parallel_guard};
-
-pub use std::sync::atomic::Ordering;
-pub use std::sync::atomic::Ordering::SeqCst;
+pub use parallel::{join, par_for_each_in, par_map, parallel_guard, try_par_for_each_in};
 
 pub use vec::{AppendOnlyIndexVec, AppendOnlyVec};
 
@@ -67,8 +64,7 @@ mod freeze;
 pub use freeze::{FreezeLock, FreezeReadGuard, FreezeWriteGuard};
 
 mod mode {
-    use super::Ordering;
-    use std::sync::atomic::AtomicU8;
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     const UNINITIALIZED: u8 = 0;
     const DYN_NOT_THREAD_SAFE: u8 = 1;
@@ -109,10 +105,11 @@ mod mode {
 
 pub use mode::{is_dyn_thread_safe, set_dyn_thread_safe_mode};
 
-cfg_if! {
-    if #[cfg(not(parallel_compiler))] {
+cfg_match! {
+    cfg(not(parallel_compiler)) => {
         use std::ops::Add;
         use std::cell::Cell;
+        use std::sync::atomic::Ordering;
 
         pub unsafe auto trait Send {}
         pub unsafe auto trait Sync {}
@@ -212,7 +209,7 @@ cfg_if! {
 
         use std::cell::RefCell as InnerRwLock;
 
-        pub type MTLockRef<'a, T> = &'a mut MTLock<T>;
+        pub type LRef<'a, T> = &'a mut T;
 
         #[derive(Debug, Default)]
         pub struct MTLock<T>(T);
@@ -251,7 +248,8 @@ cfg_if! {
                 MTLock(self.0.clone())
             }
         }
-    } else {
+    }
+    _ => {
         pub use std::marker::Send as Send;
         pub use std::marker::Sync as Sync;
 
@@ -264,12 +262,20 @@ cfg_if! {
 
         pub use std::sync::OnceLock;
 
-        pub use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU32, AtomicU64};
+        pub use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU32};
+
+        // PowerPC and MIPS platforms with 32-bit pointers do not
+        // have AtomicU64 type.
+        #[cfg(not(any(target_arch = "powerpc", target_arch = "mips")))]
+        pub use std::sync::atomic::AtomicU64;
+
+        #[cfg(any(target_arch = "powerpc", target_arch = "mips"))]
+        pub use portable_atomic::AtomicU64;
 
         pub use std::sync::Arc as Lrc;
         pub use std::sync::Weak as Weak;
 
-        pub type MTLockRef<'a, T> = &'a MTLock<T>;
+        pub type LRef<'a, T> = &'a T;
 
         #[derive(Debug, Default)]
         pub struct MTLock<T>(Lock<T>);
@@ -303,13 +309,13 @@ cfg_if! {
 
         use parking_lot::RwLock as InnerRwLock;
 
-        use std::thread;
-
         /// This makes locks panic if they are already held.
         /// It is only useful when you are running in a single thread
         const ERROR_CHECKING: bool = false;
     }
 }
+
+pub type MTLockRef<'a, T> = LRef<'a, MTLock<T>>;
 
 #[derive(Default)]
 #[cfg_attr(parallel_compiler, repr(align(64)))]
@@ -426,7 +432,7 @@ impl<T> RwLock<T> {
     #[inline(always)]
     pub fn leak(&self) -> &T {
         let guard = self.read();
-        let ret = unsafe { &*(&*guard as *const T) };
+        let ret = unsafe { &*std::ptr::addr_of!(*guard) };
         std::mem::forget(guard);
         ret
     }
@@ -437,58 +443,5 @@ impl<T: Clone> Clone for RwLock<T> {
     #[inline]
     fn clone(&self) -> Self {
         RwLock::new(self.borrow().clone())
-    }
-}
-
-/// A type which only allows its inner value to be used in one thread.
-/// It will panic if it is used on multiple threads.
-#[derive(Debug)]
-pub struct OneThread<T> {
-    #[cfg(parallel_compiler)]
-    thread: thread::ThreadId,
-    inner: T,
-}
-
-#[cfg(parallel_compiler)]
-unsafe impl<T> std::marker::Sync for OneThread<T> {}
-#[cfg(parallel_compiler)]
-unsafe impl<T> std::marker::Send for OneThread<T> {}
-
-impl<T> OneThread<T> {
-    #[inline(always)]
-    fn check(&self) {
-        #[cfg(parallel_compiler)]
-        assert_eq!(thread::current().id(), self.thread);
-    }
-
-    #[inline(always)]
-    pub fn new(inner: T) -> Self {
-        OneThread {
-            #[cfg(parallel_compiler)]
-            thread: thread::current().id(),
-            inner,
-        }
-    }
-
-    #[inline(always)]
-    pub fn into_inner(value: Self) -> T {
-        value.check();
-        value.inner
-    }
-}
-
-impl<T> Deref for OneThread<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        self.check();
-        &self.inner
-    }
-}
-
-impl<T> DerefMut for OneThread<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        self.check();
-        &mut self.inner
     }
 }

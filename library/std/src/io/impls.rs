@@ -303,8 +303,9 @@ impl Read for &[u8] {
 
     #[inline]
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        buf.extend_from_slice(*self);
         let len = self.len();
+        buf.try_reserve(len)?;
+        buf.extend_from_slice(*self);
         *self = &self[len..];
         Ok(len)
     }
@@ -451,7 +452,7 @@ impl<A: Allocator> Read for VecDeque<u8, A> {
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
         // The total len is known upfront so we can reserve it in a single call.
         let len = self.len();
-        buf.reserve(len);
+        buf.try_reserve(len)?;
 
         let (front, back) = self.as_slices();
         buf.extend_from_slice(front);
@@ -472,6 +473,24 @@ impl<A: Allocator> Read for VecDeque<u8, A> {
         buf.push_str(string);
         self.clear();
         Ok(len)
+    }
+}
+
+/// BufRead is implemented for `VecDeque<u8>` by reading bytes from the front of the `VecDeque`.
+#[stable(feature = "vecdeque_buf_read", since = "1.75.0")]
+impl<A: Allocator> BufRead for VecDeque<u8, A> {
+    /// Returns the contents of the "front" slice as returned by
+    /// [`as_slices`][`VecDeque::as_slices`]. If the contained byte slices of the `VecDeque` are
+    /// discontiguous, multiple calls to `fill_buf` will be needed to read the entire content.
+    #[inline]
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        let (front, _) = self.as_slices();
+        Ok(front)
+    }
+
+    #[inline]
+    fn consume(&mut self, amt: usize) {
+        self.drain(..amt);
     }
 }
 
@@ -503,6 +522,20 @@ impl<A: Allocator> Write for VecDeque<u8, A> {
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         self.extend(buf);
         Ok(())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[unstable(feature = "read_buf", issue = "78485")]
+impl<'a> io::Write for core::io::BorrowedCursor<'a> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let amt = cmp::min(buf.len(), self.capacity());
+        self.append(&buf[..amt]);
+        Ok(amt)
     }
 
     #[inline]

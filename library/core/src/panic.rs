@@ -17,7 +17,7 @@ pub use self::unwind_safe::{AssertUnwindSafe, RefUnwindSafe, UnwindSafe};
 
 #[doc(hidden)]
 #[unstable(feature = "edition_panic", issue = "none", reason = "use panic!() instead")]
-#[allow_internal_unstable(core_panic, const_format_args)]
+#[allow_internal_unstable(panic_internals, const_format_args)]
 #[rustc_diagnostic_item = "core_panic_2015_macro"]
 #[rustc_macro_transparency = "semitransparent"]
 pub macro panic_2015 {
@@ -44,9 +44,10 @@ pub macro panic_2015 {
 
 #[doc(hidden)]
 #[unstable(feature = "edition_panic", issue = "none", reason = "use panic!() instead")]
-#[allow_internal_unstable(core_panic, const_format_args)]
+#[allow_internal_unstable(panic_internals, const_format_args)]
 #[rustc_diagnostic_item = "core_panic_2021_macro"]
 #[rustc_macro_transparency = "semitransparent"]
+#[cfg(feature = "panic_immediate_abort")]
 pub macro panic_2021 {
     () => (
         $crate::panicking::panic("explicit panic")
@@ -63,8 +64,52 @@ pub macro panic_2021 {
 }
 
 #[doc(hidden)]
+#[unstable(feature = "edition_panic", issue = "none", reason = "use panic!() instead")]
+#[allow_internal_unstable(
+    panic_internals,
+    core_intrinsics,
+    const_dispatch,
+    const_eval_select,
+    const_format_args,
+    rustc_attrs
+)]
+#[rustc_diagnostic_item = "core_panic_2021_macro"]
+#[rustc_macro_transparency = "semitransparent"]
+#[cfg(not(feature = "panic_immediate_abort"))]
+pub macro panic_2021 {
+    () => ({
+        // Create a function so that the argument for `track_caller`
+        // can be moved inside if possible.
+        #[cold]
+        #[track_caller]
+        #[inline(never)]
+        const fn panic_cold_explicit() -> ! {
+            $crate::panicking::panic_explicit()
+        }
+        panic_cold_explicit();
+    }),
+    // Special-case the single-argument case for const_panic.
+    ("{}", $arg:expr $(,)?) => ({
+        #[cold]
+        #[track_caller]
+        #[inline(never)]
+        #[rustc_const_panic_str] // enforce a &&str argument in const-check and hook this by const-eval
+        #[rustc_do_not_const_check] // hooked by const-eval
+        const fn panic_cold_display<T: $crate::fmt::Display>(arg: &T) -> ! {
+            $crate::panicking::panic_display(arg)
+        }
+        panic_cold_display(&$arg);
+    }),
+    ($($t:tt)+) => ({
+        // Semicolon to prevent temporaries inside the formatting machinery from
+        // being considered alive in the caller after the panic_fmt call.
+        $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+    }),
+}
+
+#[doc(hidden)]
 #[unstable(feature = "edition_panic", issue = "none", reason = "use unreachable!() instead")]
-#[allow_internal_unstable(core_panic)]
+#[allow_internal_unstable(panic_internals)]
 #[rustc_diagnostic_item = "unreachable_2015_macro"]
 #[rustc_macro_transparency = "semitransparent"]
 pub macro unreachable_2015 {
@@ -83,7 +128,7 @@ pub macro unreachable_2015 {
 
 #[doc(hidden)]
 #[unstable(feature = "edition_panic", issue = "none", reason = "use unreachable!() instead")]
-#[allow_internal_unstable(core_panic)]
+#[allow_internal_unstable(panic_internals)]
 #[rustc_macro_transparency = "semitransparent"]
 pub macro unreachable_2021 {
     () => (

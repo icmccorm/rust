@@ -1,7 +1,4 @@
-// compile-flags: --document-hidden-items
-
-#![feature(no_core)]
-#![no_core]
+//@ compile-flags: --document-hidden-items
 
 // @has "$.index[*][?(@.name == 'HiddenPubStruct')]"
 // @has "$.index[*][?(@.inner.impl)]"

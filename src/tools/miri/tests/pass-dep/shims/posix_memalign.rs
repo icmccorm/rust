@@ -1,6 +1,6 @@
 //@ignore-target-windows: No libc on Windows
 
-#![feature(pointer_is_aligned)]
+#![feature(pointer_is_aligned_to)]
 #![feature(strict_provenance)]
 
 use core::ptr;
@@ -58,7 +58,7 @@ fn main() {
 
     // Non-power of 2 align
     unsafe {
-        let mut ptr: *mut libc::c_void = ptr::invalid_mut(0x1234567);
+        let mut ptr: *mut libc::c_void = ptr::without_provenance_mut(0x1234567);
         let align = 15;
         let size = 8;
         assert_eq!(libc::posix_memalign(&mut ptr, align, size), libc::EINVAL);
@@ -70,7 +70,7 @@ fn main() {
 
     // Too small align (smaller than ptr)
     unsafe {
-        let mut ptr: *mut libc::c_void = ptr::invalid_mut(0x1234567);
+        let mut ptr: *mut libc::c_void = ptr::without_provenance_mut(0x1234567);
         let align = std::mem::size_of::<usize>() / 2;
         let size = 8;
         assert_eq!(libc::posix_memalign(&mut ptr, align, size), libc::EINVAL);

@@ -1,32 +1,38 @@
-// compile-flags: -Zunleash-the-miri-inside-of-you
+//@ compile-flags: -Zunleash-the-miri-inside-of-you
+//@ normalize-stderr-test "(the raw bytes of the constant) \(size: [0-9]*, align: [0-9]*\)" -> "$1 (size: $$SIZE, align: $$ALIGN)"
+//@ normalize-stderr-test "([0-9a-f][0-9a-f] |╾─*ALLOC[0-9]+(\+[a-z0-9]+)?(<imm>)?─*╼ )+ *│.*" -> "HEX_DUMP"
 
+#![deny(const_eval_mutable_ptr_in_final_value)]
 use std::cell::UnsafeCell;
 
 // a test demonstrating what things we could allow with a smarter const qualification
 
-// this is fine because is not possible to mutate through an immutable reference.
 static FOO: &&mut u32 = &&mut 42;
+//~^ ERROR encountered mutable pointer in final value of static
+//~| WARNING this was previously accepted by the compiler
 
-// this is fine because accessing an immutable static `BAR` is equivalent to accessing `*&BAR`
-// which puts the mutable reference behind an immutable one.
 static BAR: &mut () = &mut ();
+//~^ ERROR encountered mutable pointer in final value of static
+//~| WARNING this was previously accepted by the compiler
 
 struct Foo<T>(T);
 
-// this is fine for the same reason as `BAR`.
 static BOO: &mut Foo<()> = &mut Foo(());
+//~^ ERROR encountered mutable pointer in final value of static
+//~| WARNING this was previously accepted by the compiler
 
-// interior mutability is fine
 struct Meh {
     x: &'static UnsafeCell<i32>,
 }
 unsafe impl Sync for Meh {}
-static MEH: Meh = Meh {
-    x: &UnsafeCell::new(42),
-};
+static MEH: Meh = Meh { x: &UnsafeCell::new(42) };
+//~^ ERROR encountered mutable pointer in final value of static
+//~| WARNING this was previously accepted by the compiler
 
-// this is fine for the same reason as `BAR`.
 static OH_YES: &mut i32 = &mut 42;
+//~^ ERROR encountered mutable pointer in final value of static
+//~| WARNING this was previously accepted by the compiler
+//~| ERROR it is undefined behavior to use this value
 
 fn main() {
     unsafe {

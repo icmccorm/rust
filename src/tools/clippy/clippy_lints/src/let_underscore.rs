@@ -1,11 +1,11 @@
 use clippy_utils::diagnostics::span_lint_and_help;
 use clippy_utils::ty::{implements_trait, is_must_use_ty, match_type};
 use clippy_utils::{is_from_proc_macro, is_must_use_func_call, paths};
-use rustc_hir::{Local, PatKind};
+use rustc_hir::{LetStmt, LocalSource, PatKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty::{GenericArgKind, IsSuggestable};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 use rustc_span::{BytePos, Span};
 
 declare_clippy_lint! {
@@ -17,7 +17,7 @@ declare_clippy_lint! {
     /// expr
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// fn f() -> Result<u32, u32> {
     ///     Ok(0)
     /// }
@@ -69,7 +69,7 @@ declare_clippy_lint! {
     /// and ignore the resulting value.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// async fn foo() -> Result<(), ()> {
     ///     Ok(())
     /// }
@@ -77,7 +77,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # async fn context() {
     /// async fn foo() -> Result<(), ()> {
     ///     Ok(())
@@ -107,14 +107,14 @@ declare_clippy_lint! {
     /// lints.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// fn foo() -> Result<u32, ()> {
     ///     Ok(123)
     /// }
     /// let _ = foo();
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// fn foo() -> Result<u32, ()> {
     ///     Ok(123)
     /// }
@@ -138,8 +138,9 @@ const SYNC_GUARD_PATHS: [&[&str]; 3] = [
 ];
 
 impl<'tcx> LateLintPass<'tcx> for LetUnderscore {
-    fn check_local(&mut self, cx: &LateContext<'tcx>, local: &Local<'tcx>) {
-        if !in_external_macro(cx.tcx.sess, local.span)
+    fn check_local(&mut self, cx: &LateContext<'tcx>, local: &LetStmt<'tcx>) {
+        if matches!(local.source, LocalSource::Normal)
+            && !in_external_macro(cx.tcx.sess, local.span)
             && let PatKind::Wild = local.pat.kind
             && let Some(init) = local.init
         {
@@ -159,14 +160,15 @@ impl<'tcx> LateLintPass<'tcx> for LetUnderscore {
                             binding or dropping explicitly with `std::mem::drop`",
                 );
             } else if let Some(future_trait_def_id) = cx.tcx.lang_items().future_trait()
-                && implements_trait(cx, cx.typeck_results().expr_ty(init), future_trait_def_id, &[]) {
+                && implements_trait(cx, cx.typeck_results().expr_ty(init), future_trait_def_id, &[])
+            {
                 span_lint_and_help(
                     cx,
                     LET_UNDERSCORE_FUTURE,
                     local.span,
                     "non-binding `let` on a future",
                     None,
-                    "consider awaiting the future or dropping explicitly with `std::mem::drop`"
+                    "consider awaiting the future or dropping explicitly with `std::mem::drop`",
                 );
             } else if is_must_use_ty(cx, cx.typeck_results().expr_ty(init)) {
                 span_lint_and_help(
@@ -203,17 +205,17 @@ impl<'tcx> LateLintPass<'tcx> for LetUnderscore {
                     return;
                 }
 
-				span_lint_and_help(
+                span_lint_and_help(
                     cx,
                     LET_UNDERSCORE_UNTYPED,
                     local.span,
                     "non-binding `let` without a type annotation",
-                    Some(
-						Span::new(local.pat.span.hi(),
-						local.pat.span.hi() + BytePos(1),
-						local.pat.span.ctxt(),
-						local.pat.span.parent()
-					)),
+                    Some(Span::new(
+                        local.pat.span.hi(),
+                        local.pat.span.hi() + BytePos(1),
+                        local.pat.span.ctxt(),
+                        local.pat.span.parent(),
+                    )),
                     "consider adding a type annotation",
                 );
             }

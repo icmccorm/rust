@@ -1,4 +1,3 @@
-use rustc_hir as hir;
 use rustc_hir::lang_items::LangItem;
 use rustc_index::Idx;
 use rustc_middle::mir::patch::MirPatch;
@@ -7,6 +6,8 @@ use rustc_middle::traits::Reveal;
 use rustc_middle::ty::util::IntTypeExt;
 use rustc_middle::ty::GenericArgsRef;
 use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_span::source_map::Spanned;
+use rustc_span::DUMMY_SP;
 use rustc_target::abi::{FieldIdx, VariantIdx, FIRST_VARIANT};
 use std::{fmt, iter};
 
@@ -419,14 +420,14 @@ where
     ) -> BasicBlock {
         // drop glue is sent straight to codegen
         // box cannot be directly dereferenced
-        let unique_ty = adt.non_enum_variant().fields[FieldIdx::new(0)].ty(self.tcx(), args);
+        let unique_ty = adt.non_enum_variant().fields[FieldIdx::ZERO].ty(self.tcx(), args);
         let unique_variant = unique_ty.ty_adt_def().unwrap().non_enum_variant();
-        let nonnull_ty = unique_variant.fields[FieldIdx::from_u32(0)].ty(self.tcx(), args);
+        let nonnull_ty = unique_variant.fields[FieldIdx::ZERO].ty(self.tcx(), args);
         let ptr_ty = Ty::new_imm_ptr(self.tcx(), args[0].expect_ty());
 
-        let unique_place = self.tcx().mk_place_field(self.place, FieldIdx::new(0), unique_ty);
-        let nonnull_place = self.tcx().mk_place_field(unique_place, FieldIdx::new(0), nonnull_ty);
-        let ptr_place = self.tcx().mk_place_field(nonnull_place, FieldIdx::new(0), ptr_ty);
+        let unique_place = self.tcx().mk_place_field(self.place, FieldIdx::ZERO, unique_ty);
+        let nonnull_place = self.tcx().mk_place_field(unique_place, FieldIdx::ZERO, nonnull_ty);
+        let ptr_place = self.tcx().mk_place_field(nonnull_place, FieldIdx::ZERO, ptr_ty);
         let interior = self.tcx().mk_place_deref(ptr_place);
 
         let interior_path = self.elaborator.deref_subpath(self.path);
@@ -481,12 +482,8 @@ where
     ) -> (BasicBlock, Unwind) {
         let (succ, unwind) = self.drop_ladder_bottom();
         if !adt.is_enum() {
-            let fields = self.move_paths_for_fields(
-                self.place,
-                self.path,
-                &adt.variant(FIRST_VARIANT),
-                args,
-            );
+            let fields =
+                self.move_paths_for_fields(self.place, self.path, adt.variant(FIRST_VARIANT), args);
             self.drop_ladder(fields, succ, unwind)
         } else {
             self.open_drop_for_multivariant(adt, args, succ, unwind)
@@ -518,7 +515,7 @@ where
                     self.place,
                     ProjectionElem::Downcast(Some(variant.name), variant_index),
                 );
-                let fields = self.move_paths_for_fields(base_place, variant_path, &variant, args);
+                let fields = self.move_paths_for_fields(base_place, variant_path, variant, args);
                 values.push(discr.val);
                 if let Unwind::To(unwind) = unwind {
                     // We can't use the half-ladder from the original
@@ -631,11 +628,7 @@ where
         let drop_fn = tcx.associated_item_def_ids(drop_trait)[0];
         let ty = self.place_ty(self.place);
 
-        let ref_ty = Ty::new_ref(
-            tcx,
-            tcx.lifetimes.re_erased,
-            ty::TypeAndMut { ty, mutbl: hir::Mutability::Mut },
-        );
+        let ref_ty = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, ty);
         let ref_place = self.new_temp(ref_ty);
         let unit_temp = Place::from(self.new_temp(Ty::new_unit(tcx)));
 
@@ -656,7 +649,10 @@ where
                         [ty.into()],
                         self.source_info.span,
                     ),
-                    args: vec![Operand::Move(Place::from(ref_place))],
+                    args: vec![Spanned {
+                        node: Operand::Move(Place::from(ref_place)),
+                        span: DUMMY_SP,
+                    }],
                     destination: unit_temp,
                     target: Some(succ),
                     unwind: unwind.into_action(),
@@ -699,7 +695,7 @@ where
         let move_ = |place: Place<'tcx>| Operand::Move(place);
         let tcx = self.tcx();
 
-        let ptr_ty = Ty::new_ptr(tcx, ty::TypeAndMut { ty: ety, mutbl: hir::Mutability::Mut });
+        let ptr_ty = Ty::new_mut_ptr(tcx, ety);
         let ptr = Place::from(self.new_temp(ptr_ty));
         let can_go = Place::from(self.new_temp(tcx.types.bool));
         let one = self.constant_usize(1);
@@ -859,14 +855,17 @@ where
     fn open_drop(&mut self) -> BasicBlock {
         let ty = self.place_ty(self.place);
         match ty.kind() {
-            ty::Closure(_, args) => self.open_drop_for_tuple(&args.as_closure().upvar_tys()),
-            // Note that `elaborate_drops` only drops the upvars of a generator,
+            ty::Closure(_, args) => self.open_drop_for_tuple(args.as_closure().upvar_tys()),
+            ty::CoroutineClosure(_, args) => {
+                self.open_drop_for_tuple(args.as_coroutine_closure().upvar_tys())
+            }
+            // Note that `elaborate_drops` only drops the upvars of a coroutine,
             // and this is ok because `open_drop` here can only be reached
-            // within that own generator's resume function.
+            // within that own coroutine's resume function.
             // This should only happen for the self argument on the resume function.
-            // It effectively only contains upvars until the generator transformation runs.
-            // See librustc_body/transform/generator.rs for more details.
-            ty::Generator(_, args, _) => self.open_drop_for_tuple(&args.as_generator().upvar_tys()),
+            // It effectively only contains upvars until the coroutine transformation runs.
+            // See librustc_body/transform/coroutine.rs for more details.
+            ty::Coroutine(_, args) => self.open_drop_for_tuple(args.as_coroutine().upvar_tys()),
             ty::Tuple(fields) => self.open_drop_for_tuple(fields),
             ty::Adt(def, args) => self.open_drop_for_adt(*def, args),
             ty::Dynamic(..) => self.complete_drop(self.succ, self.unwind),

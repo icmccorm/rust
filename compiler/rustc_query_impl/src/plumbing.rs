@@ -7,7 +7,8 @@ use crate::rustc_middle::ty::TyEncoder;
 use crate::QueryConfigRestored;
 use rustc_data_structures::stable_hasher::{Hash64, HashStable, StableHasher};
 use rustc_data_structures::sync::Lock;
-use rustc_errors::Diagnostic;
+use rustc_data_structures::unord::UnordMap;
+use rustc_errors::DiagInner;
 
 use rustc_index::Idx;
 use rustc_middle::dep_graph::dep_kinds;
@@ -17,8 +18,9 @@ use rustc_middle::dep_graph::{
 use rustc_middle::query::on_disk_cache::AbsoluteBytePos;
 use rustc_middle::query::on_disk_cache::{CacheDecoder, CacheEncoder, EncodedDepNodeIndex};
 use rustc_middle::query::Key;
+use rustc_middle::ty::print::with_reduced_queries;
 use rustc_middle::ty::tls::{self, ImplicitCtxt};
-use rustc_middle::ty::{self, print::with_no_queries, TyCtxt};
+use rustc_middle::ty::{self, TyCtxt};
 use rustc_query_system::dep_graph::{DepNodeParams, HasDepContext};
 use rustc_query_system::ich::StableHashingContext;
 use rustc_query_system::query::{
@@ -30,7 +32,7 @@ use rustc_serialize::Decodable;
 use rustc_serialize::Encodable;
 use rustc_session::Limit;
 use rustc_span::def_id::LOCAL_CRATE;
-use std::num::NonZeroU64;
+use std::num::NonZero;
 use thin_vec::ThinVec;
 
 #[derive(Copy, Clone)]
@@ -68,10 +70,8 @@ impl QueryContext for QueryCtxt<'_> {
     #[inline]
     fn next_job_id(self) -> QueryJobId {
         QueryJobId(
-            NonZeroU64::new(
-                self.query_system.jobs.fetch_add(1, rustc_data_structures::sync::Ordering::Relaxed),
-            )
-            .unwrap(),
+            NonZero::new(self.query_system.jobs.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                .unwrap(),
         )
     }
 
@@ -80,14 +80,14 @@ impl QueryContext for QueryCtxt<'_> {
         tls::with_related_context(self.tcx, |icx| icx.query)
     }
 
-    fn try_collect_active_jobs(self) -> Option<QueryMap> {
+    fn collect_active_jobs(self) -> QueryMap {
         let mut jobs = QueryMap::default();
 
         for collect in super::TRY_COLLECT_ACTIVE_JOBS.iter() {
             collect(self.tcx, &mut jobs);
         }
 
-        Some(jobs)
+        jobs
     }
 
     // Interactions with on_disk_cache
@@ -127,7 +127,7 @@ impl QueryContext for QueryCtxt<'_> {
         self,
         token: QueryJobId,
         depth_limit: bool,
-        diagnostics: Option<&Lock<ThinVec<Diagnostic>>>,
+        diagnostics: Option<&Lock<ThinVec<DiagInner>>>,
         compute: impl FnOnce() -> R,
     ) -> R {
         // The `TyCtxt` stored in TLS has the same global interner lifetime
@@ -155,11 +155,11 @@ impl QueryContext for QueryCtxt<'_> {
     fn depth_limit_error(self, job: QueryJobId) {
         let mut span = None;
         let mut layout_of_depth = None;
-        if let Some(map) = self.try_collect_active_jobs() {
-            if let Some((info, depth)) = job.try_find_layout_root(map, dep_kinds::layout_of) {
-                span = Some(info.job.span);
-                layout_of_depth = Some(LayoutOfDepth { desc: info.query.description, depth });
-            }
+        if let Some((info, depth)) =
+            job.try_find_layout_root(self.collect_active_jobs(), dep_kinds::layout_of)
+        {
+            span = Some(info.job.span);
+            layout_of_depth = Some(LayoutOfDepth { desc: info.query.description, depth });
         }
 
         let suggested_limit = match self.recursion_limit() {
@@ -167,7 +167,7 @@ impl QueryContext for QueryCtxt<'_> {
             limit => limit * 2,
         };
 
-        self.sess.emit_fatal(QueryOverflow {
+        self.sess.dcx().emit_fatal(QueryOverflow {
             span,
             layout_of_depth,
             suggested_limit,
@@ -190,12 +190,25 @@ pub(super) fn encode_all_query_results<'tcx>(
     }
 }
 
+pub fn query_key_hash_verify_all<'tcx>(tcx: TyCtxt<'tcx>) {
+    if tcx.sess().opts.unstable_opts.incremental_verify_ich || cfg!(debug_assertions) {
+        tcx.sess.time("query_key_hash_verify_all", || {
+            for verify in super::QUERY_KEY_HASH_VERIFY.iter() {
+                verify(tcx);
+            }
+        })
+    }
+}
+
 macro_rules! handle_cycle_error {
     ([]) => {{
         rustc_query_system::HandleCycleError::Error
     }};
     ([(fatal_cycle) $($rest:tt)*]) => {{
         rustc_query_system::HandleCycleError::Fatal
+    }};
+    ([(cycle_stash) $($rest:tt)*]) => {{
+        rustc_query_system::HandleCycleError::Stash
     }};
     ([(cycle_delay_bug) $($rest:tt)*]) => {{
         rustc_query_system::HandleCycleError::DelayBug
@@ -303,18 +316,18 @@ pub(crate) fn create_query_frame<
     kind: DepKind,
     name: &'static str,
 ) -> QueryStackFrame {
+    // If reduced queries are requested, we may be printing a query stack due
+    // to a panic. Avoid using `default_span` and `def_kind` in that case.
+    let reduce_queries = with_reduced_queries();
+
     // Avoid calling queries while formatting the description
-    let description = ty::print::with_no_queries!(
-        // Disable visible paths printing for performance reasons.
-        // Showing visible path instead of any path is not that important in production.
-        ty::print::with_no_visible_paths!(
-            // Force filename-line mode to avoid invoking `type_of` query.
-            ty::print::with_forced_impl_filename_line!(do_describe(tcx, key))
-        )
-    );
-    let description =
-        if tcx.sess.verbose() { format!("{description} [{name:?}]") } else { description };
-    let span = if kind == dep_graph::dep_kinds::def_span || with_no_queries() {
+    let description = ty::print::with_no_queries!(do_describe(tcx, key));
+    let description = if tcx.sess.verbose_internals() {
+        format!("{description} [{name:?}]")
+    } else {
+        description
+    };
+    let span = if kind == dep_graph::dep_kinds::def_span || reduce_queries {
         // The `def_span` query is used to calculate `default_span`,
         // so exit to avoid infinite recursion.
         None
@@ -322,11 +335,11 @@ pub(crate) fn create_query_frame<
         Some(key.default_span(tcx))
     };
     let def_id = key.key_as_def_id();
-    let def_kind = if kind == dep_graph::dep_kinds::opt_def_kind || with_no_queries() {
+    let def_kind = if kind == dep_graph::dep_kinds::def_kind || reduce_queries {
         // Try to avoid infinite recursion.
         None
     } else {
-        def_id.and_then(|def_id| def_id.as_local()).and_then(|def_id| tcx.opt_def_kind(def_id))
+        def_id.and_then(|def_id| def_id.as_local()).map(|def_id| tcx.def_kind(def_id))
     };
     let hash = || {
         tcx.with_stable_hashing_context(|mut hcx| {
@@ -336,9 +349,9 @@ pub(crate) fn create_query_frame<
             hasher.finish::<Hash64>()
         })
     };
-    let ty_adt_id = key.ty_adt_id();
+    let ty_def_id = key.ty_def_id();
 
-    QueryStackFrame::new(description, span, def_id, def_kind, kind, ty_adt_id, hash)
+    QueryStackFrame::new(description, span, def_id, def_kind, kind, ty_def_id, hash)
 }
 
 pub(crate) fn encode_query_results<'a, 'tcx, Q>(
@@ -355,7 +368,7 @@ pub(crate) fn encode_query_results<'a, 'tcx, Q>(
     assert!(query.query_state(qcx).all_inactive());
     let cache = query.query_cache(qcx);
     cache.iter(&mut |key, value, dep_node| {
-        if query.cache_on_disk(qcx.tcx, &key) {
+        if query.cache_on_disk(qcx.tcx, key) {
             let dep_node = SerializedDepNodeIndex::new(dep_node.index());
 
             // Record position of the cache entry.
@@ -364,6 +377,34 @@ pub(crate) fn encode_query_results<'a, 'tcx, Q>(
             // Encode the type check tables with the `SerializedDepNodeIndex`
             // as tag.
             encoder.encode_tagged(dep_node, &Q::restore(*value));
+        }
+    });
+}
+
+pub(crate) fn query_key_hash_verify<'tcx>(
+    query: impl QueryConfig<QueryCtxt<'tcx>>,
+    qcx: QueryCtxt<'tcx>,
+) {
+    let _timer =
+        qcx.profiler().generic_activity_with_arg("query_key_hash_verify_for", query.name());
+
+    let mut map = UnordMap::default();
+
+    let cache = query.query_cache(qcx);
+    cache.iter(&mut |key, _, _| {
+        let node = DepNode::construct(qcx.tcx, query.dep_kind(), key);
+        if let Some(other_key) = map.insert(node, *key) {
+            bug!(
+                "query key:\n\
+                `{:?}`\n\
+                and key:\n\
+                `{:?}`\n\
+                mapped to the same dep node:\n\
+                {:?}",
+                key,
+                other_key,
+                node
+            );
         }
     });
 }
@@ -437,8 +478,6 @@ where
     );
 
     if let Some(key) = Q::Key::recover(tcx, &dep_node) {
-        #[cfg(debug_assertions)]
-        let _guard = tracing::span!(tracing::Level::TRACE, stringify!($name), ?key).entered();
         force_query(query, QueryCtxt::new(tcx), key, dep_node);
         true
     } else {
@@ -691,6 +730,13 @@ macro_rules! define_queries {
                     )
                 }
             }}
+
+            pub fn query_key_hash_verify<'tcx>(tcx: TyCtxt<'tcx>) {
+                $crate::plumbing::query_key_hash_verify(
+                    query_impl::$name::QueryType::config(tcx),
+                    QueryCtxt::new(tcx),
+                )
+            }
         })*}
 
         pub(crate) fn engine(incremental: bool) -> QueryEngine {
@@ -729,6 +775,10 @@ macro_rules! define_queries {
                 &mut EncodedDepNodeIndex)
             >
         ] = &[$(expand_if_cached!([$($modifiers)*], query_impl::$name::encode_query_results)),*];
+
+        const QUERY_KEY_HASH_VERIFY: &[
+            for<'tcx> fn(TyCtxt<'tcx>)
+        ] = &[$(query_impl::$name::query_key_hash_verify),*];
 
         #[allow(nonstandard_style)]
         mod query_callbacks {

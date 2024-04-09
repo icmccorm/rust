@@ -178,7 +178,7 @@ impl Command {
             .context("Please install rustup-toolchain-install-master by running 'cargo install rustup-toolchain-install-master'")?;
         let sh = Shell::new()?;
         sh.change_dir(miri_dir()?);
-        let new_commit = Some(sh.read_file("rust-version")?.trim().to_owned());
+        let new_commit = sh.read_file("rust-version")?.trim().to_owned();
         let current_commit = {
             let rustc_info = cmd!(sh, "rustc +miri --version -v").read();
             if rustc_info.is_err() {
@@ -193,7 +193,7 @@ impl Command {
             }
         };
         // Check if we already are at that commit.
-        if current_commit == new_commit {
+        if current_commit.as_ref() == Some(&new_commit) {
             if active_toolchain()? != "miri" {
                 cmd!(sh, "rustup override set miri").run()?;
             }
@@ -202,7 +202,7 @@ impl Command {
         // Install and setup new toolchain.
         cmd!(sh, "rustup toolchain uninstall miri").run()?;
 
-        cmd!(sh, "rustup-toolchain-install-master -n miri -c cargo -c rust-src -c rustc-dev -c llvm-tools -c rustfmt -c clippy {flags...} -- {new_commit...}").run()?;
+        cmd!(sh, "rustup-toolchain-install-master -n miri -c cargo -c rust-src -c rustc-dev -c llvm-tools -c rustfmt -c clippy {flags...} -- {new_commit}").run()?;
         cmd!(sh, "rustup override set miri").run()?;
         // Cleanup.
         cmd!(sh, "cargo clean").run()?;
@@ -286,7 +286,7 @@ impl Command {
                 "This will pull a copy of the rust-lang/rust history into this Miri checkout, growing it by about 1GB."
             );
             print!(
-                "To avoid that, abort now and set the `--rustc-git` flag to an existing rustc checkout. Proceed? [y/N] "
+                "To avoid that, abort now and set the `RUSTC_GIT` environment variable to an existing rustc checkout. Proceed? [y/N] "
             );
             std::io::stdout().flush()?;
             let mut answer = String::new();
@@ -297,7 +297,7 @@ impl Command {
         };
         // Prepare the branch. Pushing works much better if we use as base exactly
         // the commit that we pulled from last time, so we use the `rust-version`
-        // file as a good approximation of that.
+        // file to find out which commit that would be.
         println!("Preparing {github_user}/rust (base: {base})...");
         if cmd!(sh, "git fetch https://github.com/{github_user}/rust {branch}")
             .ignore_stderr()
@@ -344,7 +344,7 @@ impl Command {
         println!(
             // Open PR with `subtree update` title to silence the `no-merges` triagebot check
             // See https://github.com/rust-lang/rust/pull/114157
-            "    https://github.com/rust-lang/rust/compare/{github_user}:{branch}?quick_pull=1&title=Miri+subtree+update"
+            "    https://github.com/rust-lang/rust/compare/{github_user}:{branch}?quick_pull=1&title=Miri+subtree+update&body=r?+@ghost"
         );
 
         drop(josh);
@@ -356,11 +356,17 @@ impl Command {
             .unwrap_or_else(|_| "0".into())
             .parse()
             .context("failed to parse MIRI_SEED_START")?;
-        let seed_count: u64 = env::var("MIRI_SEEDS")
-            .unwrap_or_else(|_| "256".into())
-            .parse()
-            .context("failed to parse MIRI_SEEDS")?;
-        let seed_end = seed_start + seed_count;
+        let seed_end: u64 = match (env::var("MIRI_SEEDS"), env::var("MIRI_SEED_END")) {
+            (Ok(_), Ok(_)) => bail!("Only one of MIRI_SEEDS and MIRI_SEED_END may be set"),
+            (Ok(seeds), Err(_)) =>
+                seed_start + seeds.parse::<u64>().context("failed to parse MIRI_SEEDS")?,
+            (Err(_), Ok(seed_end)) => seed_end.parse().context("failed to parse MIRI_SEED_END")?,
+            (Err(_), Err(_)) => seed_start + 256,
+        };
+        if seed_end <= seed_start {
+            bail!("the end of the seed range must be larger than the start.");
+        }
+
         let Some((command_name, trailing_args)) = command.split_first() else {
             bail!("expected many-seeds command to be non-empty");
         };
@@ -374,9 +380,9 @@ impl Command {
                 .env("MIRIFLAGS", miriflags)
                 .quiet()
                 .run();
-            if status.is_err() {
+            if let Err(err) = status {
                 println!("Failing seed: {seed}");
-                break;
+                return Err(err.into());
             }
         }
         Ok(())
@@ -473,24 +479,36 @@ impl Command {
         Ok(())
     }
 
-    fn run(dep: bool, flags: Vec<OsString>) -> Result<()> {
+    fn run(dep: bool, mut flags: Vec<OsString>) -> Result<()> {
         let mut e = MiriEnv::new()?;
         // Scan for "--target" to overwrite the "MIRI_TEST_TARGET" env var so
-        // that we set the MIRI_SYSROOT up the right way.
+        // that we set the MIRI_SYSROOT up the right way. We must make sure that
+        // MIRI_TEST_TARGET and `--target` are in sync.
         use itertools::Itertools;
-        let target = flags.iter().tuple_windows().find(|(first, _)| first == &"--target");
+        let target = flags
+            .iter()
+            .take_while(|arg| *arg != "--")
+            .tuple_windows()
+            .find(|(first, _)| *first == "--target");
         if let Some((_, target)) = target {
             // Found it!
             e.sh.set_var("MIRI_TEST_TARGET", target);
         } else if let Ok(target) = std::env::var("MIRI_TEST_TARGET") {
-            // Make sure miri actually uses this target.
-            let miriflags = e.sh.var("MIRIFLAGS").unwrap_or_default();
-            e.sh.set_var("MIRIFLAGS", format!("{miriflags} --target {target}"));
+            // Convert `MIRI_TEST_TARGET` into `--target`.
+            flags.push("--target".into());
+            flags.push(target.into());
         }
+        // Scan for "--edition", set one ourselves if that flag is not present.
+        let have_edition =
+            flags.iter().take_while(|arg| *arg != "--").any(|arg| *arg == "--edition");
+        if !have_edition {
+            flags.push("--edition=2021".into()); // keep in sync with `tests/ui.rs`.`
+        }
+
         // Prepare a sysroot.
         e.build_miri_sysroot(/* quiet */ true)?;
 
-        // Then run the actual command.
+        // Then run the actual command. Also add MIRIFLAGS.
         let miri_manifest = path!(e.miri_dir / "Cargo.toml");
         let miri_flags = e.sh.var("MIRIFLAGS").unwrap_or_default();
         let miri_flags = flagsplit(&miri_flags);
@@ -499,7 +517,7 @@ impl Command {
         if dep {
             cmd!(
                 e.sh,
-                "cargo +{toolchain} --quiet test --test compiletest {extra_flags...} --manifest-path {miri_manifest} -- --miri-run-dep-mode {miri_flags...} {flags...}"
+                "cargo +{toolchain} --quiet test {extra_flags...} --manifest-path {miri_manifest} --test ui -- --miri-run-dep-mode {miri_flags...} {flags...}"
             ).quiet().run()?;
         } else {
             cmd!(
@@ -511,37 +529,27 @@ impl Command {
     }
 
     fn fmt(flags: Vec<OsString>) -> Result<()> {
+        use itertools::Itertools;
+
         let e = MiriEnv::new()?;
-        let toolchain = &e.toolchain;
         let config_path = path!(e.miri_dir / "rustfmt.toml");
 
-        let mut cmd = cmd!(
-            e.sh,
-            "rustfmt +{toolchain} --edition=2021 --config-path {config_path} --unstable-features --skip-children {flags...}"
-        );
-        eprintln!("$ {cmd} ...");
+        // Collect each rust file in the miri repo.
+        let files = WalkDir::new(&e.miri_dir)
+            .into_iter()
+            .filter_entry(|entry| {
+                let name = entry.file_name().to_string_lossy();
+                let ty = entry.file_type();
+                if ty.is_file() {
+                    name.ends_with(".rs")
+                } else {
+                    // dir or symlink. skip `target` and `.git`.
+                    &name != "target" && &name != ".git"
+                }
+            })
+            .filter_ok(|item| item.file_type().is_file())
+            .map_ok(|item| item.into_path());
 
-        // Add all the filenames to the command.
-        // FIXME: `rustfmt` will follow the `mod` statements in these files, so we get a bunch of
-        // duplicate diffs.
-        for item in WalkDir::new(&e.miri_dir).into_iter().filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            let ty = entry.file_type();
-            if ty.is_file() {
-                name.ends_with(".rs")
-            } else {
-                // dir or symlink. skip `target` and `.git`.
-                &name != "target" && &name != ".git"
-            }
-        }) {
-            let item = item?;
-            if item.file_type().is_file() {
-                cmd = cmd.arg(item.into_path());
-            }
-        }
-
-        // We want our own error message, repeating the command is too much.
-        cmd.quiet().run().map_err(|_| anyhow!("`rustfmt` failed"))?;
-        Ok(())
+        e.format_files(files, &e.toolchain[..], &config_path, &flags[..])
     }
 }

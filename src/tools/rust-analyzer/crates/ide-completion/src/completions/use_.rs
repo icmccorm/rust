@@ -2,7 +2,7 @@
 
 use hir::ScopeDef;
 use ide_db::{FxHashSet, SymbolKind};
-use syntax::{ast, AstNode};
+use syntax::{ast, format_smolstr, AstNode};
 
 use crate::{
     context::{CompletionContext, PathCompletionCtx, Qualified},
@@ -71,9 +71,9 @@ pub(crate) fn complete_use_path(
 
                         if add_resolution {
                             let mut builder = Builder::from_resolution(ctx, path_ctx, name, def);
-                            builder.set_relevance(CompletionRelevance {
+                            builder.with_relevance(|r| CompletionRelevance {
                                 is_name_already_imported,
-                                ..Default::default()
+                                ..r
                             });
                             acc.add(builder.build(ctx.db));
                         }
@@ -108,7 +108,7 @@ pub(crate) fn complete_use_path(
                             let item = CompletionItem::new(
                                 CompletionItemKind::SymbolKind(SymbolKind::Enum),
                                 ctx.source_range(),
-                                format!("{}::", e.name(ctx.db).display(ctx.db)),
+                                format_smolstr!("{}::", e.name(ctx.db).display(ctx.db)),
                             );
                             acc.add(item.build(ctx.db));
                         }

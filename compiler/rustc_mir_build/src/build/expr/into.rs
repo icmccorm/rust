@@ -9,6 +9,7 @@ use rustc_hir as hir;
 use rustc_middle::mir::*;
 use rustc_middle::thir::*;
 use rustc_middle::ty::CanonicalUserTypeAnnotation;
+use rustc_span::source_map::Spanned;
 use std::iter;
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
@@ -19,12 +20,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         &mut self,
         destination: Place<'tcx>,
         mut block: BasicBlock,
-        expr: &Expr<'tcx>,
+        expr_id: ExprId,
     ) -> BlockAnd<()> {
         // since we frequently have to reference `self` from within a
         // closure, where `self` would be shadowed, it's easier to
         // just use the name `this` uniformly
         let this = self;
+        let expr = &this.thir[expr_id];
         let expr_span = expr.span;
         let source_info = this.source_info(expr_span);
 
@@ -40,112 +42,97 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let region_scope = (region_scope, source_info);
                 ensure_sufficient_stack(|| {
                     this.in_scope(region_scope, lint_level, |this| {
-                        this.expr_into_dest(destination, block, &this.thir[value])
+                        this.expr_into_dest(destination, block, value)
                     })
                 })
             }
             ExprKind::Block { block: ast_block } => {
                 this.ast_block(destination, block, ast_block, source_info)
             }
-            ExprKind::Match { scrutinee, ref arms, .. } => {
-                this.match_expr(destination, expr_span, block, &this.thir[scrutinee], arms)
-            }
+            ExprKind::Match { scrutinee, ref arms, .. } => this.match_expr(
+                destination,
+                block,
+                scrutinee,
+                arms,
+                expr_span,
+                this.thir[scrutinee].span,
+            ),
             ExprKind::If { cond, then, else_opt, if_then_scope } => {
-                let then_blk;
-                let then_expr = &this.thir[then];
-                let then_source_info = this.source_info(then_expr.span);
+                let then_span = this.thir[then].span;
+                let then_source_info = this.source_info(then_span);
                 let condition_scope = this.local_scope();
 
-                let mut else_blk = unpack!(
-                    then_blk = this.in_scope(
-                        (if_then_scope, then_source_info),
-                        LintLevel::Inherited,
-                        |this| {
-                            let source_info = if this.is_let(cond) {
-                                let variable_scope = this.new_source_scope(
-                                    then_expr.span,
-                                    LintLevel::Inherited,
-                                    None,
-                                );
-                                this.source_scope = variable_scope;
-                                SourceInfo { span: then_expr.span, scope: variable_scope }
-                            } else {
-                                this.source_info(then_expr.span)
-                            };
-                            let (then_block, else_block) =
-                                this.in_if_then_scope(condition_scope, then_expr.span, |this| {
-                                    let then_blk = unpack!(this.then_else_break(
-                                        block,
-                                        &this.thir[cond],
-                                        Some(condition_scope),
-                                        condition_scope,
-                                        source_info
-                                    ));
+                let then_and_else_blocks = this.in_scope(
+                    (if_then_scope, then_source_info),
+                    LintLevel::Inherited,
+                    |this| {
+                        // FIXME: Does this need extra logic to handle let-chains?
+                        let source_info = if this.is_let(cond) {
+                            let variable_scope =
+                                this.new_source_scope(then_span, LintLevel::Inherited);
+                            this.source_scope = variable_scope;
+                            SourceInfo { span: then_span, scope: variable_scope }
+                        } else {
+                            this.source_info(then_span)
+                        };
 
-                                    this.expr_into_dest(destination, then_blk, then_expr)
-                                });
-                            then_block.and(else_block)
-                        },
-                    )
+                        // Lower the condition, and have it branch into `then` and `else` blocks.
+                        let (then_block, else_block) =
+                            this.in_if_then_scope(condition_scope, then_span, |this| {
+                                let then_blk = unpack!(this.then_else_break(
+                                    block,
+                                    cond,
+                                    Some(condition_scope), // Temp scope
+                                    source_info,
+                                    true, // Declare `let` bindings normally
+                                ));
+
+                                // Lower the `then` arm into its block.
+                                this.expr_into_dest(destination, then_blk, then)
+                            });
+
+                        // Pack `(then_block, else_block)` into `BlockAnd<BasicBlock>`.
+                        then_block.and(else_block)
+                    },
                 );
 
-                else_blk = if let Some(else_opt) = else_opt {
-                    unpack!(this.expr_into_dest(destination, else_blk, &this.thir[else_opt]))
+                // Unpack `BlockAnd<BasicBlock>` into `(then_blk, else_blk)`.
+                let (then_blk, mut else_blk);
+                else_blk = unpack!(then_blk = then_and_else_blocks);
+
+                // If there is an `else` arm, lower it into `else_blk`.
+                if let Some(else_expr) = else_opt {
+                    unpack!(else_blk = this.expr_into_dest(destination, else_blk, else_expr));
                 } else {
-                    // Body of the `if` expression without an `else` clause must return `()`, thus
-                    // we implicitly generate an `else {}` if it is not specified.
+                    // There is no `else` arm, so we know both arms have type `()`.
+                    // Generate the implicit `else {}` by assigning unit.
                     let correct_si = this.source_info(expr_span.shrink_to_hi());
                     this.cfg.push_assign_unit(else_blk, correct_si, destination, this.tcx);
-                    else_blk
-                };
+                }
 
+                // The `then` and `else` arms have been lowered into their respective
+                // blocks, so make both of them meet up in a new block.
                 let join_block = this.cfg.start_new_block();
                 this.cfg.goto(then_blk, source_info, join_block);
                 this.cfg.goto(else_blk, source_info, join_block);
                 join_block.unit()
             }
-            ExprKind::Let { expr, ref pat } => {
-                let scope = this.local_scope();
-                let (true_block, false_block) = this.in_if_then_scope(scope, expr_span, |this| {
-                    this.lower_let_expr(block, &this.thir[expr], pat, scope, None, expr_span, true)
-                });
-
-                this.cfg.push_assign_constant(
-                    true_block,
-                    source_info,
-                    destination,
-                    ConstOperand {
-                        span: expr_span,
-                        user_ty: None,
-                        const_: Const::from_bool(this.tcx, true),
-                    },
-                );
-
-                this.cfg.push_assign_constant(
-                    false_block,
-                    source_info,
-                    destination,
-                    ConstOperand {
-                        span: expr_span,
-                        user_ty: None,
-                        const_: Const::from_bool(this.tcx, false),
-                    },
-                );
-
-                let join_block = this.cfg.start_new_block();
-                this.cfg.goto(true_block, source_info, join_block);
-                this.cfg.goto(false_block, source_info, join_block);
-                join_block.unit()
+            ExprKind::Let { .. } => {
+                // After desugaring, `let` expressions should only appear inside `if`
+                // expressions or `match` guards, possibly nested within a let-chain.
+                // In both cases they are specifically handled by the lowerings of
+                // those expressions, so this case is currently unreachable.
+                span_bug!(expr_span, "unexpected let expression outside of if or match-guard");
             }
             ExprKind::NeverToAny { source } => {
-                let source = &this.thir[source];
+                let source_expr = &this.thir[source];
                 let is_call =
-                    matches!(source.kind, ExprKind::Call { .. } | ExprKind::InlineAsm { .. });
+                    matches!(source_expr.kind, ExprKind::Call { .. } | ExprKind::InlineAsm { .. });
 
                 // (#66975) Source could be a const of type `!`, so has to
                 // exist in the generated MIR.
                 unpack!(
-                    block = this.as_temp(block, Some(this.local_scope()), source, Mutability::Mut,)
+                    block = this.as_temp(block, Some(this.local_scope()), source, Mutability::Mut)
                 );
 
                 // This is an optimization. If the expression was a call then we already have an
@@ -166,10 +153,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     this.in_if_then_scope(condition_scope, expr.span, |this| {
                         this.then_else_break(
                             block,
-                            &this.thir[lhs],
-                            Some(condition_scope),
-                            condition_scope,
+                            lhs,
+                            Some(condition_scope), // Temp scope
                             source_info,
+                            // This flag controls how inner `let` expressions are lowered,
+                            // but either way there shouldn't be any of those in here.
+                            true,
                         )
                     });
                 let (short_circuit, continuation, constant) = match op {
@@ -192,7 +181,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         const_: Const::from_bool(this.tcx, constant),
                     },
                 );
-                let rhs = unpack!(this.expr_into_dest(destination, continuation, &this.thir[rhs]));
+                let rhs = unpack!(this.expr_into_dest(destination, continuation, rhs));
                 let target = this.cfg.start_new_block();
                 this.cfg.goto(rhs, source_info, target);
                 this.cfg.goto(short_circuit, source_info, target);
@@ -231,8 +220,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     // introduce a unit temporary as the destination for the loop body.
                     let tmp = this.get_unit_temp();
                     // Execute the body, branching back to the test.
-                    let body_block_end =
-                        unpack!(this.expr_into_dest(tmp, body_block, &this.thir[body]));
+                    let body_block_end = unpack!(this.expr_into_dest(tmp, body_block, body));
                     this.cfg.goto(body_block_end, source_info, loop_block);
 
                     // Loops are only exited by `break` expressions.
@@ -240,11 +228,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 })
             }
             ExprKind::Call { ty: _, fun, ref args, from_hir_call, fn_span } => {
-                let fun = unpack!(block = this.as_local_operand(block, &this.thir[fun]));
+                let fun = unpack!(block = this.as_local_operand(block, fun));
                 let args: Vec<_> = args
                     .into_iter()
                     .copied()
-                    .map(|arg| unpack!(block = this.as_local_call_operand(block, &this.thir[arg])))
+                    .map(|arg| Spanned {
+                        node: unpack!(block = this.as_local_call_operand(block, arg)),
+                        span: this.thir.exprs[arg].span,
+                    })
                     .collect();
 
                 let success = this.cfg.start_new_block();
@@ -280,16 +271,17 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 this.diverge_from(block);
                 success.unit()
             }
-            ExprKind::Use { source } => this.expr_into_dest(destination, block, &this.thir[source]),
+            ExprKind::Use { source } => this.expr_into_dest(destination, block, source),
             ExprKind::Borrow { arg, borrow_kind } => {
-                let arg = &this.thir[arg];
                 // We don't do this in `as_rvalue` because we use `as_place`
                 // for borrow expressions, so we cannot create an `RValue` that
                 // remains valid across user code. `as_rvalue` is usually called
                 // by this method anyway, so this shouldn't cause too many
                 // unnecessary temporaries.
                 let arg_place = match borrow_kind {
-                    BorrowKind::Shared => unpack!(block = this.as_read_only_place(block, arg)),
+                    BorrowKind::Shared => {
+                        unpack!(block = this.as_read_only_place(block, arg))
+                    }
                     _ => unpack!(block = this.as_place(block, arg)),
                 };
                 let borrow = Rvalue::Ref(this.tcx.lifetimes.re_erased, borrow_kind, arg_place);
@@ -297,7 +289,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 block.unit()
             }
             ExprKind::AddressOf { mutability, arg } => {
-                let arg = &this.thir[arg];
                 let place = match mutability {
                     hir::Mutability::Not => this.as_read_only_place(block, arg),
                     hir::Mutability::Mut => this.as_place(block, arg),
@@ -332,7 +323,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                                 block = this.as_operand(
                                     block,
                                     Some(scope),
-                                    &this.thir[f.expr],
+                                    f.expr,
                                     LocalInfo::AggregateTemp,
                                     NeedsTemporary::Maybe,
                                 )
@@ -344,8 +335,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let field_names = adt_def.variant(variant_index).fields.indices();
 
                 let fields = if let Some(FruInfo { base, field_types }) = base {
-                    let place_builder =
-                        unpack!(block = this.as_place_builder(block, &this.thir[*base]));
+                    let place_builder = unpack!(block = this.as_place_builder(block, *base));
 
                     // MIR does not natively support FRU, so for each
                     // base-supplied field, generate an operand that
@@ -393,24 +383,30 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 line_spans,
             }) => {
                 use rustc_middle::{mir, thir};
+
+                let destination_block = this.cfg.start_new_block();
+                let mut targets = if options.contains(InlineAsmOptions::NORETURN) {
+                    vec![]
+                } else {
+                    vec![destination_block]
+                };
+
                 let operands = operands
                     .into_iter()
                     .map(|op| match *op {
                         thir::InlineAsmOperand::In { reg, expr } => mir::InlineAsmOperand::In {
                             reg,
-                            value: unpack!(block = this.as_local_operand(block, &this.thir[expr])),
+                            value: unpack!(block = this.as_local_operand(block, expr)),
                         },
                         thir::InlineAsmOperand::Out { reg, late, expr } => {
                             mir::InlineAsmOperand::Out {
                                 reg,
                                 late,
-                                place: expr.map(|expr| {
-                                    unpack!(block = this.as_place(block, &this.thir[expr]))
-                                }),
+                                place: expr.map(|expr| unpack!(block = this.as_place(block, expr))),
                             }
                         }
                         thir::InlineAsmOperand::InOut { reg, late, expr } => {
-                            let place = unpack!(block = this.as_place(block, &this.thir[expr]));
+                            let place = unpack!(block = this.as_place(block, expr));
                             mir::InlineAsmOperand::InOut {
                                 reg,
                                 late,
@@ -423,11 +419,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                             mir::InlineAsmOperand::InOut {
                                 reg,
                                 late,
-                                in_value: unpack!(
-                                    block = this.as_local_operand(block, &this.thir[in_expr])
-                                ),
+                                in_value: unpack!(block = this.as_local_operand(block, in_expr)),
                                 out_place: out_expr.map(|out_expr| {
-                                    unpack!(block = this.as_place(block, &this.thir[out_expr]))
+                                    unpack!(block = this.as_place(block, out_expr))
                                 }),
                             }
                         }
@@ -452,14 +446,28 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         thir::InlineAsmOperand::SymStatic { def_id } => {
                             mir::InlineAsmOperand::SymStatic { def_id }
                         }
+                        thir::InlineAsmOperand::Label { block } => {
+                            let target = this.cfg.start_new_block();
+                            let target_index = targets.len();
+                            targets.push(target);
+
+                            let tmp = this.get_unit_temp();
+                            let target = unpack!(this.ast_block(tmp, target, block, source_info));
+                            this.cfg.terminate(
+                                target,
+                                source_info,
+                                TerminatorKind::Goto { target: destination_block },
+                            );
+
+                            mir::InlineAsmOperand::Label { target_index }
+                        }
                     })
                     .collect();
 
-                if !options.contains(InlineAsmOptions::NORETURN) {
+                if !expr.ty.is_never() {
                     this.cfg.push_assign_unit(block, source_info, destination, this.tcx);
                 }
 
-                let destination_block = this.cfg.start_new_block();
                 this.cfg.terminate(
                     block,
                     source_info,
@@ -468,11 +476,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         operands,
                         options,
                         line_spans,
-                        destination: if options.contains(InlineAsmOptions::NORETURN) {
-                            None
-                        } else {
-                            Some(destination_block)
-                        },
+                        targets,
                         unwind: if options.contains(InlineAsmOptions::MAY_UNWIND) {
                             UnwindAction::Continue
                         } else {
@@ -488,7 +492,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
             // These cases don't actually need a destination
             ExprKind::Assign { .. } | ExprKind::AssignOp { .. } => {
-                unpack!(block = this.stmt_expr(block, expr, None));
+                unpack!(block = this.stmt_expr(block, expr_id, None));
                 this.cfg.push_assign_unit(block, source_info, destination, this.tcx);
                 block.unit()
             }
@@ -497,7 +501,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::Break { .. }
             | ExprKind::Return { .. }
             | ExprKind::Become { .. } => {
-                unpack!(block = this.stmt_expr(block, expr, None));
+                unpack!(block = this.stmt_expr(block, expr_id, None));
                 // No assign, as these have type `!`.
                 block.unit()
             }
@@ -509,7 +513,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::ValueTypeAscription { .. } => {
                 debug_assert!(Category::of(&expr.kind) == Some(Category::Place));
 
-                let place = unpack!(block = this.as_place(block, expr));
+                let place = unpack!(block = this.as_place(block, expr_id));
                 let rvalue = Rvalue::Use(this.consume_by_copy_or_move(place));
                 this.cfg.push_assign(block, source_info, destination, rvalue);
                 block.unit()
@@ -524,7 +528,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     this.local_decls.push(LocalDecl::new(expr.ty, expr.span));
                 }
 
-                let place = unpack!(block = this.as_place(block, expr));
+                let place = unpack!(block = this.as_place(block, expr_id));
                 let rvalue = Rvalue::Use(this.consume_by_copy_or_move(place));
                 this.cfg.push_assign(block, source_info, destination, rvalue);
                 block.unit()
@@ -536,7 +540,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     block = this.as_operand(
                         block,
                         Some(scope),
-                        &this.thir[value],
+                        value,
                         LocalInfo::Boring,
                         NeedsTemporary::No
                     )
@@ -547,7 +551,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     source_info,
                     TerminatorKind::Yield { value, resume, resume_arg: destination, drop: None },
                 );
-                this.generator_drop_cleanup(block);
+                this.coroutine_drop_cleanup(block);
                 resume.unit()
             }
 
@@ -582,7 +586,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     _ => true,
                 });
 
-                let rvalue = unpack!(block = this.as_local_rvalue(block, expr));
+                let rvalue = unpack!(block = this.as_local_rvalue(block, expr_id));
                 this.cfg.push_assign(block, source_info, destination, rvalue);
                 block.unit()
             }

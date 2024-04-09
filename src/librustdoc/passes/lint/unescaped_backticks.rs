@@ -4,7 +4,7 @@ use crate::clean::Item;
 use crate::core::DocContext;
 use crate::html::markdown::main_body_opts;
 use pulldown_cmark::{BrokenLink, Event, Parser};
-use rustc_errors::DiagnosticBuilder;
+use rustc_errors::Diag;
 use rustc_lint_defs::Applicability;
 use rustc_resolve::rustdoc::source_span_for_markdown_range;
 use std::ops::Range;
@@ -56,7 +56,7 @@ pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item) {
                 )
                 .unwrap_or_else(|| item.attr_span(tcx));
 
-                tcx.struct_span_lint_hir(crate::lint::UNESCAPED_BACKTICKS, hir_id, span, "unescaped backtick", |lint| {
+                tcx.node_span_lint(crate::lint::UNESCAPED_BACKTICKS, hir_id, span, "unescaped backtick", |lint| {
                     let mut help_emitted = false;
 
                     match element.prev_code_guess {
@@ -111,8 +111,6 @@ pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item) {
                     }
 
                     suggest_insertion(cx, item, &dox, lint, backtick_index, '\\', "if you meant to use a literal backtick, escape it");
-
-                    lint
                 });
             }
             Event::Code(_) => {
@@ -370,7 +368,7 @@ fn suggest_insertion(
     cx: &DocContext<'_>,
     item: &Item,
     dox: &str,
-    lint: &mut DiagnosticBuilder<'_, ()>,
+    lint: &mut Diag<'_, ()>,
     insert_index: usize,
     suggestion: char,
     message: &'static str,

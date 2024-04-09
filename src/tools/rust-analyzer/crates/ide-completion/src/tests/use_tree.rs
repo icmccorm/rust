@@ -9,6 +9,33 @@ fn check(ra_fixture: &str, expect: Expect) {
 }
 
 #[test]
+fn use_tree_completion() {
+    check(
+        r#"
+struct implThing;
+
+use crate::{impl$0};
+"#,
+        expect![[r#"
+            st implThing implThing
+            kw self
+        "#]],
+    );
+
+    check(
+        r#"
+struct implThing;
+
+use crate::{impl$0;
+"#,
+        expect![[r#"
+            st implThing implThing
+            kw self
+        "#]],
+    );
+}
+
+#[test]
 fn use_tree_start() {
     cov_mark::check!(unqualified_path_selected_only);
     check(
@@ -65,7 +92,7 @@ use self::{foo::*, bar$0};
 "#,
         expect![[r#"
             md foo
-            st S
+            st S   S
         "#]],
     );
 }
@@ -82,7 +109,7 @@ mod foo {
 use foo::{bar::$0}
 "#,
         expect![[r#"
-            st FooBar
+            st FooBar FooBar
         "#]],
     );
     check(
@@ -115,7 +142,7 @@ mod foo {
 use foo::{bar::{baz::$0}}
 "#,
         expect![[r#"
-            st FooBarBaz
+            st FooBarBaz FooBarBaz
         "#]],
     );
     check(
@@ -152,7 +179,7 @@ struct Bar;
 "#,
         expect![[r#"
             ma foo macro_rules! foo_
-            st Foo
+            st Foo Foo
         "#]],
     );
 }
@@ -193,7 +220,7 @@ struct Bar;
 "#,
         expect![[r#"
             md foo
-            st Bar
+            st Bar Bar
         "#]],
     );
 }
@@ -212,7 +239,7 @@ struct Bar;
         expect![[r#"
             md bar
             md foo
-            st Bar
+            st Bar Bar
         "#]],
     );
 }
@@ -230,7 +257,7 @@ mod a {
 }
 "#,
         expect![[r#"
-            ct A
+            ct A       usize
             md b
             kw super::
         "#]],
@@ -248,7 +275,7 @@ struct Bar;
 "#,
         expect![[r#"
             md foo
-            st Bar
+            st Bar Bar
         "#]],
     );
 }
@@ -265,7 +292,7 @@ pub mod foo {}
 "#,
         expect![[r#"
             md foo
-            st Foo
+            st Foo Foo
         "#]],
     );
 }
@@ -425,7 +452,7 @@ marco_rules! m { () => {} }
         expect![[r#"
             fn foo  fn()
             md simd
-            st S
+            st S    S
         "#]],
     );
 }

@@ -4,6 +4,10 @@ fn noop() {}
 
 // EMIT_MIR simplify_if.main.SimplifyConstCondition-after-const-prop.diff
 fn main() {
+    // CHECK-LABEL: fn main(
+
+    // CHECK: bb0: {
+    // CHECK-NEXT: return;
     if false {
         noop();
     }

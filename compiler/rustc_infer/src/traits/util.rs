@@ -2,7 +2,7 @@ use smallvec::smallvec;
 
 use crate::infer::outlives::components::{push_outlives_components, Component};
 use crate::traits::{self, Obligation, PredicateObligation};
-use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
+use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::ty::{self, ToPredicate, Ty, TyCtxt};
 use rustc_span::symbol::Ident;
 use rustc_span::Span;
@@ -76,7 +76,13 @@ impl<'tcx> Extend<ty::Predicate<'tcx>> for PredicateSet<'tcx> {
 pub struct Elaborator<'tcx, O> {
     stack: Vec<O>,
     visited: PredicateSet<'tcx>,
-    only_self: bool,
+    mode: Filter,
+}
+
+enum Filter {
+    All,
+    OnlySelf,
+    OnlySelfThatDefines(Ident),
 }
 
 /// Describes how to elaborate an obligation into a sub-obligation.
@@ -224,7 +230,7 @@ pub fn elaborate<'tcx, O: Elaboratable<'tcx>>(
     obligations: impl IntoIterator<Item = O>,
 ) -> Elaborator<'tcx, O> {
     let mut elaborator =
-        Elaborator { stack: Vec::new(), visited: PredicateSet::new(tcx), only_self: false };
+        Elaborator { stack: Vec::new(), visited: PredicateSet::new(tcx), mode: Filter::All };
     elaborator.extend_deduped(obligations);
     elaborator
 }
@@ -242,76 +248,54 @@ impl<'tcx, O: Elaboratable<'tcx>> Elaborator<'tcx, O> {
     /// Filter to only the supertraits of trait predicates, i.e. only the predicates
     /// that have `Self` as their self type, instead of all implied predicates.
     pub fn filter_only_self(mut self) -> Self {
-        self.only_self = true;
+        self.mode = Filter::OnlySelf;
+        self
+    }
+
+    /// Filter to only the supertraits of trait predicates that define the assoc_ty.
+    pub fn filter_only_self_that_defines(mut self, assoc_ty: Ident) -> Self {
+        self.mode = Filter::OnlySelfThatDefines(assoc_ty);
         self
     }
 
     fn elaborate(&mut self, elaboratable: &O) {
         let tcx = self.visited.tcx;
 
-        let bound_predicate = elaboratable.predicate().kind();
-        match bound_predicate.skip_binder() {
-            ty::PredicateKind::Clause(ty::ClauseKind::Trait(data)) => {
+        // We only elaborate clauses.
+        let Some(clause) = elaboratable.predicate().as_clause() else {
+            return;
+        };
+
+        let bound_clause = clause.kind();
+        match bound_clause.skip_binder() {
+            ty::ClauseKind::Trait(data) => {
                 // Negative trait bounds do not imply any supertrait bounds
-                if data.polarity == ty::ImplPolarity::Negative {
+                if data.polarity != ty::PredicatePolarity::Positive {
                     return;
                 }
                 // Get predicates implied by the trait, or only super predicates if we only care about self predicates.
-                let predicates = if self.only_self {
-                    tcx.super_predicates_of(data.def_id())
-                } else {
-                    tcx.implied_predicates_of(data.def_id())
+                let predicates = match self.mode {
+                    Filter::All => tcx.implied_predicates_of(data.def_id()),
+                    Filter::OnlySelf => tcx.super_predicates_of(data.def_id()),
+                    Filter::OnlySelfThatDefines(ident) => {
+                        tcx.super_predicates_that_define_assoc_item((data.def_id(), ident))
+                    }
                 };
 
                 let obligations =
                     predicates.predicates.iter().enumerate().map(|(index, &(clause, span))| {
                         elaboratable.child_with_derived_cause(
-                            clause.subst_supertrait(tcx, &bound_predicate.rebind(data.trait_ref)),
+                            clause
+                                .instantiate_supertrait(tcx, &bound_clause.rebind(data.trait_ref)),
                             span,
-                            bound_predicate.rebind(data),
+                            bound_clause.rebind(data),
                             index,
                         )
                     });
                 debug!(?data, ?obligations, "super_predicates");
                 self.extend_deduped(obligations);
             }
-            ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(..)) => {
-                // Currently, we do not elaborate WF predicates,
-                // although we easily could.
-            }
-            ty::PredicateKind::ObjectSafe(..) => {
-                // Currently, we do not elaborate object-safe
-                // predicates.
-            }
-            ty::PredicateKind::Subtype(..) => {
-                // Currently, we do not "elaborate" predicates like `X <: Y`,
-                // though conceivably we might.
-            }
-            ty::PredicateKind::Coerce(..) => {
-                // Currently, we do not "elaborate" predicates like `X -> Y`,
-                // though conceivably we might.
-            }
-            ty::PredicateKind::Clause(ty::ClauseKind::Projection(..)) => {
-                // Nothing to elaborate in a projection predicate.
-            }
-            ty::PredicateKind::ClosureKind(..) => {
-                // Nothing to elaborate when waiting for a closure's kind to be inferred.
-            }
-            ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(..)) => {
-                // Currently, we do not elaborate const-evaluatable
-                // predicates.
-            }
-            ty::PredicateKind::ConstEquate(..) => {
-                // Currently, we do not elaborate const-equate
-                // predicates.
-            }
-            ty::PredicateKind::Clause(ty::ClauseKind::RegionOutlives(..)) => {
-                // Nothing to elaborate from `'a: 'b`.
-            }
-            ty::PredicateKind::Clause(ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(
-                ty_max,
-                r_min,
-            ))) => {
+            ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(ty_max, r_min)) => {
                 // We know that `T: 'a` for some type `T`. We can
                 // often elaborate this. For example, if we know that
                 // `[U]: 'a`, that implies that `U: 'a`. Similarly, if
@@ -326,7 +310,7 @@ impl<'tcx, O: Elaboratable<'tcx>> Elaborator<'tcx, O> {
                 // consider this as evidence that `T: 'static`, but
                 // I'm a bit wary of such constructions and so for now
                 // I want to be conservative. --nmatsakis
-                if r_min.is_late_bound() {
+                if r_min.is_bound() {
                     return;
                 }
 
@@ -337,7 +321,7 @@ impl<'tcx, O: Elaboratable<'tcx>> Elaborator<'tcx, O> {
                         .into_iter()
                         .filter_map(|component| match component {
                             Component::Region(r) => {
-                                if r.is_late_bound() {
+                                if r.is_bound() {
                                     None
                                 } else {
                                     Some(ty::ClauseKind::RegionOutlives(ty::OutlivesPredicate(
@@ -348,6 +332,11 @@ impl<'tcx, O: Elaboratable<'tcx>> Elaborator<'tcx, O> {
 
                             Component::Param(p) => {
                                 let ty = Ty::new_param(tcx, p.index, p.name);
+                                Some(ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(ty, r_min)))
+                            }
+
+                            Component::Placeholder(p) => {
+                                let ty = Ty::new_placeholder(tcx, p);
                                 Some(ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(ty, r_min)))
                             }
 
@@ -369,15 +358,25 @@ impl<'tcx, O: Elaboratable<'tcx>> Elaborator<'tcx, O> {
                             }
                         })
                         .map(|clause| {
-                            elaboratable.child(bound_predicate.rebind(clause).to_predicate(tcx))
+                            elaboratable.child(bound_clause.rebind(clause).to_predicate(tcx))
                         }),
                 );
             }
-            ty::PredicateKind::Ambiguous => {}
-            ty::PredicateKind::AliasRelate(..) => {
-                // No
+            ty::ClauseKind::RegionOutlives(..) => {
+                // Nothing to elaborate from `'a: 'b`.
             }
-            ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(..)) => {
+            ty::ClauseKind::WellFormed(..) => {
+                // Currently, we do not elaborate WF predicates,
+                // although we easily could.
+            }
+            ty::ClauseKind::Projection(..) => {
+                // Nothing to elaborate in a projection predicate.
+            }
+            ty::ClauseKind::ConstEvaluatable(..) => {
+                // Currently, we do not elaborate const-evaluatable
+                // predicates.
+            }
+            ty::ClauseKind::ConstArgHasType(..) => {
                 // Nothing to elaborate
             }
         }
@@ -409,14 +408,14 @@ impl<'tcx, O: Elaboratable<'tcx>> Iterator for Elaborator<'tcx, O> {
 pub fn supertraits<'tcx>(
     tcx: TyCtxt<'tcx>,
     trait_ref: ty::PolyTraitRef<'tcx>,
-) -> impl Iterator<Item = ty::PolyTraitRef<'tcx>> {
+) -> FilterToTraits<Elaborator<'tcx, ty::Predicate<'tcx>>> {
     elaborate(tcx, [trait_ref.to_predicate(tcx)]).filter_only_self().filter_to_traits()
 }
 
 pub fn transitive_bounds<'tcx>(
     tcx: TyCtxt<'tcx>,
     trait_refs: impl Iterator<Item = ty::PolyTraitRef<'tcx>>,
-) -> impl Iterator<Item = ty::PolyTraitRef<'tcx>> {
+) -> FilterToTraits<Elaborator<'tcx, ty::Predicate<'tcx>>> {
     elaborate(tcx, trait_refs.map(|trait_ref| trait_ref.to_predicate(tcx)))
         .filter_only_self()
         .filter_to_traits()
@@ -429,31 +428,12 @@ pub fn transitive_bounds<'tcx>(
 /// `T::Item` and helps to avoid cycle errors (see e.g. #35237).
 pub fn transitive_bounds_that_define_assoc_item<'tcx>(
     tcx: TyCtxt<'tcx>,
-    bounds: impl Iterator<Item = ty::PolyTraitRef<'tcx>>,
+    trait_refs: impl Iterator<Item = ty::PolyTraitRef<'tcx>>,
     assoc_name: Ident,
-) -> impl Iterator<Item = ty::PolyTraitRef<'tcx>> {
-    let mut stack: Vec<_> = bounds.collect();
-    let mut visited = FxIndexSet::default();
-
-    std::iter::from_fn(move || {
-        while let Some(trait_ref) = stack.pop() {
-            let anon_trait_ref = tcx.anonymize_bound_vars(trait_ref);
-            if visited.insert(anon_trait_ref) {
-                let super_predicates =
-                    tcx.super_predicates_that_define_assoc_item((trait_ref.def_id(), assoc_name));
-                for (super_predicate, _) in super_predicates.predicates {
-                    let subst_predicate = super_predicate.subst_supertrait(tcx, &trait_ref);
-                    if let Some(binder) = subst_predicate.as_trait_clause() {
-                        stack.push(binder.map_bound(|t| t.trait_ref));
-                    }
-                }
-
-                return Some(trait_ref);
-            }
-        }
-
-        return None;
-    })
+) -> FilterToTraits<Elaborator<'tcx, ty::Predicate<'tcx>>> {
+    elaborate(tcx, trait_refs.map(|trait_ref| trait_ref.to_predicate(tcx)))
+        .filter_only_self_that_defines(assoc_name)
+        .filter_to_traits()
 }
 
 ///////////////////////////////////////////////////////////////////////////

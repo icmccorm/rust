@@ -1,4 +1,4 @@
-// edition:2021
+//@ edition:2021
 
 fn foo(b: bool) -> impl std::fmt::Debug {
     if b {
@@ -36,13 +36,13 @@ fn muh() -> Result<(), impl std::fmt::Debug> {
 
 fn muh2() -> Result<(), impl std::fmt::Debug> {
     return Err(From::from("foo"));
-    //~^ ERROR type annotations needed
+    //~^ ERROR cannot call associated function on trait
     Ok(())
 }
 
 fn muh3() -> Result<(), impl std::fmt::Debug> {
     Err(From::from("foo"))
-    //~^ ERROR type annotations needed
+    //~^ ERROR cannot call associated function on trait
 }
 
 fn main() {}

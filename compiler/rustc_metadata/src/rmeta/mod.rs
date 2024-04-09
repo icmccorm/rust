@@ -3,6 +3,7 @@ use decoder::Metadata;
 use def_path_hash_map::DefPathHashMapRef;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
+use rustc_middle::middle::lib_features::FeatureStability;
 use table::TableBuilder;
 
 use rustc_ast as ast;
@@ -11,7 +12,7 @@ use rustc_attr as attr;
 use rustc_data_structures::svh::Svh;
 use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, DefKind, DocLinkResMap};
-use rustc_hir::def_id::{CrateNum, DefId, DefIndex, DefPathHash, StableCrateId};
+use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, DefIndex, DefPathHash, StableCrateId};
 use rustc_hir::definitions::DefKey;
 use rustc_hir::lang_items::LangItem;
 use rustc_index::bit_set::BitSet;
@@ -36,7 +37,7 @@ use rustc_target::abi::{FieldIdx, VariantIdx};
 use rustc_target::spec::{PanicStrategy, TargetTriple};
 
 use std::marker::PhantomData;
-use std::num::NonZeroUsize;
+use std::num::NonZero;
 
 use decoder::DecodeContext;
 pub(crate) use decoder::{CrateMetadata, CrateNumMap, MetadataBlob};
@@ -56,20 +57,14 @@ pub(crate) fn rustc_version(cfg_version: &'static str) -> String {
 /// Metadata encoding version.
 /// N.B., increment this if you change the format of metadata such that
 /// the rustc version can't be found to compare with `rustc_version()`.
-const METADATA_VERSION: u8 = 8;
+const METADATA_VERSION: u8 = 9;
 
 /// Metadata header which includes `METADATA_VERSION`.
 ///
 /// This header is followed by the length of the compressed data, then
-/// the position of the `CrateRoot`, which is encoded as a 32-bit big-endian
+/// the position of the `CrateRoot`, which is encoded as a 64-bit little-endian
 /// unsigned integer, and further followed by the rustc version string.
 pub const METADATA_HEADER: &[u8] = &[b'r', b'u', b's', b't', 0, 0, 0, METADATA_VERSION];
-
-#[derive(Encodable, Decodable)]
-enum SpanEncodingMode {
-    Shorthand(usize),
-    Direct,
-}
 
 /// A value of type T referred to by its absolute position
 /// in the metadata, and which can be decoded lazily.
@@ -88,7 +83,7 @@ enum SpanEncodingMode {
 /// order than they were encoded in.
 #[must_use]
 struct LazyValue<T> {
-    position: NonZeroUsize,
+    position: NonZero<usize>,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -97,7 +92,7 @@ impl<T: ParameterizedOverTcx> ParameterizedOverTcx for LazyValue<T> {
 }
 
 impl<T> LazyValue<T> {
-    fn from_position(position: NonZeroUsize) -> LazyValue<T> {
+    fn from_position(position: NonZero<usize>) -> LazyValue<T> {
         LazyValue { position, _marker: PhantomData }
     }
 }
@@ -113,7 +108,7 @@ impl<T> LazyValue<T> {
 /// the minimal distance the length of the sequence, i.e.
 /// it's assumed there's no 0-byte element in the sequence.
 struct LazyArray<T> {
-    position: NonZeroUsize,
+    position: NonZero<usize>,
     num_elems: usize,
     _marker: PhantomData<fn() -> T>,
 }
@@ -124,12 +119,12 @@ impl<T: ParameterizedOverTcx> ParameterizedOverTcx for LazyArray<T> {
 
 impl<T> Default for LazyArray<T> {
     fn default() -> LazyArray<T> {
-        LazyArray::from_position_and_num_elems(NonZeroUsize::new(1).unwrap(), 0)
+        LazyArray::from_position_and_num_elems(NonZero::new(1).unwrap(), 0)
     }
 }
 
 impl<T> LazyArray<T> {
-    fn from_position_and_num_elems(position: NonZeroUsize, num_elems: usize) -> LazyArray<T> {
+    fn from_position_and_num_elems(position: NonZero<usize>, num_elems: usize) -> LazyArray<T> {
         LazyArray { position, num_elems, _marker: PhantomData }
     }
 }
@@ -140,7 +135,7 @@ impl<T> LazyArray<T> {
 /// `LazyArray<T>`, but without requiring encoding or decoding all the values
 /// eagerly and in-order.
 struct LazyTable<I, T> {
-    position: NonZeroUsize,
+    position: NonZero<usize>,
     /// The encoded size of the elements of a table is selected at runtime to drop
     /// trailing zeroes. This is the number of bytes used for each table element.
     width: usize,
@@ -155,7 +150,7 @@ impl<I: 'static, T: ParameterizedOverTcx> ParameterizedOverTcx for LazyTable<I, 
 
 impl<I, T> LazyTable<I, T> {
     fn from_position_and_encoded_size(
-        position: NonZeroUsize,
+        position: NonZero<usize>,
         width: usize,
         len: usize,
     ) -> LazyTable<I, T> {
@@ -192,11 +187,11 @@ enum LazyState {
 
     /// Inside a metadata node, and before any `Lazy`s.
     /// The position is that of the node itself.
-    NodeStart(NonZeroUsize),
+    NodeStart(NonZero<usize>),
 
     /// Inside a metadata node, with a previous `Lazy`s.
     /// The position is where that previous `Lazy` would start.
-    Previous(NonZeroUsize),
+    Previous(NonZero<usize>),
 }
 
 type SyntaxContextTable = LazyTable<u32, Option<LazyValue<SyntaxContextData>>>;
@@ -263,7 +258,7 @@ pub(crate) struct CrateRoot {
 
     crate_deps: LazyArray<CrateDep>,
     dylib_dependency_formats: LazyArray<Option<LinkagePreference>>,
-    lib_features: LazyArray<(Symbol, Option<Symbol>)>,
+    lib_features: LazyArray<(Symbol, FeatureStability)>,
     stability_implications: LazyArray<(Symbol, Symbol)>,
     lang_items: LazyArray<(DefIndex, LangItem)>,
     lang_items_missing: LazyArray<LangItem>,
@@ -380,13 +375,19 @@ macro_rules! define_tables {
 
 define_tables! {
 - defaulted:
-    is_intrinsic: Table<DefIndex, bool>,
+    intrinsic: Table<DefIndex, Option<LazyValue<ty::IntrinsicDef>>>,
     is_macro_rules: Table<DefIndex, bool>,
     is_type_alias_impl_trait: Table<DefIndex, bool>,
     type_alias_is_lazy: Table<DefIndex, bool>,
     attr_flags: Table<DefIndex, AttrFlags>,
-    def_path_hashes: Table<DefIndex, DefPathHash>,
+    // The u64 is the crate-local part of the DefPathHash. All hashes in this crate have the same
+    // StableCrateId, so we omit encoding those into the table.
+    //
+    // Note also that this table is fully populated (no gaps) as every DefIndex should have a
+    // corresponding DefPathHash.
+    def_path_hashes: Table<DefIndex, u64>,
     explicit_item_bounds: Table<DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
+    explicit_item_super_predicates: Table<DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
     inferred_outlives_of: Table<DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
     inherent_impls: Table<DefIndex, LazyArray<DefIndex>>,
     associated_types_for_impl_traits_in_associated_fn: Table<DefIndex, LazyArray<DefId>>,
@@ -397,6 +398,7 @@ define_tables! {
     // That's why the encoded list needs to contain `ModChild` structures describing all the names
     // individually instead of `DefId`s.
     module_children_reexports: Table<DefIndex, LazyArray<ModChild>>,
+    cross_crate_inlinable: Table<DefIndex, bool>,
 
 - optional:
     attributes: Table<DefIndex, LazyArray<ast::Attribute>>,
@@ -404,7 +406,7 @@ define_tables! {
     // so we can take their names, visibilities etc from other encoded tables.
     module_children_non_reexports: Table<DefIndex, LazyArray<DefIndex>>,
     associated_item_or_field_def_ids: Table<DefIndex, LazyArray<DefIndex>>,
-    opt_def_kind: Table<DefIndex, DefKind>,
+    def_kind: Table<DefIndex, DefKind>,
     visibility: Table<DefIndex, LazyValue<ty::Visibility<DefIndex>>>,
     def_span: Table<DefIndex, LazyValue<Span>>,
     def_ident_span: Table<DefIndex, LazyValue<Span>>,
@@ -422,17 +424,16 @@ define_tables! {
     variances_of: Table<DefIndex, LazyArray<ty::Variance>>,
     fn_sig: Table<DefIndex, LazyValue<ty::EarlyBinder<ty::PolyFnSig<'static>>>>,
     codegen_fn_attrs: Table<DefIndex, LazyValue<CodegenFnAttrs>>,
-    impl_trait_ref: Table<DefIndex, LazyValue<ty::EarlyBinder<ty::TraitRef<'static>>>>,
+    impl_trait_header: Table<DefIndex, LazyValue<ty::ImplTraitHeader<'static>>>,
     const_param_default: Table<DefIndex, LazyValue<ty::EarlyBinder<rustc_middle::ty::Const<'static>>>>,
     object_lifetime_default: Table<DefIndex, LazyValue<ObjectLifetimeDefault>>,
     optimized_mir: Table<DefIndex, LazyValue<mir::Body<'static>>>,
     mir_for_ctfe: Table<DefIndex, LazyValue<mir::Body<'static>>>,
     closure_saved_names_of_captured_variables: Table<DefIndex, LazyValue<IndexVec<FieldIdx, Symbol>>>,
-    mir_generator_witnesses: Table<DefIndex, LazyValue<mir::GeneratorLayout<'static>>>,
+    mir_coroutine_witnesses: Table<DefIndex, LazyValue<mir::CoroutineLayout<'static>>>,
     promoted_mir: Table<DefIndex, LazyValue<IndexVec<mir::Promoted, mir::Body<'static>>>>,
     thir_abstract_const: Table<DefIndex, LazyValue<ty::EarlyBinder<ty::Const<'static>>>>,
     impl_parent: Table<DefIndex, RawDefId>,
-    impl_polarity: Table<DefIndex, ty::ImplPolarity>,
     constness: Table<DefIndex, hir::Constness>,
     defaultness: Table<DefIndex, hir::Defaultness>,
     // FIXME(eddyb) perhaps compute this on the fly if cheap enough?
@@ -441,7 +442,9 @@ define_tables! {
     rendered_const: Table<DefIndex, LazyValue<String>>,
     asyncness: Table<DefIndex, ty::Asyncness>,
     fn_arg_names: Table<DefIndex, LazyArray<Ident>>,
-    generator_kind: Table<DefIndex, LazyValue<hir::GeneratorKind>>,
+    coroutine_kind: Table<DefIndex, hir::CoroutineKind>,
+    coroutine_for_closure: Table<DefIndex, RawDefId>,
+    eval_static_initializer: Table<DefIndex, LazyValue<mir::interpret::ConstAllocation<'static>>>,
     trait_def: Table<DefIndex, LazyValue<ty::TraitDef>>,
     trait_item_def_id: Table<DefIndex, RawDefId>,
     expn_that_defined: Table<DefIndex, LazyValue<ExpnId>>,
@@ -458,7 +461,7 @@ define_tables! {
     macro_definition: Table<DefIndex, LazyValue<ast::DelimArgs>>,
     proc_macro: Table<DefIndex, MacroKind>,
     deduced_param_attrs: Table<DefIndex, LazyArray<DeducedParamAttrs>>,
-    trait_impl_trait_tys: Table<DefIndex, LazyValue<FxHashMap<DefId, ty::EarlyBinder<Ty<'static>>>>>,
+    trait_impl_trait_tys: Table<DefIndex, LazyValue<DefIdMap<ty::EarlyBinder<Ty<'static>>>>>,
     doc_link_resolutions: Table<DefIndex, LazyValue<DocLinkResMap>>,
     doc_link_traits_in_scope: Table<DefIndex, LazyArray<DefId>>,
     assumed_wf_types_for_rpitit: Table<DefIndex, LazyArray<(Ty<'static>, Span)>>,
@@ -480,10 +483,90 @@ bitflags::bitflags! {
     }
 }
 
-// Tags used for encoding Spans:
-const TAG_VALID_SPAN_LOCAL: u8 = 0;
-const TAG_VALID_SPAN_FOREIGN: u8 = 1;
-const TAG_PARTIAL_SPAN: u8 = 2;
+/// A span tag byte encodes a bunch of data, so that we can cut out a few extra bytes from span
+/// encodings (which are very common, for example, libcore has ~650,000 unique spans and over 1.1
+/// million references to prior-written spans).
+///
+/// The byte format is split into several parts:
+///
+/// [ a a a a a c d d ]
+///
+/// `a` bits represent the span length. We have 5 bits, so we can store lengths up to 30 inline, with
+/// an all-1s pattern representing that the length is stored separately.
+///
+/// `c` represents whether the span context is zero (and then it is not stored as a separate varint)
+/// for direct span encodings, and whether the offset is absolute or relative otherwise (zero for
+/// absolute).
+///
+/// d bits represent the kind of span we are storing (local, foreign, partial, indirect).
+#[derive(Encodable, Decodable, Copy, Clone)]
+struct SpanTag(u8);
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum SpanKind {
+    Local = 0b00,
+    Foreign = 0b01,
+    Partial = 0b10,
+    // Indicates the actual span contents are elsewhere.
+    // If this is the kind, then the span context bit represents whether it is a relative or
+    // absolute offset.
+    Indirect = 0b11,
+}
+
+impl SpanTag {
+    fn new(kind: SpanKind, context: rustc_span::SyntaxContext, length: usize) -> SpanTag {
+        let mut data = 0u8;
+        data |= kind as u8;
+        if context.is_root() {
+            data |= 0b100;
+        }
+        let all_1s_len = (0xffu8 << 3) >> 3;
+        // strictly less than - all 1s pattern is a sentinel for storage being out of band.
+        if length < all_1s_len as usize {
+            data |= (length as u8) << 3;
+        } else {
+            data |= all_1s_len << 3;
+        }
+
+        SpanTag(data)
+    }
+
+    fn indirect(relative: bool, length_bytes: u8) -> SpanTag {
+        let mut tag = SpanTag(SpanKind::Indirect as u8);
+        if relative {
+            tag.0 |= 0b100;
+        }
+        assert!(length_bytes <= 8);
+        tag.0 |= length_bytes << 3;
+        tag
+    }
+
+    fn kind(self) -> SpanKind {
+        let masked = self.0 & 0b11;
+        match masked {
+            0b00 => SpanKind::Local,
+            0b01 => SpanKind::Foreign,
+            0b10 => SpanKind::Partial,
+            0b11 => SpanKind::Indirect,
+            _ => unreachable!(),
+        }
+    }
+
+    fn is_relative_offset(self) -> bool {
+        debug_assert_eq!(self.kind(), SpanKind::Indirect);
+        self.0 & 0b100 != 0
+    }
+
+    fn context(self) -> Option<rustc_span::SyntaxContext> {
+        if self.0 & 0b100 != 0 { Some(rustc_span::SyntaxContext::root()) } else { None }
+    }
+
+    fn length(self) -> Option<rustc_span::BytePos> {
+        let all_1s_len = (0xffu8 << 3) >> 3;
+        let len = self.0 >> 3;
+        if len != all_1s_len { Some(rustc_span::BytePos(u32::from(len))) } else { None }
+    }
+}
 
 // Tags for encoding Symbol's
 const SYMBOL_STR: u8 = 0;

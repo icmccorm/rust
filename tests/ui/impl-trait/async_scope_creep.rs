@@ -1,7 +1,7 @@
 #![feature(type_alias_impl_trait)]
-// edition:2021
-//[rpit] check-pass
-// revisions: tait rpit
+//@ edition:2021
+//@ check-pass
+//@ revisions: tait rpit
 
 struct Pending {}
 
@@ -23,7 +23,7 @@ impl Pending {
 
     #[cfg(tait)]
     fn read_fut(&mut self) -> OpeningReadFuture<'_> {
-        self.read() //[tait]~ ERROR: cannot satisfy `impl AsyncRead + 'a == PendingReader<'a>`
+        self.read()
     }
 
     #[cfg(rpit)]

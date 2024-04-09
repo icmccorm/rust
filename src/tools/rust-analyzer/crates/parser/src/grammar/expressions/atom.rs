@@ -58,6 +58,7 @@ pub(super) const ATOM_EXPR_FIRST: TokenSet =
         T![match],
         T![move],
         T![return],
+        T![become],
         T![static],
         T![try],
         T![unsafe],
@@ -102,6 +103,7 @@ pub(super) fn atom_expr(
         T![try] => try_block_expr(p, None),
         T![match] => match_expr(p),
         T![return] => return_expr(p),
+        T![become] => become_expr(p),
         T![yield] => yield_expr(p),
         T![do] if p.nth_at_contextual_kw(1, T![yeet]) => yeet_expr(p),
         T![continue] => continue_expr(p),
@@ -145,7 +147,7 @@ pub(super) fn atom_expr(
         T![async] if la == T![move] && p.nth(2) == T!['{'] => {
             let m = p.start();
             p.bump(T![async]);
-            p.eat(T![move]);
+            p.bump(T![move]);
             stmt_list(p);
             m.complete(p, BLOCK_EXPR)
         }
@@ -388,8 +390,7 @@ fn if_expr(p: &mut Parser<'_>) -> CompletedMarker {
     p.bump(T![if]);
     expr_no_struct(p);
     block_expr(p);
-    if p.at(T![else]) {
-        p.bump(T![else]);
+    if p.eat(T![else]) {
         if p.at(T![if]) {
             if_expr(p);
         } else {
@@ -489,6 +490,18 @@ fn match_expr(p: &mut Parser<'_>) -> CompletedMarker {
     m.complete(p, MATCH_EXPR)
 }
 
+// test_err match_arms_recovery
+// fn foo() {
+//     match () {
+//         _ => (),,
+//         _ => ,
+//         _ => (),
+//          => (),
+//         if true => (),
+//         _ => (),
+//         () if => (),
+//     }
+// }
 pub(crate) fn match_arm_list(p: &mut Parser<'_>) {
     assert!(p.at(T!['{']));
     let m = p.start();
@@ -508,6 +521,10 @@ pub(crate) fn match_arm_list(p: &mut Parser<'_>) {
     while !p.at(EOF) && !p.at(T!['}']) {
         if p.at(T!['{']) {
             error_block(p, "expected match arm");
+            continue;
+        }
+        if p.at(T![,]) {
+            p.err_and_bump("expected pattern");
             continue;
         }
         match_arm(p);
@@ -543,26 +560,30 @@ fn match_arm(p: &mut Parser<'_>) {
     // }
     attributes::outer_attrs(p);
 
-    patterns::pattern_top_r(p, TokenSet::EMPTY);
+    patterns::pattern_top_r(p, TokenSet::new(&[T![=], T![if]]));
     if p.at(T![if]) {
         match_guard(p);
     }
     p.expect(T![=>]);
-    let blocklike = match expr_stmt(p, None) {
-        Some((_, blocklike)) => blocklike,
-        None => BlockLike::NotBlock,
-    };
+    if p.eat(T![,]) {
+        p.error("expected expression");
+    } else {
+        let blocklike = match expr_stmt(p, None) {
+            Some((_, blocklike)) => blocklike,
+            None => BlockLike::NotBlock,
+        };
 
-    // test match_arms_commas
-    // fn foo() {
-    //     match () {
-    //         _ => (),
-    //         _ => {}
-    //         _ => ()
-    //     }
-    // }
-    if !p.eat(T![,]) && !blocklike.is_block() && !p.at(T!['}']) {
-        p.error("expected `,`");
+        // test match_arms_commas
+        // fn foo() {
+        //     match () {
+        //         _ => (),
+        //         _ => {}
+        //         _ => ()
+        //     }
+        // }
+        if !p.eat(T![,]) && !blocklike.is_block() && !p.at(T!['}']) {
+            p.error("expected `,`");
+        }
     }
     m.complete(p, MATCH_ARM);
 }
@@ -578,7 +599,11 @@ fn match_guard(p: &mut Parser<'_>) -> CompletedMarker {
     assert!(p.at(T![if]));
     let m = p.start();
     p.bump(T![if]);
-    expr(p);
+    if p.at(T![=]) {
+        p.error("expected expression");
+    } else {
+        expr(p);
+    }
     m.complete(p, MATCH_GUARD)
 }
 
@@ -619,6 +644,18 @@ fn return_expr(p: &mut Parser<'_>) -> CompletedMarker {
         expr(p);
     }
     m.complete(p, RETURN_EXPR)
+}
+
+// test become_expr
+// fn foo() {
+//     become foo();
+// }
+fn become_expr(p: &mut Parser<'_>) -> CompletedMarker {
+    assert!(p.at(T![become]));
+    let m = p.start();
+    p.bump(T![become]);
+    expr(p);
+    m.complete(p, BECOME_EXPR)
 }
 
 // test yield_expr

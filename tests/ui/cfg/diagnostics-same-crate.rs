@@ -5,7 +5,11 @@ pub mod inner {
 
     #[cfg(FALSE)]
     pub mod doesnt_exist {
+        //~^ NOTE found an item that was configured out
+        //~| NOTE found an item that was configured out
+        //~| NOTE found an item that was configured out
         pub fn hello() {}
+        pub mod hi {}
     }
 
     pub mod wrong {
@@ -18,6 +22,15 @@ pub mod inner {
         pub fn meow() {}
         //~^ NOTE found an item that was configured out
     }
+}
+
+mod placeholder {
+    use super::inner::doesnt_exist;
+    //~^ ERROR unresolved import `super::inner::doesnt_exist`
+    //~| NOTE no `doesnt_exist` in `inner`
+    use super::inner::doesnt_exist::hi;
+    //~^ ERROR unresolved import `super::inner::doesnt_exist`
+    //~| NOTE could not find `doesnt_exist` in `inner`
 }
 
 #[cfg(i_dont_exist_and_you_can_do_nothing_about_it)]
@@ -34,7 +47,6 @@ fn main() {
 
     // The module isn't found - we would like to get a diagnostic, but currently don't due to
     // the awkward way the resolver diagnostics are currently implemented.
-    // FIXME(Nilstrieb): Also add a note to the cfg diagnostic here
     inner::doesnt_exist::hello(); //~ ERROR failed to resolve
     //~| NOTE could not find `doesnt_exist` in `inner`
 

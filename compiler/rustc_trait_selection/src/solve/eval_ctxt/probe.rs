@@ -1,5 +1,10 @@
+use crate::solve::assembly::Candidate;
+
 use super::EvalCtxt;
-use rustc_middle::traits::solve::{inspect, CandidateSource, QueryResult};
+use rustc_middle::traits::{
+    query::NoSolution,
+    solve::{inspect, CandidateSource, QueryResult},
+};
 use std::marker::PhantomData;
 
 pub(in crate::solve) struct ProbeCtxt<'me, 'a, 'tcx, F, T> {
@@ -19,6 +24,7 @@ where
             infcx: outer_ecx.infcx,
             variables: outer_ecx.variables,
             var_values: outer_ecx.var_values,
+            is_normalizes_to_goal: outer_ecx.is_normalizes_to_goal,
             predefined_opaques_in_body: outer_ecx.predefined_opaques_in_body,
             max_input_universe: outer_ecx.max_input_universe,
             search_graph: outer_ecx.search_graph,
@@ -33,6 +39,23 @@ where
             outer_ecx.inspect.finish_probe(nested_ecx.inspect);
         }
         r
+    }
+}
+
+pub(in crate::solve) struct TraitProbeCtxt<'me, 'a, 'tcx, F> {
+    cx: ProbeCtxt<'me, 'a, 'tcx, F, QueryResult<'tcx>>,
+    source: CandidateSource,
+}
+
+impl<'tcx, F> TraitProbeCtxt<'_, '_, 'tcx, F>
+where
+    F: FnOnce(&QueryResult<'tcx>) -> inspect::ProbeKind<'tcx>,
+{
+    pub(in crate::solve) fn enter(
+        self,
+        f: impl FnOnce(&mut EvalCtxt<'_, 'tcx>) -> QueryResult<'tcx>,
+    ) -> Result<Candidate<'tcx>, NoSolution> {
+        self.cx.enter(|ecx| f(ecx)).map(|result| Candidate { source: self.source, result })
     }
 }
 
@@ -69,20 +92,18 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
     pub(in crate::solve) fn probe_trait_candidate(
         &mut self,
         source: CandidateSource,
-    ) -> ProbeCtxt<
-        '_,
-        'a,
-        'tcx,
-        impl FnOnce(&QueryResult<'tcx>) -> inspect::ProbeKind<'tcx>,
-        QueryResult<'tcx>,
-    > {
-        ProbeCtxt {
-            ecx: self,
-            probe_kind: move |result: &QueryResult<'tcx>| inspect::ProbeKind::TraitCandidate {
-                source,
-                result: *result,
+    ) -> TraitProbeCtxt<'_, 'a, 'tcx, impl FnOnce(&QueryResult<'tcx>) -> inspect::ProbeKind<'tcx>>
+    {
+        TraitProbeCtxt {
+            cx: ProbeCtxt {
+                ecx: self,
+                probe_kind: move |result: &QueryResult<'tcx>| inspect::ProbeKind::TraitCandidate {
+                    source,
+                    result: *result,
+                },
+                _result: PhantomData,
             },
-            _result: PhantomData,
+            source,
         }
     }
 }

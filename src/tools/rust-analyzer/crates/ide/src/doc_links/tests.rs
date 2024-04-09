@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::iter;
 
 use expect_test::{expect, Expect};
 use hir::Semantics;
@@ -18,19 +18,16 @@ use crate::{
 
 fn check_external_docs(
     ra_fixture: &str,
-    target_dir: Option<&OsStr>,
+    target_dir: Option<&str>,
     expect_web_url: Option<Expect>,
     expect_local_url: Option<Expect>,
-    sysroot: Option<&OsStr>,
+    sysroot: Option<&str>,
 ) {
     let (analysis, position) = fixture::position(ra_fixture);
     let links = analysis.external_docs(position, target_dir, sysroot).unwrap();
 
     let web_url = links.web_url;
     let local_url = links.local_url;
-
-    println!("web_url: {:?}", web_url);
-    println!("local_url: {:?}", local_url);
 
     match (expect_web_url, web_url) {
         (Some(expect), Some(url)) => expect.assert_eq(&url),
@@ -63,10 +60,12 @@ fn check_doc_links(ra_fixture: &str) {
     let defs = extract_definitions_from_docs(&docs);
     let actual: Vec<_> = defs
         .into_iter()
-        .map(|(_, link, ns)| {
+        .flat_map(|(_, link, ns)| {
             let def = resolve_doc_path_for_def(sema.db, cursor_def, &link, ns)
                 .unwrap_or_else(|| panic!("Failed to resolve {link}"));
-            let nav_target = def.try_to_nav(sema.db).unwrap();
+            def.try_to_nav(sema.db).unwrap().into_iter().zip(iter::repeat(link))
+        })
+        .map(|(nav_target, link)| {
             let range =
                 FileRange { file_id: nav_target.file_id, range: nav_target.focus_or_full_range() };
             (range, link)
@@ -128,10 +127,10 @@ fn external_docs_doc_builtin_type() {
 //- /main.rs crate:foo
 let x: u3$02 = 0;
 "#,
-        Some(&OsStr::new("/home/user/project")),
+        Some("/home/user/project"),
         Some(expect![[r#"https://doc.rust-lang.org/nightly/core/primitive.u32.html"#]]),
         Some(expect![[r#"file:///sysroot/share/doc/rust/html/core/primitive.u32.html"#]]),
-        Some(&OsStr::new("/sysroot")),
+        Some("/sysroot"),
     );
 }
 
@@ -144,10 +143,10 @@ use foo$0::Foo;
 //- /lib.rs crate:foo
 pub struct Foo;
 "#,
-        Some(&OsStr::new("/home/user/project")),
+        Some("/home/user/project"),
         Some(expect![[r#"https://docs.rs/foo/*/foo/index.html"#]]),
         Some(expect![[r#"file:///home/user/project/doc/foo/index.html"#]]),
-        Some(&OsStr::new("/sysroot")),
+        Some("/sysroot"),
     );
 }
 
@@ -158,10 +157,10 @@ fn external_docs_doc_url_std_crate() {
 //- /main.rs crate:std
 use self$0;
 "#,
-        Some(&OsStr::new("/home/user/project")),
+        Some("/home/user/project"),
         Some(expect!["https://doc.rust-lang.org/stable/std/index.html"]),
         Some(expect!["file:///sysroot/share/doc/rust/html/std/index.html"]),
-        Some(&OsStr::new("/sysroot")),
+        Some("/sysroot"),
     );
 }
 
@@ -172,10 +171,10 @@ fn external_docs_doc_url_struct() {
 //- /main.rs crate:foo
 pub struct Fo$0o;
 "#,
-        Some(&OsStr::new("/home/user/project")),
+        Some("/home/user/project"),
         Some(expect![[r#"https://docs.rs/foo/*/foo/struct.Foo.html"#]]),
         Some(expect![[r#"file:///home/user/project/doc/foo/struct.Foo.html"#]]),
-        Some(&OsStr::new("/sysroot")),
+        Some("/sysroot"),
     );
 }
 
@@ -186,10 +185,10 @@ fn external_docs_doc_url_windows_backslash_path() {
 //- /main.rs crate:foo
 pub struct Fo$0o;
 "#,
-        Some(&OsStr::new(r"C:\Users\user\project")),
+        Some(r"C:\Users\user\project"),
         Some(expect![[r#"https://docs.rs/foo/*/foo/struct.Foo.html"#]]),
         Some(expect![[r#"file:///C:/Users/user/project/doc/foo/struct.Foo.html"#]]),
-        Some(&OsStr::new("/sysroot")),
+        Some("/sysroot"),
     );
 }
 
@@ -200,10 +199,10 @@ fn external_docs_doc_url_windows_slash_path() {
 //- /main.rs crate:foo
 pub struct Fo$0o;
 "#,
-        Some(&OsStr::new(r"C:/Users/user/project")),
+        Some("C:/Users/user/project"),
         Some(expect![[r#"https://docs.rs/foo/*/foo/struct.Foo.html"#]]),
         Some(expect![[r#"file:///C:/Users/user/project/doc/foo/struct.Foo.html"#]]),
-        Some(&OsStr::new("/sysroot")),
+        Some("/sysroot"),
     );
 }
 
@@ -460,14 +459,15 @@ mod module {}
 fn doc_links_inherent_impl_items() {
     check_doc_links(
         r#"
-// /// [`Struct::CONST`]
-// /// [`Struct::function`]
-/// FIXME #9694
+/// [`Struct::CONST`]
+/// [`Struct::function`]
 struct Struct$0;
 
 impl Struct {
     const CONST: () = ();
+       // ^^^^^ Struct::CONST
     fn function() {}
+    // ^^^^^^^^ Struct::function
 }
 "#,
     )
@@ -480,12 +480,13 @@ fn doc_links_trait_impl_items() {
 trait Trait {
     type Type;
     const CONST: usize;
+       // ^^^^^ Struct::CONST
     fn function();
+    // ^^^^^^^^ Struct::function
 }
-// /// [`Struct::Type`]
-// /// [`Struct::CONST`]
-// /// [`Struct::function`]
-/// FIXME #9694
+// FIXME #9694: [`Struct::Type`]
+/// [`Struct::CONST`]
+/// [`Struct::function`]
 struct Struct$0;
 
 impl Trait for Struct {
@@ -658,5 +659,31 @@ pub struct $0Foo;
 pub struct $0Foo;
 "#,
         expect![["[`foo`]"]],
+    );
+}
+
+#[test]
+fn rewrite_intra_doc_link() {
+    check_rewrite(
+        r#"
+        //- minicore: eq, derive
+        //- /main.rs crate:foo
+        //! $0[PartialEq]
+        fn main() {}
+        "#,
+        expect!["[PartialEq](https://doc.rust-lang.org/stable/core/cmp/trait.PartialEq.html)"],
+    );
+}
+
+#[test]
+fn rewrite_intra_doc_link_with_anchor() {
+    check_rewrite(
+        r#"
+        //- minicore: eq, derive
+        //- /main.rs crate:foo
+        //! $0[PartialEq#derivable]
+        fn main() {}
+        "#,
+        expect!["[PartialEq#derivable](https://doc.rust-lang.org/stable/core/cmp/trait.PartialEq.html#derivable)"],
     );
 }

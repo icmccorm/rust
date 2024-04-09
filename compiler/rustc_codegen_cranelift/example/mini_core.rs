@@ -8,10 +8,11 @@
     rustc_attrs,
     transparent_unions,
     auto_traits,
+    freeze_impls,
     thread_local
 )]
 #![no_core]
-#![allow(dead_code, internal_features)]
+#![allow(dead_code, internal_features, ambiguous_wide_pointer_comparisons)]
 
 #[lang = "sized"]
 pub trait Sized {}
@@ -89,8 +90,9 @@ unsafe impl Sync for i16 {}
 unsafe impl Sync for i32 {}
 unsafe impl Sync for isize {}
 unsafe impl Sync for char {}
+unsafe impl Sync for f32 {}
 unsafe impl<'a, T: ?Sized> Sync for &'a T {}
-unsafe impl Sync for [u8; 16] {}
+unsafe impl<T: Sync, const N: usize> Sync for [T; N] {}
 
 #[lang = "freeze"]
 unsafe auto trait Freeze {}
@@ -103,9 +105,6 @@ unsafe impl<T: ?Sized> Freeze for &mut T {}
 
 #[lang = "structural_peq"]
 pub trait StructuralPartialEq {}
-
-#[lang = "structural_teq"]
-pub trait StructuralEq {}
 
 #[lang = "not"]
 pub trait Not {
@@ -467,6 +466,35 @@ pub fn panic(_msg: &'static str) -> ! {
     }
 }
 
+macro_rules! panic_const {
+    ($($lang:ident = $message:expr,)+) => {
+        pub mod panic_const {
+            use super::*;
+
+            $(
+                #[track_caller]
+                #[lang = stringify!($lang)]
+                pub fn $lang() -> ! {
+                    panic($message);
+                }
+            )+
+        }
+    }
+}
+
+panic_const! {
+    panic_const_add_overflow = "attempt to add with overflow",
+    panic_const_sub_overflow = "attempt to subtract with overflow",
+    panic_const_mul_overflow = "attempt to multiply with overflow",
+    panic_const_div_overflow = "attempt to divide with overflow",
+    panic_const_rem_overflow = "attempt to calculate the remainder with overflow",
+    panic_const_neg_overflow = "attempt to negate with overflow",
+    panic_const_shr_overflow = "attempt to shift right with overflow",
+    panic_const_shl_overflow = "attempt to shift left with overflow",
+    panic_const_div_by_zero = "attempt to divide by zero",
+    panic_const_rem_by_zero = "attempt to calculate the remainder with a divisor of zero",
+}
+
 #[lang = "panic_bounds_check"]
 #[track_caller]
 fn panic_bounds_check(index: usize, len: usize) -> ! {
@@ -528,8 +556,11 @@ pub struct Unique<T: ?Sized> {
 impl<T: ?Sized, U: ?Sized> CoerceUnsized<Unique<U>> for Unique<T> where T: Unsize<U> {}
 impl<T: ?Sized, U: ?Sized> DispatchFromDyn<Unique<U>> for Unique<T> where T: Unsize<U> {}
 
+#[lang = "global_alloc_ty"]
+pub struct Global;
+
 #[lang = "owned_box"]
-pub struct Box<T: ?Sized, A = ()>(Unique<T>, A);
+pub struct Box<T: ?Sized, A = Global>(Unique<T>, A);
 
 impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<Box<U>> for Box<T> {}
 
@@ -539,7 +570,7 @@ impl<T> Box<T> {
             let size = intrinsics::size_of::<T>();
             let ptr = libc::malloc(size);
             intrinsics::copy(&val as *const T as *const u8, ptr, size);
-            Box(Unique { pointer: NonNull(ptr as *const T), _marker: PhantomData }, ())
+            Box(Unique { pointer: NonNull(ptr as *const T), _marker: PhantomData }, Global)
         }
     }
 }
@@ -680,6 +711,12 @@ pub macro line() {
 #[rustc_builtin_macro]
 #[rustc_macro_transparency = "semitransparent"]
 pub macro cfg() {
+    /* compiler built-in */
+}
+
+#[rustc_builtin_macro]
+#[rustc_macro_transparency = "semitransparent"]
+pub macro asm() {
     /* compiler built-in */
 }
 

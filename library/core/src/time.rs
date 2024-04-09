@@ -28,6 +28,14 @@ const NANOS_PER_MILLI: u32 = 1_000_000;
 const NANOS_PER_MICRO: u32 = 1_000;
 const MILLIS_PER_SEC: u64 = 1_000;
 const MICROS_PER_SEC: u64 = 1_000_000;
+#[unstable(feature = "duration_units", issue = "120301")]
+const SECS_PER_MINUTE: u64 = 60;
+#[unstable(feature = "duration_units", issue = "120301")]
+const MINS_PER_HOUR: u64 = 60;
+#[unstable(feature = "duration_units", issue = "120301")]
+const HOURS_PER_DAY: u64 = 24;
+#[unstable(feature = "duration_units", issue = "120301")]
+const DAYS_PER_WEEK: u64 = 7;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -197,13 +205,18 @@ impl Duration {
     #[must_use]
     #[rustc_const_stable(feature = "duration_consts_2", since = "1.58.0")]
     pub const fn new(secs: u64, nanos: u32) -> Duration {
-        let secs = match secs.checked_add((nanos / NANOS_PER_SEC) as u64) {
-            Some(secs) => secs,
-            None => panic!("overflow in Duration::new"),
-        };
-        let nanos = nanos % NANOS_PER_SEC;
-        // SAFETY: nanos % NANOS_PER_SEC < NANOS_PER_SEC, therefore nanos is within the valid range
-        Duration { secs, nanos: unsafe { Nanoseconds(nanos) } }
+        if nanos < NANOS_PER_SEC {
+            // SAFETY: nanos < NANOS_PER_SEC, therefore nanos is within the valid range
+            Duration { secs, nanos: unsafe { Nanoseconds(nanos) } }
+        } else {
+            let secs = match secs.checked_add((nanos / NANOS_PER_SEC) as u64) {
+                Some(secs) => secs,
+                None => panic!("overflow in Duration::new"),
+            };
+            let nanos = nanos % NANOS_PER_SEC;
+            // SAFETY: nanos % NANOS_PER_SEC < NANOS_PER_SEC, therefore nanos is within the valid range
+            Duration { secs, nanos: unsafe { Nanoseconds(nanos) } }
+        }
     }
 
     /// Creates a new `Duration` from the specified number of whole seconds.
@@ -268,6 +281,11 @@ impl Duration {
 
     /// Creates a new `Duration` from the specified number of nanoseconds.
     ///
+    /// Note: Using this on the return value of `as_nanos()` might cause unexpected behavior:
+    /// `as_nanos()` returns a u128, and can return values that do not fit in u64, e.g. 585 years.
+    /// Instead, consider using the pattern `Duration::new(d.as_secs(), d.subsec_nanos())`
+    /// if you cannot copy/clone the Duration directly.
+    ///
     /// # Examples
     ///
     /// ```
@@ -284,6 +302,118 @@ impl Duration {
     #[rustc_const_stable(feature = "duration_consts", since = "1.32.0")]
     pub const fn from_nanos(nanos: u64) -> Duration {
         Duration::new(nanos / (NANOS_PER_SEC as u64), (nanos % (NANOS_PER_SEC as u64)) as u32)
+    }
+
+    /// Creates a new `Duration` from the specified number of weeks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the given number of weeks overflows the `Duration` size.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(duration_constructors)]
+    /// use std::time::Duration;
+    ///
+    /// let duration = Duration::from_weeks(4);
+    ///
+    /// assert_eq!(4 * 7 * 24 * 60 * 60, duration.as_secs());
+    /// assert_eq!(0, duration.subsec_nanos());
+    /// ```
+    #[unstable(feature = "duration_constructors", issue = "120301")]
+    #[must_use]
+    #[inline]
+    pub const fn from_weeks(weeks: u64) -> Duration {
+        if weeks > u64::MAX / (SECS_PER_MINUTE * MINS_PER_HOUR * HOURS_PER_DAY * DAYS_PER_WEEK) {
+            panic!("overflow in Duration::from_days");
+        }
+
+        Duration::from_secs(weeks * MINS_PER_HOUR * SECS_PER_MINUTE * HOURS_PER_DAY * DAYS_PER_WEEK)
+    }
+
+    /// Creates a new `Duration` from the specified number of days.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the given number of days overflows the `Duration` size.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(duration_constructors)]
+    /// use std::time::Duration;
+    ///
+    /// let duration = Duration::from_days(7);
+    ///
+    /// assert_eq!(7 * 24 * 60 * 60, duration.as_secs());
+    /// assert_eq!(0, duration.subsec_nanos());
+    /// ```
+    #[unstable(feature = "duration_constructors", issue = "120301")]
+    #[must_use]
+    #[inline]
+    pub const fn from_days(days: u64) -> Duration {
+        if days > u64::MAX / (SECS_PER_MINUTE * MINS_PER_HOUR * HOURS_PER_DAY) {
+            panic!("overflow in Duration::from_days");
+        }
+
+        Duration::from_secs(days * MINS_PER_HOUR * SECS_PER_MINUTE * HOURS_PER_DAY)
+    }
+
+    /// Creates a new `Duration` from the specified number of hours.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the given number of hours overflows the `Duration` size.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(duration_constructors)]
+    /// use std::time::Duration;
+    ///
+    /// let duration = Duration::from_hours(6);
+    ///
+    /// assert_eq!(6 * 60 * 60, duration.as_secs());
+    /// assert_eq!(0, duration.subsec_nanos());
+    /// ```
+    #[unstable(feature = "duration_constructors", issue = "120301")]
+    #[must_use]
+    #[inline]
+    pub const fn from_hours(hours: u64) -> Duration {
+        if hours > u64::MAX / (SECS_PER_MINUTE * MINS_PER_HOUR) {
+            panic!("overflow in Duration::from_hours");
+        }
+
+        Duration::from_secs(hours * MINS_PER_HOUR * SECS_PER_MINUTE)
+    }
+
+    /// Creates a new `Duration` from the specified number of minutes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the given number of minutes overflows the `Duration` size.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(duration_constructors)]
+    /// use std::time::Duration;
+    ///
+    /// let duration = Duration::from_mins(10);
+    ///
+    /// assert_eq!(10 * 60, duration.as_secs());
+    /// assert_eq!(0, duration.subsec_nanos());
+    /// ```
+    #[unstable(feature = "duration_constructors", issue = "120301")]
+    #[must_use]
+    #[inline]
+    pub const fn from_mins(mins: u64) -> Duration {
+        if mins > u64::MAX / SECS_PER_MINUTE {
+            panic!("overflow in Duration::from_mins");
+        }
+
+        Duration::from_secs(mins * SECS_PER_MINUTE)
     }
 
     /// Returns true if this `Duration` spans no time.
@@ -459,6 +589,27 @@ impl Duration {
     #[inline]
     pub const fn as_nanos(&self) -> u128 {
         self.secs as u128 * NANOS_PER_SEC as u128 + self.nanos.0 as u128
+    }
+
+    /// Computes the absolute difference between `self` and `other`.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(duration_abs_diff)]
+    /// use std::time::Duration;
+    ///
+    /// assert_eq!(Duration::new(100, 0).abs_diff(Duration::new(80, 0)), Duration::new(20, 0));
+    /// assert_eq!(Duration::new(100, 400_000_000).abs_diff(Duration::new(110, 0)), Duration::new(9, 600_000_000));
+    /// ```
+    #[unstable(feature = "duration_abs_diff", issue = "117618")]
+    #[must_use = "this returns the result of the operation, \
+                  without modifying the original"]
+    #[inline]
+    pub const fn abs_diff(self, other: Duration) -> Duration {
+        if let Some(res) = self.checked_sub(other) { res } else { other.checked_sub(self).unwrap() }
     }
 
     /// Checked `Duration` addition. Computes `self + other`, returning [`None`]
@@ -705,6 +856,48 @@ impl Duration {
         (self.secs as f32) + (self.nanos.0 as f32) / (NANOS_PER_SEC as f32)
     }
 
+    /// Returns the number of milliseconds contained by this `Duration` as `f64`.
+    ///
+    /// The returned value does include the fractional (nanosecond) part of the duration.
+    ///
+    /// # Examples
+    /// ```
+    /// #![feature(duration_millis_float)]
+    /// use std::time::Duration;
+    ///
+    /// let dur = Duration::new(2, 345_678_000);
+    /// assert_eq!(dur.as_millis_f64(), 2345.678);
+    /// ```
+    #[unstable(feature = "duration_millis_float", issue = "122451")]
+    #[must_use]
+    #[inline]
+    #[rustc_const_unstable(feature = "duration_consts_float", issue = "72440")]
+    pub const fn as_millis_f64(&self) -> f64 {
+        (self.secs as f64) * (MILLIS_PER_SEC as f64)
+            + (self.nanos.0 as f64) / (NANOS_PER_MILLI as f64)
+    }
+
+    /// Returns the number of milliseconds contained by this `Duration` as `f32`.
+    ///
+    /// The returned value does include the fractional (nanosecond) part of the duration.
+    ///
+    /// # Examples
+    /// ```
+    /// #![feature(duration_millis_float)]
+    /// use std::time::Duration;
+    ///
+    /// let dur = Duration::new(2, 345_678_000);
+    /// assert_eq!(dur.as_millis_f32(), 2345.678);
+    /// ```
+    #[unstable(feature = "duration_millis_float", issue = "122451")]
+    #[must_use]
+    #[inline]
+    #[rustc_const_unstable(feature = "duration_consts_float", issue = "72440")]
+    pub const fn as_millis_f32(&self) -> f32 {
+        (self.secs as f32) * (MILLIS_PER_SEC as f32)
+            + (self.nanos.0 as f32) / (NANOS_PER_MILLI as f32)
+    }
+
     /// Creates a new `Duration` from the specified number of seconds represented
     /// as `f64`.
     ///
@@ -910,6 +1103,7 @@ impl Duration {
 impl Add for Duration {
     type Output = Duration;
 
+    #[inline]
     fn add(self, rhs: Duration) -> Duration {
         self.checked_add(rhs).expect("overflow when adding durations")
     }
@@ -917,6 +1111,7 @@ impl Add for Duration {
 
 #[stable(feature = "time_augmented_assignment", since = "1.9.0")]
 impl AddAssign for Duration {
+    #[inline]
     fn add_assign(&mut self, rhs: Duration) {
         *self = *self + rhs;
     }
@@ -926,6 +1121,7 @@ impl AddAssign for Duration {
 impl Sub for Duration {
     type Output = Duration;
 
+    #[inline]
     fn sub(self, rhs: Duration) -> Duration {
         self.checked_sub(rhs).expect("overflow when subtracting durations")
     }
@@ -933,6 +1129,7 @@ impl Sub for Duration {
 
 #[stable(feature = "time_augmented_assignment", since = "1.9.0")]
 impl SubAssign for Duration {
+    #[inline]
     fn sub_assign(&mut self, rhs: Duration) {
         *self = *self - rhs;
     }
@@ -942,6 +1139,7 @@ impl SubAssign for Duration {
 impl Mul<u32> for Duration {
     type Output = Duration;
 
+    #[inline]
     fn mul(self, rhs: u32) -> Duration {
         self.checked_mul(rhs).expect("overflow when multiplying duration by scalar")
     }
@@ -951,6 +1149,7 @@ impl Mul<u32> for Duration {
 impl Mul<Duration> for u32 {
     type Output = Duration;
 
+    #[inline]
     fn mul(self, rhs: Duration) -> Duration {
         rhs * self
     }
@@ -958,6 +1157,7 @@ impl Mul<Duration> for u32 {
 
 #[stable(feature = "time_augmented_assignment", since = "1.9.0")]
 impl MulAssign<u32> for Duration {
+    #[inline]
     fn mul_assign(&mut self, rhs: u32) {
         *self = *self * rhs;
     }
@@ -967,6 +1167,7 @@ impl MulAssign<u32> for Duration {
 impl Div<u32> for Duration {
     type Output = Duration;
 
+    #[inline]
     fn div(self, rhs: u32) -> Duration {
         self.checked_div(rhs).expect("divide by zero error when dividing duration by scalar")
     }
@@ -974,6 +1175,7 @@ impl Div<u32> for Duration {
 
 #[stable(feature = "time_augmented_assignment", since = "1.9.0")]
 impl DivAssign<u32> for Duration {
+    #[inline]
     fn div_assign(&mut self, rhs: u32) {
         *self = *self / rhs;
     }

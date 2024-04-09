@@ -1,6 +1,4 @@
-// check-pass
-
-#![feature(associated_type_bounds, return_position_impl_trait_in_trait)]
+//@ check-pass
 
 trait Trait {
     type Type;

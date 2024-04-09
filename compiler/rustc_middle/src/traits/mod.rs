@@ -12,11 +12,11 @@ pub mod util;
 use crate::infer::canonical::Canonical;
 use crate::mir::ConstraintCategory;
 use crate::ty::abstract_const::NotConstEvaluatable;
-use crate::ty::GenericArgsRef;
 use crate::ty::{self, AdtKind, Ty};
+use crate::ty::{GenericArgsRef, TyCtxt};
 
 use rustc_data_structures::sync::Lrc;
-use rustc_errors::{Applicability, Diagnostic};
+use rustc_errors::{Applicability, Diag, EmissionGuarantee};
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_span::def_id::{LocalDefId, CRATE_DEF_ID};
@@ -177,7 +177,7 @@ impl<'tcx> ObligationCause<'tcx> {
 
         // NOTE(flaper87): As of now, it keeps track of the whole error
         // chain. Ideally, we should have a way to configure this either
-        // by using -Z verbose or just a CLI argument.
+        // by using -Z verbose-internals or just a CLI argument.
         self.code =
             variant(DerivedObligationCause { parent_trait_pred, parent_code: self.code }).into();
         self
@@ -250,9 +250,6 @@ pub enum ObligationCauseCode<'tcx> {
     /// A tuple is WF only if its middle elements are `Sized`.
     TupleElem,
 
-    /// This is the trait reference from the given projection.
-    ProjectionWf(ty::AliasTy<'tcx>),
-
     /// Must satisfy all of the where-clause predicates of the
     /// given item.
     ItemObligation(DefId),
@@ -292,22 +289,29 @@ pub enum ObligationCauseCode<'tcx> {
     /// Type of each variable must be `Sized`.
     VariableType(hir::HirId),
     /// Argument type must be `Sized`.
-    SizedArgumentType(Option<Span>),
+    SizedArgumentType(Option<hir::HirId>),
     /// Return type must be `Sized`.
     SizedReturnType,
+    /// Return type of a call expression must be `Sized`.
+    SizedCallReturnType,
     /// Yield type must be `Sized`.
     SizedYieldType,
     /// Inline asm operand type must be `Sized`.
     InlineAsmSized,
     /// Captured closure type must be `Sized`.
     SizedClosureCapture(LocalDefId),
-    /// Types live across generator yields must be `Sized`.
-    SizedGeneratorInterior(LocalDefId),
+    /// Types live across coroutine yields must be `Sized`.
+    SizedCoroutineInterior(LocalDefId),
     /// `[expr; N]` requires `type_of(expr): Copy`.
     RepeatElementCopy {
-        /// If element is a `const fn` we display a help message suggesting to move the
-        /// function call to a new `const` item while saying that `T` doesn't implement `Copy`.
-        is_const_fn: bool,
+        /// If element is a `const fn` or const ctor we display a help message suggesting
+        /// to move it to a new `const` item while saying that `T` doesn't implement `Copy`.
+        is_constable: IsConstable,
+        elt_type: Ty<'tcx>,
+        elt_span: Span,
+        /// Span of the statement/item in which the repeat expression occurs. We can use this to
+        /// place a `const` declaration before it
+        elt_stmt_span: Span,
     },
 
     /// Types of fields (other than the last, except for packed structs) in a struct must be sized.
@@ -338,7 +342,8 @@ pub enum ObligationCauseCode<'tcx> {
         parent_code: InternedObligationCauseCode<'tcx>,
     },
 
-    /// Error derived when matching traits/impls; see ObligationCause for more details
+    /// Error derived when checking an impl item is compatible with
+    /// its corresponding trait item's definition
     CompareImplItemObligation {
         impl_item_def_id: LocalDefId,
         trait_item_def_id: DefId,
@@ -366,9 +371,6 @@ pub enum ObligationCauseCode<'tcx> {
         /// Whether the `Span` came from an expression or a type expression.
         origin_expr: bool,
     },
-
-    /// Constants in patterns must have `Structural` type.
-    ConstPatternStructural,
 
     /// Computing common supertype in an if expression
     IfExpression(Box<IfExpressionCause<'tcx>>),
@@ -402,9 +404,6 @@ pub enum ObligationCauseCode<'tcx> {
     /// `return` with an expression
     ReturnValue(hir::HirId),
 
-    /// Return type of this function
-    ReturnType,
-
     /// Opaque return type of this function
     OpaqueReturnType(Option<(Ty<'tcx>, Span)>),
 
@@ -414,10 +413,7 @@ pub enum ObligationCauseCode<'tcx> {
     /// #[feature(trivial_bounds)] is not enabled
     TrivialBound,
 
-    /// If `X` is the concrete type of an opaque type `impl Y`, then `X` must implement `Y`
-    OpaqueType,
-
-    AwaitableExpr(Option<hir::HirId>),
+    AwaitableExpr(hir::HirId),
 
     ForLoopIterator,
 
@@ -435,8 +431,10 @@ pub enum ObligationCauseCode<'tcx> {
     MatchImpl(ObligationCause<'tcx>, DefId),
 
     BinOp {
+        lhs_hir_id: hir::HirId,
+        rhs_hir_id: Option<hir::HirId>,
         rhs_span: Option<Span>,
-        is_lit: bool,
+        rhs_is_lit: bool,
         output_ty: Option<Ty<'tcx>>,
     },
 
@@ -453,6 +451,21 @@ pub enum ObligationCauseCode<'tcx> {
 
     /// Obligations emitted during the normalization of a weak type alias.
     TypeAlias(InternedObligationCauseCode<'tcx>, Span, DefId),
+}
+
+/// Whether a value can be extracted into a const.
+/// Used for diagnostics around array repeat expressions.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, HashStable, TyEncodable, TyDecodable)]
+pub enum IsConstable {
+    No,
+    /// Call to a const fn
+    Fn,
+    /// Use of a const ctor
+    Ctor,
+}
+
+crate::TrivialTypeTraversalAndLiftImpls! {
+    IsConstable,
 }
 
 /// The 'location' at which we try to perform HIR-based wf checking.
@@ -501,6 +514,21 @@ impl<'tcx> ObligationCauseCode<'tcx> {
         base_cause
     }
 
+    /// Returns the base obligation and the base trait predicate, if any, ignoring
+    /// derived obligations.
+    pub fn peel_derives_with_predicate(&self) -> (&Self, Option<ty::PolyTraitPredicate<'tcx>>) {
+        let mut base_cause = self;
+        let mut base_trait_pred = None;
+        while let Some((parent_code, parent_pred)) = base_cause.parent() {
+            base_cause = parent_code;
+            if let Some(parent_pred) = parent_pred {
+                base_trait_pred = Some(parent_pred);
+            }
+        }
+
+        (base_cause, base_trait_pred)
+    }
+
     pub fn parent(&self) -> Option<(&Self, Option<ty::PolyTraitPredicate<'tcx>>)> {
         match self {
             FunctionArgumentObligation { parent_code, .. } => Some((parent_code, None)),
@@ -522,7 +550,7 @@ impl<'tcx> ObligationCauseCode<'tcx> {
 }
 
 // `ObligationCauseCode` is used a lot. Make sure it doesn't unintentionally get bigger.
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_pointer_width = "64"))]
 static_assert_size!(ObligationCauseCode<'_>, 48);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -542,8 +570,9 @@ pub struct MatchExpressionArmCause<'tcx> {
     pub prior_arm_span: Span,
     pub scrut_span: Span,
     pub source: hir::MatchSource,
-    pub prior_arms: Vec<Span>,
-    pub opt_suggest_box_span: Option<Span>,
+    pub prior_non_diverging_arms: Vec<Span>,
+    // Is the expectation of this match expression an RPIT?
+    pub tail_defines_return_position_impl_trait: Option<LocalDefId>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -554,7 +583,8 @@ pub struct IfExpressionCause<'tcx> {
     pub then_ty: Ty<'tcx>,
     pub else_ty: Ty<'tcx>,
     pub outer_span: Option<Span>,
-    pub opt_suggest_box_span: Option<Span>,
+    // Is the expectation of this match expression an RPIT?
+    pub tail_defines_return_position_impl_trait: Option<LocalDefId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, HashStable, TyEncodable, TyDecodable)]
@@ -577,24 +607,22 @@ pub enum SelectionError<'tcx> {
     /// After a closure impl has selected, its "outputs" were evaluated
     /// (which for closures includes the "input" type params) and they
     /// didn't resolve. See `confirm_poly_trait_refs` for more.
-    OutputTypeParameterMismatch(Box<SelectionOutputTypeParameterMismatch<'tcx>>),
+    SignatureMismatch(Box<SignatureMismatchData<'tcx>>),
     /// The trait pointed by `DefId` is not object safe.
     TraitNotObjectSafe(DefId),
     /// A given constant couldn't be evaluated.
     NotConstEvaluatable(NotConstEvaluatable),
     /// Exceeded the recursion depth during type projection.
     Overflow(OverflowError),
-    /// Signaling that an error has already been emitted, to avoid
-    /// multiple errors being shown.
-    ErrorReporting,
     /// Computing an opaque type's hidden type caused an error (e.g. a cycle error).
     /// We can thus not know whether the hidden type implements an auto trait, so
     /// we should not presume anything about it.
     OpaqueTypeAutoTraitLeakageUnknown(DefId),
 }
 
+// FIXME(@lcnr): The `Binder` here should be unnecessary. Just use `TraitRef` instead.
 #[derive(Clone, Debug, TypeVisitable)]
-pub struct SelectionOutputTypeParameterMismatch<'tcx> {
+pub struct SignatureMismatchData<'tcx> {
     pub found_trait_ref: ty::PolyTraitRef<'tcx>,
     pub expected_trait_ref: ty::PolyTraitRef<'tcx>,
     pub terr: ty::error::TypeError<'tcx>,
@@ -665,7 +693,7 @@ impl<'tcx, N> ImplSource<'tcx, N> {
     pub fn borrow_nested_obligations(&self) -> &[N] {
         match self {
             ImplSource::UserDefined(i) => &i.nested,
-            ImplSource::Param(n) | ImplSource::Builtin(_, n) => &n,
+            ImplSource::Param(n) | ImplSource::Builtin(_, n) => n,
         }
     }
 
@@ -695,7 +723,7 @@ impl<'tcx, N> ImplSource<'tcx, N> {
 }
 
 /// Identifies a particular impl in the source, along with a set of
-/// substitutions from the impl's type/lifetime parameters. The
+/// generic parameters from the impl's type/lifetime parameters. The
 /// `nested` vector corresponds to the nested obligations attached to
 /// the impl's type parameters.
 ///
@@ -822,50 +850,31 @@ impl ObjectSafetyViolation {
         }
     }
 
-    pub fn solution(&self, err: &mut Diagnostic) {
+    pub fn solution(&self) -> ObjectSafetyViolationSolution {
         match self {
             ObjectSafetyViolation::SizedSelf(_)
             | ObjectSafetyViolation::SupertraitSelf(_)
-            | ObjectSafetyViolation::SupertraitNonLifetimeBinder(..) => {}
+            | ObjectSafetyViolation::SupertraitNonLifetimeBinder(..) => {
+                ObjectSafetyViolationSolution::None
+            }
             ObjectSafetyViolation::Method(
                 name,
                 MethodViolationCode::StaticMethod(Some((add_self_sugg, make_sized_sugg))),
                 _,
-            ) => {
-                err.span_suggestion(
-                    add_self_sugg.1,
-                    format!(
-                        "consider turning `{name}` into a method by giving it a `&self` argument"
-                    ),
-                    add_self_sugg.0.to_string(),
-                    Applicability::MaybeIncorrect,
-                );
-                err.span_suggestion(
-                    make_sized_sugg.1,
-                    format!(
-                        "alternatively, consider constraining `{name}` so it does not apply to \
-                             trait objects"
-                    ),
-                    make_sized_sugg.0.to_string(),
-                    Applicability::MaybeIncorrect,
-                );
-            }
+            ) => ObjectSafetyViolationSolution::AddSelfOrMakeSized {
+                name: *name,
+                add_self_sugg: add_self_sugg.clone(),
+                make_sized_sugg: make_sized_sugg.clone(),
+            },
             ObjectSafetyViolation::Method(
                 name,
                 MethodViolationCode::UndispatchableReceiver(Some(span)),
                 _,
-            ) => {
-                err.span_suggestion(
-                    *span,
-                    format!("consider changing method `{name}`'s `self` parameter to be `&self`"),
-                    "&Self",
-                    Applicability::MachineApplicable,
-                );
-            }
+            ) => ObjectSafetyViolationSolution::ChangeToRefSelf(*name, *span),
             ObjectSafetyViolation::AssocConst(name, _)
             | ObjectSafetyViolation::GAT(name, _)
             | ObjectSafetyViolation::Method(name, ..) => {
-                err.help(format!("consider moving `{name}` to another trait"));
+                ObjectSafetyViolationSolution::MoveToAnotherTrait(*name)
             }
         }
     }
@@ -885,6 +894,60 @@ impl ObjectSafetyViolation {
                 smallvec![*span]
             }
             _ => smallvec![],
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ObjectSafetyViolationSolution {
+    None,
+    AddSelfOrMakeSized {
+        name: Symbol,
+        add_self_sugg: (String, Span),
+        make_sized_sugg: (String, Span),
+    },
+    ChangeToRefSelf(Symbol, Span),
+    MoveToAnotherTrait(Symbol),
+}
+
+impl ObjectSafetyViolationSolution {
+    pub fn add_to<G: EmissionGuarantee>(self, err: &mut Diag<'_, G>) {
+        match self {
+            ObjectSafetyViolationSolution::None => {}
+            ObjectSafetyViolationSolution::AddSelfOrMakeSized {
+                name,
+                add_self_sugg,
+                make_sized_sugg,
+            } => {
+                err.span_suggestion(
+                    add_self_sugg.1,
+                    format!(
+                        "consider turning `{name}` into a method by giving it a `&self` argument"
+                    ),
+                    add_self_sugg.0,
+                    Applicability::MaybeIncorrect,
+                );
+                err.span_suggestion(
+                    make_sized_sugg.1,
+                    format!(
+                        "alternatively, consider constraining `{name}` so it does not apply to \
+                             trait objects"
+                    ),
+                    make_sized_sugg.0,
+                    Applicability::MaybeIncorrect,
+                );
+            }
+            ObjectSafetyViolationSolution::ChangeToRefSelf(name, span) => {
+                err.span_suggestion(
+                    span,
+                    format!("consider changing method `{name}`'s `self` parameter to be `&self`"),
+                    "&Self",
+                    Applicability::MachineApplicable,
+                );
+            }
+            ObjectSafetyViolationSolution::MoveToAnotherTrait(name) => {
+                err.help(format!("consider moving `{name}` to another trait"));
+            }
         }
     }
 }
@@ -935,13 +998,32 @@ pub enum CodegenObligationError {
     FulfillmentError,
 }
 
+/// Defines the treatment of opaque types in a given inference context.
+///
+/// This affects both what opaques are allowed to be defined, but also whether
+/// opaques are replaced with inference vars eagerly in the old solver (e.g.
+/// in projection, and in the signature during function type-checking).
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, HashStable, TypeFoldable, TypeVisitable)]
-pub enum DefiningAnchor {
-    /// `DefId` of the item.
-    Bind(LocalDefId),
-    /// When opaque types are not resolved, we `Bubble` up, meaning
-    /// return the opaque/hidden type pair from query, for caller of query to handle it.
+pub enum DefiningAnchor<'tcx> {
+    /// Define opaques which are in-scope of the current item being analyzed.
+    /// Also, eagerly replace these opaque types in `replace_opaque_types_with_inference_vars`.
+    ///
+    /// If the list is empty, do not allow any opaques to be defined. This is used to catch type mismatch
+    /// errors when handling opaque types, and also should be used when we would
+    /// otherwise reveal opaques (such as [`Reveal::All`] reveal mode).
+    Bind(&'tcx ty::List<LocalDefId>),
+    /// In contexts where we don't currently know what opaques are allowed to be
+    /// defined, such as (old solver) canonical queries, we will simply allow
+    /// opaques to be defined, but "bubble" them up in the canonical response or
+    /// otherwise treat them to be handled later.
+    ///
+    /// We do not eagerly replace opaque types in `replace_opaque_types_with_inference_vars`,
+    /// which may affect what predicates pass and fail in the old trait solver.
     Bubble,
-    /// Used to catch type mismatch errors when handling opaque types.
-    Error,
+}
+
+impl<'tcx> DefiningAnchor<'tcx> {
+    pub fn bind(tcx: TyCtxt<'tcx>, item: LocalDefId) -> Self {
+        Self::Bind(tcx.opaque_types_defined_by(item))
+    }
 }

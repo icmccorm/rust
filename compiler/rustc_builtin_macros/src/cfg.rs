@@ -8,38 +8,38 @@ use rustc_ast::token;
 use rustc_ast::tokenstream::TokenStream;
 use rustc_attr as attr;
 use rustc_errors::PResult;
-use rustc_expand::base::{self, *};
+use rustc_expand::base::{DummyResult, ExpandResult, ExtCtxt, MacEager, MacroExpanderResult};
 use rustc_span::Span;
 
 pub fn expand_cfg(
     cx: &mut ExtCtxt<'_>,
     sp: Span,
     tts: TokenStream,
-) -> Box<dyn base::MacResult + 'static> {
+) -> MacroExpanderResult<'static> {
     let sp = cx.with_def_site_ctxt(sp);
 
-    match parse_cfg(cx, sp, tts) {
+    ExpandResult::Ready(match parse_cfg(cx, sp, tts) {
         Ok(cfg) => {
             let matches_cfg = attr::cfg_matches(
                 &cfg,
-                &cx.sess.parse_sess,
+                &cx.sess,
                 cx.current_expansion.lint_node_id,
                 Some(cx.ecfg.features),
             );
             MacEager::expr(cx.expr_bool(sp, matches_cfg))
         }
-        Err(mut err) => {
-            err.emit();
-            DummyResult::any(sp)
+        Err(err) => {
+            let guar = err.emit();
+            DummyResult::any(sp, guar)
         }
-    }
+    })
 }
 
-fn parse_cfg<'a>(cx: &mut ExtCtxt<'a>, span: Span, tts: TokenStream) -> PResult<'a, ast::MetaItem> {
+fn parse_cfg<'a>(cx: &ExtCtxt<'a>, span: Span, tts: TokenStream) -> PResult<'a, ast::MetaItem> {
     let mut p = cx.new_parser_from_tts(tts);
 
     if p.token == token::Eof {
-        return Err(cx.create_err(errors::RequiresCfgPattern { span }));
+        return Err(cx.dcx().create_err(errors::RequiresCfgPattern { span }));
     }
 
     let cfg = p.parse_meta_item()?;
@@ -47,7 +47,7 @@ fn parse_cfg<'a>(cx: &mut ExtCtxt<'a>, span: Span, tts: TokenStream) -> PResult<
     let _ = p.eat(&token::Comma);
 
     if !p.eat(&token::Eof) {
-        return Err(cx.create_err(errors::OneCfgPattern { span }));
+        return Err(cx.dcx().create_err(errors::OneCfgPattern { span }));
     }
 
     Ok(cfg)

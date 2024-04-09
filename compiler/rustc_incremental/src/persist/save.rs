@@ -1,3 +1,4 @@
+use crate::assert_dep_graph::assert_dep_graph;
 use crate::errors;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::sync::join;
@@ -9,6 +10,7 @@ use rustc_serialize::opaque::{FileEncodeResult, FileEncoder};
 use rustc_serialize::Encodable as RustcEncodable;
 use rustc_session::Session;
 use std::fs;
+use std::sync::Arc;
 
 use super::data::*;
 use super::dirty_clean;
@@ -30,8 +32,8 @@ pub fn save_dep_graph(tcx: TyCtxt<'_>) {
         if sess.opts.incremental.is_none() {
             return;
         }
-        // This is going to be deleted in finalize_session_directory, so let's not create it
-        if let Some(_) = sess.has_errors_or_delayed_span_bugs() {
+        // This is going to be deleted in finalize_session_directory, so let's not create it.
+        if sess.dcx().has_errors_or_delayed_bugs().is_some() {
             return;
         }
 
@@ -39,7 +41,7 @@ pub fn save_dep_graph(tcx: TyCtxt<'_>) {
         let dep_graph_path = dep_graph_path(sess);
         let staging_dep_graph_path = staging_dep_graph_path(sess);
 
-        sess.time("assert_dep_graph", || crate::assert_dep_graph(tcx));
+        sess.time("assert_dep_graph", || assert_dep_graph(tcx));
         sess.time("check_dirty_clean", || dirty_clean::check_dirty_clean_annotations(tcx));
 
         if sess.opts.unstable_opts.incremental_info {
@@ -49,11 +51,8 @@ pub fn save_dep_graph(tcx: TyCtxt<'_>) {
         join(
             move || {
                 sess.time("incr_comp_persist_dep_graph", || {
-                    if let Err(err) = tcx.dep_graph.encode(&tcx.sess.prof) {
-                        sess.emit_err(errors::WriteDepGraph { path: &staging_dep_graph_path, err });
-                    }
                     if let Err(err) = fs::rename(&staging_dep_graph_path, &dep_graph_path) {
-                        sess.emit_err(errors::MoveDepGraph {
+                        sess.dcx().emit_err(errors::MoveDepGraph {
                             from: &staging_dep_graph_path,
                             to: &dep_graph_path,
                             err,
@@ -89,7 +88,7 @@ pub fn save_work_product_index(
         return;
     }
     // This is going to be deleted in finalize_session_directory, so let's not create it
-    if let Some(_) = sess.has_errors_or_delayed_span_bugs() {
+    if sess.dcx().has_errors().is_some() {
         return;
     }
 
@@ -105,7 +104,7 @@ pub fn save_work_product_index(
     // deleted during invalidation. Some object files don't change their
     // content, they are just not needed anymore.
     let previous_work_products = dep_graph.previous_work_products();
-    for (id, wp) in previous_work_products.to_sorted_stable_ord().iter() {
+    for (id, wp) in previous_work_products.to_sorted_stable_ord() {
         if !new_work_products.contains_key(id) {
             work_product::delete_workproduct_files(sess, wp);
             debug_assert!(
@@ -149,7 +148,7 @@ fn encode_query_cache(tcx: TyCtxt<'_>, encoder: FileEncoder) -> FileEncodeResult
 /// and moves it to the permanent dep-graph path
 pub(crate) fn build_dep_graph(
     sess: &Session,
-    prev_graph: SerializedDepGraph,
+    prev_graph: Arc<SerializedDepGraph>,
     prev_work_products: WorkProductMap,
 ) -> Option<DepGraph> {
     if sess.opts.incremental.is_none() {
@@ -163,7 +162,7 @@ pub(crate) fn build_dep_graph(
     let mut encoder = match FileEncoder::new(&path_buf) {
         Ok(encoder) => encoder,
         Err(err) => {
-            sess.emit_err(errors::CreateDepGraph { path: &path_buf, err });
+            sess.dcx().emit_err(errors::CreateDepGraph { path: &path_buf, err });
             return None;
         }
     };

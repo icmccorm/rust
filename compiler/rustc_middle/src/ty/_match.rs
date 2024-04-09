@@ -3,7 +3,7 @@ use crate::ty::relate::{self, Relate, RelateResult, TypeRelation};
 use crate::ty::{self, InferConst, Ty, TyCtxt};
 
 /// A type "A" *matches* "B" if the fresh types in B could be
-/// substituted with values so as to make it equal to A. Matching is
+/// instantiated with values so as to make it equal to A. Matching is
 /// intended to be used only on freshened types, and it basically
 /// indicates if the non-freshened versions of A and B could have been
 /// unified.
@@ -18,31 +18,24 @@ use crate::ty::{self, InferConst, Ty, TyCtxt};
 /// Like subtyping, matching is really a binary relation, so the only
 /// important thing about the result is Ok/Err. Also, matching never
 /// affects any type variables or unification state.
-pub struct Match<'tcx> {
+pub struct MatchAgainstFreshVars<'tcx> {
     tcx: TyCtxt<'tcx>,
-    param_env: ty::ParamEnv<'tcx>,
 }
 
-impl<'tcx> Match<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, param_env: ty::ParamEnv<'tcx>) -> Match<'tcx> {
-        Match { tcx, param_env }
+impl<'tcx> MatchAgainstFreshVars<'tcx> {
+    pub fn new(tcx: TyCtxt<'tcx>) -> MatchAgainstFreshVars<'tcx> {
+        MatchAgainstFreshVars { tcx }
     }
 }
 
-impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
+impl<'tcx> TypeRelation<'tcx> for MatchAgainstFreshVars<'tcx> {
     fn tag(&self) -> &'static str {
-        "Match"
+        "MatchAgainstFreshVars"
     }
+
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
-
-    fn param_env(&self) -> ty::ParamEnv<'tcx> {
-        self.param_env
-    }
-    fn a_is_expected(&self) -> bool {
-        true
-    } // irrelevant
 
     fn relate_with_variance<T: Relate<'tcx>>(
         &mut self,
@@ -58,7 +51,7 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
     fn regions(
         &mut self,
         a: ty::Region<'tcx>,
-        b: ty::Region<'tcx>,
+        _b: ty::Region<'tcx>,
     ) -> RelateResult<'tcx, ty::Region<'tcx>> {
         Ok(a)
     }
@@ -78,7 +71,7 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
             ) => Ok(a),
 
             (&ty::Infer(_), _) | (_, &ty::Infer(_)) => {
-                Err(TypeError::Sorts(relate::expected_found(self, a, b)))
+                Err(TypeError::Sorts(relate::expected_found(a, b)))
             }
 
             (&ty::Error(guar), _) | (_, &ty::Error(guar)) => Ok(Ty::new_error(self.tcx(), guar)),
@@ -103,7 +96,7 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
             }
 
             (ty::ConstKind::Infer(_), _) | (_, ty::ConstKind::Infer(_)) => {
-                return Err(TypeError::ConstMismatch(relate::expected_found(self, a, b)));
+                return Err(TypeError::ConstMismatch(relate::expected_found(a, b)));
             }
 
             _ => {}

@@ -24,7 +24,7 @@ use crate::{
     },
     static_lifetime,
     utils::ClosureSubst,
-    Canonical, DomainGoal, FnPointer, FnSig, Guidance, InEnvironment, Interner, Solution,
+    Canonical, DomainGoal, FnAbi, FnPointer, FnSig, Guidance, InEnvironment, Interner, Solution,
     Substitution, TraitEnvironment, Ty, TyBuilder, TyExt,
 };
 
@@ -274,6 +274,23 @@ impl InferenceTable<'_> {
                 self.set_diverging(*tv, true);
             }
             return success(simple(Adjust::NeverToAny)(to_ty.clone()), to_ty.clone(), vec![]);
+        }
+
+        // If we are coercing into an ATPIT, coerce into its proxy inference var, instead.
+        let mut to_ty = to_ty;
+        let _to;
+        if let Some(atpit_table) = &self.atpit_coercion_table {
+            if let TyKind::OpaqueType(opaque_ty_id, _) = to_ty.kind(Interner) {
+                if !matches!(
+                    from_ty.kind(Interner),
+                    TyKind::InferenceVar(..) | TyKind::OpaqueType(..)
+                ) {
+                    if let Some(ty) = atpit_table.get(opaque_ty_id) {
+                        _to = ty.clone();
+                        to_ty = &_to;
+                    }
+                }
+            }
         }
 
         // Consider coercing the subtype to a DST
@@ -647,7 +664,7 @@ impl InferenceTable<'_> {
         let goal: InEnvironment<DomainGoal> =
             InEnvironment::new(&self.trait_env.env, coerce_unsized_tref.cast(Interner));
 
-        let canonicalized = self.canonicalize(goal);
+        let canonicalized = self.canonicalize_with_free_vars(goal);
 
         // FIXME: rustc's coerce_unsized is more specialized -- it only tries to
         // solve `CoerceUnsized` and `Unsize` goals at this point and leaves the
@@ -691,7 +708,7 @@ fn coerce_closure_fn_ty(closure_substs: &Substitution, safety: chalk_ir::Safety)
     match closure_sig.kind(Interner) {
         TyKind::Function(fn_ty) => TyKind::Function(FnPointer {
             num_binders: fn_ty.num_binders,
-            sig: FnSig { safety, ..fn_ty.sig },
+            sig: FnSig { safety, abi: FnAbi::Rust, variadic: fn_ty.sig.variadic },
             substitution: fn_ty.substitution.clone(),
         })
         .intern(Interner),

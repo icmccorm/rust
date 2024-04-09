@@ -1,11 +1,11 @@
 use crate::rustc_lint::LintContext;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::macros::root_macro_call;
-use clippy_utils::{is_else_clause, peel_blocks_with_stmt, span_extract_comment, sugg};
+use clippy_utils::{is_else_clause, is_parent_stmt, peel_blocks_with_stmt, span_extract_comment, sugg};
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind, UnOp};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 use rustc_span::sym;
 
 declare_clippy_lint! {
@@ -16,14 +16,14 @@ declare_clippy_lint! {
     /// `assert!` is simpler than `if`-then-`panic!`.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let sad_people: Vec<&str> = vec![];
     /// if !sad_people.is_empty() {
     ///     panic!("there are sad people: {:?}", sad_people);
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// let sad_people: Vec<&str> = vec![];
     /// assert!(sad_people.is_empty(), "there are sad people: {:?}", sad_people);
     /// ```
@@ -63,8 +63,10 @@ impl<'tcx> LateLintPass<'tcx> for ManualAssert {
                 _ => (cond, "!"),
             };
             let cond_sugg = sugg::Sugg::hir_with_applicability(cx, cond, "..", &mut applicability).maybe_par();
-            let sugg = format!("assert!({not}{cond_sugg}, {format_args_snip});");
-            // we show to the user the suggestion without the comments, but when applying the fix, include the comments in the block
+            let semicolon = if is_parent_stmt(cx, expr.hir_id) { ";" } else { "" };
+            let sugg = format!("assert!({not}{cond_sugg}, {format_args_snip}){semicolon}");
+            // we show to the user the suggestion without the comments, but when applying the fix, include the
+            // comments in the block
             span_lint_and_then(
                 cx,
                 MANUAL_ASSERT,
@@ -77,16 +79,11 @@ impl<'tcx> LateLintPass<'tcx> for ManualAssert {
                             expr.span.shrink_to_lo(),
                             "add comments back",
                             comments,
-                            applicability
+                            applicability,
                         );
                     }
-                    diag.span_suggestion(
-                        expr.span,
-                        "try instead",
-                        sugg,
-                        applicability
-                    );
-                }
+                    diag.span_suggestion(expr.span, "try instead", sugg, applicability);
+                },
             );
         }
     }

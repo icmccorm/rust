@@ -3,17 +3,18 @@ use super::place::PlaceRef;
 use super::{FunctionCx, LocalRef};
 
 use crate::base;
-use crate::common::{self, IntPredicate};
+use crate::common::IntPredicate;
 use crate::traits::*;
 use crate::MemFlags;
 
+use rustc_hir as hir;
 use rustc_middle::mir;
 use rustc_middle::mir::Operand;
 use rustc_middle::ty::cast::{CastTy, IntTy};
 use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, adjustment::PointerCoercion, Instance, Ty, TyCtxt};
 use rustc_session::config::OptLevel;
-use rustc_span::source_map::{Span, DUMMY_SP};
+use rustc_span::{Span, DUMMY_SP};
 use rustc_target::abi::{self, FIRST_VARIANT};
 
 impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
@@ -94,8 +95,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 }
 
                 if let OperandValue::Immediate(v) = cg_elem.val {
-                    let zero = bx.const_usize(0);
-                    let start = dest.project_index(bx, zero).llval;
+                    let start = dest.llval;
                     let size = bx.const_usize(dest.layout.size.bytes());
 
                     // Use llvm.memset.p0i8.* to initialize all zero arrays
@@ -239,17 +239,17 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 };
                 if let OperandValueKind::Immediate(out_scalar) = cast_kind
                     && in_scalar.size(self.cx) == out_scalar.size(self.cx)
-                        {
-                            let operand_bty = bx.backend_type(operand.layout);
-                            let cast_bty = bx.backend_type(cast);
-                            Some(OperandValue::Immediate(self.transmute_immediate(
-                                bx,
-                                imm,
-                                in_scalar,
-                                operand_bty,
-                                out_scalar,
-                                cast_bty,
-                            )))
+                {
+                    let operand_bty = bx.backend_type(operand.layout);
+                    let cast_bty = bx.backend_type(cast);
+                    Some(OperandValue::Immediate(self.transmute_immediate(
+                        bx,
+                        imm,
+                        in_scalar,
+                        operand_bty,
+                        out_scalar,
+                        cast_bty,
+                    )))
                 } else {
                     None
                 }
@@ -303,15 +303,17 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         self.assume_scalar_range(bx, imm, from_scalar, from_backend_ty);
 
         imm = match (from_scalar.primitive(), to_scalar.primitive()) {
-            (Int(..) | F32 | F64, Int(..) | F32 | F64) => bx.bitcast(imm, to_backend_ty),
-            (Pointer(..), Pointer(..)) => bx.pointercast(imm, to_backend_ty),
-            (Int(..), Pointer(..)) => bx.inttoptr(imm, to_backend_ty),
-            (Pointer(..), Int(..)) => bx.ptrtoint(imm, to_backend_ty),
-            (F32 | F64, Pointer(..)) => {
-                let int_imm = bx.bitcast(imm, bx.cx().type_isize());
-                bx.inttoptr(int_imm, to_backend_ty)
+            (Int(..) | F16 | F32 | F64 | F128, Int(..) | F16 | F32 | F64 | F128) => {
+                bx.bitcast(imm, to_backend_ty)
             }
-            (Pointer(..), F32 | F64) => {
+            (Pointer(..), Pointer(..)) => bx.pointercast(imm, to_backend_ty),
+            (Int(..), Pointer(..)) => bx.ptradd(bx.const_null(bx.type_ptr()), imm),
+            (Pointer(..), Int(..)) => bx.ptrtoint(imm, to_backend_ty),
+            (F16 | F32 | F64 | F128, Pointer(..)) => {
+                let int_imm = bx.bitcast(imm, bx.cx().type_isize());
+                bx.ptradd(bx.const_null(bx.type_ptr()), int_imm)
+            }
+            (Pointer(..), F16 | F32 | F64 | F128) => {
                 let int_imm = bx.ptrtoint(imm, bx.cx().type_isize());
                 bx.bitcast(int_imm, to_backend_ty)
             }
@@ -403,7 +405,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 let cast = bx.cx().layout_of(self.monomorphize(mir_cast_ty));
 
                 let val = match *kind {
-                    mir::CastKind::PointerExposeAddress => {
+                    mir::CastKind::PointerExposeProvenance => {
                         assert!(bx.cx().is_backend_immediate(cast));
                         let llptr = operand.immediate();
                         let llcast_ty = bx.cx().immediate_backend_type(cast);
@@ -435,7 +437,6 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                                     args,
                                     ty::ClosureKind::FnOnce,
                                 )
-                                .expect("failed to normalize and resolve closure during codegen")
                                 .polymorphize(bx.cx().tcx());
                                 OperandValue::Immediate(bx.cx().get_fn_addr(instance))
                             }
@@ -508,7 +509,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     // Since int2ptr can have arbitrary integer types as input (so we have to do
                     // sign extension and all that), it is currently best handled in the same code
                     // path as the other integer-to-X casts.
-                    | mir::CastKind::PointerFromExposedAddress => {
+                    | mir::CastKind::PointerWithExposedProvenance => {
                         assert!(bx.cx().is_backend_immediate(cast));
                         let ll_t_out = bx.cx().immediate_backend_type(cast);
                         if operand.layout.abi.is_uninhabited() {
@@ -572,20 +573,15 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
             mir::Rvalue::Ref(_, bk, place) => {
                 let mk_ref = move |tcx: TyCtxt<'tcx>, ty: Ty<'tcx>| {
-                    Ty::new_ref(
-                        tcx,
-                        tcx.lifetimes.re_erased,
-                        ty::TypeAndMut { ty, mutbl: bk.to_mutbl_lossy() },
-                    )
+                    Ty::new_ref(tcx, tcx.lifetimes.re_erased, ty, bk.to_mutbl_lossy())
                 };
                 self.codegen_place_to_pointer(bx, place, mk_ref)
             }
 
             mir::Rvalue::CopyForDeref(place) => self.codegen_operand(bx, &Operand::Copy(place)),
             mir::Rvalue::AddressOf(mutability, place) => {
-                let mk_ptr = move |tcx: TyCtxt<'tcx>, ty: Ty<'tcx>| {
-                    Ty::new_ptr(tcx, ty::TypeAndMut { ty, mutbl: mutability })
-                };
+                let mk_ptr =
+                    move |tcx: TyCtxt<'tcx>, ty: Ty<'tcx>| Ty::new_ptr(tcx, ty, mutability);
                 self.codegen_place_to_pointer(bx, place, mk_ptr)
             }
 
@@ -673,17 +669,23 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 let val = match null_op {
                     mir::NullOp::SizeOf => {
                         assert!(bx.cx().type_is_sized(ty));
-                        layout.size.bytes()
+                        let val = layout.size.bytes();
+                        bx.cx().const_usize(val)
                     }
                     mir::NullOp::AlignOf => {
                         assert!(bx.cx().type_is_sized(ty));
-                        layout.align.abi.bytes()
+                        let val = layout.align.abi.bytes();
+                        bx.cx().const_usize(val)
                     }
                     mir::NullOp::OffsetOf(fields) => {
-                        layout.offset_of_subfield(bx.cx(), fields.iter().map(|f| f.index())).bytes()
+                        let val = layout.offset_of_subfield(bx.cx(), fields.iter()).bytes();
+                        bx.cx().const_usize(val)
+                    }
+                    mir::NullOp::UbChecks => {
+                        let val = bx.tcx().sess.opts.debug_assertions;
+                        bx.cx().const_bool(val)
                     }
                 };
-                let val = bx.cx().const_usize(val);
                 let tcx = self.cx.tcx();
                 OperandRef {
                     val: OperandValue::Immediate(val),
@@ -702,13 +704,13 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     };
                     let fn_ptr = bx.get_fn_addr(instance);
                     let fn_abi = bx.fn_abi_of_instance(instance, ty::List::empty());
-                    let fn_ty = bx.fn_decl_backend_type(&fn_abi);
+                    let fn_ty = bx.fn_decl_backend_type(fn_abi);
                     let fn_attrs = if bx.tcx().def_kind(instance.def_id()).has_codegen_attrs() {
                         Some(bx.tcx().codegen_fn_attrs(instance.def_id()))
                     } else {
                         None
                     };
-                    bx.call(fn_ty, fn_attrs, Some(fn_abi), fn_ptr, &[], None)
+                    bx.call(fn_ty, fn_attrs, Some(fn_abi), fn_ptr, &[], None, Some(instance))
                 } else {
                     bx.get_static(def_id)
                 };
@@ -859,14 +861,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     bx.inbounds_gep(llty, lhs, &[rhs])
                 }
             }
-            mir::BinOp::Shl => common::build_masked_lshift(bx, lhs, rhs),
-            mir::BinOp::ShlUnchecked => {
-                let rhs = base::cast_shift_expr_rhs(bx, lhs, rhs);
+            mir::BinOp::Shl | mir::BinOp::ShlUnchecked => {
+                let rhs = base::build_shift_expr_rhs(bx, lhs, rhs, op == mir::BinOp::ShlUnchecked);
                 bx.shl(lhs, rhs)
             }
-            mir::BinOp::Shr => common::build_masked_rshift(bx, input_ty, lhs, rhs),
-            mir::BinOp::ShrUnchecked => {
-                let rhs = base::cast_shift_expr_rhs(bx, lhs, rhs);
+            mir::BinOp::Shr | mir::BinOp::ShrUnchecked => {
+                let rhs = base::build_shift_expr_rhs(bx, lhs, rhs, op == mir::BinOp::ShrUnchecked);
                 if is_signed { bx.ashr(lhs, rhs) } else { bx.lshr(lhs, rhs) }
             }
             mir::BinOp::Ne
@@ -879,6 +879,35 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     bx.fcmp(base::bin_op_to_fcmp_predicate(op.to_hir_binop()), lhs, rhs)
                 } else {
                     bx.icmp(base::bin_op_to_icmp_predicate(op.to_hir_binop(), is_signed), lhs, rhs)
+                }
+            }
+            mir::BinOp::Cmp => {
+                use std::cmp::Ordering;
+                debug_assert!(!is_float);
+                let pred = |op| base::bin_op_to_icmp_predicate(op, is_signed);
+                if bx.cx().tcx().sess.opts.optimize == OptLevel::No {
+                    // FIXME: This actually generates tighter assembly, and is a classic trick
+                    // <https://graphics.stanford.edu/~seander/bithacks.html#CopyIntegerSign>
+                    // However, as of 2023-11 it optimizes worse in things like derived
+                    // `PartialOrd`, so only use it in debug for now. Once LLVM can handle it
+                    // better (see <https://github.com/llvm/llvm-project/issues/73417>), it'll
+                    // be worth trying it in optimized builds as well.
+                    let is_gt = bx.icmp(pred(hir::BinOpKind::Gt), lhs, rhs);
+                    let gtext = bx.zext(is_gt, bx.type_i8());
+                    let is_lt = bx.icmp(pred(hir::BinOpKind::Lt), lhs, rhs);
+                    let ltext = bx.zext(is_lt, bx.type_i8());
+                    bx.unchecked_ssub(gtext, ltext)
+                } else {
+                    // These operations are those expected by `tests/codegen/integer-cmp.rs`,
+                    // from <https://github.com/rust-lang/rust/pull/63767>.
+                    let is_lt = bx.icmp(pred(hir::BinOpKind::Lt), lhs, rhs);
+                    let is_ne = bx.icmp(pred(hir::BinOpKind::Ne), lhs, rhs);
+                    let ge = bx.select(
+                        is_ne,
+                        bx.cx().const_i8(Ordering::Greater as i8),
+                        bx.cx().const_i8(Ordering::Equal as i8),
+                    );
+                    bx.select(is_lt, bx.cx().const_i8(Ordering::Less as i8), ge)
                 }
             }
         }

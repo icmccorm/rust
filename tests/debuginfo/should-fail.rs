@@ -1,9 +1,9 @@
-// min-lldb-version: 310
+//@ min-lldb-version: 310
 
 // == Test [gdb|lldb]-[command|check] are parsed correctly ===
-// should-fail
-// needs-run-enabled
-// compile-flags:-g
+//@ should-fail
+//@ needs-run-enabled
+//@ compile-flags:-g
 
 // === GDB TESTS ===================================================================================
 
@@ -16,8 +16,8 @@
 
 // lldb-command:run
 
-// lldb-command:print x
-// lldb-check:[...]$0 = 5
+// lldb-command:v x
+// lldb-check:[...] 5
 
 // === CDB TESTS ==================================================================================
 

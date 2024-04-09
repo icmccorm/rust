@@ -1,4 +1,4 @@
-use rustc_middle::mir::coverage::{CounterId, ExpressionId, Operand};
+use rustc_middle::mir::coverage::{CodeRegion, CounterId, CovTerm, ExpressionId, MappingKind};
 
 /// Must match the layout of `LLVMRustCounterKind`.
 #[derive(Copy, Clone, Debug)]
@@ -43,11 +43,11 @@ impl Counter {
         Self { kind: CounterKind::Expression, id: expression_id.as_u32() }
     }
 
-    pub(crate) fn from_operand(operand: Operand) -> Self {
-        match operand {
-            Operand::Zero => Self::ZERO,
-            Operand::Counter(id) => Self::counter_value_reference(id),
-            Operand::Expression(id) => Self::expression(id),
+    pub(crate) fn from_term(term: CovTerm) -> Self {
+        match term {
+            CovTerm::Zero => Self::ZERO,
+            CovTerm::Counter(id) => Self::counter_value_reference(id),
+            CovTerm::Expression(id) => Self::expression(id),
         }
     }
 }
@@ -71,17 +71,6 @@ pub struct CounterExpression {
     pub kind: ExprKind,
     pub lhs: Counter,
     pub rhs: Counter,
-}
-
-impl CounterExpression {
-    /// The dummy expression `(0 - 0)` has a representation of all zeroes,
-    /// making it marginally more efficient to initialize than `(0 + 0)`.
-    pub(crate) const DUMMY: Self =
-        Self { lhs: Counter::ZERO, kind: ExprKind::Subtract, rhs: Counter::ZERO };
-
-    pub fn new(lhs: Counter, kind: ExprKind, rhs: Counter) -> Self {
-        Self { kind, lhs, rhs }
-    }
 }
 
 /// Corresponds to enum `llvm::coverage::CounterMappingRegion::RegionKind`.
@@ -160,6 +149,33 @@ pub struct CounterMappingRegion {
 }
 
 impl CounterMappingRegion {
+    pub(crate) fn from_mapping(
+        mapping_kind: &MappingKind,
+        local_file_id: u32,
+        code_region: &CodeRegion,
+    ) -> Self {
+        let &CodeRegion { file_name: _, start_line, start_col, end_line, end_col } = code_region;
+        match *mapping_kind {
+            MappingKind::Code(term) => Self::code_region(
+                Counter::from_term(term),
+                local_file_id,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+            ),
+            MappingKind::Branch { true_term, false_term } => Self::branch_region(
+                Counter::from_term(true_term),
+                Counter::from_term(false_term),
+                local_file_id,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+            ),
+        }
+    }
+
     pub(crate) fn code_region(
         counter: Counter,
         file_id: u32,
@@ -181,9 +197,6 @@ impl CounterMappingRegion {
         }
     }
 
-    // This function might be used in the future; the LLVM API is still evolving, as is coverage
-    // support.
-    #[allow(dead_code)]
     pub(crate) fn branch_region(
         counter: Counter,
         false_counter: Counter,

@@ -1,7 +1,4 @@
-// check-pass
-
-#![feature(return_position_impl_trait_in_trait)]
-#![allow(incomplete_features)]
+//@ check-pass
 
 trait Foo<T> {
     fn foo<F2: Foo<T>>(self) -> impl Foo<T>;

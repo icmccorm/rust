@@ -7,6 +7,7 @@
 use std::fmt;
 
 use rustc_ast::ast;
+use rustc_attr::DeprecatedSince;
 use rustc_hir::{def::CtorKind, def::DefKind, def_id::DefId};
 use rustc_metadata::rendered_const;
 use rustc_middle::ty::{self, TyCtxt};
@@ -18,6 +19,7 @@ use rustdoc_json_types::*;
 
 use crate::clean::{self, ItemId};
 use crate::formats::item_type::ItemType;
+use crate::formats::FormatRenderer;
 use crate::json::JsonRenderer;
 use crate::passes::collect_intra_doc_links::UrlFragment;
 
@@ -41,7 +43,7 @@ impl JsonRenderer<'_> {
             })
             .collect();
         let docs = item.opt_doc_value();
-        let attrs = item.attributes(self.tcx, true);
+        let attrs = item.attributes(self.tcx, self.cache(), true);
         let span = item.span(self.tcx);
         let visibility = item.visibility(self.tcx);
         let clean::Item { name, item_id, .. } = item;
@@ -137,9 +139,14 @@ where
 }
 
 pub(crate) fn from_deprecation(deprecation: rustc_attr::Deprecation) -> Deprecation {
-    #[rustfmt::skip]
-    let rustc_attr::Deprecation { since, note, is_since_rustc_version: _, suggestion: _ } = deprecation;
-    Deprecation { since: since.map(|s| s.to_string()), note: note.map(|s| s.to_string()) }
+    let rustc_attr::Deprecation { since, note, suggestion: _ } = deprecation;
+    let since = match since {
+        DeprecatedSince::RustcVersion(version) => Some(version.to_string()),
+        DeprecatedSince::Future => Some("TBD".to_owned()),
+        DeprecatedSince::NonStandard(since) => Some(since.to_string()),
+        DeprecatedSince::Unspecified | DeprecatedSince::Err => None,
+    };
+    Deprecation { since, note: note.map(|s| s.to_string()) }
 }
 
 impl FromWithTcx<clean::GenericArgs> for GenericArgs {
@@ -176,7 +183,7 @@ impl FromWithTcx<clean::Constant> for Constant {
         let expr = constant.expr(tcx);
         let value = constant.value(tcx);
         let is_literal = constant.is_literal(tcx);
-        Constant { type_: constant.type_.into_tcx(tcx), expr, value, is_literal }
+        Constant { type_: (*constant.type_).into_tcx(tcx), expr, value, is_literal }
     }
 }
 
@@ -243,15 +250,16 @@ pub(crate) fn id_from_item_inner(
                     // their parent module, which isn't present in the output JSON items. So
                     // instead, we directly get the primitive symbol and convert it to u32 to
                     // generate the ID.
-                    if matches!(tcx.def_kind(def_id), DefKind::Mod) &&
-                        let Some(prim) = tcx.get_attrs(*def_id, sym::rustc_doc_primitive)
-                            .find_map(|attr| attr.value_str()) {
+                    if matches!(tcx.def_kind(def_id), DefKind::Mod)
+                        && let Some(prim) = tcx
+                            .get_attrs(*def_id, sym::rustc_doc_primitive)
+                            .find_map(|attr| attr.value_str())
+                    {
                         format!(":{}", prim.as_u32())
                     } else {
-                        tcx
-                        .opt_item_name(*def_id)
-                        .map(|n| format!(":{}", n.as_u32()))
-                        .unwrap_or_default()
+                        tcx.opt_item_name(*def_id)
+                            .map(|n| format!(":{}", n.as_u32()))
+                            .unwrap_or_default()
                     }
                 }
             };
@@ -324,11 +332,11 @@ fn from_clean_item(item: clean::Item, tcx: TyCtxt<'_>) -> ItemEnum {
         }
         // FIXME(generic_const_items): Add support for generic associated consts.
         TyAssocConstItem(_generics, ty) => {
-            ItemEnum::AssocConst { type_: ty.into_tcx(tcx), default: None }
+            ItemEnum::AssocConst { type_: (*ty).into_tcx(tcx), default: None }
         }
         // FIXME(generic_const_items): Add support for generic associated consts.
         AssocConstItem(_generics, ty, default) => {
-            ItemEnum::AssocConst { type_: ty.into_tcx(tcx), default: Some(default.expr(tcx)) }
+            ItemEnum::AssocConst { type_: (*ty).into_tcx(tcx), default: Some(default.expr(tcx)) }
         }
         TyAssocTypeItem(g, b) => ItemEnum::AssocType {
             generics: g.into_tcx(tcx),
@@ -448,12 +456,12 @@ impl FromWithTcx<clean::GenericParamDefKind> for GenericParamDefKind {
             Lifetime { outlives } => GenericParamDefKind::Lifetime {
                 outlives: outlives.into_iter().map(convert_lifetime).collect(),
             },
-            Type { did: _, bounds, default, synthetic } => GenericParamDefKind::Type {
+            Type { bounds, default, synthetic } => GenericParamDefKind::Type {
                 bounds: bounds.into_tcx(tcx),
                 default: default.map(|x| (*x).into_tcx(tcx)),
                 synthetic,
             },
-            Const { ty, default } => GenericParamDefKind::Const {
+            Const { ty, default, is_host_effect: _ } => GenericParamDefKind::Const {
                 type_: (*ty).into_tcx(tcx),
                 default: default.map(|x| *x),
             },
@@ -478,25 +486,24 @@ impl FromWithTcx<clean::WherePredicate> for WherePredicate {
                                     outlives: outlives.iter().map(|lt| lt.0.to_string()).collect(),
                                 }
                             }
-                            clean::GenericParamDefKind::Type {
-                                did: _,
-                                bounds,
-                                default,
-                                synthetic,
-                            } => GenericParamDefKind::Type {
-                                bounds: bounds
-                                    .into_iter()
-                                    .map(|bound| bound.into_tcx(tcx))
-                                    .collect(),
-                                default: default.map(|ty| (*ty).into_tcx(tcx)),
-                                synthetic,
-                            },
-                            clean::GenericParamDefKind::Const { ty, default } => {
-                                GenericParamDefKind::Const {
-                                    type_: (*ty).into_tcx(tcx),
-                                    default: default.map(|d| *d),
+                            clean::GenericParamDefKind::Type { bounds, default, synthetic } => {
+                                GenericParamDefKind::Type {
+                                    bounds: bounds
+                                        .into_iter()
+                                        .map(|bound| bound.into_tcx(tcx))
+                                        .collect(),
+                                    default: default.map(|ty| (*ty).into_tcx(tcx)),
+                                    synthetic,
                                 }
                             }
+                            clean::GenericParamDefKind::Const {
+                                ty,
+                                default,
+                                is_host_effect: _,
+                            } => GenericParamDefKind::Const {
+                                type_: (*ty).into_tcx(tcx),
+                                default: default.map(|d| *d),
+                            },
                         };
                         GenericParamDef { name, kind }
                     })
@@ -506,9 +513,8 @@ impl FromWithTcx<clean::WherePredicate> for WherePredicate {
                 lifetime: convert_lifetime(lifetime),
                 bounds: bounds.into_tcx(tcx),
             },
-            // FIXME(fmease): Convert bound parameters as well.
-            EqPredicate { lhs, rhs, bound_params: _ } => {
-                WherePredicate::EqPredicate { lhs: (*lhs).into_tcx(tcx), rhs: (*rhs).into_tcx(tcx) }
+            EqPredicate { lhs, rhs } => {
+                WherePredicate::EqPredicate { lhs: lhs.into_tcx(tcx), rhs: rhs.into_tcx(tcx) }
             }
         }
     }
@@ -538,6 +544,9 @@ pub(crate) fn from_trait_bound_modifier(
         None => TraitBoundModifier::None,
         Maybe => TraitBoundModifier::Maybe,
         MaybeConst => TraitBoundModifier::MaybeConst,
+        // FIXME(const_trait_impl): Create rjt::TBM::Const and map to it once always-const bounds
+        // are less experimental.
+        Const => TraitBoundModifier::None,
         // FIXME(negative-bounds): This bound should be rendered negative, but
         // since that's experimental, maybe let's not add it to the rustdoc json
         // API just now...
@@ -639,10 +648,12 @@ impl FromWithTcx<clean::Trait> for Trait {
     fn from_tcx(trait_: clean::Trait, tcx: TyCtxt<'_>) -> Self {
         let is_auto = trait_.is_auto(tcx);
         let is_unsafe = trait_.unsafety(tcx) == rustc_hir::Unsafety::Unsafe;
+        let is_object_safe = trait_.is_object_safe(tcx);
         let clean::Trait { items, generics, bounds, .. } = trait_;
         Trait {
             is_auto,
             is_unsafe,
+            is_object_safe,
             items: ids(items, tcx),
             generics: generics.into_tcx(tcx),
             bounds: bounds.into_tcx(tcx),
@@ -745,7 +756,7 @@ impl FromWithTcx<clean::Discriminant> for Discriminant {
             // `rustc_middle` types, not `rustc_hir`, but because JSON never inlines
             // the expr is always some.
             expr: disr.expr(tcx).unwrap(),
-            value: disr.value(tcx),
+            value: disr.value(tcx, false),
         }
     }
 }

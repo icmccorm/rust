@@ -1,3 +1,5 @@
+//@compile-flags: -Zdeduplicate-diagnostics=yes
+
 #![feature(inline_const)]
 #![warn(clippy::indexing_slicing)]
 // We also check the out_of_bounds_indexing lint here, because it lints similar things and
@@ -12,8 +14,6 @@
 
 const ARR: [i32; 2] = [1, 2];
 const REF: &i32 = &ARR[idx()]; // This should be linted, since `suppress-restriction-lint-in-const` default is false.
-//~^ ERROR: indexing may panic
-const REF_ERR: &i32 = &ARR[idx4()]; // Ok, let rustc handle const contexts.
 //~^ ERROR: indexing may panic
 
 const fn idx() -> usize {
@@ -74,4 +74,7 @@ fn main() {
     //~^ ERROR: indexing may panic
     v[M];
     //~^ ERROR: indexing may panic
+
+    let slice = &x;
+    let _ = x[4];
 }

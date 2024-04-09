@@ -2,11 +2,11 @@ use ide_db::{
     assists::{AssistId, AssistKind},
     base_db::FileId,
     defs::Definition,
-    search::FileReference,
+    search::{FileReference, FileReferenceNode},
     syntax_helpers::node_ext::full_path_of_name_ref,
 };
 use syntax::{
-    ast::{self, NameLike, NameRef},
+    ast::{self, NameRef},
     AstNode, SyntaxKind, TextRange,
 };
 
@@ -37,16 +37,14 @@ pub(crate) fn unnecessary_async(acc: &mut Assists, ctx: &AssistContext<'_>) -> O
         return None;
     }
     // Do nothing if the function isn't async.
-    if let None = function.async_token() {
-        return None;
-    }
+    function.async_token()?;
     // Do nothing if the function has an `await` expression in its body.
     if function.body()?.syntax().descendants().find_map(ast::AwaitExpr::cast).is_some() {
         return None;
     }
     // Do nothing if the method is a member of trait.
     if let Some(impl_) = function.syntax().ancestors().nth(2).and_then(ast::Impl::cast) {
-        if let Some(_) = impl_.trait_() {
+        if impl_.trait_().is_some() {
             return None;
         }
     }
@@ -76,7 +74,7 @@ pub(crate) fn unnecessary_async(acc: &mut Assists, ctx: &AssistContext<'_>) -> O
                 for await_expr in find_all_references(ctx, &Definition::Function(fn_def))
                     // Keep only references that correspond NameRefs.
                     .filter_map(|(_, reference)| match reference.name {
-                        NameLike::NameRef(nameref) => Some(nameref),
+                        FileReferenceNode::NameRef(nameref) => Some(nameref),
                         _ => None,
                     })
                     // Keep only references that correspond to await expressions

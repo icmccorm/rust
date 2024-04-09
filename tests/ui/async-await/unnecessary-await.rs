@@ -1,4 +1,4 @@
-// edition:2018
+//@ edition:2018
 
 async fn foo () { }
 fn bar() -> impl std::future::Future { async {} }
@@ -29,6 +29,11 @@ async fn with_macros() {
     //~^ ERROR `()` is not a future
 
     f!(());
+}
+
+// Regression test for issue #117014.
+async fn desugaring_span_ctxt() {
+    for x in [] {}.await //~ ERROR `()` is not a future
 }
 
 fn main() {}

@@ -1,16 +1,16 @@
-// build-pass
-// edition:2021
-// compile-flags: -Cdebuginfo=2
+//@ build-pass
+//@ edition:2021
+//@ compile-flags: -Cdebuginfo=2
 
 // We were not normalizing opaques with escaping bound vars during codegen,
 // leading to later errors during debuginfo computation.
 
-#![feature(async_fn_in_trait)]
 
 #[derive(Clone, Copy)]
 pub struct SharedState {}
 
 pub trait State {
+    #[allow(async_fn_in_trait)]
     async fn execute(self, shared_state: &SharedState);
 }
 

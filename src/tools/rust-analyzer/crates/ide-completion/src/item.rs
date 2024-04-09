@@ -1,6 +1,6 @@
 //! See `CompletionItem` structure.
 
-use std::fmt;
+use std::{fmt, mem};
 
 use hir::Mutability;
 use ide_db::{
@@ -10,7 +10,7 @@ use ide_db::{
 use itertools::Itertools;
 use smallvec::SmallVec;
 use stdx::{impl_from, never};
-use syntax::{SmolStr, TextRange, TextSize};
+use syntax::{format_smolstr, SmolStr, TextRange, TextSize};
 use text_edit::TextEdit;
 
 use crate::{
@@ -26,6 +26,10 @@ use crate::{
 pub struct CompletionItem {
     /// Label in the completion pop up which identifies completion.
     pub label: SmolStr,
+    /// Additional label details in the completion pop up that are
+    /// displayed and aligned on the right side after the label.
+    pub label_detail: Option<SmolStr>,
+
     /// Range of identifier that is being completed.
     ///
     /// It should be used primarily for UI, but we also use this to convert
@@ -89,7 +93,7 @@ impl fmt::Debug for CompletionItem {
         let mut s = f.debug_struct("CompletionItem");
         s.field("label", &self.label).field("source_range", &self.source_range);
         if self.text_edit.len() == 1 {
-            let atom = &self.text_edit.iter().next().unwrap();
+            let atom = self.text_edit.iter().next().unwrap();
             s.field("delete", &atom.delete);
             s.field("insert", &atom.insert);
         } else {
@@ -148,6 +152,8 @@ pub struct CompletionRelevance {
     pub is_local: bool,
     /// This is set when trait items are completed in an impl of that trait.
     pub is_item_from_trait: bool,
+    /// This is set for when trait items are from traits with `#[doc(notable_trait)]`
+    pub is_item_from_notable_trait: bool,
     /// This is set when an import is suggested whose name is already imported.
     pub is_name_already_imported: bool,
     /// This is set for completions that will insert a `use` item.
@@ -160,6 +166,8 @@ pub struct CompletionRelevance {
     pub postfix_match: Option<CompletionRelevancePostfixMatch>,
     /// This is set for type inference results
     pub is_definite: bool,
+    /// This is set for items that are function (associated or method)
+    pub function: Option<CompletionRelevanceFn>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -201,6 +209,24 @@ pub enum CompletionRelevancePostfixMatch {
     Exact,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CompletionRelevanceFn {
+    pub has_params: bool,
+    pub has_self_param: bool,
+    pub return_type: CompletionRelevanceReturnType,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CompletionRelevanceReturnType {
+    Other,
+    /// Returns the Self type of the impl/trait
+    DirectConstructor,
+    /// Returns something that indirectly constructs the `Self` type of the impl/trait e.g. `Result<Self, ()>`, `Option<Self>`
+    Constructor,
+    /// Returns a possible builder for the type
+    Builder,
+}
+
 impl CompletionRelevance {
     /// Provides a relevance score. Higher values are more relevant.
     ///
@@ -224,6 +250,8 @@ impl CompletionRelevance {
             is_private_editable,
             postfix_match,
             is_definite,
+            is_item_from_notable_trait,
+            function,
         } = self;
 
         // lower rank private things
@@ -262,9 +290,39 @@ impl CompletionRelevance {
         if is_item_from_trait {
             score += 1;
         }
+        if is_item_from_notable_trait {
+            score += 1;
+        }
         if is_definite {
             score += 10;
         }
+
+        score += function
+            .map(|asf| {
+                let mut fn_score = match asf.return_type {
+                    CompletionRelevanceReturnType::DirectConstructor => 15,
+                    CompletionRelevanceReturnType::Builder => 10,
+                    CompletionRelevanceReturnType::Constructor => 5,
+                    CompletionRelevanceReturnType::Other => 0,
+                };
+
+                // When a fn is bumped due to return type:
+                // Bump Constructor or Builder methods with no arguments,
+                // over them than with self arguments
+                if fn_score > 0 {
+                    if !asf.has_params {
+                        // bump associated functions
+                        fn_score += 1;
+                    } else if asf.has_self_param {
+                        // downgrade methods (below Constructor)
+                        fn_score = 1;
+                    }
+                }
+
+                fn_score
+            })
+            .unwrap_or_default();
+
         score
     }
 
@@ -284,9 +342,9 @@ pub enum CompletionItemKind {
     BuiltinType,
     InferredType,
     Keyword,
-    Method,
     Snippet,
     UnresolvedReference,
+    Expression,
 }
 
 impl_from!(SymbolKind for CompletionItemKind);
@@ -310,6 +368,8 @@ impl CompletionItemKind {
                 SymbolKind::LifetimeParam => "lt",
                 SymbolKind::Local => "lc",
                 SymbolKind::Macro => "ma",
+                SymbolKind::Method => "me",
+                SymbolKind::ProcMacro => "pm",
                 SymbolKind::Module => "md",
                 SymbolKind::SelfParam => "sp",
                 SymbolKind::SelfType => "sy",
@@ -328,9 +388,9 @@ impl CompletionItemKind {
             CompletionItemKind::BuiltinType => "bt",
             CompletionItemKind::InferredType => "it",
             CompletionItemKind::Keyword => "kw",
-            CompletionItemKind::Method => "me",
             CompletionItemKind::Snippet => "sn",
             CompletionItemKind::UnresolvedReference => "??",
+            CompletionItemKind::Expression => "ex",
         }
     }
 }
@@ -423,15 +483,16 @@ impl Builder {
     }
 
     pub(crate) fn build(self, db: &RootDatabase) -> CompletionItem {
-        let _p = profile::span("item::Builder::build");
+        let _p = tracing::span!(tracing::Level::INFO, "item::Builder::build").entered();
 
-        let mut label = self.label;
+        let label = self.label;
+        let mut label_detail = None;
         let mut lookup = self.lookup.unwrap_or_else(|| label.clone());
         let insert_text = self.insert_text.unwrap_or_else(|| label.to_string());
 
         if !self.doc_aliases.is_empty() {
             let doc_aliases = self.doc_aliases.iter().join(", ");
-            label = SmolStr::from(format!("{label} (alias {doc_aliases})"));
+            label_detail.replace(format_smolstr!(" (alias {doc_aliases})"));
             let lookup_doc_aliases = self
                 .doc_aliases
                 .iter()
@@ -448,16 +509,21 @@ impl Builder {
                 // after typing a comma or space.
                 .join("");
             if !lookup_doc_aliases.is_empty() {
-                lookup = SmolStr::from(format!("{lookup}{lookup_doc_aliases}"));
+                lookup = format_smolstr!("{lookup}{lookup_doc_aliases}");
             }
         }
         if let [import_edit] = &*self.imports_to_add {
             // snippets can have multiple imports, but normal completions only have up to one
-            if let Some(original_path) = import_edit.original_path.as_ref() {
-                label = SmolStr::from(format!("{label} (use {})", original_path.display(db)));
-            }
+            label_detail.replace(format_smolstr!(
+                "{} (use {})",
+                label_detail.as_deref().unwrap_or_default(),
+                import_edit.import_path.display(db)
+            ));
         } else if let Some(trait_name) = self.trait_name {
-            label = SmolStr::from(format!("{label} (as {trait_name})"));
+            label_detail.replace(format_smolstr!(
+                "{} (as {trait_name})",
+                label_detail.as_deref().unwrap_or_default(),
+            ));
         }
 
         let text_edit = match self.text_edit {
@@ -479,6 +545,7 @@ impl Builder {
         CompletionItem {
             source_range: self.source_range,
             label,
+            label_detail,
             text_edit,
             is_snippet: self.is_snippet,
             detail: self.detail,
@@ -536,7 +603,7 @@ impl Builder {
         self.detail = detail.map(Into::into);
         if let Some(detail) = &self.detail {
             if never!(detail.contains('\n'), "multiline detail:\n{}", detail) {
-                self.detail = Some(detail.splitn(2, '\n').next().unwrap().to_string());
+                self.detail = Some(detail.split('\n').next().unwrap().to_owned());
             }
         }
         self
@@ -555,6 +622,13 @@ impl Builder {
     }
     pub(crate) fn set_relevance(&mut self, relevance: CompletionRelevance) -> &mut Builder {
         self.relevance = relevance;
+        self
+    }
+    pub(crate) fn with_relevance(
+        &mut self,
+        relevance: impl FnOnce(CompletionRelevance) -> CompletionRelevance,
+    ) -> &mut Builder {
+        self.relevance = relevance(mem::take(&mut self.relevance));
         self
     }
     pub(crate) fn trigger_call_info(&mut self) -> &mut Builder {

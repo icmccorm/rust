@@ -1,5 +1,8 @@
+use std::ptr::addr_of;
+
 static mut FOO: i32 = 42;
-static BAR: Foo = Foo(unsafe { &FOO as *const _ });
+
+static BAR: Foo = Foo(unsafe { addr_of!(FOO) });
 
 #[allow(dead_code)]
 struct Foo(*const i32);

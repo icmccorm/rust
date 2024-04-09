@@ -5,7 +5,7 @@
 
 use super::{BasicBlock, Const, Local, UserTypeProjection};
 
-use crate::mir::coverage::{CodeRegion, CoverageKind};
+use crate::mir::coverage::CoverageKind;
 use crate::traits::Reveal;
 use crate::ty::adjustment::PointerCoercion;
 use crate::ty::GenericArgsRef;
@@ -13,10 +13,11 @@ use crate::ty::{self, List, Ty};
 use crate::ty::{Region, UserTypeAnnotationIndex};
 
 use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
+use rustc_data_structures::packed::Pu128;
 use rustc_hir::def_id::DefId;
-use rustc_hir::{self as hir};
-use rustc_hir::{self, GeneratorKind};
+use rustc_hir::CoroutineKind;
 use rustc_index::IndexVec;
+use rustc_span::source_map::Spanned;
 use rustc_target::abi::{FieldIdx, VariantIdx};
 
 use rustc_ast::Mutability;
@@ -82,10 +83,10 @@ pub enum MirPhase {
     ///    that Rust itself has them. Where exactly these are is generally subject to change, and so we
     ///    don't document this here. Runtime MIR has most retags explicit (though implicit retags
     ///    can still occur at `Rvalue::{Ref,AddrOf}`).
-    ///  - Generator bodies: In analysis MIR, locals may actually be behind a pointer that user code has
-    ///    access to. This occurs in generator bodies. Such locals do not behave like other locals,
+    ///  - Coroutine bodies: In analysis MIR, locals may actually be behind a pointer that user code has
+    ///    access to. This occurs in coroutine bodies. Such locals do not behave like other locals,
     ///    because they eg may be aliased in surprising ways. Runtime MIR has no such special locals -
-    ///    all generator bodies are lowered and so all places that look like locals really are locals.
+    ///    all coroutine bodies are lowered and so all places that look like locals really are locals.
     ///
     /// Also note that the lint pass which reports eg `200_u8 + 200_u8` as an error is run as a part
     /// of analysis to runtime MIR lowering. To ensure lints are reported reliably, this means that
@@ -123,7 +124,8 @@ pub enum AnalysisPhase {
     /// * [`TerminatorKind::FalseEdge`]
     /// * [`StatementKind::FakeRead`]
     /// * [`StatementKind::AscribeUserType`]
-    /// * [`Rvalue::Ref`] with `BorrowKind::Shallow`
+    /// * [`StatementKind::Coverage`] with [`CoverageKind::BlockMarker`] or [`CoverageKind::SpanMarker`]
+    /// * [`Rvalue::Ref`] with `BorrowKind::Fake`
     ///
     /// Furthermore, `Deref` projections must be the first projection within any place (if they
     /// appear at all)
@@ -137,7 +139,7 @@ pub enum RuntimePhase {
     /// In addition to the semantic changes, beginning with this phase, the following variants are
     /// disallowed:
     /// * [`TerminatorKind::Yield`]
-    /// * [`TerminatorKind::GeneratorDrop`]
+    /// * [`TerminatorKind::CoroutineDrop`]
     /// * [`Rvalue::Aggregate`] for any `AggregateKind` except `Array`
     /// * [`PlaceElem::OpaqueCast`]
     ///
@@ -182,7 +184,7 @@ pub enum BorrowKind {
     /// should not prevent `if let None = x { ... }`, for example, because the
     /// mutating `(*x as Some).0` can't affect the discriminant of `x`.
     /// We can also report errors with this kind of borrow differently.
-    Shallow,
+    Fake,
 
     /// Data is mutable and not aliasable.
     Mut { kind: MutBorrowKind },
@@ -292,7 +294,7 @@ pub enum StatementKind<'tcx> {
 
     /// Write the discriminant for a variant to the enum Place.
     ///
-    /// This is permitted for both generators and ADTs. This does not necessarily write to the
+    /// This is permitted for both coroutines and ADTs. This does not necessarily write to the
     /// entire place; instead, it writes to the minimum set of bytes as required by the layout for
     /// the type.
     SetDiscriminant { place: Box<Place<'tcx>>, variant_index: VariantIdx },
@@ -361,12 +363,17 @@ pub enum StatementKind<'tcx> {
     /// Disallowed after drop elaboration.
     AscribeUserType(Box<(Place<'tcx>, UserTypeProjection)>, ty::Variance),
 
-    /// Marks the start of a "coverage region", injected with '-Cinstrument-coverage'. A
-    /// `Coverage` statement carries metadata about the coverage region, used to inject a coverage
-    /// map into the binary. If `Coverage::kind` is a `Counter`, the statement also generates
-    /// executable code, to increment a counter variable at runtime, each time the code region is
-    /// executed.
-    Coverage(Box<Coverage>),
+    /// Carries control-flow-sensitive information injected by `-Cinstrument-coverage`,
+    /// such as where to generate physical coverage-counter-increments during codegen.
+    ///
+    /// Coverage statements are used in conjunction with the coverage mappings and other
+    /// information stored in the function's
+    /// [`mir::Body::function_coverage_info`](crate::mir::Body::function_coverage_info).
+    /// (For inlined MIR, take care to look up the *original function's* coverage info.)
+    ///
+    /// Interpreters and codegen backends that don't support coverage instrumentation
+    /// can usually treat this as a no-op.
+    Coverage(CoverageKind),
 
     /// Denotes a call to an intrinsic that does not require an unwind path and always returns.
     /// This avoids adding a new block and a terminator for simple intrinsics.
@@ -512,13 +519,6 @@ pub enum FakeReadCause {
 
 #[derive(Clone, Debug, PartialEq, TyEncodable, TyDecodable, Hash, HashStable)]
 #[derive(TypeFoldable, TypeVisitable)]
-pub struct Coverage {
-    pub kind: CoverageKind,
-    pub code_region: Option<CodeRegion>,
-}
-
-#[derive(Clone, Debug, PartialEq, TyEncodable, TyDecodable, Hash, HashStable)]
-#[derive(TypeFoldable, TypeVisitable)]
 pub struct CopyNonOverlapping<'tcx> {
     pub src: Operand<'tcx>,
     pub dst: Operand<'tcx>,
@@ -622,8 +622,8 @@ pub enum TerminatorKind<'tcx> {
     /// `dest = move _0`. It might additionally do other things, like have side-effects in the
     /// aliasing model.
     ///
-    /// If the body is a generator body, this has slightly different semantics; it instead causes a
-    /// `GeneratorState::Returned(_0)` to be created (as if by an `Aggregate` rvalue) and assigned
+    /// If the body is a coroutine body, this has slightly different semantics; it instead causes a
+    /// `CoroutineState::Returned(_0)` to be created (as if by an `Aggregate` rvalue) and assigned
     /// to the return place.
     Return,
 
@@ -670,7 +670,9 @@ pub enum TerminatorKind<'tcx> {
         /// These are owned by the callee, which is free to modify them.
         /// This allows the memory occupied by "by-value" arguments to be
         /// reused across function calls without duplicating the contents.
-        args: Vec<Operand<'tcx>>,
+        /// The span for each arg is also included
+        /// (e.g. `a` and `b` in `x.foo(a, b)`).
+        args: Vec<Spanned<Operand<'tcx>>>,
         /// Where the returned value will be written
         destination: Place<'tcx>,
         /// Where to go after this call returns. If none, the call necessarily diverges.
@@ -705,14 +707,14 @@ pub enum TerminatorKind<'tcx> {
 
     /// Marks a suspend point.
     ///
-    /// Like `Return` terminators in generator bodies, this computes `value` and then a
-    /// `GeneratorState::Yielded(value)` as if by `Aggregate` rvalue. That value is then assigned to
+    /// Like `Return` terminators in coroutine bodies, this computes `value` and then a
+    /// `CoroutineState::Yielded(value)` as if by `Aggregate` rvalue. That value is then assigned to
     /// the return place of the function calling this one, and execution continues in the calling
     /// function. When next invoked with the same first argument, execution of this function
     /// continues at the `resume` basic block, with the second argument written to the `resume_arg`
-    /// place. If the generator is dropped before then, the `drop` basic block is invoked.
+    /// place. If the coroutine is dropped before then, the `drop` basic block is invoked.
     ///
-    /// Not permitted in bodies that are not generator bodies, or after generator lowering.
+    /// Not permitted in bodies that are not coroutine bodies, or after coroutine lowering.
     ///
     /// **Needs clarification**: What about the evaluation order of the `resume_arg` and `value`?
     Yield {
@@ -722,21 +724,21 @@ pub enum TerminatorKind<'tcx> {
         resume: BasicBlock,
         /// The place to store the resume argument in.
         resume_arg: Place<'tcx>,
-        /// Cleanup to be done if the generator is dropped at this suspend point.
+        /// Cleanup to be done if the coroutine is dropped at this suspend point.
         drop: Option<BasicBlock>,
     },
 
-    /// Indicates the end of dropping a generator.
+    /// Indicates the end of dropping a coroutine.
     ///
-    /// Semantically just a `return` (from the generators drop glue). Only permitted in the same situations
+    /// Semantically just a `return` (from the coroutines drop glue). Only permitted in the same situations
     /// as `yield`.
     ///
-    /// **Needs clarification**: Is that even correct? The generator drop code is always confusing
+    /// **Needs clarification**: Is that even correct? The coroutine drop code is always confusing
     /// to me, because it's not even really in the current body.
     ///
     /// **Needs clarification**: Are there type system constraints on these terminators? Should
     /// there be a "block type" like `cleanup` blocks for them?
-    GeneratorDrop,
+    CoroutineDrop,
 
     /// A block where control flow only ever takes one real path, but borrowck needs to be more
     /// conservative.
@@ -786,9 +788,10 @@ pub enum TerminatorKind<'tcx> {
         /// used to map assembler errors back to the line in the source code.
         line_spans: &'tcx [Span],
 
-        /// Destination block after the inline assembly returns, unless it is
-        /// diverging (InlineAsmOptions::NORETURN).
-        destination: Option<BasicBlock>,
+        /// Valid targets for the inline assembly.
+        /// The first element is the fallthrough destination, unless
+        /// InlineAsmOptions::NORETURN is set.
+        targets: Vec<BasicBlock>,
 
         /// Action to be taken if the inline assembly unwinds. This is present
         /// if and only if InlineAsmOptions::MAY_UNWIND is set.
@@ -811,7 +814,7 @@ impl TerminatorKind<'_> {
             TerminatorKind::Call { .. } => "Call",
             TerminatorKind::Assert { .. } => "Assert",
             TerminatorKind::Yield { .. } => "Yield",
-            TerminatorKind::GeneratorDrop => "GeneratorDrop",
+            TerminatorKind::CoroutineDrop => "CoroutineDrop",
             TerminatorKind::FalseEdge { .. } => "FalseEdge",
             TerminatorKind::FalseUnwind { .. } => "FalseUnwind",
             TerminatorKind::InlineAsm { .. } => "InlineAsm",
@@ -823,7 +826,7 @@ impl TerminatorKind<'_> {
 pub struct SwitchTargets {
     /// Possible values. The locations to branch to in each case
     /// are found in the corresponding indices from the `targets` vector.
-    pub(super) values: SmallVec<[u128; 1]>,
+    pub(super) values: SmallVec<[Pu128; 1]>,
 
     /// Possible branch sites. The last element of this vector is used
     /// for the otherwise branch, so targets.len() == values.len() + 1
@@ -879,8 +882,8 @@ pub enum AssertKind<O> {
     OverflowNeg(O),
     DivisionByZero(O),
     RemainderByZero(O),
-    ResumedAfterReturn(GeneratorKind),
-    ResumedAfterPanic(GeneratorKind),
+    ResumedAfterReturn(CoroutineKind),
+    ResumedAfterPanic(CoroutineKind),
     MisalignedPointerDereference { required: O, found: O },
 }
 
@@ -910,6 +913,10 @@ pub enum InlineAsmOperand<'tcx> {
     },
     SymStatic {
         def_id: DefId,
+    },
+    Label {
+        /// This represents the index into the `targets` array in `TerminatorKind::InlineAsm`.
+        target_index: usize,
     },
 }
 
@@ -957,8 +964,8 @@ pub type AssertMessage<'tcx> = AssertKind<Operand<'tcx>>;
 ///    was unsized and so had metadata associated with it, then the metadata is retained if the
 ///    field is unsized and thrown out if it is sized.
 ///
-///    These projections are only legal for tuples, ADTs, closures, and generators. If the ADT or
-///    generator has more than one variant, the parent place's variant index must be set, indicating
+///    These projections are only legal for tuples, ADTs, closures, and coroutines. If the ADT or
+///    coroutine has more than one variant, the parent place's variant index must be set, indicating
 ///    which variant is being used. If it has just one variant, the variant index may or may not be
 ///    included - the single possible variant is inferred if it is not included.
 ///  - [`OpaqueCast`](ProjectionElem::OpaqueCast): This projection changes the place's type to the
@@ -986,18 +993,15 @@ pub type AssertMessage<'tcx> = AssertKind<Operand<'tcx>>;
 ///    pointee's type. The resulting address is the address that was stored in the pointer. If the
 ///    pointee type is unsized, the pointer additionally stored the value of the metadata.
 ///
-/// Computing a place may cause UB. One possibility is that the pointer used for a `Deref` may not
-/// be suitably aligned. Another possibility is that the place is not in bounds, meaning it does not
-/// point to an actual allocation.
-///
-/// However, if this is actually UB and when the UB kicks in is undecided. This is being discussed
-/// in [UCG#319]. The options include that every place must obey those rules, that only some places
-/// must obey them, or that places impose no rules of their own.
-///
-/// [UCG#319]: https://github.com/rust-lang/unsafe-code-guidelines/issues/319
-///
-/// Rust currently requires that every place obey those two rules. This is checked by MIRI and taken
-/// advantage of by codegen (via `gep inbounds`). That is possibly subject to change.
+/// The "validity invariant" of places is the same as that of raw pointers, meaning that e.g.
+/// `*ptr` on a dangling or unaligned pointer is never UB. (Later doing a load/store on that place
+/// or turning it into a reference can be UB though!) The only ways for a place computation can
+/// cause UB are:
+/// - On a `Deref` projection, we do an actual load of the inner place, with all the usual
+///   consequences (the inner place must be based on an aligned pointer, it must point to allocated
+///   memory, the aliasig model must allow reads, this must not be a data race).
+/// - For the projections that perform pointer arithmetic, the offset must in-bounds of an
+///   allocation (i.e., the preconditions of `ptr::offset` must be met).
 #[derive(Copy, Clone, PartialEq, Eq, Hash, TyEncodable, HashStable, TypeFoldable, TypeVisitable)]
 pub struct Place<'tcx> {
     pub local: Local,
@@ -1067,14 +1071,28 @@ pub enum ProjectionElem<V, T> {
         from_end: bool,
     },
 
-    /// "Downcast" to a variant of an enum or a generator.
+    /// "Downcast" to a variant of an enum or a coroutine.
     ///
     /// The included Symbol is the name of the variant, used for printing MIR.
+    ///
+    /// This operation itself is never UB, all it does is change the type of the place.
     Downcast(Option<Symbol>, VariantIdx),
 
     /// Like an explicit cast from an opaque type to a concrete type, but without
     /// requiring an intermediate variable.
     OpaqueCast(T),
+
+    /// A `Subtype(T)` projection is applied to any `StatementKind::Assign` where
+    /// type of lvalue doesn't match the type of rvalue, the primary goal is making subtyping
+    /// explicit during optimizations and codegen.
+    ///
+    /// This projection doesn't impact the runtime behavior of the program except for potentially changing
+    /// some type metadata of the interpreter or codegen backend.
+    ///
+    /// This goal is achieved with mir_transform pass `Subtyper`, which runs right after
+    /// borrowchecker, as we only care about subtyping that can affect trait selection and
+    /// `TypeId`.
+    Subtype(T),
 }
 
 /// Alias for projections as they appear in places, where the base is a place
@@ -1265,8 +1283,8 @@ pub enum Rvalue<'tcx> {
     /// `dest = Foo { x: ..., y: ... }` from `dest.x = ...; dest.y = ...;` in the case that `Foo`
     /// has a destructor.
     ///
-    /// Disallowed after deaggregation for all aggregate kinds except `Array` and `Generator`. After
-    /// generator lowering, `Generator` aggregate kinds are disallowed too.
+    /// Disallowed after deaggregation for all aggregate kinds except `Array` and `Coroutine`. After
+    /// coroutine lowering, `Coroutine` aggregate kinds are disallowed too.
     Aggregate(Box<AggregateKind<'tcx>>, IndexVec<FieldIdx, Operand<'tcx>>),
 
     /// Transmutes a `*mut u8` into shallow-initialized `Box<T>`.
@@ -1291,11 +1309,11 @@ pub enum Rvalue<'tcx> {
 pub enum CastKind {
     /// An exposing pointer to address cast. A cast between a pointer and an integer type, or
     /// between a function pointer and an integer type.
-    /// See the docs on `expose_addr` for more details.
-    PointerExposeAddress,
+    /// See the docs on `expose_provenance` for more details.
+    PointerExposeProvenance,
     /// An address-to-pointer cast that picks up an exposed provenance.
-    /// See the docs on `from_exposed_addr` for more details.
-    PointerFromExposedAddress,
+    /// See the docs on `with_exposed_provenance` for more details.
+    PointerWithExposedProvenance,
     /// Pointer related casts that are done by coercions. Note that reference-to-raw-ptr casts are
     /// translated into `&raw mut/const *r`, i.e., they are not actually casts.
     PointerCoercion(PointerCoercion),
@@ -1331,7 +1349,8 @@ pub enum AggregateKind<'tcx> {
     Adt(DefId, VariantIdx, GenericArgsRef<'tcx>, Option<UserTypeAnnotationIndex>, Option<FieldIdx>),
 
     Closure(DefId, GenericArgsRef<'tcx>),
-    Generator(DefId, GenericArgsRef<'tcx>, hir::Movability),
+    Coroutine(DefId, GenericArgsRef<'tcx>),
+    CoroutineClosure(DefId, GenericArgsRef<'tcx>),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, TyEncodable, TyDecodable, Hash, HashStable)]
@@ -1341,7 +1360,10 @@ pub enum NullOp<'tcx> {
     /// Returns the minimum alignment of a type
     AlignOf,
     /// Returns the offset of a field
-    OffsetOf(&'tcx List<FieldIdx>),
+    OffsetOf(&'tcx List<(VariantIdx, FieldIdx)>),
+    /// Returns whether we should perform some UB-checking at runtime.
+    /// See the `ub_checks` intrinsic docs for details.
+    UbChecks,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1391,18 +1413,18 @@ pub enum BinOp {
     BitOr,
     /// The `<<` operator (shift left)
     ///
-    /// The offset is truncated to the size of the first operand before shifting.
+    /// The offset is truncated to the size of the first operand and made unsigned before shifting.
     Shl,
-    /// Like `Shl`, but is UB if the RHS >= LHS::BITS
+    /// Like `Shl`, but is UB if the RHS >= LHS::BITS or RHS < 0
     ShlUnchecked,
     /// The `>>` operator (shift right)
     ///
-    /// The offset is truncated to the size of the first operand before shifting.
+    /// The offset is truncated to the size of the first operand and made unsigned before shifting.
     ///
     /// This is an arithmetic shift if the LHS is signed
     /// and a logical shift if the LHS is unsigned.
     Shr,
-    /// Like `Shl`, but is UB if the RHS >= LHS::BITS
+    /// Like `Shl`, but is UB if the RHS >= LHS::BITS or RHS < 0
     ShrUnchecked,
     /// The `==` operator (equality)
     Eq,
@@ -1416,12 +1438,22 @@ pub enum BinOp {
     Ge,
     /// The `>` operator (greater than)
     Gt,
+    /// The `<=>` operator (three-way comparison, like `Ord::cmp`)
+    ///
+    /// This is supported only on the integer types and `char`, always returning
+    /// [`rustc_hir::LangItem::OrderingEnum`] (aka [`std::cmp::Ordering`]).
+    ///
+    /// [`Rvalue::BinaryOp`]`(BinOp::Cmp, A, B)` returns
+    /// - `Ordering::Less` (`-1_i8`, as a Scalar) if `A < B`
+    /// - `Ordering::Equal` (`0_i8`, as a Scalar) if `A == B`
+    /// - `Ordering::Greater` (`+1_i8`, as a Scalar) if `A > B`
+    Cmp,
     /// The `ptr.offset` operator
     Offset,
 }
 
 // Some nodes are used a lot. Make sure they don't unintentionally get bigger.
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_pointer_width = "64"))]
 mod size_asserts {
     use super::*;
     // tidy-alphabetical-start
@@ -1430,5 +1462,6 @@ mod size_asserts {
     static_assert_size!(Place<'_>, 16);
     static_assert_size!(PlaceElem<'_>, 24);
     static_assert_size!(Rvalue<'_>, 40);
+    static_assert_size!(StatementKind<'_>, 16);
     // tidy-alphabetical-end
 }

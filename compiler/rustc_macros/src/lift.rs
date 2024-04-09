@@ -1,9 +1,10 @@
 use quote::quote;
-use syn::{self, parse_quote};
+use syn::parse_quote;
 
 pub fn lift_derive(mut s: synstructure::Structure<'_>) -> proc_macro2::TokenStream {
     s.add_bounds(synstructure::AddBounds::Generics);
     s.bind_with(|_| synstructure::BindStyle::Move);
+    s.underscore_const(true);
 
     let tcx: syn::Lifetime = parse_quote!('tcx);
     let newtcx: syn::GenericParam = parse_quote!('__lifted);

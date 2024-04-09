@@ -10,7 +10,7 @@ use crate::infer::canonical::{Canonical, QueryResponse};
 use crate::ty::error::TypeError;
 use crate::ty::GenericArg;
 use crate::ty::{self, Ty, TyCtxt};
-use rustc_span::source_map::Span;
+use rustc_span::Span;
 
 pub mod type_op {
     use crate::ty::fold::TypeFoldable;
@@ -67,7 +67,7 @@ pub mod type_op {
     }
 }
 
-pub type CanonicalProjectionGoal<'tcx> = Canonical<'tcx, ty::ParamEnvAnd<'tcx, ty::AliasTy<'tcx>>>;
+pub type CanonicalAliasGoal<'tcx> = Canonical<'tcx, ty::ParamEnvAnd<'tcx, ty::AliasTy<'tcx>>>;
 
 pub type CanonicalTyGoal<'tcx> = Canonical<'tcx, ty::ParamEnvAnd<'tcx, Ty<'tcx>>>;
 
@@ -105,19 +105,8 @@ pub struct DropckOutlivesResult<'tcx> {
 impl<'tcx> DropckOutlivesResult<'tcx> {
     pub fn report_overflows(&self, tcx: TyCtxt<'tcx>, span: Span, ty: Ty<'tcx>) {
         if let Some(overflow_ty) = self.overflows.get(0) {
-            tcx.sess.emit_err(DropCheckOverflow { span, ty, overflow_ty: *overflow_ty });
+            tcx.dcx().emit_err(DropCheckOverflow { span, ty, overflow_ty: *overflow_ty });
         }
-    }
-
-    pub fn into_kinds_reporting_overflows(
-        self,
-        tcx: TyCtxt<'tcx>,
-        span: Span,
-        ty: Ty<'tcx>,
-    ) -> Vec<GenericArg<'tcx>> {
-        self.report_overflows(tcx, span, ty);
-        let DropckOutlivesResult { kinds, overflows: _ } = self;
-        kinds
     }
 }
 
@@ -188,10 +177,10 @@ pub struct MethodAutoderefBadTy<'tcx> {
     pub ty: Canonical<'tcx, QueryResponse<'tcx, Ty<'tcx>>>,
 }
 
-/// Result from the `normalize_projection_ty` query.
+/// Result of the `normalize_canonicalized_{{,inherent_}projection,weak}_ty` queries.
 #[derive(Clone, Debug, HashStable, TypeFoldable, TypeVisitable)]
 pub struct NormalizationResult<'tcx> {
-    /// Result of normalization.
+    /// Result of the normalization.
     pub normalized_ty: Ty<'tcx>,
 }
 
@@ -202,7 +191,7 @@ pub struct NormalizationResult<'tcx> {
 /// case they are called implied bounds). They are fed to the
 /// `OutlivesEnv` which in turn is supplied to the region checker and
 /// other parts of the inference system.
-#[derive(Clone, Debug, TypeFoldable, TypeVisitable, HashStable)]
+#[derive(Copy, Clone, Debug, TypeFoldable, TypeVisitable, HashStable)]
 pub enum OutlivesBound<'tcx> {
     RegionSubRegion(ty::Region<'tcx>, ty::Region<'tcx>),
     RegionSubParam(ty::Region<'tcx>, ty::ParamTy),

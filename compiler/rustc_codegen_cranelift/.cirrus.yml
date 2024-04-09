@@ -3,7 +3,7 @@ task:
   freebsd_instance:
     image: freebsd-13-2-release-amd64
   setup_rust_script:
-    - pkg install -y git bash
+    - pkg install -y git bash binutils
     - curl https://sh.rustup.rs -sSf --output rustup.sh
     - sh rustup.sh --default-toolchain none -y --profile=minimal
   target_cache:
@@ -13,4 +13,7 @@ task:
     - ./y.sh prepare
   test_script:
     - . $HOME/.cargo/env
+    # Disabling incr comp reduces cache size and incr comp doesn't save as much
+    # on CI anyway.
+    - export CARGO_BUILD_INCREMENTAL=false
     - ./y.sh test

@@ -48,17 +48,18 @@ o("codegen-tests", "rust.codegen-tests", "run the tests/codegen tests")
 o("ninja", "llvm.ninja", "build LLVM using the Ninja generator (for MSVC, requires building in the correct environment)")
 o("locked-deps", "build.locked-deps", "force Cargo.lock to be up to date")
 o("vendor", "build.vendor", "enable usage of vendored Rust crates")
-o("sanitizers", "build.sanitizers", "build the sanitizer runtimes (asan, lsan, msan, tsan, hwasan)")
+o("sanitizers", "build.sanitizers", "build the sanitizer runtimes (asan, dfsan, lsan, msan, tsan, hwasan)")
 o("dist-src", "rust.dist-src", "when building tarballs enables building a source tarball")
 o("cargo-native-static", "build.cargo-native-static", "static native libraries in cargo")
 o("profiler", "build.profiler", "build the profiler runtime")
 o("full-tools", None, "enable all tools")
 o("lld", "rust.lld", "build lld")
+o("llvm-bitcode-linker", "rust.llvm-bitcode-linker", "build llvm bitcode linker")
 o("clang", "llvm.clang", "build clang")
-o("missing-tools", "dist.missing-tools", "allow failures when building tools")
 o("use-libcxx", "llvm.use-libcxx", "build LLVM with libc++")
 o("control-flow-guard", "rust.control-flow-guard", "Enable Control Flow Guard")
 o("patch-binaries-for-nix", "build.patch-binaries-for-nix", "whether patch binaries for usage with Nix toolchains")
+o("new-symbol-mangling", "rust.new-symbol-mangling", "use symbol-mangling-version v0")
 
 v("llvm-cflags", "llvm.cflags", "build LLVM with these extra compiler flags")
 v("llvm-cxxflags", "llvm.cxxflags", "build LLVM with these extra compiler flags")
@@ -97,20 +98,7 @@ v("llvm-root", None, "set LLVM root")
 v("llvm-config", None, "set path to llvm-config")
 v("llvm-filecheck", None, "set path to LLVM's FileCheck utility")
 v("python", "build.python", "set path to python")
-v("android-cross-path", "target.arm-linux-androideabi.android-ndk",
-  "Android NDK standalone path (deprecated)")
-v("i686-linux-android-ndk", "target.i686-linux-android.android-ndk",
-  "i686-linux-android NDK standalone path")
-v("arm-linux-androideabi-ndk", "target.arm-linux-androideabi.android-ndk",
-  "arm-linux-androideabi NDK standalone path")
-v("armv7-linux-androideabi-ndk", "target.armv7-linux-androideabi.android-ndk",
-  "armv7-linux-androideabi NDK standalone path")
-v("thumbv7neon-linux-androideabi-ndk", "target.thumbv7neon-linux-androideabi.android-ndk",
-  "thumbv7neon-linux-androideabi NDK standalone path")
-v("aarch64-linux-android-ndk", "target.aarch64-linux-android.android-ndk",
-  "aarch64-linux-android NDK standalone path")
-v("x86_64-linux-android-ndk", "target.x86_64-linux-android.android-ndk",
-  "x86_64-linux-android NDK standalone path")
+v("android-ndk", "build.android-ndk", "set path to Android NDK")
 v("musl-root", "target.x86_64-unknown-linux-musl.musl-root",
   "MUSL root installation directory (deprecated)")
 v("musl-root-x86_64", "target.x86_64-unknown-linux-musl.musl-root",
@@ -143,6 +131,8 @@ v("musl-root-riscv32gc", "target.riscv32gc-unknown-linux-musl.musl-root",
   "riscv32gc-unknown-linux-musl install directory")
 v("musl-root-riscv64gc", "target.riscv64gc-unknown-linux-musl.musl-root",
   "riscv64gc-unknown-linux-musl install directory")
+v("musl-root-loongarch64", "target.loongarch64-unknown-linux-musl.musl-root",
+  "loongarch64-unknown-linux-musl install directory")
 v("qemu-armhf-rootfs", "target.arm-unknown-linux-gnueabihf.qemu-rootfs",
   "rootfs in qemu testing, you probably don't want to use this")
 v("qemu-aarch64-rootfs", "target.aarch64-unknown-linux-gnu.qemu-rootfs",
@@ -162,6 +152,7 @@ v("default-linker", "rust.default-linker", "the default linker")
 # (others are conditionally saved).
 o("manage-submodules", "build.submodules", "let the build manage the git submodules")
 o("full-bootstrap", "build.full-bootstrap", "build three compilers instead of two (not recommended except for testing reproducible builds)")
+o("bootstrap-cache-path", "build.bootstrap-cache-path", "use provided path for the bootstrap cache")
 o("extended", "build.extended", "build an extended rust tool set")
 
 v("tools", None, "List of extended tools will be installed")
@@ -265,7 +256,7 @@ def parse_args(args):
         if not found:
             unknown_args.append(arg)
 
-    # Note: here and a few other places, we use [-1] to apply the *last* value
+    # NOTE: here and a few other places, we use [-1] to apply the *last* value
     # passed.  But if option-checking is enabled, then the known_args loop will
     # also assert that options are only passed once.
     option_checking = ('option-checking' not in known_args
@@ -378,6 +369,7 @@ def apply_args(known_args, option_checking, config):
             set('rust.codegen-backends', ['llvm'], config)
             set('rust.lld', True, config)
             set('rust.llvm-tools', True, config)
+            set('rust.llvm-bitcode-linker', True, config)
             set('build.extended', True, config)
         elif option.name in ['option-checking', 'verbose-configure']:
             # this was handled above
@@ -489,7 +481,7 @@ def configure_section(lines, config):
             # These are used by rpm, but aren't accepted by x.py.
             # Give a warning that they're ignored, but not a hard error.
             if key in ["infodir", "localstatedir"]:
-                print("warning: {} will be ignored".format(key))
+                print("WARNING: {} will be ignored".format(key))
             else:
                 raise RuntimeError("failed to find config line for {}".format(key))
 

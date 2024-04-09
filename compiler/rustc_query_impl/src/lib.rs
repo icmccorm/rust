@@ -1,16 +1,12 @@
 //! Support for serializing the dep-graph and reloading it.
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-// this shouldn't be necessary, but the check for `&mut _` is too naive and denies returning a function pointer that takes a mut ref
-#![feature(const_mut_refs)]
-#![feature(const_refs_to_cell)]
+#![doc(rust_logo)]
+#![feature(rustdoc_internals)]
+#![feature(generic_nonzero)]
 #![feature(min_specialization)]
-#![feature(never_type)]
 #![feature(rustc_attrs)]
-#![recursion_limit = "256"]
 #![allow(rustc::potential_query_instability, unused_parens)]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
 #![allow(internal_features)]
 
 #[macro_use]
@@ -36,7 +32,7 @@ use rustc_middle::ty::TyCtxt;
 use rustc_query_system::dep_graph::SerializedDepNodeIndex;
 use rustc_query_system::ich::StableHashingContext;
 use rustc_query_system::query::{
-    get_query_incr, get_query_non_incr, HashResult, QueryCache, QueryConfig, QueryInfo, QueryMap,
+    get_query_incr, get_query_non_incr, CycleError, HashResult, QueryCache, QueryConfig, QueryMap,
     QueryMode, QueryState,
 };
 use rustc_query_system::HandleCycleError;
@@ -45,7 +41,7 @@ use rustc_span::{ErrorGuaranteed, Span};
 
 #[macro_use]
 mod plumbing;
-pub use crate::plumbing::QueryCtxt;
+pub use crate::plumbing::{query_key_hash_verify_all, QueryCtxt};
 
 mod profiling_support;
 pub use self::profiling_support::alloc_self_profile_query_strings;
@@ -145,10 +141,10 @@ where
     fn value_from_cycle_error(
         self,
         tcx: TyCtxt<'tcx>,
-        cycle: &[QueryInfo],
+        cycle_error: &CycleError,
         guar: ErrorGuaranteed,
     ) -> Self::Value {
-        (self.dynamic.value_from_cycle_error)(tcx, cycle, guar)
+        (self.dynamic.value_from_cycle_error)(tcx, cycle_error, guar)
     }
 
     #[inline(always)]

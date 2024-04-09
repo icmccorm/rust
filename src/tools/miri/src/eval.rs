@@ -7,6 +7,7 @@ use std::task::Poll;
 use std::thread;
 
 use crate::borrow_tracker::RetagFields;
+use crate::concurrency::thread::TlsAllocAction;
 use crate::diagnostics::report_leaks;
 use crate::shims::llvm_ffi_support::EvalContextExt;
 use log::info;
@@ -17,7 +18,7 @@ use rustc_middle::ty::Ty;
 use rustc_middle::ty::{
     self,
     layout::{LayoutCx, LayoutOf},
-    TyCtxt,
+    Ty, TyCtxt,
 };
 use rustc_session::config::EntryFnType;
 use rustc_target::spec::abi::Abi;
@@ -120,8 +121,6 @@ pub struct MiriConfig {
     pub unique_is_unique: bool,
     /// Controls alignment checking.
     pub check_alignment: AlignmentCheck,
-    /// Controls function [ABI](Abi) checking.
-    pub check_abi: bool,
     /// Action for an op requiring communication with the host.
     pub isolated_op: IsolatedOp,
     /// Determines if memory leaks should be ignored.
@@ -138,6 +137,8 @@ pub struct MiriConfig {
     pub tracked_call_ids: FxHashSet<CallId>,
     /// The allocation ids to report about.
     pub tracked_alloc_ids: FxHashSet<AllocId>,
+    /// For the tracked alloc ids, also report read/write accesses.
+    pub track_alloc_accesses: bool,
     /// Determine if data race detection should be enabled
     pub data_race_detector: bool,
     /// Determine if weak memory emulation should be enabled. Requires data race detection to be enabled
@@ -200,7 +201,6 @@ impl Default for MiriConfig {
             borrow_tracker: Some(BorrowTrackerMethod::StackedBorrows),
             unique_is_unique: false,
             check_alignment: AlignmentCheck::Int,
-            check_abi: true,
             isolated_op: IsolatedOp::Reject(RejectOpWith::Abort),
             ignore_leaks: false,
             forwarded_env_vars: vec![],
@@ -209,6 +209,7 @@ impl Default for MiriConfig {
             tracked_pointer_tags: FxHashSet::default(),
             tracked_call_ids: FxHashSet::default(),
             tracked_alloc_ids: FxHashSet::default(),
+            track_alloc_accesses: false,
             data_race_detector: true,
             weak_memory_emulation: true,
             track_outdated_loads: false,
@@ -288,9 +289,9 @@ impl MainThreadState {
                 // Figure out exit code.
                 let ret_place = this.machine.main_fn_ret_place.clone().unwrap();
                 let exit_code = this.read_target_isize(&ret_place)?;
-                // Need to call this ourselves since we are not going to return to the scheduler
-                // loop, and we want the main thread TLS to not show up as memory leaks.
-                this.terminate_active_thread()?;
+                // Deal with our thread-local memory. We do *not* want to actually free it, instead we consider TLS
+                // to be like a global `static`, so that all memory reached by it is considered to "not leak".
+                this.terminate_active_thread(TlsAllocAction::Leak)?;
                 // Stop interpreter loop.
                 throw_machine_stop!(TerminationInfo::Exit { code: exit_code, leak_check: true });
             }
@@ -309,12 +310,8 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
 ) -> InterpResult<'tcx, InterpCx<'mir, 'tcx, MiriMachine<'mir, 'tcx>>> {
     let param_env = ty::ParamEnv::reveal_all();
     let layout_cx = LayoutCx { tcx, param_env };
-    let mut ecx = InterpCx::new(
-        tcx,
-        rustc_span::source_map::DUMMY_SP,
-        param_env,
-        MiriMachine::new(config, layout_cx),
-    );
+    let mut ecx =
+        InterpCx::new(tcx, rustc_span::DUMMY_SP, param_env, MiriMachine::new(config, layout_cx));
 
     // Some parts of initialization require a full `InterpCx`.
     MiriMachine::late_init(&mut ecx, config, {
@@ -326,7 +323,7 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
     // Make sure we have MIR. We check MIR for some stable monomorphic function in libcore.
     let sentinel = ecx.try_resolve_path(&["core", "ascii", "escape_default"], Namespace::ValueNS);
     if !matches!(sentinel, Some(s) if tcx.is_mir_available(s.def.def_id())) {
-        tcx.sess.fatal(
+        tcx.dcx().fatal(
             "the current sysroot was built without `-Zalways-encode-mir`, or libcore seems missing. \
             Use `cargo miri setup` to prepare a sysroot that is suitable for Miri."
         );
@@ -411,7 +408,7 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
     match entry_type {
         EntryFnType::Main { .. } => {
             let start_id = tcx.lang_items().start_fn().unwrap_or_else(|| {
-                tcx.sess.fatal(
+                tcx.dcx().fatal(
                     "could not find start function. Make sure the entry point is marked with `#[start]`."
                 );
             });
@@ -442,7 +439,7 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
                     argv,
                     Scalar::from_u8(sigpipe).into(),
                 ],
-                Some(&ret_place.into()),
+                Some(&ret_place),
                 StackPopCleanup::Root { cleanup: true },
             )?;
         }
@@ -451,7 +448,7 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
                 entry_instance,
                 Abi::Rust,
                 &[argc.into(), argv],
-                Some(&ret_place.into()),
+                Some(&ret_place),
                 StackPopCleanup::Root { cleanup: true },
             )?;
         }
@@ -530,8 +527,8 @@ pub fn eval_entry<'tcx>(
     if leak_check && !ignore_leaks {
         // Check for thread leaks.
         if !ecx.have_all_terminated() {
-            tcx.sess.err("the main thread terminated without waiting for all remaining threads");
-            tcx.sess.note_without_error("pass `-Zmiri-ignore-leaks` to disable this check");
+            tcx.dcx().err("the main thread terminated without waiting for all remaining threads");
+            tcx.dcx().note("pass `-Zmiri-ignore-leaks` to disable this check");
             return None;
         }
         // Check for memory leaks.
@@ -542,10 +539,10 @@ pub fn eval_entry<'tcx>(
             let leak_message = "the evaluated program leaked memory, pass `-Zmiri-ignore-leaks` to disable this check";
             if ecx.machine.collect_leak_backtraces {
                 // If we are collecting leak backtraces, each leak is a distinct error diagnostic.
-                tcx.sess.note_without_error(leak_message);
+                tcx.dcx().note(leak_message);
             } else {
                 // If we do not have backtraces, we just report an error without any span.
-                tcx.sess.err(leak_message);
+                tcx.dcx().err(leak_message);
             };
             // Ignore the provided return code - let the reported error
             // determine the return code.

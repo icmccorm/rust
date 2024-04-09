@@ -1,11 +1,12 @@
 #![feature(start, core_intrinsics, lang_items)]
 #![no_std]
+#![allow(internal_features)]
 
 #[link(name = "c")]
 extern {}
 
 #[panic_handler]
-fn panic_handler(_: &core::panic::PanicInfo) -> ! {
+fn panic_handler(_: &core::panic::PanicInfo<'_>) -> ! {
     core::intrinsics::abort();
 }
 

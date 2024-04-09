@@ -100,6 +100,7 @@ pub use num::FloatToInt;
 #[stable(feature = "convert_id", since = "1.33.0")]
 #[rustc_const_stable(feature = "const_identity", since = "1.33.0")]
 #[inline(always)]
+#[rustc_diagnostic_item = "convert_identity"]
 pub const fn identity<T>(x: T) -> T {
     x
 }
@@ -137,7 +138,7 @@ pub const fn identity<T>(x: T) -> T {
 ///
 /// [dereferenceable types]: core::ops::Deref
 /// [pointed-to value]: core::ops::Deref::Target
-/// ['`Deref` coercion']: core::ops::Deref#more-on-deref-coercion
+/// ['`Deref` coercion']: core::ops::Deref#deref-coercion
 ///
 /// ```
 /// let x = Box::new(5i32);
@@ -243,7 +244,7 @@ pub trait AsRef<T: ?Sized> {
 ///
 /// [mutably dereferenceable types]: core::ops::DerefMut
 /// [pointed-to value]: core::ops::Deref::Target
-/// ['`Deref` coercion']: core::ops::DerefMut#more-on-deref-coercion
+/// ['`Deref` coercion']: core::ops::DerefMut#mutable-deref-coercion
 ///
 /// ```
 /// let mut x = Box::new(5i32);
@@ -395,6 +396,7 @@ pub trait AsMut<T: ?Sized> {
 /// For example, take this code:
 ///
 /// ```
+/// # #![allow(non_local_definitions)]
 /// struct Wrapper<T>(Vec<T>);
 /// impl<T> From<Wrapper<T>> for Vec<T> {
 ///     fn from(w: Wrapper<T>) -> Vec<T> {
@@ -464,10 +466,10 @@ pub trait Into<T>: Sized {
 /// Prefer using [`Into`] over using `From` when specifying trait bounds on a generic function.
 /// This way, types that directly implement [`Into`] can be used as arguments as well.
 ///
-/// The `From` is also very useful when performing error handling. When constructing a function
+/// The `From` trait is also very useful when performing error handling. When constructing a function
 /// that is capable of failing, the return type will generally be of the form `Result<T, E>`.
-/// The `From` trait simplifies error handling by allowing a function to return a single error type
-/// that encapsulate multiple error types. See the "Examples" section and [the book][book] for more
+/// `From` simplifies error handling by allowing a function to return a single error type
+/// that encapsulates multiple error types. See the "Examples" section and [the book][book] for more
 /// details.
 ///
 /// **Note: This trait must not fail**. The `From` trait is intended for perfect conversions.
@@ -477,6 +479,46 @@ pub trait Into<T>: Sized {
 ///
 /// - `From<T> for U` implies [`Into`]`<U> for T`
 /// - `From` is reflexive, which means that `From<T> for T` is implemented
+///
+/// # When to implement `From`
+///
+/// While there's no technical restrictions on which conversions can be done using
+/// a `From` implementation, the general expectation is that the conversions
+/// should typically be restricted as follows:
+///
+/// * The conversion is *infallible*: if the conversion can fail, use [`TryFrom`]
+///   instead; don't provide a `From` impl that panics.
+///
+/// * The conversion is *lossless*: semantically, it should not lose or discard
+///   information. For example, `i32: From<u16>` exists, where the original
+///   value can be recovered using `u16: TryFrom<i32>`.  And `String: From<&str>`
+///   exists, where you can get something equivalent to the original value via
+///   `Deref`.  But `From` cannot be used to convert from `u32` to `u16`, since
+///   that cannot succeed in a lossless way.  (There's some wiggle room here for
+///   information not considered semantically relevant.  For example,
+///   `Box<[T]>: From<Vec<T>>` exists even though it might not preserve capacity,
+///   like how two vectors can be equal despite differing capacities.)
+///
+/// * The conversion is *value-preserving*: the conceptual kind and meaning of
+///   the resulting value is the same, even though the Rust type and technical
+///   representation might be different.  For example `-1_i8 as u8` is *lossless*,
+///   since `as` casting back can recover the original value, but that conversion
+///   is *not* available via `From` because `-1` and `255` are different conceptual
+///   values (despite being identical bit patterns technically).  But
+///   `f32: From<i16>` *is* available because `1_i16` and `1.0_f32` are conceptually
+///   the same real number (despite having very different bit patterns technically).
+///   `String: From<char>` is available because they're both *text*, but
+///   `String: From<u32>` is *not* available, since `1` (a number) and `"1"`
+///   (text) are too different.  (Converting values to text is instead covered
+///   by the [`Display`](crate::fmt::Display) trait.)
+///
+/// * The conversion is *obvious*: it's the only reasonable conversion between
+///   the two types.  Otherwise it's better to have it be a named method or
+///   constructor, like how [`str::as_bytes`] is a method and how integers have
+///   methods like [`u32::from_ne_bytes`], [`u32::from_le_bytes`], and
+///   [`u32::from_be_bytes`], none of which are `From` implementations.  Whereas
+///   there's only one reasonable way to wrap an [`Ipv6Addr`](crate::net::Ipv6Addr)
+///   into an [`IpAddr`](crate::net::IpAddr), thus `IpAddr: From<Ipv6Addr>` exists.
 ///
 /// # Examples
 ///
@@ -532,7 +574,7 @@ pub trait Into<T>: Sized {
 #[rustc_diagnostic_item = "From"]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_on_unimplemented(on(
-    all(_Self = "&str", any(T = "alloc::string::String", T = "std::string::String")),
+    all(_Self = "&str", T = "alloc::string::String"),
     note = "to coerce a `{T}` into a `{Self}`, use `&*` as a prefix",
 ))]
 pub trait From<T>: Sized {
@@ -577,12 +619,11 @@ pub trait TryInto<T>: Sized {
 /// For example, there is no way to convert an [`i64`] into an [`i32`]
 /// using the [`From`] trait, because an [`i64`] may contain a value
 /// that an [`i32`] cannot represent and so the conversion would lose data.
-/// This might be handled by truncating the [`i64`] to an [`i32`] (essentially
-/// giving the [`i64`]'s value modulo [`i32::MAX`]) or by simply returning
-/// [`i32::MAX`], or by some other method.  The [`From`] trait is intended
-/// for perfect conversions, so the `TryFrom` trait informs the
-/// programmer when a type conversion could go bad and lets them
-/// decide how to handle it.
+/// This might be handled by truncating the [`i64`] to an [`i32`] or by
+/// simply returning [`i32::MAX`], or by some other method.  The [`From`]
+/// trait is intended for perfect conversions, so the `TryFrom` trait
+/// informs the programmer when a type conversion could go bad and lets
+/// them decide how to handle it.
 ///
 /// # Generic Implementations
 ///
@@ -642,6 +683,7 @@ pub trait TryFrom<T>: Sized {
 
     /// Performs the conversion.
     #[stable(feature = "try_from", since = "1.34.0")]
+    #[rustc_diagnostic_item = "try_from_fn"]
     fn try_from(value: T) -> Result<Self, Self::Error>;
 }
 
@@ -712,6 +754,7 @@ where
     /// That is, this conversion is whatever the implementation of
     /// <code>[From]&lt;T&gt; for U</code> chooses to do.
     #[inline]
+    #[track_caller]
     fn into(self) -> U {
         U::from(self)
     }

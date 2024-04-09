@@ -101,6 +101,7 @@ use parking_lot::RwLock;
 use smallvec::SmallVec;
 
 bitflags::bitflags! {
+    #[derive(Clone, Copy)]
     struct EventFilter: u16 {
         const GENERIC_ACTIVITIES  = 1 << 0;
         const QUERY_PROVIDERS     = 1 << 1;
@@ -114,14 +115,14 @@ bitflags::bitflags! {
         const INCR_RESULT_HASHING = 1 << 8;
         const ARTIFACT_SIZES = 1 << 9;
 
-        const DEFAULT = Self::GENERIC_ACTIVITIES.bits |
-                        Self::QUERY_PROVIDERS.bits |
-                        Self::QUERY_BLOCKED.bits |
-                        Self::INCR_CACHE_LOADS.bits |
-                        Self::INCR_RESULT_HASHING.bits |
-                        Self::ARTIFACT_SIZES.bits;
+        const DEFAULT = Self::GENERIC_ACTIVITIES.bits() |
+                        Self::QUERY_PROVIDERS.bits() |
+                        Self::QUERY_BLOCKED.bits() |
+                        Self::INCR_CACHE_LOADS.bits() |
+                        Self::INCR_RESULT_HASHING.bits() |
+                        Self::ARTIFACT_SIZES.bits();
 
-        const ARGS = Self::QUERY_KEYS.bits | Self::FUNCTION_ARGS.bits;
+        const ARGS = Self::QUERY_KEYS.bits() | Self::FUNCTION_ARGS.bits();
     }
 }
 
@@ -859,22 +860,20 @@ fn get_thread_id() -> u32 {
 }
 
 // Memory reporting
-cfg_if! {
-    if #[cfg(windows)] {
+cfg_match! {
+    cfg(windows) => {
         pub fn get_resident_set_size() -> Option<usize> {
             use std::mem;
 
             use windows::{
-                // FIXME: change back to K32GetProcessMemoryInfo when windows crate
-                // updated to 0.49.0+ to drop dependency on psapi.dll
-                Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+                Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
                 Win32::System::Threading::GetCurrentProcess,
             };
 
             let mut pmc = PROCESS_MEMORY_COUNTERS::default();
             let pmc_size = mem::size_of_val(&pmc);
             unsafe {
-                GetProcessMemoryInfo(
+                K32GetProcessMemoryInfo(
                     GetCurrentProcess(),
                     &mut pmc,
                     pmc_size as u32,
@@ -885,7 +884,8 @@ cfg_if! {
 
             Some(pmc.WorkingSetSize)
         }
-    } else if #[cfg(target_os = "macos")] {
+    }
+    cfg(target_os = "macos")  => {
         pub fn get_resident_set_size() -> Option<usize> {
             use libc::{c_int, c_void, getpid, proc_pidinfo, proc_taskinfo, PROC_PIDTASKINFO};
             use std::mem;
@@ -903,7 +903,8 @@ cfg_if! {
                 }
             }
         }
-    } else if #[cfg(unix)] {
+    }
+    cfg(unix) => {
         pub fn get_resident_set_size() -> Option<usize> {
             let field = 1;
             let contents = fs::read("/proc/self/statm").ok()?;
@@ -912,7 +913,8 @@ cfg_if! {
             let npages = s.parse::<usize>().ok()?;
             Some(npages * 4096)
         }
-    } else {
+    }
+    _ => {
         pub fn get_resident_set_size() -> Option<usize> {
             None
         }

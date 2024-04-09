@@ -5,8 +5,7 @@ LL | /     match i {
 LL | |         // Add `bool` to the overall `coercion`.
 LL | |         0 => true,
    | |              ---- this is found to be of type `bool`
-LL | |
-LL | |         // Necessary to cause the ICE:
+...  |
 LL | |         1 => true,
    | |              ---- this is found to be of type `bool`
 ...  |
@@ -17,6 +16,6 @@ LL | |         _ => (),
 LL | |     }
    | |_____- `match` arms have incompatible types
 
-error: aborting due to previous error
+error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0308`.

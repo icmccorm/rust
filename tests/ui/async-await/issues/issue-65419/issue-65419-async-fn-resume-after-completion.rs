@@ -1,14 +1,12 @@
-// issue 65419 - Attempting to run an async fn after completion mentions generators when it should
+// issue 65419 - Attempting to run an async fn after completion mentions coroutines when it should
 // be talking about `async fn`s instead.
 
-// run-fail
-// error-pattern: thread 'main' panicked
-// error-pattern: `async fn` resumed after completion
-// edition:2018
-// ignore-wasm no panic or subprocess support
-// ignore-emscripten no panic or subprocess support
+//@ run-fail
+//@ error-pattern: thread 'main' panicked
+//@ error-pattern: `async fn` resumed after completion
+//@ edition:2018
 
-#![feature(generators, generator_trait)]
+#![feature(coroutines, coroutine_trait)]
 
 async fn foo() {
 }

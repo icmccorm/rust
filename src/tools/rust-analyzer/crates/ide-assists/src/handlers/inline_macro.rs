@@ -41,7 +41,7 @@ pub(crate) fn inline_macro(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option
 
     acc.add(
         AssistId("inline_macro", AssistKind::RefactorInline),
-        format!("Inline macro"),
+        "Inline macro".to_owned(),
         text_range,
         |builder| builder.replace(text_range, expanded.to_string()),
     )
@@ -288,11 +288,11 @@ macro_rules! foo {
 }
 fn main() {
     cfg_if!{
-  if #[cfg(test)]{
-    1;
-  }else {
-    1;
-  }
+    if #[cfg(test)]{
+        1;
+    }else {
+        1;
+    }
 };
 }
 "#,

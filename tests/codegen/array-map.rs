@@ -1,7 +1,5 @@
-// compile-flags: -C opt-level=3 -C target-cpu=x86-64-v3
-// no-system-llvm
-// only-x86_64
-// ignore-debug (the extra assertions get in the way)
+//@ compile-flags: -C opt-level=3 -C target-cpu=x86-64-v3
+//@ only-x86_64
 
 #![crate_type = "lib"]
 
@@ -10,7 +8,7 @@
 pub fn short_integer_map(x: [u32; 8]) -> [u32; 8] {
     // CHECK: load <8 x i32>
     // CHECK: shl <8 x i32>
-    // CHECK: or <8 x i32>
+    // CHECK: or{{( disjoint)?}} <8 x i32>
     // CHECK: store <8 x i32>
     x.map(|x| 2 * x + 1)
 }

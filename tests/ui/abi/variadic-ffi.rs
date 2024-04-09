@@ -1,5 +1,4 @@
-// run-pass
-// ignore-wasm32-bare no libc to test ffi with
+//@ run-pass
 #![feature(c_variadic)]
 
 use std::ffi::VaList;
@@ -8,11 +7,6 @@ use std::ffi::VaList;
 extern "C" {
     fn rust_interesting_average(_: u64, ...) -> f64;
 
-    // FIXME: we need to disable this lint for `VaList`,
-    // since it contains a `MaybeUninit<i32>` on the asmjs target,
-    // and this type isn't FFI-safe. This is OK for now,
-    // since the type is layout-compatible with `i32`.
-    #[cfg_attr(target_arch = "asmjs", allow(improper_ctypes))]
     fn rust_valist_interesting_average(_: u64, _: VaList) -> f64;
 }
 

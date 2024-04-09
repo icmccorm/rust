@@ -2,7 +2,7 @@ use clippy_utils::diagnostics::span_lint_and_help;
 use rustc_ast::ast::{Crate, Inline, Item, ItemKind, ModKind};
 use rustc_errors::MultiSpan;
 use rustc_lint::{EarlyContext, EarlyLintPass, Level, LintContext};
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_session::impl_lint_pass;
 use rustc_span::{FileName, Span};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -119,7 +119,7 @@ impl EarlyLintPass for DuplicateMod {
                 cx,
                 DUPLICATE_MOD,
                 multi_span,
-                &format!("file is loaded as a module multiple times: `{}`", local_path.display()),
+                format!("file is loaded as a module multiple times: `{}`", local_path.display()),
                 None,
                 "replace all but one `mod` item with `use` items",
             );

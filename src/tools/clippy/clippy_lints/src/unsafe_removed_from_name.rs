@@ -1,9 +1,9 @@
 use clippy_utils::diagnostics::span_lint;
 use rustc_ast::ast::{Item, ItemKind, UseTree, UseTreeKind};
 use rustc_lint::{EarlyContext, EarlyLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
-use rustc_span::source_map::Span;
+use rustc_session::declare_lint_pass;
 use rustc_span::symbol::Ident;
+use rustc_span::Span;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -65,7 +65,7 @@ fn unsafe_to_safe_check(old_name: Ident, new_name: Ident, cx: &EarlyContext<'_>,
             cx,
             UNSAFE_REMOVED_FROM_NAME,
             span,
-            &format!("removed `unsafe` from the name of `{old_str}` in use as `{new_str}`"),
+            format!("removed `unsafe` from the name of `{old_str}` in use as `{new_str}`"),
         );
     }
 }

@@ -9,12 +9,13 @@
 //!  - or-fun-call
 //!  - option-if-let-else
 
+use crate::consts::{constant, FullInt};
 use crate::ty::{all_predicates_of, is_copy};
 use crate::visitors::is_const_evaluatable;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::{walk_expr, Visitor};
-use rustc_hir::{Block, Expr, ExprKind, QPath, UnOp};
+use rustc_hir::{BinOpKind, Block, Expr, ExprKind, QPath, UnOp};
 use rustc_lint::LateContext;
 use rustc_middle::ty;
 use rustc_middle::ty::adjustment::Adjust;
@@ -98,7 +99,10 @@ fn fn_eagerness(cx: &LateContext<'_>, fn_id: DefId, name: Symbol, have_one_arg: 
 }
 
 fn res_has_significant_drop(res: Res, cx: &LateContext<'_>, e: &Expr<'_>) -> bool {
-    if let Res::Def(DefKind::Ctor(..) | DefKind::Variant, _) | Res::SelfCtor(_) = res {
+    if let Res::Def(DefKind::Ctor(..) | DefKind::Variant | DefKind::Enum | DefKind::Struct, _)
+    | Res::SelfCtor(_)
+    | Res::SelfTyAlias { .. } = res
+    {
         cx.typeck_results()
             .expr_ty(e)
             .has_significant_drop(cx.tcx, cx.param_env)
@@ -172,6 +176,13 @@ fn expr_eagerness<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) -> EagernessS
                     self.eagerness |= NoChange;
                     return;
                 },
+                #[expect(clippy::match_same_arms)] // arm pattern can't be merged due to `ref`, see rust#105778
+                ExprKind::Struct(path, ..) => {
+                    if res_has_significant_drop(self.cx.qpath_res(path, e.hir_id), self.cx, e) {
+                        self.eagerness = ForceNoChange;
+                        return;
+                    }
+                },
                 ExprKind::Path(ref path) => {
                     if res_has_significant_drop(self.cx.qpath_res(path, e.hir_id), self.cx, e) {
                         self.eagerness = ForceNoChange;
@@ -193,6 +204,12 @@ fn expr_eagerness<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) -> EagernessS
                         self.eagerness = Lazy;
                     }
                 },
+
+                // `-i32::MIN` panics with overflow checks
+                ExprKind::Unary(UnOp::Neg, right) if constant(self.cx, self.cx.typeck_results(), right).is_none() => {
+                    self.eagerness |= NoChange;
+                },
+
                 // Custom `Deref` impl might have side effects
                 ExprKind::Unary(UnOp::Deref, e)
                     if self.cx.typeck_results().expr_ty(e).builtin_deref(true).is_none() =>
@@ -207,6 +224,49 @@ fn expr_eagerness<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) -> EagernessS
                         self.cx.typeck_results().expr_ty(e).kind(),
                         ty::Bool | ty::Int(_) | ty::Uint(_),
                     ) => {},
+
+                // `>>` and `<<` panic when the right-hand side is greater than or equal to the number of bits in the
+                // type of the left-hand side, or is negative.
+                // We intentionally only check if the right-hand isn't a constant, because even if the suggestion would
+                // overflow with constants, the compiler emits an error for it and the programmer will have to fix it.
+                // Thus, we would realistically only delay the lint.
+                ExprKind::Binary(op, _, right)
+                    if matches!(op.node, BinOpKind::Shl | BinOpKind::Shr)
+                        && constant(self.cx, self.cx.typeck_results(), right).is_none() =>
+                {
+                    self.eagerness |= NoChange;
+                },
+
+                ExprKind::Binary(op, left, right)
+                    if matches!(op.node, BinOpKind::Div | BinOpKind::Rem)
+                        && let right_ty = self.cx.typeck_results().expr_ty(right)
+                        && let left = constant(self.cx, self.cx.typeck_results(), left)
+                        && let right = constant(self.cx, self.cx.typeck_results(), right)
+                            .and_then(|c| c.int_value(self.cx, right_ty))
+                        && matches!(
+                            (left, right),
+                            // `1 / x`: x might be zero
+                            (_, None)
+                            // `x / -1`: x might be T::MIN
+                            | (None, Some(FullInt::S(-1)))
+                        ) =>
+                {
+                    self.eagerness |= NoChange;
+                },
+
+                // Similar to `>>` and `<<`, we only want to avoid linting entirely if either side is unknown and the
+                // compiler can't emit an error for an overflowing expression.
+                // Suggesting eagerness for `true.then(|| i32::MAX + 1)` is okay because the compiler will emit an
+                // error and it's good to have the eagerness warning up front when the user fixes the logic error.
+                ExprKind::Binary(op, left, right)
+                    if matches!(op.node, BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul)
+                        && !self.cx.typeck_results().expr_ty(e).is_floating_point()
+                        && (constant(self.cx, self.cx.typeck_results(), left).is_none()
+                            || constant(self.cx, self.cx.typeck_results(), right).is_none()) =>
+                {
+                    self.eagerness |= NoChange;
+                },
+
                 ExprKind::Binary(_, lhs, rhs)
                     if self.cx.typeck_results().expr_ty(lhs).is_primitive()
                         && self.cx.typeck_results().expr_ty(rhs).is_primitive() => {},
@@ -241,7 +301,6 @@ fn expr_eagerness<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) -> EagernessS
                 | ExprKind::Closure { .. }
                 | ExprKind::Field(..)
                 | ExprKind::AddrOf(..)
-                | ExprKind::Struct(..)
                 | ExprKind::Repeat(..)
                 | ExprKind::Block(Block { stmts: [], .. }, _)
                 | ExprKind::OffsetOf(..) => (),

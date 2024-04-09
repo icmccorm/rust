@@ -1,4 +1,5 @@
 // This test checks the position of the `i` for the notable traits.
+include: "utils.goml"
 go-to: "file://" + |DOC_PATH| + "/test_docs/struct.NotableStructWithLongName.html"
 show-text: true
 // We start with a wide screen.
@@ -7,13 +8,13 @@ set-window-size: (1100, 600)
 compare-elements-position: (
     "//*[@id='method.create_an_iterator_from_read']//a[text()='NotableStructWithLongName']",
     "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']",
-    ("y"),
+    ["y"],
 )
 // Checking they don't have the same x position.
 compare-elements-position-false: (
     "//*[@id='method.create_an_iterator_from_read']//a[text()='NotableStructWithLongName']",
     "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']",
-    ("x"),
+    ["x"],
 )
 // The `i` should be *after* the type.
 assert-position: (
@@ -37,7 +38,7 @@ compare-elements-position-near: (
 compare-elements-position-false: (
     "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']",
     "//*[@class='tooltip popover']",
-    ("x")
+    ["x"]
 )
 click: "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']"
 move-cursor-to: "//h1"
@@ -48,7 +49,7 @@ set-window-size: (1055, 600)
 compare-elements-position-false: (
     "//*[@id='method.create_an_iterator_from_read']//a[text()='NotableStructWithLongName']",
     "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']",
-    ("y", "x"),
+    ["y", "x"],
 )
 
 // Now both the `i` and the struct name should be on the next line.
@@ -57,13 +58,13 @@ set-window-size: (980, 600)
 compare-elements-position: (
     "//*[@id='method.create_an_iterator_from_read']//a[text()='NotableStructWithLongName']",
     "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']",
-    ("y"),
+    ["y"],
 )
 // Checking they don't have the same x position.
 compare-elements-position-false: (
     "//*[@id='method.create_an_iterator_from_read']//a[text()='NotableStructWithLongName']",
     "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']",
-    ("x"),
+    ["x"],
 )
 // The `i` should be *after* the type.
 assert-position: (
@@ -81,13 +82,13 @@ set-window-size: (650, 600)
 compare-elements-position: (
     "//*[@id='method.create_an_iterator_from_read']//a[text()='NotableStructWithLongName']",
     "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']",
-    ("y"),
+    ["y"],
 )
 // Checking they don't have the same x position.
 compare-elements-position-false: (
     "//*[@id='method.create_an_iterator_from_read']//a[text()='NotableStructWithLongName']",
     "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']",
-    ("x"),
+    ["x"],
 )
 // The `i` should be *after* the type.
 assert-position: (
@@ -109,7 +110,7 @@ compare-elements-position-near: (
 compare-elements-position-false: (
     "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']",
     "//*[@class='tooltip popover']",
-    ("x")
+    ["x"]
 )
 assert-position: (
     "//*[@class='tooltip popover']",
@@ -122,16 +123,13 @@ assert-count: ("//*[@class='tooltip popover']", 0)
 // Now check the colors.
 define-function: (
     "check-colors",
-    (theme, header_color, content_color, type_color, trait_color, link_color),
+    [theme, header_color, content_color, type_color, trait_color, link_color],
     block {
         go-to: "file://" + |DOC_PATH| + "/test_docs/struct.NotableStructWithLongName.html"
         // This is needed to ensure that the text color is computed.
         show-text: true
 
-        // Setting the theme.
-        set-local-storage: {"rustdoc-theme": |theme|, "rustdoc-use-system-theme": "false"}
-        // We reload the page so the local storage settings are being used.
-        reload:
+        call-function: ("switch-theme", {"theme": |theme|})
 
         assert-css: (
              "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']",

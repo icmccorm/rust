@@ -1,7 +1,4 @@
-// NOTE: rustc cannot currently handle bounds of the form `for<'a> <Foo as Bar<'a>>::Assoc: Baz`.
-// This should hopefully be fixed with Chalk.
-
-#![feature(associated_type_bounds)]
+//@ check-pass
 
 use std::fmt::Debug;
 use std::iter::Once;
@@ -24,9 +21,6 @@ impl<'a, 'b> Lam<&'a &'b u8> for L2 {
 
 trait Case1 {
     type C: Clone + Iterator<Item: Send + Iterator<Item: for<'a> Lam<&'a u8, App: Debug>> + Sync>;
-    //~^ ERROR `<<Self as Case1>::C as Iterator>::Item` is not an iterator
-    //~| ERROR `<<Self as Case1>::C as Iterator>::Item` cannot be sent between threads safely
-    //~| ERROR `<<Self as Case1>::C as Iterator>::Item` cannot be shared between threads safely
 }
 
 pub struct S1;
@@ -35,33 +29,17 @@ impl Case1 for S1 {
 }
 
 fn assume_case1<T: Case1>() {
-    fn assert_a<_0, A>()
-    where
-        A: Iterator<Item = _0>,
-        _0: Debug,
-    {
-    }
-    assert_a::<_, T::A>();
-
-    fn assert_b<_0, B>()
-    where
-        B: Iterator<Item = _0>,
-        _0: 'static,
-    {
-    }
-    assert_b::<_, T::B>();
-
-    fn assert_c<_0, _1, _2, C>()
+    fn assert_c<_1, _2, C>()
     where
         C: Clone + Iterator<Item = _2>,
         _2: Send + Iterator<Item = _1>,
-        _1: for<'a> Lam<&'a u8, App = _0>,
-        _0: Debug,
+        _1: for<'a> Lam<&'a u8>,
+        for<'a> <_1 as Lam<&'a u8>>::App: Debug,
     {
     }
-    assert_c::<_, _, _, T::C>();
+    assert_c::<_, _, T::C>();
 }
 
 fn main() {
-    assume_case1(S1);
+    assume_case1::<S1>();
 }

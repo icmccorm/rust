@@ -14,13 +14,12 @@ use either::{Left, Right};
 
 use rustc_ast::Mutability;
 use rustc_data_structures::intern::Interned;
-use rustc_span::DUMMY_SP;
 use rustc_target::abi::{Align, HasDataLayout, Size};
 
 use super::{
-    read_target_uint, write_target_uint, AllocId, BadBytesAccess, InterpError, InterpResult,
-    Pointer, PointerArithmetic, Provenance, ResourceExhaustionInfo, Scalar, ScalarSizeMismatch,
-    UndefinedBehaviorInfo, UnsupportedOpInfo,
+    read_target_uint, write_target_uint, AllocId, BadBytesAccess, CtfeProvenance, InterpError,
+    InterpResult, Pointer, PointerArithmetic, Provenance, ResourceExhaustionInfo, Scalar,
+    ScalarSizeMismatch, UndefinedBehaviorInfo, UnsupportedOpInfo,
 };
 use crate::ty;
 use init_mask::*;
@@ -32,23 +31,23 @@ pub use init_mask::{InitChunk, InitChunkIter};
 pub trait AllocBytes:
     Clone + fmt::Debug + Eq + PartialEq + Hash + Deref<Target = [u8]> + DerefMut<Target = [u8]>
 {
-    /// Adjust the bytes to the specified alignment -- by default, this is a no-op.
-    fn adjust_to_align(self, _align: Align) -> Self;
-
     /// Create an `AllocBytes` from a slice of `u8`.
     fn from_bytes<'a>(slice: impl Into<Cow<'a, [u8]>>, _align: Align) -> Self;
 
-    /// Create a zeroed `AllocBytes` of the specified size and alignment;
-    /// call the callback error handler if there is an error in allocating the memory.
+    /// Create a zeroed `AllocBytes` of the specified size and alignment.
+    /// Returns `None` if we ran out of memory on the host.
     fn zeroed(size: Size, _align: Align) -> Option<Self>;
+
+    /// Gives direct access to the raw underlying storage.
+    ///
+    /// Crucially this pointer is compatible with:
+    /// - other pointers retunred by this method, and
+    /// - references returned from `deref()`, as long as there was no write.
+    fn as_mut_ptr(&mut self) -> *mut u8;
 }
 
-// Default `bytes` for `Allocation` is a `Box<[u8]>`.
+/// Default `bytes` for `Allocation` is a `Box<u8>`.
 impl AllocBytes for Box<[u8]> {
-    fn adjust_to_align(self, _align: Align) -> Self {
-        self
-    }
-
     fn from_bytes<'a>(slice: impl Into<Cow<'a, [u8]>>, _align: Align) -> Self {
         Box::<[u8]>::from(slice.into())
     }
@@ -58,6 +57,11 @@ impl AllocBytes for Box<[u8]> {
         // SAFETY: the box was zero-allocated, which is a valid initial value for Box<[u8]>
         let bytes = unsafe { bytes.assume_init() };
         Some(bytes)
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        // Carefully avoiding any intermediate references.
+        ptr::addr_of_mut!(**self).cast()
     }
 }
 
@@ -70,7 +74,7 @@ impl AllocBytes for Box<[u8]> {
 // hashed. (see the `Hash` impl below for more details), so the impl is not derived.
 #[derive(Clone, Eq, PartialEq, TyEncodable, TyDecodable)]
 #[derive(HashStable)]
-pub struct Allocation<Prov: Provenance = AllocId, Extra = (), Bytes = Box<[u8]>> {
+pub struct Allocation<Prov: Provenance = CtfeProvenance, Extra = (), Bytes = Box<[u8]>> {
     /// The actual bytes of the allocation.
     /// Note that the bytes of a pointer represent the offset of the pointer.
     bytes: Bytes,
@@ -299,6 +303,7 @@ impl<Prov: Provenance, Bytes: AllocBytes> Allocation<Prov, (), Bytes> {
     }
 
     fn uninit_inner<R>(size: Size, align: Align, fail: impl FnOnce() -> R) -> Result<Self, R> {
+        // We raise an error if we cannot create the allocation on the host.
         // This results in an error that can happen non-deterministically, since the memory
         // available to the compiler can change between runs. Normally queries are always
         // deterministic. However, we can be non-deterministic here because all uses of const
@@ -320,9 +325,7 @@ impl<Prov: Provenance, Bytes: AllocBytes> Allocation<Prov, (), Bytes> {
     /// available to the compiler to do so.
     pub fn try_uninit<'tcx>(size: Size, align: Align) -> InterpResult<'tcx, Self> {
         Self::uninit_inner(size, align, || {
-            ty::tls::with(|tcx| {
-                tcx.sess.delay_span_bug(DUMMY_SP, "exhausted memory during interpretation")
-            });
+            ty::tls::with(|tcx| tcx.dcx().delayed_bug("exhausted memory during interpretation"));
             InterpError::ResourceExhaustion(ResourceExhaustionInfo::MemoryExhausted).into()
         })
     }
@@ -342,19 +345,17 @@ impl<Prov: Provenance, Bytes: AllocBytes> Allocation<Prov, (), Bytes> {
     }
 }
 
-impl<Bytes: AllocBytes> Allocation<AllocId, (), Bytes> {
-    /// Adjust allocation from the ones in tcx to a custom Machine instance
-    /// with a different Provenance and Extra type.
+impl<Bytes: AllocBytes> Allocation<CtfeProvenance, (), Bytes> {
+    /// Adjust allocation from the ones in `tcx` to a custom Machine instance
+    /// with a different `Provenance` and `Extra` type.
     pub fn adjust_from_tcx<Prov: Provenance, Extra, Err>(
         self,
         cx: &impl HasDataLayout,
         extra: Extra,
-        mut adjust_ptr: impl FnMut(Pointer<AllocId>) -> Result<Pointer<Prov>, Err>,
+        mut adjust_ptr: impl FnMut(Pointer<CtfeProvenance>) -> Result<Pointer<Prov>, Err>,
     ) -> Result<Allocation<Prov, Extra, Bytes>, Err> {
-        // Compute new pointer provenance, which also adjusts the bytes, and realign the pointer if
-        // necessary.
-        let mut bytes = self.bytes.adjust_to_align(self.align);
-
+        let mut bytes = self.bytes;
+        // Adjust provenance of pointers stored in this allocation.
         let mut new_provenance = Vec::with_capacity(self.provenance.ptrs().len());
         let ptr_size = cx.data_layout().pointer_size.bytes_usize();
         let endian = cx.data_layout().endian;
@@ -410,10 +411,6 @@ impl<Prov: Provenance, Extra, Bytes: AllocBytes> Allocation<Prov, Extra, Bytes> 
 
 /// Byte accessors.
 impl<Prov: Provenance, Extra, Bytes: AllocBytes> Allocation<Prov, Extra, Bytes> {
-    pub fn base_addr(&self) -> *const u8 {
-        self.bytes.as_ptr()
-    }
-
     /// This is the entirely abstraction-violating way to just grab the raw bytes without
     /// caring about provenance or initialization.
     ///
@@ -463,13 +460,14 @@ impl<Prov: Provenance, Extra, Bytes: AllocBytes> Allocation<Prov, Extra, Bytes> 
         Ok(self.get_bytes_unchecked(range))
     }
 
-    /// Just calling this already marks everything as defined and removes provenance,
-    /// so be sure to actually put data there!
+    /// This is the entirely abstraction-violating way to just get mutable access to the raw bytes.
+    /// Just calling this already marks everything as defined and removes provenance, so be sure to
+    /// actually overwrite all the data there!
     ///
     /// It is the caller's responsibility to check bounds and alignment beforehand.
     /// Most likely, you want to use the `PlaceTy` and `OperandTy`-based methods
     /// on `InterpCx` instead.
-    pub fn get_bytes_mut(
+    pub fn get_bytes_unchecked_for_overwrite(
         &mut self,
         cx: &impl HasDataLayout,
         range: AllocRange,
@@ -480,8 +478,9 @@ impl<Prov: Provenance, Extra, Bytes: AllocBytes> Allocation<Prov, Extra, Bytes> 
         Ok(&mut self.bytes[range.start.bytes_usize()..range.end().bytes_usize()])
     }
 
-    /// A raw pointer variant of `get_bytes_mut` that avoids invalidating existing aliases into this memory.
-    pub fn get_bytes_mut_ptr(
+    /// A raw pointer variant of `get_bytes_unchecked_for_overwrite` that avoids invalidating existing immutable aliases
+    /// into this memory.
+    pub fn get_bytes_unchecked_for_overwrite_ptr(
         &mut self,
         cx: &impl HasDataLayout,
         range: AllocRange,
@@ -490,9 +489,18 @@ impl<Prov: Provenance, Extra, Bytes: AllocBytes> Allocation<Prov, Extra, Bytes> 
         self.provenance.clear(range, cx)?;
 
         assert!(range.end().bytes_usize() <= self.bytes.len()); // need to do our own bounds-check
+        // Cruciall, we go via `AllocBytes::as_mut_ptr`, not `AllocBytes::deref_mut`.
         let begin_ptr = self.bytes.as_mut_ptr().wrapping_add(range.start.bytes_usize());
         let len = range.end().bytes_usize() - range.start.bytes_usize();
         Ok(ptr::slice_from_raw_parts_mut(begin_ptr, len))
+    }
+
+    /// This gives direct mutable access to the entire buffer, just exposing their internal state
+    /// without reseting anything. Directly exposes `AllocBytes::as_mut_ptr`. Only works if
+    /// `OFFSET_IS_ADDR` is true.
+    pub fn get_bytes_unchecked_raw_mut(&mut self) -> *mut u8 {
+        assert!(Prov::OFFSET_IS_ADDR);
+        self.bytes.as_mut_ptr()
     }
 }
 
@@ -615,7 +623,8 @@ impl<Prov: Provenance, Extra, Bytes: AllocBytes> Allocation<Prov, Extra, Bytes> 
         };
 
         let endian = cx.data_layout().endian;
-        let dst = self.get_bytes_mut(cx, range)?;
+        // Yes we do overwrite all the bytes in `dst`.
+        let dst = self.get_bytes_unchecked_for_overwrite(cx, range)?;
         write_target_uint(endian, dst, bytes).unwrap();
 
         // See if we have to also store some provenance.

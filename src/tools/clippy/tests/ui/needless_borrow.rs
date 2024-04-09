@@ -1,6 +1,7 @@
 #![feature(lint_reasons)]
 #![allow(
     unused,
+    non_local_definitions,
     clippy::uninlined_format_args,
     clippy::unnecessary_mut_passed,
     clippy::unnecessary_to_owned,
@@ -131,6 +132,9 @@ fn main() {
             0
         }
     }
+
+    // issue #11786
+    let x: (&str,) = (&"",);
 }
 
 #[allow(clippy::needless_borrowed_reference)]
@@ -190,27 +194,48 @@ fn issue9383() {
     // Should not lint because unions need explicit deref when accessing field
     use std::mem::ManuallyDrop;
 
-    union Coral {
-        crab: ManuallyDrop<Vec<i32>>,
+    #[derive(Clone, Copy)]
+    struct Wrap<T>(T);
+    impl<T> core::ops::Deref for Wrap<T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            &self.0
+        }
+    }
+    impl<T> core::ops::DerefMut for Wrap<T> {
+        fn deref_mut(&mut self) -> &mut T {
+            &mut self.0
+        }
     }
 
-    union Ocean {
-        coral: ManuallyDrop<Coral>,
+    union U<T: Copy> {
+        u: T,
     }
 
-    let mut ocean = Ocean {
-        coral: ManuallyDrop::new(Coral {
-            crab: ManuallyDrop::new(vec![1, 2, 3]),
-        }),
-    };
+    #[derive(Clone, Copy)]
+    struct Foo {
+        x: u32,
+    }
 
     unsafe {
-        ManuallyDrop::drop(&mut (&mut ocean.coral).crab);
+        let mut x = U {
+            u: ManuallyDrop::new(Foo { x: 0 }),
+        };
+        let _ = &mut (&mut x.u).x;
+        let _ = &mut (&mut { x.u }).x;
+        let _ = &mut ({ &mut x.u }).x;
 
-        (*ocean.coral).crab = ManuallyDrop::new(vec![4, 5, 6]);
-        ManuallyDrop::drop(&mut (*ocean.coral).crab);
+        let mut x = U {
+            u: Wrap(ManuallyDrop::new(Foo { x: 0 })),
+        };
+        let _ = &mut (&mut x.u).x;
+        let _ = &mut (&mut { x.u }).x;
+        let _ = &mut ({ &mut x.u }).x;
 
-        ManuallyDrop::drop(&mut ocean.coral);
+        let mut x = U { u: Wrap(Foo { x: 0 }) };
+        let _ = &mut (&mut x.u).x;
+        let _ = &mut (&mut { x.u }).x;
+        let _ = &mut ({ &mut x.u }).x;
     }
 }
 

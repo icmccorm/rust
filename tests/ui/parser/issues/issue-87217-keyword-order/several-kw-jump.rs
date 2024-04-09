@@ -1,4 +1,4 @@
-// edition:2018
+//@ edition:2018
 
 // There is an order to respect for keywords before a function:
 // `<visibility>, const, async, unsafe, extern, "<ABI>"`
@@ -12,3 +12,8 @@ async unsafe const fn test() {}
 //~| HELP `const` must come before `async unsafe`
 //~| SUGGESTION const async unsafe
 //~| NOTE keyword order for functions declaration is `pub`, `default`, `const`, `async`, `unsafe`, `extern`
+//~| ERROR functions cannot be both `const` and `async`
+//~| NOTE `const` because of this
+//~| NOTE `async` because of this
+
+fn main() {}

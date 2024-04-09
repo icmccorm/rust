@@ -53,11 +53,11 @@ LL |     priv_trait::mac!();
    |
    = note: this error originates in the macro `priv_trait::mac` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error: trait `PrivTr` is private
+error: associated type `PrivTr::AssocTy` is private
   --> $DIR/associated-item-privacy-trait.rs:25:34
    |
 LL |         pub type InSignatureTy = <Pub as PrivTr>::AssocTy;
-   |                                  ^^^^^^^^^^^^^^^^^^^^^^^^ private trait
+   |                                  ^^^^^^^^^^^^^^^^^^^^^^^^ private associated type
 ...
 LL |     priv_trait::mac!();
    |     ------------------ in this macro invocation
@@ -69,17 +69,6 @@ error: trait `PrivTr` is private
    |
 LL |         pub trait InSignatureTr: PrivTr {}
    |                                  ^^^^^^ private trait
-...
-LL |     priv_trait::mac!();
-   |     ------------------ in this macro invocation
-   |
-   = note: this error originates in the macro `priv_trait::mac` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-error: trait `PrivTr` is private
-  --> $DIR/associated-item-privacy-trait.rs:29:14
-   |
-LL |         impl PrivTr for u8 {}
-   |              ^^^^^^ private trait
 ...
 LL |     priv_trait::mac!();
    |     ------------------ in this macro invocation
@@ -327,6 +316,17 @@ LL |     priv_parent_substs::mac!();
    |     -------------------------- in this macro invocation
    |
    = note: this error originates in the macro `priv_parent_substs::mac` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: trait `PrivTr` is private
+  --> $DIR/associated-item-privacy-trait.rs:29:14
+   |
+LL |         impl PrivTr for u8 {}
+   |              ^^^^^^ private trait
+...
+LL |     priv_trait::mac!();
+   |     ------------------ in this macro invocation
+   |
+   = note: this error originates in the macro `priv_trait::mac` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error: aborting due to 30 previous errors
 

@@ -62,8 +62,8 @@ pub unsafe fn panic(data: Box<dyn Any + Send>) -> u32 {
     let exception = Box::new(Exception {
         _uwe: uw::_Unwind_Exception {
             exception_class: rust_exception_class(),
-            exception_cleanup,
-            private: [0; uw::unwinder_private_data_size],
+            exception_cleanup: Some(exception_cleanup),
+            private: [core::ptr::null(); uw::unwinder_private_data_size],
         },
         canary: &CANARY,
         cause: data,

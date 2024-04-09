@@ -14,7 +14,7 @@ where
     C: HasDataLayout + HasTargetSpec,
 {
     if !fn_abi.ret.is_ignore() {
-        if fn_abi.ret.layout.is_aggregate() {
+        if fn_abi.ret.layout.is_aggregate() && fn_abi.ret.layout.is_sized() {
             // Returning a structure. Most often, this will use
             // a hidden first argument. On some platforms, though,
             // small structs are returned as integers.
@@ -50,7 +50,7 @@ where
     }
 
     for arg in fn_abi.args.iter_mut() {
-        if arg.is_ignore() {
+        if arg.is_ignore() || !arg.layout.is_sized() {
             continue;
         }
 
@@ -72,7 +72,8 @@ where
             // - For backwards compatibility, arguments with natural alignment > 4 are still passed
             //   on stack (via `byval`). For example, this includes `double`, `int64_t`,
             //   and structs containing them, provided they lack an explicit alignment attribute.
-            assert!(arg.layout.align.abi >= max_repr_align,
+            assert!(
+                arg.layout.align.abi >= max_repr_align,
                 "abi alignment {:?} less than requested alignment {max_repr_align:?}",
                 arg.layout.align.abi,
             );

@@ -28,6 +28,7 @@ pub trait TyExt {
     fn is_unknown(&self) -> bool;
     fn contains_unknown(&self) -> bool;
     fn is_ty_var(&self) -> bool;
+    fn is_union(&self) -> bool;
 
     fn as_adt(&self) -> Option<(hir_def::AdtId, &Substitution)>;
     fn as_builtin(&self) -> Option<BuiltinType>;
@@ -94,6 +95,10 @@ impl TyExt for Ty {
 
     fn is_ty_var(&self) -> bool {
         matches!(self.kind(Interner), TyKind::InferenceVar(_, _))
+    }
+
+    fn is_union(&self) -> bool {
+        matches!(self.adt_id(Interner), Some(AdtId(hir_def::AdtId::UnionId(_))))
     }
 
     fn as_adt(&self) -> Option<(hir_def::AdtId, &Substitution)> {
@@ -197,11 +202,7 @@ impl TyExt for Ty {
     fn callable_sig(&self, db: &dyn HirDatabase) -> Option<CallableSig> {
         match self.kind(Interner) {
             TyKind::Function(fn_ptr) => Some(CallableSig::from_fn_ptr(fn_ptr)),
-            TyKind::FnDef(def, parameters) => {
-                let callable_def = db.lookup_intern_callable_def((*def).into());
-                let sig = db.callable_item_signature(callable_def);
-                Some(sig.substitute(Interner, parameters))
-            }
+            TyKind::FnDef(def, parameters) => Some(CallableSig::from_def(db, *def, parameters)),
             TyKind::Closure(.., substs) => ClosureSubst(substs).sig_ty().callable_sig(db),
             _ => None,
         }
@@ -213,7 +214,7 @@ impl TyExt for Ty {
             // invariant ensured by `TyLoweringContext::lower_dyn_trait()`.
             // FIXME: dyn types may not have principal trait and we don't want to return auto trait
             // here.
-            TyKind::Dyn(dyn_ty) => dyn_ty.bounds.skip_binders().interned().get(0).and_then(|b| {
+            TyKind::Dyn(dyn_ty) => dyn_ty.bounds.skip_binders().interned().first().and_then(|b| {
                 match b.skip_binders() {
                     WhereClause::Implemented(trait_ref) => Some(trait_ref),
                     _ => None,
@@ -267,6 +268,13 @@ impl TyExt for Ty {
                             data.substitute(Interner, &subst).into_value_and_skipped_binders().0
                         })
                     }
+                    ImplTraitId::AssociatedTypeImplTrait(alias, idx) => {
+                        db.type_alias_impl_traits(alias).map(|it| {
+                            let data =
+                                (*it).as_ref().map(|rpit| rpit.impl_traits[idx].bounds.clone());
+                            data.substitute(Interner, &subst).into_value_and_skipped_binders().0
+                        })
+                    }
                 }
             }
             TyKind::Alias(AliasTy::Opaque(opaque_ty)) => {
@@ -274,6 +282,13 @@ impl TyExt for Ty {
                 {
                     ImplTraitId::ReturnTypeImplTrait(func, idx) => {
                         db.return_type_impl_traits(func).map(|it| {
+                            let data =
+                                (*it).as_ref().map(|rpit| rpit.impl_traits[idx].bounds.clone());
+                            data.substitute(Interner, &opaque_ty.substitution)
+                        })
+                    }
+                    ImplTraitId::AssociatedTypeImplTrait(alias, idx) => {
+                        db.type_alias_impl_traits(alias).map(|it| {
                             let data =
                                 (*it).as_ref().map(|rpit| rpit.impl_traits[idx].bounds.clone());
                             data.substitute(Interner, &opaque_ty.substitution)
@@ -422,7 +437,7 @@ pub trait DynTyExt {
 
 impl DynTyExt for DynTy {
     fn principal(&self) -> Option<&TraitRef> {
-        self.bounds.skip_binders().interned().get(0).and_then(|b| match b.skip_binders() {
+        self.bounds.skip_binders().interned().first().and_then(|b| match b.skip_binders() {
             crate::WhereClause::Implemented(trait_ref) => Some(trait_ref),
             _ => None,
         })

@@ -65,7 +65,7 @@ where
                     _ => return Err(CannotUseFpConv),
                 }
             }
-            abi::F32 | abi::F64 => {
+            abi::F16 | abi::F32 | abi::F64 | abi::F128 => {
                 if arg_layout.size.bits() > flen {
                     return Err(CannotUseFpConv);
                 }
@@ -158,6 +158,10 @@ fn classify_ret<'a, Ty, C>(cx: &C, arg: &mut ArgAbi<'a, Ty>, xlen: u64, flen: u6
 where
     Ty: TyAbiInterface<'a, C> + Copy,
 {
+    if !arg.layout.is_sized() {
+        // Not touching this...
+        return false; // I guess? return value of this function is not documented
+    }
     if let Some(conv) = should_use_fp_conv(cx, &arg.layout, xlen, flen) {
         match conv {
             FloatConv::Float(f) => {
@@ -220,6 +224,10 @@ fn classify_arg<'a, Ty, C>(
 ) where
     Ty: TyAbiInterface<'a, C> + Copy,
 {
+    if !arg.layout.is_sized() {
+        // Not touching this...
+        return;
+    }
     if !is_vararg {
         match should_use_fp_conv(cx, &arg.layout, xlen, flen) {
             Some(FloatConv::Float(f)) if *avail_fprs >= 1 => {

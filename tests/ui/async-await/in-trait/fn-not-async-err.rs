@@ -1,7 +1,4 @@
-// edition: 2021
-
-#![feature(async_fn_in_trait)]
-#![allow(incomplete_features)]
+//@ edition: 2021
 
 trait MyTrait {
     async fn foo(&self) -> i32;
@@ -9,7 +6,7 @@ trait MyTrait {
 
 impl MyTrait for i32 {
     fn foo(&self) -> i32 {
-        //~^ ERROR: method `foo` should be async
+        //~^ ERROR: method should be `async` or return a future, but it is synchronous
         *self
     }
 }

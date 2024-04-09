@@ -1,20 +1,23 @@
 borrowck_assign_due_to_use_closure =
     assignment occurs due to use in closure
 
-borrowck_assign_due_to_use_generator =
-    assign occurs due to use in generator
+borrowck_assign_due_to_use_coroutine =
+    assign occurs due to use in coroutine
 
 borrowck_assign_part_due_to_use_closure =
     assignment to part occurs due to use in closure
 
-borrowck_assign_part_due_to_use_generator =
-    assign to part occurs due to use in generator
+borrowck_assign_part_due_to_use_coroutine =
+    assign to part occurs due to use in coroutine
 
 borrowck_borrow_due_to_use_closure =
     borrow occurs due to use in closure
 
-borrowck_borrow_due_to_use_generator =
-    borrow occurs due to use in generator
+borrowck_borrow_due_to_use_coroutine =
+    borrow occurs due to use in coroutine
+
+borrowck_calling_operator_moves =
+    calling this operator moves the value
 
 borrowck_calling_operator_moves_lhs =
     calling this operator moves the left-hand side
@@ -129,6 +132,12 @@ borrowck_moved_due_to_usage_in_operator =
         *[false] operator
     }
 
+borrowck_opaque_type_lifetime_mismatch =
+    opaque type used twice with different lifetimes
+    .label = lifetime `{$arg}` used here
+    .prev_lifetime_label = lifetime `{$prev}` previously used here
+    .note = if all non-lifetime generic parameters are the same, but the lifetime parameters differ, it is not possible to differentiate the opaque types
+
 borrowck_opaque_type_non_generic_param =
     expected generic {$kind} parameter, found `{$ty}`
     .label = {STREQ($ty, "'static") ->
@@ -142,11 +151,11 @@ borrowck_partial_var_move_by_use_in_closure =
         *[false] moved
     } due to use in closure
 
-borrowck_partial_var_move_by_use_in_generator =
+borrowck_partial_var_move_by_use_in_coroutine =
     variable {$is_partial ->
         [true] partially moved
         *[false] moved
-    } due to use in generator
+    } due to use in coroutine
 
 borrowck_returned_async_block_escaped =
     returns an `async` block that contains a reference to a captured variable, which then escapes the closure body
@@ -163,7 +172,13 @@ borrowck_returned_lifetime_wrong =
 borrowck_returned_ref_escaped =
     returns a reference to a captured variable which escapes the closure body
 
-borrowck_simd_shuffle_last_const = last argument of `simd_shuffle` is required to be a `const` item
+borrowck_simd_intrinsic_arg_const =
+    {$arg ->
+        [1] 1st
+        [2] 2nd
+        [3] 3rd
+        *[other] {$arg}th
+    } argument of `{$intrinsic}` is required to be a `const` item
 
 borrowck_suggest_create_freash_reborrow =
     consider reborrowing the `Pin` instead of moving it
@@ -180,15 +195,15 @@ borrowck_ty_no_impl_copy =
 borrowck_use_due_to_use_closure =
     use occurs due to use in closure
 
-borrowck_use_due_to_use_generator =
-    use occurs due to use in generator
+borrowck_use_due_to_use_coroutine =
+    use occurs due to use in coroutine
 
 borrowck_used_impl_require_static =
     the used `impl` has a `'static` requirement
 
 borrowck_value_capture_here =
     value captured {$is_within ->
-        [true] here by generator
+        [true] here by coroutine
         *[false] here
     }
 
@@ -207,8 +222,8 @@ borrowck_value_moved_here =
 borrowck_var_borrow_by_use_in_closure =
     borrow occurs due to use in closure
 
-borrowck_var_borrow_by_use_in_generator =
-    borrow occurs due to use in generator
+borrowck_var_borrow_by_use_in_coroutine =
+    borrow occurs due to use in coroutine
 
 borrowck_var_borrow_by_use_place_in_closure =
     {$is_single_var ->
@@ -216,11 +231,11 @@ borrowck_var_borrow_by_use_place_in_closure =
         [false] borrows occur
     } due to use of {$place} in closure
 
-borrowck_var_borrow_by_use_place_in_generator =
+borrowck_var_borrow_by_use_place_in_coroutine =
     {$is_single_var ->
         *[true] borrow occurs
         [false] borrows occur
-    } due to use of {$place} in generator
+    } due to use of {$place} in coroutine
 
 borrowck_var_cannot_escape_closure =
     captured variable cannot escape `FnMut` closure body
@@ -234,8 +249,8 @@ borrowck_var_does_not_need_mut =
 borrowck_var_first_borrow_by_use_place_in_closure =
     first borrow occurs due to use of {$place} in closure
 
-borrowck_var_first_borrow_by_use_place_in_generator =
-    first borrow occurs due to use of {$place} in generator
+borrowck_var_first_borrow_by_use_place_in_coroutine =
+    first borrow occurs due to use of {$place} in coroutine
 
 borrowck_var_here_captured = variable captured here
 
@@ -244,8 +259,8 @@ borrowck_var_here_defined = variable defined here
 borrowck_var_move_by_use_in_closure =
     move occurs due to use in closure
 
-borrowck_var_move_by_use_in_generator =
-    move occurs due to use in generator
+borrowck_var_move_by_use_in_coroutine =
+    move occurs due to use in coroutine
 
 borrowck_var_mutable_borrow_by_use_place_in_closure =
     mutable borrow occurs due to use of {$place} in closure
@@ -253,5 +268,5 @@ borrowck_var_mutable_borrow_by_use_place_in_closure =
 borrowck_var_second_borrow_by_use_place_in_closure =
     second borrow occurs due to use of {$place} in closure
 
-borrowck_var_second_borrow_by_use_place_in_generator =
-    second borrow occurs due to use of {$place} in generator
+borrowck_var_second_borrow_by_use_place_in_coroutine =
+    second borrow occurs due to use of {$place} in coroutine

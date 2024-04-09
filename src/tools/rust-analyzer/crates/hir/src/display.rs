@@ -1,6 +1,6 @@
 //! HirDisplay implementations for various hir types.
 use hir_def::{
-    data::adt::VariantData,
+    data::adt::{StructKind, VariantData},
     generics::{
         TypeOrConstParamData, TypeParamProvenance, WherePredicate, WherePredicateTypeTarget,
     },
@@ -17,10 +17,10 @@ use hir_ty::{
 };
 
 use crate::{
-    Adt, AsAssocItem, AssocItemContainer, Const, ConstParam, Enum, ExternCrateDecl, Field,
-    Function, GenericParam, HasCrate, HasVisibility, LifetimeParam, Macro, Module, SelfParam,
-    Static, Struct, Trait, TraitAlias, TyBuilder, Type, TypeAlias, TypeOrConstParam, TypeParam,
-    Union, Variant,
+    Adt, AsAssocItem, AssocItem, AssocItemContainer, Const, ConstParam, Enum, ExternCrateDecl,
+    Field, Function, GenericParam, HasCrate, HasVisibility, LifetimeParam, Macro, Module,
+    SelfParam, Static, Struct, Trait, TraitAlias, TupleField, TyBuilder, Type, TypeAlias,
+    TypeOrConstParam, TypeParam, Union, Variant,
 };
 
 impl HirDisplay for Function {
@@ -158,12 +158,62 @@ impl HirDisplay for Adt {
 
 impl HirDisplay for Struct {
     fn hir_fmt(&self, f: &mut HirFormatter<'_>) -> Result<(), HirDisplayError> {
-        write_visibility(self.module(f.db).id, self.visibility(f.db), f)?;
+        let module_id = self.module(f.db).id;
+        // FIXME: Render repr if its set explicitly?
+        write_visibility(module_id, self.visibility(f.db), f)?;
         f.write_str("struct ")?;
         write!(f, "{}", self.name(f.db).display(f.db.upcast()))?;
         let def_id = GenericDefId::AdtId(AdtId::StructId(self.id));
         write_generic_params(def_id, f)?;
-        write_where_clause(def_id, f)?;
+
+        let variant_data = self.variant_data(f.db);
+        match variant_data.kind() {
+            StructKind::Tuple => {
+                f.write_char('(')?;
+                let mut it = variant_data.fields().iter().peekable();
+
+                while let Some((id, _)) = it.next() {
+                    let field = Field { parent: (*self).into(), id };
+                    write_visibility(module_id, field.visibility(f.db), f)?;
+                    field.ty(f.db).hir_fmt(f)?;
+                    if it.peek().is_some() {
+                        f.write_str(", ")?;
+                    }
+                }
+
+                f.write_char(')')?;
+                write_where_clause(def_id, f)?;
+            }
+            StructKind::Record => {
+                let has_where_clause = write_where_clause(def_id, f)?;
+                if let Some(limit) = f.entity_limit {
+                    let fields = self.fields(f.db);
+                    let count = fields.len().min(limit);
+                    f.write_char(if !has_where_clause { ' ' } else { '\n' })?;
+                    if count == 0 {
+                        if fields.is_empty() {
+                            f.write_str("{}")?;
+                        } else {
+                            f.write_str("{ /* … */ }")?;
+                        }
+                    } else {
+                        f.write_str(" {\n")?;
+                        for field in &fields[..count] {
+                            f.write_str("    ")?;
+                            field.hir_fmt(f)?;
+                            f.write_str(",\n")?;
+                        }
+
+                        if fields.len() > count {
+                            f.write_str("    /* … */\n")?;
+                        }
+                        f.write_str("}")?;
+                    }
+                }
+            }
+            StructKind::Unit => _ = write_where_clause(def_id, f)?,
+        }
+
         Ok(())
     }
 }
@@ -175,7 +225,20 @@ impl HirDisplay for Enum {
         write!(f, "{}", self.name(f.db).display(f.db.upcast()))?;
         let def_id = GenericDefId::AdtId(AdtId::EnumId(self.id));
         write_generic_params(def_id, f)?;
-        write_where_clause(def_id, f)?;
+        let has_where_clause = write_where_clause(def_id, f)?;
+
+        let variants = self.variants(f.db);
+        if !variants.is_empty() {
+            f.write_char(if !has_where_clause { ' ' } else { '\n' })?;
+            f.write_str("{\n")?;
+            for variant in variants {
+                f.write_str("    ")?;
+                variant.hir_fmt(f)?;
+                f.write_str(",\n")?;
+            }
+            f.write_str("}")?;
+        }
+
         Ok(())
     }
 }
@@ -187,7 +250,20 @@ impl HirDisplay for Union {
         write!(f, "{}", self.name(f.db).display(f.db.upcast()))?;
         let def_id = GenericDefId::AdtId(AdtId::UnionId(self.id));
         write_generic_params(def_id, f)?;
-        write_where_clause(def_id, f)?;
+        let has_where_clause = write_where_clause(def_id, f)?;
+
+        let fields = self.fields(f.db);
+        if !fields.is_empty() {
+            f.write_char(if !has_where_clause { ' ' } else { '\n' })?;
+            f.write_str("{\n")?;
+            for field in self.fields(f.db) {
+                f.write_str("    ")?;
+                field.hir_fmt(f)?;
+                f.write_str(",\n")?;
+            }
+            f.write_str("}")?;
+        }
+
         Ok(())
     }
 }
@@ -196,6 +272,13 @@ impl HirDisplay for Field {
     fn hir_fmt(&self, f: &mut HirFormatter<'_>) -> Result<(), HirDisplayError> {
         write_visibility(self.parent.module(f.db).id, self.visibility(f.db), f)?;
         write!(f, "{}: ", self.name(f.db).display(f.db.upcast()))?;
+        self.ty(f.db).hir_fmt(f)
+    }
+}
+
+impl HirDisplay for TupleField {
+    fn hir_fmt(&self, f: &mut HirFormatter<'_>) -> Result<(), HirDisplayError> {
+        write!(f, "pub {}: ", self.name().display(f.db.upcast()))?;
         self.ty(f.db).hir_fmt(f)
     }
 }
@@ -380,7 +463,10 @@ fn write_generic_params(
     Ok(())
 }
 
-fn write_where_clause(def: GenericDefId, f: &mut HirFormatter<'_>) -> Result<(), HirDisplayError> {
+fn write_where_clause(
+    def: GenericDefId,
+    f: &mut HirFormatter<'_>,
+) -> Result<bool, HirDisplayError> {
     let params = f.db.generic_params(def);
 
     // unnamed type targets are displayed inline with the argument itself, e.g. `f: impl Y`.
@@ -399,7 +485,7 @@ fn write_where_clause(def: GenericDefId, f: &mut HirFormatter<'_>) -> Result<(),
         });
 
     if !has_displayable_predicate {
-        return Ok(());
+        return Ok(false);
     }
 
     let write_target = |target: &WherePredicateTypeTarget, f: &mut HirFormatter<'_>| match target {
@@ -477,7 +563,7 @@ fn write_where_clause(def: GenericDefId, f: &mut HirFormatter<'_>) -> Result<(),
     // End of final predicate. There must be at least one predicate here.
     f.write_char(',')?;
 
-    Ok(())
+    Ok(true)
 }
 
 impl HirDisplay for Const {
@@ -528,7 +614,37 @@ impl HirDisplay for Trait {
         write!(f, "trait {}", data.name.display(f.db.upcast()))?;
         let def_id = GenericDefId::TraitId(self.id);
         write_generic_params(def_id, f)?;
-        write_where_clause(def_id, f)?;
+        let has_where_clause = write_where_clause(def_id, f)?;
+
+        if let Some(limit) = f.entity_limit {
+            let assoc_items = self.items(f.db);
+            let count = assoc_items.len().min(limit);
+            f.write_char(if !has_where_clause { ' ' } else { '\n' })?;
+            if count == 0 {
+                if assoc_items.is_empty() {
+                    f.write_str("{}")?;
+                } else {
+                    f.write_str("{ /* … */ }")?;
+                }
+            } else {
+                f.write_str("{\n")?;
+                for item in &assoc_items[..count] {
+                    f.write_str("    ")?;
+                    match item {
+                        AssocItem::Function(func) => func.hir_fmt(f),
+                        AssocItem::Const(cst) => cst.hir_fmt(f),
+                        AssocItem::TypeAlias(type_alias) => type_alias.hir_fmt(f),
+                    }?;
+                    f.write_str(";\n")?;
+                }
+
+                if assoc_items.len() > count {
+                    f.write_str("    /* … */\n")?;
+                }
+                f.write_str("}")?;
+            }
+        }
+
         Ok(())
     }
 }
@@ -556,15 +672,15 @@ impl HirDisplay for TypeAlias {
         write!(f, "type {}", data.name.display(f.db.upcast()))?;
         let def_id = GenericDefId::TypeAliasId(self.id);
         write_generic_params(def_id, f)?;
-        write_where_clause(def_id, f)?;
         if !data.bounds.is_empty() {
             f.write_str(": ")?;
-            f.write_joined(&data.bounds, " + ")?;
+            f.write_joined(data.bounds.iter(), " + ")?;
         }
         if let Some(ty) = &data.type_ref {
             f.write_str(" = ")?;
             ty.hir_fmt(f)?;
         }
+        write_where_clause(def_id, f)?;
         Ok(())
     }
 }

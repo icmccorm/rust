@@ -1,13 +1,12 @@
-// run-pass
+//@ run-pass
 // This test case makes sure that we don't run into LLVM's dreaded
 // "possible ODR violation" assertion when compiling with LTO + Debuginfo.
 // It covers cases that have traditionally been prone to cause this error.
 // If new cases emerge, add them to this file.
 
-// aux-build:debuginfo-lto-aux.rs
-// compile-flags: -C lto -g
-// no-prefer-dynamic
-// ignore-asmjs wasm2js does not support source maps yet
+//@ aux-build:debuginfo-lto-aux.rs
+//@ compile-flags: -C lto -g
+//@ no-prefer-dynamic
 
 extern crate debuginfo_lto_aux;
 

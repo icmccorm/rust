@@ -6,9 +6,9 @@ use rustc_middle::mir::interpret::{InterpResult, PointerArithmetic, Scalar};
 use rustc_middle::mir::CastKind;
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::layout::{IntegerExt, LayoutOf, TyAndLayout};
-use rustc_middle::ty::{self, FloatTy, Ty, TypeAndMut};
+use rustc_middle::ty::{self, FloatTy, Ty};
 use rustc_target::abi::Integer;
-use rustc_type_ir::sty::TyKind::*;
+use rustc_type_ir::TyKind::*;
 
 use super::{
     util::ensure_monomorphic_enough, FnVal, ImmTy, Immediate, InterpCx, Machine, OpTy, PlaceTy,
@@ -34,15 +34,15 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 self.unsize_into(src, cast_layout, dest)?;
             }
 
-            CastKind::PointerExposeAddress => {
+            CastKind::PointerExposeProvenance => {
                 let src = self.read_immediate(src)?;
-                let res = self.pointer_expose_address_cast(&src, cast_layout)?;
+                let res = self.pointer_expose_provenance_cast(&src, cast_layout)?;
                 self.write_immediate(*res, dest)?;
             }
 
-            CastKind::PointerFromExposedAddress => {
+            CastKind::PointerWithExposedProvenance => {
                 let src = self.read_immediate(src)?;
-                let res = self.pointer_from_exposed_address_cast(&src, cast_layout)?;
+                let res = self.pointer_with_exposed_provenance_cast(&src, cast_layout)?;
                 self.write_immediate(*res, dest)?;
             }
 
@@ -117,8 +117,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                             def_id,
                             args,
                             ty::ClosureKind::FnOnce,
-                        )
-                        .ok_or_else(|| err_inval!(TooGeneric))?;
+                        );
                         let fn_ptr = self.fn_ptr(FnVal::Instance(instance));
                         self.write_pointer(fn_ptr, dest)?;
                     }
@@ -145,20 +144,16 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 assert!(dest.layout.is_sized());
                 assert_eq!(cast_ty, dest.layout.ty); // we otherwise ignore `cast_ty` enirely...
                 if src.layout.size != dest.layout.size {
-                    let src_bytes = src.layout.size.bytes();
-                    let dest_bytes = dest.layout.size.bytes();
-                    let src_ty = format!("{}", src.layout.ty);
-                    let dest_ty = format!("{}", dest.layout.ty);
                     throw_ub_custom!(
                         fluent::const_eval_invalid_transmute,
-                        src_bytes = src_bytes,
-                        dest_bytes = dest_bytes,
-                        src = src_ty,
-                        dest = dest_ty,
+                        src_bytes = src.layout.size.bytes(),
+                        dest_bytes = dest.layout.size.bytes(),
+                        src = src.layout.ty,
+                        dest = dest.layout.ty,
                     );
                 }
 
-                self.copy_op(src, dest, /*allow_transmute*/ true)?;
+                self.copy_op_allow_transmute(src, dest)?;
             }
         }
         Ok(())
@@ -185,15 +180,16 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         src: &ImmTy<'tcx, M::Provenance>,
         cast_to: TyAndLayout<'tcx>,
     ) -> InterpResult<'tcx, ImmTy<'tcx, M::Provenance>> {
-        use rustc_type_ir::sty::TyKind::*;
+        use rustc_type_ir::TyKind::*;
 
-        let val = match src.layout.ty.kind() {
-            // Floating point
-            Float(FloatTy::F32) => self.cast_from_float(src.to_scalar().to_f32()?, cast_to.ty),
-            Float(FloatTy::F64) => self.cast_from_float(src.to_scalar().to_f64()?, cast_to.ty),
-            _ => {
-                bug!("Can't cast 'Float' type into {}", cast_to.ty);
-            }
+        let Float(fty) = src.layout.ty.kind() else {
+            bug!("FloatToFloat/FloatToInt cast: source type {} is not a float type", src.layout.ty)
+        };
+        let val = match fty {
+            FloatTy::F16 => unimplemented!("f16_f128"),
+            FloatTy::F32 => self.cast_from_float(src.to_scalar().to_f32()?, cast_to.ty),
+            FloatTy::F64 => self.cast_from_float(src.to_scalar().to_f64()?, cast_to.ty),
+            FloatTy::F128 => unimplemented!("f16_f128"),
         };
         Ok(ImmTy::from_scalar(val, cast_to))
     }
@@ -229,12 +225,12 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         }
     }
 
-    pub fn pointer_expose_address_cast(
+    pub fn pointer_expose_provenance_cast(
         &mut self,
         src: &ImmTy<'tcx, M::Provenance>,
         cast_to: TyAndLayout<'tcx>,
     ) -> InterpResult<'tcx, ImmTy<'tcx, M::Provenance>> {
-        assert_matches!(src.layout.ty.kind(), ty::RawPtr(_) | ty::FnPtr(_));
+        assert_matches!(src.layout.ty.kind(), ty::RawPtr(_, _) | ty::FnPtr(_));
         assert!(cast_to.ty.is_integral());
 
         let scalar = src.to_scalar();
@@ -246,13 +242,13 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         Ok(ImmTy::from_scalar(self.cast_from_int_like(scalar, src.layout, cast_to.ty)?, cast_to))
     }
 
-    pub fn pointer_from_exposed_address_cast(
+    pub fn pointer_with_exposed_provenance_cast(
         &self,
         src: &ImmTy<'tcx, M::Provenance>,
         cast_to: TyAndLayout<'tcx>,
     ) -> InterpResult<'tcx, ImmTy<'tcx, M::Provenance>> {
         assert!(src.layout.ty.is_integral());
-        assert_matches!(cast_to.ty.kind(), ty::RawPtr(_));
+        assert_matches!(cast_to.ty.kind(), ty::RawPtr(_, _));
 
         // First cast to usize.
         let scalar = src.to_scalar();
@@ -260,7 +256,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         let addr = addr.to_target_usize(self)?;
 
         // Then turn address into pointer.
-        let ptr = M::ptr_from_addr_cast(&self, addr)?;
+        let ptr = M::ptr_from_addr_cast(self, addr)?;
         Ok(ImmTy::from_scalar(Scalar::from_maybe_pointer(ptr, self), cast_to))
     }
 
@@ -280,6 +276,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         trace!("cast_from_scalar: {}, {} -> {}", v, src_layout.ty, cast_ty);
 
         Ok(match *cast_ty.kind() {
+            // int -> int
             Int(_) | Uint(_) => {
                 let size = match *cast_ty.kind() {
                     Int(t) => Integer::from_int_ty(self, t).size(),
@@ -290,15 +287,26 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 Scalar::from_uint(v, size)
             }
 
-            Float(FloatTy::F32) if signed => Scalar::from_f32(Single::from_i128(v as i128).value),
-            Float(FloatTy::F64) if signed => Scalar::from_f64(Double::from_i128(v as i128).value),
-            Float(FloatTy::F32) => Scalar::from_f32(Single::from_u128(v).value),
-            Float(FloatTy::F64) => Scalar::from_f64(Double::from_u128(v).value),
-
-            Char => {
-                // `u8` to `char` cast
-                Scalar::from_u32(u8::try_from(v).unwrap().into())
+            // signed int -> float
+            Float(fty) if signed => {
+                let v = v as i128;
+                match fty {
+                    FloatTy::F16 => unimplemented!("f16_f128"),
+                    FloatTy::F32 => Scalar::from_f32(Single::from_i128(v).value),
+                    FloatTy::F64 => Scalar::from_f64(Double::from_i128(v).value),
+                    FloatTy::F128 => unimplemented!("f16_f128"),
+                }
             }
+            // unsigned int -> float
+            Float(fty) => match fty {
+                FloatTy::F16 => unimplemented!("f16_f128"),
+                FloatTy::F32 => Scalar::from_f32(Single::from_u128(v).value),
+                FloatTy::F64 => Scalar::from_f64(Double::from_u128(v).value),
+                FloatTy::F128 => unimplemented!("f16_f128"),
+            },
+
+            // u8 -> char
+            Char => Scalar::from_u32(u8::try_from(v).unwrap().into()),
 
             // Casts to bool are not permitted by rustc, no need to handle them here.
             _ => span_bug!(self.cur_span(), "invalid int to {} cast", cast_ty),
@@ -310,7 +318,22 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     where
         F: Float + Into<Scalar<M::Provenance>> + FloatConvert<Single> + FloatConvert<Double>,
     {
-        use rustc_type_ir::sty::TyKind::*;
+        use rustc_type_ir::TyKind::*;
+
+        fn adjust_nan<
+            'mir,
+            'tcx: 'mir,
+            M: Machine<'mir, 'tcx>,
+            F1: rustc_apfloat::Float + FloatConvert<F2>,
+            F2: rustc_apfloat::Float,
+        >(
+            ecx: &InterpCx<'mir, 'tcx, M>,
+            f1: F1,
+            f2: F2,
+        ) -> F2 {
+            if f2.is_nan() { M::generate_nan(ecx, &[f1]) } else { f2 }
+        }
+
         match *dest_ty.kind() {
             // float -> uint
             Uint(t) => {
@@ -329,10 +352,13 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 let v = f.to_i128(size.bits_usize()).value;
                 Scalar::from_int(v, size)
             }
-            // float -> f32
-            Float(FloatTy::F32) => Scalar::from_f32(f.convert(&mut false).value),
-            // float -> f64
-            Float(FloatTy::F64) => Scalar::from_f64(f.convert(&mut false).value),
+            // float -> float
+            Float(fty) => match fty {
+                FloatTy::F16 => unimplemented!("f16_f128"),
+                FloatTy::F32 => Scalar::from_f32(adjust_nan(self, f, f.convert(&mut false).value)),
+                FloatTy::F64 => Scalar::from_f64(adjust_nan(self, f, f.convert(&mut false).value)),
+                FloatTy::F128 => unimplemented!("f16_f128"),
+            },
             // That's it.
             _ => span_bug!(self.cur_span(), "invalid float to {} cast", dest_ty),
         }
@@ -401,7 +427,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         }
     }
 
-    fn unsize_into(
+    pub fn unsize_into(
         &mut self,
         src: &OpTy<'tcx, M::Provenance>,
         cast_ty: TyAndLayout<'tcx>,
@@ -409,10 +435,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     ) -> InterpResult<'tcx> {
         trace!("Unsizing {:?} of type {} into {}", *src, src.layout.ty, cast_ty.ty);
         match (&src.layout.ty.kind(), &cast_ty.ty.kind()) {
-            (&ty::Ref(_, s, _), &ty::Ref(_, c, _) | &ty::RawPtr(TypeAndMut { ty: c, .. }))
-            | (&ty::RawPtr(TypeAndMut { ty: s, .. }), &ty::RawPtr(TypeAndMut { ty: c, .. })) => {
-                self.unsize_into_ptr(src, dest, *s, *c)
-            }
+            (&ty::Ref(_, s, _), &ty::Ref(_, c, _) | &ty::RawPtr(c, _))
+            | (&ty::RawPtr(s, _), &ty::RawPtr(c, _)) => self.unsize_into_ptr(src, dest, *s, *c),
             (&ty::Adt(def_a, _), &ty::Adt(def_b, _)) => {
                 assert_eq!(def_a, def_b); // implies same number of fields
 
@@ -427,7 +451,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                     if src_field.layout.is_1zst() && cast_ty_field.is_1zst() {
                         // Skip 1-ZST fields.
                     } else if src_field.layout.ty == cast_ty_field.ty {
-                        self.copy_op(&src_field, &dst_field, /*allow_transmute*/ false)?;
+                        self.copy_op(&src_field, &dst_field)?;
                     } else {
                         if found_cast_field {
                             span_bug!(self.cur_span(), "unsize_into: more than one field to cast");

@@ -3,7 +3,7 @@
 #![allow(unused)]
 #![allow(
     clippy::assign_op_pattern,
-    clippy::blocks_in_if_conditions,
+    clippy::blocks_in_conditions,
     clippy::let_and_return,
     clippy::let_unit_value,
     clippy::nonminimal_bool,
@@ -230,7 +230,9 @@ fn does_not_lint() {
     }
 
     let x;
-    if true && let Some(n) = Some("let chains too") {
+    if true
+        && let Some(n) = Some("let chains too")
+    {
         x = 1;
     } else {
         x = 2;

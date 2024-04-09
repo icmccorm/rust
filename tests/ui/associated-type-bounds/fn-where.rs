@@ -1,9 +1,7 @@
-// run-pass
-// aux-build:fn-aux.rs
+//@ run-pass
+//@ aux-build:fn-aux.rs
 
 #![allow(unused)]
-#![feature(associated_type_bounds)]
-
 extern crate fn_aux;
 
 use fn_aux::*;

@@ -2,14 +2,14 @@ use clippy_utils::diagnostics::span_lint;
 use clippy_utils::{get_trait_def_id, paths};
 use rustc_hir::{Impl, Item, ItemKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for mis-uses of the serde API.
+    /// Checks for misuses of the serde API.
     ///
     /// ### Why is this bad?
-    /// Serde is very finnicky about how its API should be
+    /// Serde is very finicky about how its API should be
     /// used, but the type system can't be used to enforce it (yet?).
     ///
     /// ### Example

@@ -3,8 +3,9 @@
 // of terminologies might not be relevant in the context of Clippy. Note that its behavior might
 // differ from the time of `rustc` even if the name stays the same.
 
-use crate::msrvs::Msrv;
+use clippy_config::msrvs::Msrv;
 use hir::LangItem;
+use rustc_attr::StableSince;
 use rustc_const_eval::transform::check_consts::ConstCx;
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
@@ -111,7 +112,7 @@ fn check_rvalue<'tcx>(
         Rvalue::Repeat(operand, _)
         | Rvalue::Use(operand)
         | Rvalue::Cast(
-            CastKind::PointerFromExposedAddress
+            CastKind::PointerWithExposedProvenance
             | CastKind::IntToInt
             | CastKind::FloatToInt
             | CastKind::IntToFloat
@@ -148,7 +149,7 @@ fn check_rvalue<'tcx>(
                 Err((span, "unsizing casts are not allowed in const fn".into()))
             }
         },
-        Rvalue::Cast(CastKind::PointerExposeAddress, _, _) => {
+        Rvalue::Cast(CastKind::PointerExposeProvenance, _, _) => {
             Err((span, "casting pointers to ints is unstable in const fn".into()))
         },
         Rvalue::Cast(CastKind::DynStar, _, _) => {
@@ -173,9 +174,8 @@ fn check_rvalue<'tcx>(
                 ))
             }
         },
-        Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf | NullOp::OffsetOf(_), _) | Rvalue::ShallowInitBox(_, _) => {
-            Ok(())
-        },
+        Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf | NullOp::OffsetOf(_) | NullOp::UbChecks, _)
+        | Rvalue::ShallowInitBox(_, _) => Ok(()),
         Rvalue::UnaryOp(_, operand) => {
             let ty = operand.ty(body, tcx);
             if ty.is_integral() || ty.is_bool() {
@@ -272,6 +272,7 @@ fn check_place<'tcx>(tcx: TyCtxt<'tcx>, place: Place<'tcx>, span: Span, body: &B
             | ProjectionElem::Downcast(..)
             | ProjectionElem::Subslice { .. }
             | ProjectionElem::Deref
+            | ProjectionElem::Subtype(_)
             | ProjectionElem::Index(_) => {},
         }
     }
@@ -304,8 +305,8 @@ fn check_terminator<'tcx>(
             Ok(())
         },
         TerminatorKind::SwitchInt { discr, targets: _ } => check_operand(tcx, discr, span, body),
-        TerminatorKind::GeneratorDrop | TerminatorKind::Yield { .. } => {
-            Err((span, "const fn generators are unstable".into()))
+        TerminatorKind::CoroutineDrop | TerminatorKind::Yield { .. } => {
+            Err((span, "const fn coroutines are unstable".into()))
         },
         TerminatorKind::Call {
             func,
@@ -333,7 +334,7 @@ fn check_terminator<'tcx>(
                 // within const fns. `transmute` is allowed in all other const contexts.
                 // This won't really scale to more intrinsics or functions. Let's allow const
                 // transmutes in const fn before we add more hacks to this.
-                if tcx.is_intrinsic(fn_def_id) && tcx.item_name(fn_def_id) == sym::transmute {
+                if tcx.is_intrinsic(fn_def_id, sym::transmute) {
                     return Err((
                         span,
                         "can only call `transmute` from const items, not `const fn`".into(),
@@ -343,7 +344,7 @@ fn check_terminator<'tcx>(
                 check_operand(tcx, func, span, body)?;
 
                 for arg in args {
-                    check_operand(tcx, arg, span, body)?;
+                    check_operand(tcx, &arg.node, span, body)?;
                 }
                 Ok(())
             } else {
@@ -369,19 +370,17 @@ fn is_const_fn(tcx: TyCtxt<'_>, def_id: DefId, msrv: &Msrv) -> bool {
                 // function could be removed if `rustc` provided a MSRV-aware version of `is_const_fn`.
                 // as a part of an unimplemented MSRV check https://github.com/rust-lang/rust/issues/65262.
 
-                // HACK(nilstrieb): CURRENT_RUSTC_VERSION can return versions like 1.66.0-dev. `rustc-semver`
-                // doesn't accept the `-dev` version number so we have to strip it off.
-                let short_version = since
-                    .as_str()
-                    .split('-')
-                    .next()
-                    .expect("rustc_attr::StabilityLevel::Stable::since` is empty");
+                let const_stab_rust_version = match since {
+                    StableSince::Version(version) => version,
+                    StableSince::Current => rustc_session::RustcVersion::CURRENT,
+                    StableSince::Err => return false,
+                };
 
-                let since = rustc_span::Symbol::intern(short_version);
-
-                msrv.meets(RustcVersion::parse(since.as_str()).unwrap_or_else(|err| {
-                    panic!("`rustc_attr::StabilityLevel::Stable::since` is ill-formatted: `{since}`, {err:?}")
-                }))
+                msrv.meets(RustcVersion::new(
+                    u32::from(const_stab_rust_version.major),
+                    u32::from(const_stab_rust_version.minor),
+                    u32::from(const_stab_rust_version.patch),
+                ))
             } else {
                 // Unstable const fn with the feature enabled.
                 msrv.current().is_none()
@@ -389,7 +388,6 @@ fn is_const_fn(tcx: TyCtxt<'_>, def_id: DefId, msrv: &Msrv) -> bool {
         })
 }
 
-#[expect(clippy::similar_names)] // bit too pedantic
 fn is_ty_const_destruct<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, body: &Body<'tcx>) -> bool {
     // FIXME(effects, fee1-dead) revert to const destruct once it works again
     #[expect(unused)]

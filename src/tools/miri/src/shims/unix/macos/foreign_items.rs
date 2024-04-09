@@ -1,13 +1,12 @@
 use rustc_span::Symbol;
 use rustc_target::spec::abi::Abi;
 
+use crate::shims::unix::*;
 use crate::*;
 use shims::foreign_items::EmulateForeignItemResult;
-use shims::unix::fs::EvalContextExt as _;
-use shims::unix::thread::EvalContextExt as _;
 
-pub fn is_dyn_sym(name: &str) -> bool {
-    matches!(name, "getentropy")
+pub fn is_dyn_sym(_name: &str) -> bool {
+    false
 }
 
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
@@ -17,7 +16,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         link_name: Symbol,
         abi: Abi,
         args: &[OpTy<'tcx, Provenance>],
-        dest: &PlaceTy<'tcx, Provenance>,
+        dest: &MPlaceTy<'tcx, Provenance>,
     ) -> InterpResult<'tcx, EmulateForeignItemResult> {
         let this = self.eval_context_mut();
 
@@ -40,18 +39,18 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             "stat" | "stat64" | "stat$INODE64" => {
                 let [path, buf] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let result = this.macos_stat(path, buf)?;
+                let result = this.macos_fbsd_stat(path, buf)?;
                 this.write_scalar(result, dest)?;
             }
             "lstat" | "lstat64" | "lstat$INODE64" => {
                 let [path, buf] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let result = this.macos_lstat(path, buf)?;
+                let result = this.macos_fbsd_lstat(path, buf)?;
                 this.write_scalar(result, dest)?;
             }
             "fstat" | "fstat64" | "fstat$INODE64" => {
                 let [fd, buf] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let result = this.macos_fstat(fd, buf)?;
+                let result = this.macos_fbsd_fstat(fd, buf)?;
                 this.write_scalar(result, dest)?;
             }
             "opendir$INODE64" => {
@@ -62,21 +61,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             "readdir_r" | "readdir_r$INODE64" => {
                 let [dirp, entry, result] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let result = this.macos_readdir_r(dirp, entry, result)?;
-                this.write_scalar(result, dest)?;
-            }
-            "lseek" => {
-                let [fd, offset, whence] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                // macOS is 64bit-only, so this is lseek64
-                let result = this.lseek64(fd, offset, whence)?;
-                this.write_scalar(result, dest)?;
-            }
-            "ftruncate" => {
-                let [fd, length] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                // macOS is 64bit-only, so this is ftruncate64
-                let result = this.ftruncate64(fd, length)?;
+                let result = this.macos_fbsd_readdir_r(dirp, entry, result)?;
                 this.write_scalar(result, dest)?;
             }
             "realpath$DARWIN_EXTSN" => {
@@ -111,18 +96,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let [info] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let result = this.mach_timebase_info(info)?;
                 this.write_scalar(result, dest)?;
-            }
-
-            // Random generation related shims
-            "getentropy" => {
-                let [buf, bufsize] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let buf = this.read_pointer(buf)?;
-                let bufsize = this.read_target_usize(bufsize)?;
-
-                this.gen_random(buf, bufsize)?;
-
-                this.write_scalar(Scalar::from_i32(0), dest)?; // KERN_SUCCESS
             }
 
             // Access to command-line arguments

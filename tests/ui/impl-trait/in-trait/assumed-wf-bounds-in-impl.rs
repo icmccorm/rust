@@ -1,14 +1,14 @@
-// check-pass
-// edition: 2021
+//@ check-pass
+//@ edition: 2021
 // issue: 113796
 
-#![feature(async_fn_in_trait)]
 
 trait AsyncLendingIterator {
     type Item<'a>
     where
         Self: 'a;
 
+    #[allow(async_fn_in_trait)]
     async fn next(&mut self) -> Option<Self::Item<'_>>;
 }
 

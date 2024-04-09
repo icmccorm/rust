@@ -2,9 +2,9 @@
 use ::std::prelude::rust_2015::*;
 #[macro_use]
 extern crate std;
-// pretty-compare-only
-// pretty-mode:hir,typed
-// pp-exact:issue-4264.pp
+//@ pretty-compare-only
+//@ pretty-mode:hir,typed
+//@ pp-exact:issue-4264.pp
 
 // #4264 fixed-length vector types
 
@@ -32,7 +32,7 @@ fn bar() ({
         ({
                 let res =
                     ((::alloc::fmt::format as
-                            for<'a> fn(Arguments<'a>) -> String {format})(((<#[lang = "format_arguments"]>::new_const
+                            for<'a> fn(Arguments<'a>) -> String {format})(((format_arguments::new_const
                                 as
                                 fn(&[&'static str]) -> Arguments<'_> {Arguments::<'_>::new_const})((&([("test"
                                             as &str)] as [&str; 1]) as &[&str; 1])) as Arguments<'_>))

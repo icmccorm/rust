@@ -1,18 +1,15 @@
 //! A collection of tools for profiling rust-analyzer.
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![warn(rust_2018_idioms, unused_lifetimes)]
 
-mod stop_watch;
-mod memory_usage;
 #[cfg(feature = "cpu_profiler")]
 mod google_cpu_profiler;
-mod hprof;
-mod tree;
+mod memory_usage;
+mod stop_watch;
 
 use std::cell::RefCell;
 
 pub use crate::{
-    hprof::{heartbeat, heartbeat_span, init, init_from, span},
     memory_usage::{Bytes, MemoryUsage},
     stop_watch::{StopWatch, StopWatchSpan},
 };
@@ -24,30 +21,7 @@ pub use countme;
 /// almost zero.
 pub use countme::Count;
 
-thread_local!(static IN_SCOPE: RefCell<bool> = RefCell::new(false));
-
-/// Allows to check if the current code is within some dynamic scope, can be
-/// useful during debugging to figure out why a function is called.
-pub struct Scope {
-    prev: bool,
-}
-
-impl Scope {
-    #[must_use]
-    pub fn enter() -> Scope {
-        let prev = IN_SCOPE.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), true));
-        Scope { prev }
-    }
-    pub fn is_active() -> bool {
-        IN_SCOPE.with(|slot| *slot.borrow())
-    }
-}
-
-impl Drop for Scope {
-    fn drop(&mut self) {
-        IN_SCOPE.with(|slot| *slot.borrow_mut() = self.prev);
-    }
-}
+thread_local!(static IN_SCOPE: RefCell<bool> = const { RefCell::new(false) });
 
 /// A wrapper around google_cpu_profiler.
 ///
@@ -91,6 +65,7 @@ pub fn cpu_span() -> CpuSpan {
     }
 
     #[cfg(not(feature = "cpu_profiler"))]
+    #[allow(clippy::print_stderr)]
     {
         eprintln!(
             r#"cpu profiling is disabled, uncomment `default = [ "cpu_profiler" ]` in Cargo.toml to enable."#

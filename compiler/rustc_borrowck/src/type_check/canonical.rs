@@ -49,7 +49,9 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         // If the query has created new universes and errors are going to be emitted, register the
         // cause of these new universes for improved diagnostics.
         let universe = self.infcx.universe();
-        if old_universe != universe && let Some(error_info) = error_info {
+        if old_universe != universe
+            && let Some(error_info) = error_info
+        {
             let universe_info = error_info.to_universe_info(old_universe);
             for u in (old_universe + 1)..=universe {
                 self.borrowck_context.constraints.universe_causes.insert(u, universe_info.clone());
@@ -59,7 +61,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         Ok(output)
     }
 
-    pub(super) fn instantiate_canonical_with_fresh_inference_vars<T>(
+    pub(super) fn instantiate_canonical<T>(
         &mut self,
         span: Span,
         canonical: &Canonical<'tcx, T>,
@@ -67,8 +69,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        let (instantiated, _) =
-            self.infcx.instantiate_canonical_with_fresh_inference_vars(span, canonical);
+        let (instantiated, _) = self.infcx.instantiate_canonical(span, canonical);
         instantiated
     }
 
@@ -81,7 +82,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     ) {
         self.prove_predicate(
             ty::Binder::dummy(ty::PredicateKind::Clause(ty::ClauseKind::Trait(
-                ty::TraitPredicate { trait_ref, polarity: ty::ImplPolarity::Positive },
+                ty::TraitPredicate { trait_ref, polarity: ty::PredicatePolarity::Positive },
             ))),
             locations,
             category,
@@ -98,7 +99,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         locations: Locations,
     ) {
         for (predicate, span) in instantiated_predicates {
-            debug!(?predicate);
+            debug!(?span, ?predicate);
             let category = ConstraintCategory::Predicate(span);
             let predicate = self.normalize_with_category(predicate, locations, category);
             self.prove_predicate(predicate, locations, category);

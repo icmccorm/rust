@@ -3,7 +3,7 @@ use crate::base::allocator_kind_for_codegen;
 use std::collections::hash_map::Entry::*;
 
 use rustc_ast::expand::allocator::{ALLOCATOR_METHODS, NO_ALLOC_SHIM_IS_UNSTABLE};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::unord::UnordMap;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, LocalDefId, LOCAL_CRATE};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
@@ -16,7 +16,7 @@ use rustc_middle::ty::{self, SymbolName, TyCtxt};
 use rustc_middle::ty::{GenericArgKind, GenericArgsRef};
 use rustc_middle::util::Providers;
 use rustc_session::config::{CrateType, OomStrategy};
-use rustc_target::spec::SanitizerSet;
+use rustc_target::spec::{SanitizerSet, TlsModel};
 
 pub fn threshold(tcx: TyCtxt<'_>) -> SymbolExportLevel {
     crates_export_threshold(tcx.crate_types())
@@ -83,7 +83,7 @@ fn reachable_non_generics_provider(tcx: TyCtxt<'_>, _: LocalCrate) -> DefIdMap<S
 
             // Only consider nodes that actually have exported symbols.
             match tcx.def_kind(def_id) {
-                DefKind::Fn | DefKind::Static(_) => {}
+                DefKind::Fn | DefKind::Static { .. } => {}
                 DefKind::AssocFn if tcx.impl_of_method(def_id.to_def_id()).is_some() => {}
                 _ => return None,
             };
@@ -319,6 +319,8 @@ fn exported_symbols_provider_local(
 
         let (_, cgus) = tcx.collect_and_partition_mono_items(());
 
+        // The symbols created in this loop are sorted below it
+        #[allow(rustc::potential_query_instability)]
         for (mono_item, data) in cgus.iter().flat_map(|cgu| cgu.items().iter()) {
             if data.linkage != Linkage::External {
                 // We can only re-use things with external linkage, otherwise
@@ -377,10 +379,10 @@ fn exported_symbols_provider_local(
 fn upstream_monomorphizations_provider(
     tcx: TyCtxt<'_>,
     (): (),
-) -> DefIdMap<FxHashMap<GenericArgsRef<'_>, CrateNum>> {
+) -> DefIdMap<UnordMap<GenericArgsRef<'_>, CrateNum>> {
     let cnums = tcx.crates(());
 
-    let mut instances: DefIdMap<FxHashMap<_, _>> = Default::default();
+    let mut instances: DefIdMap<UnordMap<_, _>> = Default::default();
 
     let drop_in_place_fn_def_id = tcx.lang_items().drop_in_place_fn();
 
@@ -429,7 +431,7 @@ fn upstream_monomorphizations_provider(
 fn upstream_monomorphizations_for_provider(
     tcx: TyCtxt<'_>,
     def_id: DefId,
-) -> Option<&FxHashMap<GenericArgsRef<'_>, CrateNum>> {
+) -> Option<&UnordMap<GenericArgsRef<'_>, CrateNum>> {
     debug_assert!(!def_id.is_local());
     tcx.upstream_monomorphizations(()).get(&def_id)
 }
@@ -477,7 +479,7 @@ fn symbol_export_level(tcx: TyCtxt<'_>, sym_def_id: DefId) -> SymbolExportLevel 
         let target = &tcx.sess.target.llvm_target;
         // WebAssembly cannot export data symbols, so reduce their export level
         if target.contains("emscripten") {
-            if let DefKind::Static(_) = tcx.def_kind(sym_def_id) {
+            if let DefKind::Static { .. } = tcx.def_kind(sym_def_id) {
                 return SymbolExportLevel::Rust;
             }
         }
@@ -548,6 +550,12 @@ pub fn linking_symbol_name_for_instance_in_crate<'tcx>(
 
     let mut undecorated = symbol_name_for_instance_in_crate(tcx, symbol, instantiating_crate);
 
+    // thread local will not be a function call,
+    // so it is safe to return before windows symbol decoration check.
+    if let Some(name) = maybe_emutls_symbol_name(tcx, symbol, &undecorated) {
+        return name;
+    }
+
     let target = &tcx.sess.target;
     if !target.is_like_windows {
         // Mach-O has a global "_" suffix and `object` crate will handle it.
@@ -555,9 +563,10 @@ pub fn linking_symbol_name_for_instance_in_crate<'tcx>(
         return undecorated;
     }
 
-    let x86 = match &target.arch[..] {
-        "x86" => true,
-        "x86_64" => false,
+    let prefix = match &target.arch[..] {
+        "x86" => Some('_'),
+        "x86_64" => None,
+        "arm64ec" => Some('#'),
         // Only x86/64 use symbol decorations.
         _ => return undecorated,
     };
@@ -594,8 +603,8 @@ pub fn linking_symbol_name_for_instance_in_crate<'tcx>(
         Conv::X86Stdcall => ("_", "@"),
         Conv::X86VectorCall => ("", "@@"),
         _ => {
-            if x86 {
-                undecorated.insert(0, '_');
+            if let Some(prefix) = prefix {
+                undecorated.insert(0, prefix);
             }
             return undecorated;
         }
@@ -608,7 +617,33 @@ pub fn linking_symbol_name_for_instance_in_crate<'tcx>(
     format!("{prefix}{undecorated}{suffix}{args_in_bytes}")
 }
 
-fn wasm_import_module_map(tcx: TyCtxt<'_>, cnum: CrateNum) -> FxHashMap<DefId, String> {
+pub fn exporting_symbol_name_for_instance_in_crate<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    symbol: ExportedSymbol<'tcx>,
+    cnum: CrateNum,
+) -> String {
+    let undecorated = symbol_name_for_instance_in_crate(tcx, symbol, cnum);
+    maybe_emutls_symbol_name(tcx, symbol, &undecorated).unwrap_or(undecorated)
+}
+
+fn maybe_emutls_symbol_name<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    symbol: ExportedSymbol<'tcx>,
+    undecorated: &str,
+) -> Option<String> {
+    if matches!(tcx.sess.tls_model(), TlsModel::Emulated)
+        && let ExportedSymbol::NonGeneric(def_id) = symbol
+        && tcx.is_thread_local_static(def_id)
+    {
+        // When using emutls, LLVM will add the `__emutls_v.` prefix to thread local symbols,
+        // and exported symbol name need to match this.
+        Some(format!("__emutls_v.{undecorated}"))
+    } else {
+        None
+    }
+}
+
+fn wasm_import_module_map(tcx: TyCtxt<'_>, cnum: CrateNum) -> DefIdMap<String> {
     // Build up a map from DefId to a `NativeLib` structure, where
     // `NativeLib` internally contains information about
     // `#[link(wasm_import_module = "...")]` for example.
@@ -617,11 +652,11 @@ fn wasm_import_module_map(tcx: TyCtxt<'_>, cnum: CrateNum) -> FxHashMap<DefId, S
     let def_id_to_native_lib = native_libs
         .iter()
         .filter_map(|lib| lib.foreign_module.map(|id| (id, lib)))
-        .collect::<FxHashMap<_, _>>();
+        .collect::<DefIdMap<_>>();
 
-    let mut ret = FxHashMap::default();
+    let mut ret = DefIdMap::default();
     for (def_id, lib) in tcx.foreign_modules(cnum).iter() {
-        let module = def_id_to_native_lib.get(&def_id).and_then(|s| s.wasm_import_module());
+        let module = def_id_to_native_lib.get(def_id).and_then(|s| s.wasm_import_module());
         let Some(module) = module else { continue };
         ret.extend(lib.foreign_items.iter().map(|id| {
             assert_eq!(id.krate, cnum);

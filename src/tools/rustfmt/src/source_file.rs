@@ -49,7 +49,7 @@ where
 }
 
 pub(crate) fn write_file<T>(
-    parse_sess: Option<&ParseSess>,
+    psess: Option<&ParseSess>,
     filename: &FileName,
     formatted_text: &str,
     out: &mut T,
@@ -62,10 +62,11 @@ where
     fn ensure_real_path(filename: &FileName) -> &Path {
         match *filename {
             FileName::Real(ref path) => path,
-            _ => panic!("cannot format `{}` and emit to files", filename),
+            _ => panic!("cannot format `{filename}` and emit to files"),
         }
     }
 
+    #[allow(non_local_definitions)]
     impl From<&FileName> for rustc_span::FileName {
         fn from(filename: &FileName) -> rustc_span::FileName {
             match filename {
@@ -89,7 +90,7 @@ where
     let original_text = if newline_style != NewlineStyle::Auto && *filename != FileName::Stdin {
         Lrc::new(fs::read_to_string(ensure_real_path(filename))?)
     } else {
-        match parse_sess.and_then(|sess| sess.get_original_snippet(filename)) {
+        match psess.and_then(|psess| psess.get_original_snippet(filename)) {
             Some(ori) => ori,
             None => Lrc::new(fs::read_to_string(ensure_real_path(filename))?),
         }

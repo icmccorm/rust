@@ -197,10 +197,10 @@ impl Attribute {
                 .unwrap_or_else(|| panic!("attribute is missing tokens: {self:?}"))
                 .to_attr_token_stream()
                 .to_tokenstream(),
-            &AttrKind::DocComment(comment_kind, data) => TokenStream::new(vec![TokenTree::Token(
-                Token::new(token::DocComment(comment_kind, self.style, data), self.span),
-                Spacing::Alone,
-            )]),
+            &AttrKind::DocComment(comment_kind, data) => TokenStream::token_alone(
+                token::DocComment(comment_kind, self.style, data),
+                self.span,
+            ),
         }
     }
 }
@@ -342,7 +342,7 @@ impl MetaItem {
                 let span = span.with_hi(segments.last().unwrap().ident.span.hi());
                 Path { span, segments, tokens: None }
             }
-            Some(TokenTree::Token(Token { kind: token::Interpolated(nt), .. }, _)) => match &**nt {
+            Some(TokenTree::Token(Token { kind: token::Interpolated(nt), .. }, _)) => match &nt.0 {
                 token::Nonterminal::NtMeta(item) => return item.meta(item.path.span),
                 token::Nonterminal::NtPath(path) => (**path).clone(),
                 _ => return None,
@@ -387,11 +387,11 @@ impl MetaItemKind {
         tokens: &mut impl Iterator<Item = &'a TokenTree>,
     ) -> Option<MetaItemKind> {
         match tokens.next() {
-            Some(TokenTree::Delimited(_, Delimiter::Invisible, inner_tokens)) => {
+            Some(TokenTree::Delimited(.., Delimiter::Invisible, inner_tokens)) => {
                 MetaItemKind::name_value_from_tokens(&mut inner_tokens.trees())
             }
             Some(TokenTree::Token(token, _)) => {
-                MetaItemLit::from_token(&token).map(MetaItemKind::NameValue)
+                MetaItemLit::from_token(token).map(MetaItemKind::NameValue)
             }
             _ => None,
         }
@@ -401,7 +401,7 @@ impl MetaItemKind {
         tokens: &mut iter::Peekable<impl Iterator<Item = &'a TokenTree>>,
     ) -> Option<MetaItemKind> {
         match tokens.peek() {
-            Some(TokenTree::Delimited(_, Delimiter::Parenthesis, inner_tokens)) => {
+            Some(TokenTree::Delimited(.., Delimiter::Parenthesis, inner_tokens)) => {
                 let inner_tokens = inner_tokens.clone();
                 tokens.next();
                 MetaItemKind::list_from_tokens(inner_tokens).map(MetaItemKind::List)
@@ -520,13 +520,11 @@ impl NestedMetaItem {
         I: Iterator<Item = &'a TokenTree>,
     {
         match tokens.peek() {
-            Some(TokenTree::Token(token, _))
-                if let Some(lit) = MetaItemLit::from_token(token) =>
-            {
+            Some(TokenTree::Token(token, _)) if let Some(lit) = MetaItemLit::from_token(token) => {
                 tokens.next();
                 return Some(NestedMetaItem::Lit(lit));
             }
-            Some(TokenTree::Delimited(_, Delimiter::Invisible, inner_tokens)) => {
+            Some(TokenTree::Delimited(.., Delimiter::Invisible, inner_tokens)) => {
                 tokens.next();
                 return NestedMetaItem::from_tokens(&mut inner_tokens.trees().peekable());
             }

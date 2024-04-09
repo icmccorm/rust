@@ -2,7 +2,7 @@ use std::{fmt, marker::PhantomData};
 
 use hir::{
     db::{AstIdMapQuery, AttrsQuery, BlockDefMapQuery, ParseMacroExpansionQuery},
-    Attr, Attrs, ExpandResult, MacroFile, Module,
+    Attr, Attrs, ExpandResult, MacroFileId, Module,
 };
 use ide_db::{
     base_db::{
@@ -10,7 +10,7 @@ use ide_db::{
             debug::{DebugQueryTable, TableEntry},
             Query, QueryTable,
         },
-        CrateId, FileId, FileTextQuery, ParseQuery, SourceDatabase, SourceRootId,
+        CompressedFileTextQuery, CrateData, FileId, ParseQuery, SourceDatabase, SourceRootId,
     },
     symbol_index::ModuleSymbolsQuery,
 };
@@ -38,7 +38,7 @@ use triomphe::Arc;
 pub(crate) fn status(db: &RootDatabase, file_id: Option<FileId>) -> String {
     let mut buf = String::new();
 
-    format_to!(buf, "{}\n", collect_query(FileTextQuery.in_db(db)));
+    format_to!(buf, "{}\n", collect_query(CompressedFileTextQuery.in_db(db)));
     format_to!(buf, "{}\n", collect_query(ParseQuery.in_db(db)));
     format_to!(buf, "{}\n", collect_query(ParseMacroExpansionQuery.in_db(db)));
     format_to!(buf, "{}\n", collect_query(LibrarySymbolsQuery.in_db(db)));
@@ -54,29 +54,50 @@ pub(crate) fn status(db: &RootDatabase, file_id: Option<FileId>) -> String {
     format_to!(buf, "{} block def maps\n", collect_query_count(BlockDefMapQuery.in_db(db)));
 
     if let Some(file_id) = file_id {
-        format_to!(buf, "\nFile info:\n");
+        format_to!(buf, "\nCrates for file {}:\n", file_id.index());
         let crates = crate::parent_module::crates_for(db, file_id);
         if crates.is_empty() {
             format_to!(buf, "Does not belong to any crate");
         }
         let crate_graph = db.crate_graph();
-        for krate in crates {
-            let display_crate = |krate: CrateId| match &crate_graph[krate].display_name {
-                Some(it) => format!("{it}({})", krate.into_raw()),
-                None => format!("{}", krate.into_raw()),
-            };
-            format_to!(buf, "Crate: {}\n", display_crate(krate));
-            format_to!(buf, "Enabled cfgs: {:?}\n", crate_graph[krate].cfg_options);
-            let deps = crate_graph[krate]
-                .dependencies
+        for crate_id in crates {
+            let CrateData {
+                root_file_id,
+                edition,
+                version,
+                display_name,
+                cfg_options,
+                potential_cfg_options,
+                env,
+                dependencies,
+                origin,
+                is_proc_macro,
+            } = &crate_graph[crate_id];
+            format_to!(
+                buf,
+                "Crate: {}\n",
+                match display_name {
+                    Some(it) => format!("{it}({})", crate_id.into_raw()),
+                    None => format!("{}", crate_id.into_raw()),
+                }
+            );
+            format_to!(buf, "    Root module file id: {}\n", root_file_id.index());
+            format_to!(buf, "    Edition: {}\n", edition);
+            format_to!(buf, "    Version: {}\n", version.as_deref().unwrap_or("n/a"));
+            format_to!(buf, "    Enabled cfgs: {:?}\n", cfg_options);
+            format_to!(buf, "    Potential cfgs: {:?}\n", potential_cfg_options);
+            format_to!(buf, "    Env: {:?}\n", env);
+            format_to!(buf, "    Origin: {:?}\n", origin);
+            format_to!(buf, "    Is a proc macro crate: {}\n", is_proc_macro);
+            let deps = dependencies
                 .iter()
-                .map(|dep| format!("{}={:?}", dep.name, dep.crate_id))
+                .map(|dep| format!("{}={}", dep.name, dep.crate_id.into_raw()))
                 .format(", ");
-            format_to!(buf, "Dependencies: {}\n", deps);
+            format_to!(buf, "    Dependencies: {}\n", deps);
         }
     }
 
-    buf.trim().to_string()
+    buf.trim().to_owned()
 }
 
 fn collect_query<'q, Q>(table: QueryTable<'q, Q>) -> <Q as QueryCollect>::Collector
@@ -139,7 +160,7 @@ impl QueryCollect for ParseMacroExpansionQuery {
     type Collector = SyntaxTreeStats<true>;
 }
 
-impl QueryCollect for FileTextQuery {
+impl QueryCollect for CompressedFileTextQuery {
     type Collector = FilesStats;
 }
 
@@ -167,8 +188,8 @@ impl fmt::Display for FilesStats {
     }
 }
 
-impl StatCollect<FileId, Arc<str>> for FilesStats {
-    fn collect_entry(&mut self, _: FileId, value: Option<Arc<str>>) {
+impl StatCollect<FileId, Arc<[u8]>> for FilesStats {
+    fn collect_entry(&mut self, _: FileId, value: Option<Arc<[u8]>>) {
         self.total += 1;
         self.size += value.unwrap().len();
     }
@@ -199,8 +220,12 @@ impl StatCollect<FileId, Parse<ast::SourceFile>> for SyntaxTreeStats<false> {
     }
 }
 
-impl<M> StatCollect<MacroFile, ExpandResult<(Parse<SyntaxNode>, M)>> for SyntaxTreeStats<true> {
-    fn collect_entry(&mut self, _: MacroFile, value: Option<ExpandResult<(Parse<SyntaxNode>, M)>>) {
+impl<M> StatCollect<MacroFileId, ExpandResult<(Parse<SyntaxNode>, M)>> for SyntaxTreeStats<true> {
+    fn collect_entry(
+        &mut self,
+        _: MacroFileId,
+        value: Option<ExpandResult<(Parse<SyntaxNode>, M)>>,
+    ) {
         self.total += 1;
         self.retained += value.is_some() as usize;
     }

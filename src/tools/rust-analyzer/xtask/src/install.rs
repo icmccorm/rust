@@ -5,7 +5,7 @@ use std::{env, path::PathBuf, str};
 use anyhow::{bail, format_err, Context};
 use xshell::{cmd, Shell};
 
-use crate::flags;
+use crate::flags::{self, Malloc};
 
 impl flags::Install {
     pub(crate) fn run(self, sh: &Shell) -> anyhow::Result<()> {
@@ -31,12 +31,7 @@ const VS_CODES: &[&str] = &["code", "code-exploration", "code-insiders", "codium
 
 pub(crate) struct ServerOpt {
     pub(crate) malloc: Malloc,
-}
-
-pub(crate) enum Malloc {
-    System,
-    Mimalloc,
-    Jemalloc,
+    pub(crate) dev_rel: bool,
 }
 
 fn fix_path_for_mac(sh: &Shell) -> anyhow::Result<()> {
@@ -50,7 +45,7 @@ fn fix_path_for_mac(sh: &Shell) -> anyhow::Result<()> {
 
         [ROOT_DIR, &home_dir]
             .into_iter()
-            .map(|dir| dir.to_string() + COMMON_APP_PATH)
+            .map(|dir| dir.to_owned() + COMMON_APP_PATH)
             .map(PathBuf::from)
             .filter(|path| path.exists())
             .collect()
@@ -121,7 +116,7 @@ fn install_client(sh: &Shell, client_opt: ClientOpt) -> anyhow::Result<()> {
     if !installed_extensions.contains("rust-analyzer") {
         bail!(
             "Could not install the Visual Studio Code extension. \
-            Please make sure you have at least NodeJS 12.x together with the latest version of VS Code installed and try again. \
+            Please make sure you have at least NodeJS 16.x together with the latest version of VS Code installed and try again. \
             Note that installing via xtask install does not work for VS Code Remote, instead you’ll need to install the .vsix manually."
         );
     }
@@ -130,13 +125,10 @@ fn install_client(sh: &Shell, client_opt: ClientOpt) -> anyhow::Result<()> {
 }
 
 fn install_server(sh: &Shell, opts: ServerOpt) -> anyhow::Result<()> {
-    let features = match opts.malloc {
-        Malloc::System => &[][..],
-        Malloc::Mimalloc => &["--features", "mimalloc"],
-        Malloc::Jemalloc => &["--features", "jemalloc"],
-    };
+    let features = opts.malloc.to_features();
+    let profile = if opts.dev_rel { "dev-rel" } else { "release" };
 
-    let cmd = cmd!(sh, "cargo install --path crates/rust-analyzer --locked --force --features force-always-assert {features...}");
+    let cmd = cmd!(sh, "cargo install --path crates/rust-analyzer --profile={profile} --locked --force --features force-always-assert {features...}");
     cmd.run()?;
     Ok(())
 }

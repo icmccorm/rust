@@ -1,6 +1,5 @@
-// compile-flags: -O
-// min-llvm-version: 17
-// only-x86_64-unknown-linux-gnu
+//@ compile-flags: -O
+//@ only-x86_64-unknown-linux-gnu
 
 // We want to check that this function does not mis-optimize to loop jumping.
 

@@ -14,17 +14,18 @@ use crate::{
 };
 use base_db::CrateId;
 use chalk_ir::Mutability;
+use either::Either;
 use hir_def::{
     hir::{BindingId, Expr, ExprId, Ordering, PatId},
-    DefWithBodyId, FieldId, StaticId, UnionId, VariantId,
+    DefWithBodyId, FieldId, StaticId, TupleFieldId, UnionId, VariantId,
 };
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 
+mod borrowck;
 mod eval;
 mod lower;
-mod borrowck;
-mod pretty;
 mod monomorphization;
+mod pretty;
 
 pub use borrowck::{borrowck_query, BorrowckResult, MutabilityReason};
 pub use eval::{
@@ -40,7 +41,6 @@ pub use monomorphization::{
 use rustc_hash::FxHashMap;
 use smallvec::{smallvec, SmallVec};
 use stdx::{impl_from, never};
-use triomphe::Arc;
 
 use super::consteval::{intern_const_scalar, try_const_usize};
 
@@ -98,16 +98,16 @@ pub enum Operand {
 }
 
 impl Operand {
-    fn from_concrete_const(data: Vec<u8>, memory_map: MemoryMap, ty: Ty) -> Self {
+    fn from_concrete_const(data: Box<[u8]>, memory_map: MemoryMap, ty: Ty) -> Self {
         Operand::Constant(intern_const_scalar(ConstScalar::Bytes(data, memory_map), ty))
     }
 
-    fn from_bytes(data: Vec<u8>, ty: Ty) -> Self {
+    fn from_bytes(data: Box<[u8]>, ty: Ty) -> Self {
         Operand::from_concrete_const(data, MemoryMap::default(), ty)
     }
 
     fn const_zst(ty: Ty) -> Operand {
-        Self::from_bytes(vec![], ty)
+        Self::from_bytes(Box::default(), ty)
     }
 
     fn from_fn(
@@ -118,16 +118,16 @@ impl Operand {
         let ty =
             chalk_ir::TyKind::FnDef(CallableDefId::FunctionId(func_id).to_chalk(db), generic_args)
                 .intern(Interner);
-        Operand::from_bytes(vec![], ty)
+        Operand::from_bytes(Box::default(), ty)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProjectionElem<V, T> {
     Deref,
-    Field(FieldId),
+    Field(Either<FieldId, TupleFieldId>),
     // FIXME: get rid of this, and use FieldId for tuples and closures
-    TupleOrClosureField(usize),
+    ClosureField(usize),
     Index(V),
     ConstantIndex { offset: u64, from_end: bool },
     Subslice { from: u64, to: u64 },
@@ -147,7 +147,7 @@ impl<V, T> ProjectionElem<V, T> {
             base = normalize(
                 db,
                 // FIXME: we should get this from caller
-                Arc::new(TraitEnvironment::empty(krate)),
+                TraitEnvironment::empty(krate),
                 base,
             );
         }
@@ -159,32 +159,38 @@ impl<V, T> ProjectionElem<V, T> {
                 }
                 _ => {
                     never!("Overloaded deref on type {} is not a projection", base.display(db));
-                    return TyKind::Error.intern(Interner);
+                    TyKind::Error.intern(Interner)
                 }
             },
-            ProjectionElem::Field(f) => match &base.kind(Interner) {
+            ProjectionElem::Field(Either::Left(f)) => match &base.kind(Interner) {
                 TyKind::Adt(_, subst) => {
                     db.field_types(f.parent)[f.local_id].clone().substitute(Interner, subst)
                 }
                 ty => {
                     never!("Only adt has field, found {:?}", ty);
-                    return TyKind::Error.intern(Interner);
+                    TyKind::Error.intern(Interner)
                 }
             },
-            ProjectionElem::TupleOrClosureField(f) => match &base.kind(Interner) {
+            ProjectionElem::Field(Either::Right(f)) => match &base.kind(Interner) {
                 TyKind::Tuple(_, subst) => subst
                     .as_slice(Interner)
-                    .get(*f)
+                    .get(f.index as usize)
                     .map(|x| x.assert_ty_ref(Interner))
                     .cloned()
                     .unwrap_or_else(|| {
                         never!("Out of bound tuple field");
                         TyKind::Error.intern(Interner)
                     }),
+                _ => {
+                    never!("Only tuple has tuple field");
+                    TyKind::Error.intern(Interner)
+                }
+            },
+            ProjectionElem::ClosureField(f) => match &base.kind(Interner) {
                 TyKind::Closure(id, subst) => closure_field(*id, subst, *f),
                 _ => {
-                    never!("Only tuple or closure has tuple or closure field");
-                    return TyKind::Error.intern(Interner);
+                    never!("Only closure has closure field");
+                    TyKind::Error.intern(Interner)
                 }
             },
             ProjectionElem::ConstantIndex { .. } | ProjectionElem::Index(_) => {
@@ -192,7 +198,7 @@ impl<V, T> ProjectionElem<V, T> {
                     TyKind::Array(inner, _) | TyKind::Slice(inner) => inner.clone(),
                     _ => {
                         never!("Overloaded index is not a projection");
-                        return TyKind::Error.intern(Interner);
+                        TyKind::Error.intern(Interner)
                     }
                 }
             }
@@ -211,12 +217,12 @@ impl<V, T> ProjectionElem<V, T> {
                 TyKind::Slice(_) => base.clone(),
                 _ => {
                     never!("Subslice projection should only happen on slice and array");
-                    return TyKind::Error.intern(Interner);
+                    TyKind::Error.intern(Interner)
                 }
             },
             ProjectionElem::OpaqueCast(_) => {
                 never!("We don't emit these yet");
-                return TyKind::Error.intern(Interner);
+                TyKind::Error.intern(Interner)
             }
         }
     }
@@ -243,16 +249,16 @@ impl Default for ProjectionStore {
 }
 
 impl ProjectionStore {
-    fn shrink_to_fit(&mut self) {
+    pub fn shrink_to_fit(&mut self) {
         self.id_to_proj.shrink_to_fit();
         self.proj_to_id.shrink_to_fit();
     }
 
-    fn intern_if_exist(&self, projection: &[PlaceElem]) -> Option<ProjectionId> {
+    pub fn intern_if_exist(&self, projection: &[PlaceElem]) -> Option<ProjectionId> {
         self.proj_to_id.get(projection).copied()
     }
 
-    fn intern(&mut self, projection: Box<[PlaceElem]>) -> ProjectionId {
+    pub fn intern(&mut self, projection: Box<[PlaceElem]>) -> ProjectionId {
         let new_id = ProjectionId(self.proj_to_id.len() as u32);
         match self.proj_to_id.entry(projection) {
             Entry::Occupied(id) => *id.get(),
@@ -267,20 +273,24 @@ impl ProjectionStore {
 }
 
 impl ProjectionId {
-    const EMPTY: ProjectionId = ProjectionId(0);
+    pub const EMPTY: ProjectionId = ProjectionId(0);
 
-    fn lookup(self, store: &ProjectionStore) -> &[PlaceElem] {
+    pub fn is_empty(self) -> bool {
+        self == ProjectionId::EMPTY
+    }
+
+    pub fn lookup(self, store: &ProjectionStore) -> &[PlaceElem] {
         store.id_to_proj.get(&self).unwrap()
     }
 
-    fn project(self, projection: PlaceElem, store: &mut ProjectionStore) -> ProjectionId {
+    pub fn project(self, projection: PlaceElem, store: &mut ProjectionStore) -> ProjectionId {
         let mut current = self.lookup(store).to_vec();
         current.push(projection);
         store.intern(current.into())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Place {
     pub local: LocalId,
     pub projection: ProjectionId,
@@ -289,7 +299,7 @@ pub struct Place {
 impl Place {
     fn is_parent(&self, child: &Place, store: &ProjectionStore) -> bool {
         self.local == child.local
-            && child.projection.lookup(store).starts_with(&self.projection.lookup(store))
+            && child.projection.lookup(store).starts_with(self.projection.lookup(store))
     }
 
     /// The place itself is not included
@@ -323,7 +333,7 @@ pub enum AggregateKind {
     Adt(VariantId, Substitution),
     Union(UnionId, FieldId),
     Closure(Ty),
-    //Generator(LocalDefId, SubstsRef, Movability),
+    //Coroutine(LocalDefId, SubstsRef, Movability),
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -443,8 +453,8 @@ pub enum TerminatorKind {
     /// `dest = move _0`. It might additionally do other things, like have side-effects in the
     /// aliasing model.
     ///
-    /// If the body is a generator body, this has slightly different semantics; it instead causes a
-    /// `GeneratorState::Returned(_0)` to be created (as if by an `Aggregate` rvalue) and assigned
+    /// If the body is a coroutine body, this has slightly different semantics; it instead causes a
+    /// `CoroutineState::Returned(_0)` to be created (as if by an `Aggregate` rvalue) and assigned
     /// to the return place.
     Return,
 
@@ -556,14 +566,14 @@ pub enum TerminatorKind {
 
     /// Marks a suspend point.
     ///
-    /// Like `Return` terminators in generator bodies, this computes `value` and then a
-    /// `GeneratorState::Yielded(value)` as if by `Aggregate` rvalue. That value is then assigned to
+    /// Like `Return` terminators in coroutine bodies, this computes `value` and then a
+    /// `CoroutineState::Yielded(value)` as if by `Aggregate` rvalue. That value is then assigned to
     /// the return place of the function calling this one, and execution continues in the calling
     /// function. When next invoked with the same first argument, execution of this function
     /// continues at the `resume` basic block, with the second argument written to the `resume_arg`
-    /// place. If the generator is dropped before then, the `drop` basic block is invoked.
+    /// place. If the coroutine is dropped before then, the `drop` basic block is invoked.
     ///
-    /// Not permitted in bodies that are not generator bodies, or after generator lowering.
+    /// Not permitted in bodies that are not coroutine bodies, or after coroutine lowering.
     ///
     /// **Needs clarification**: What about the evaluation order of the `resume_arg` and `value`?
     Yield {
@@ -573,21 +583,21 @@ pub enum TerminatorKind {
         resume: BasicBlockId,
         /// The place to store the resume argument in.
         resume_arg: Place,
-        /// Cleanup to be done if the generator is dropped at this suspend point.
+        /// Cleanup to be done if the coroutine is dropped at this suspend point.
         drop: Option<BasicBlockId>,
     },
 
-    /// Indicates the end of dropping a generator.
+    /// Indicates the end of dropping a coroutine.
     ///
-    /// Semantically just a `return` (from the generators drop glue). Only permitted in the same situations
+    /// Semantically just a `return` (from the coroutines drop glue). Only permitted in the same situations
     /// as `yield`.
     ///
-    /// **Needs clarification**: Is that even correct? The generator drop code is always confusing
+    /// **Needs clarification**: Is that even correct? The coroutine drop code is always confusing
     /// to me, because it's not even really in the current body.
     ///
     /// **Needs clarification**: Are there type system constraints on these terminators? Should
     /// there be a "block type" like `cleanup` blocks for them?
-    GeneratorDrop,
+    CoroutineDrop,
 
     /// A block where control flow only ever takes one real path, but borrowck needs to be more
     /// conservative.
@@ -649,66 +659,33 @@ pub enum BorrowKind {
     /// We can also report errors with this kind of borrow differently.
     Shallow,
 
-    /// Data must be immutable but not aliasable. This kind of borrow
-    /// cannot currently be expressed by the user and is used only in
-    /// implicit closure bindings. It is needed when the closure is
-    /// borrowing or mutating a mutable referent, e.g.:
-    /// ```
-    /// let mut z = 3;
-    /// let x: &mut isize = &mut z;
-    /// let y = || *x += 5;
-    /// ```
-    /// If we were to try to translate this closure into a more explicit
-    /// form, we'd encounter an error with the code as written:
-    /// ```compile_fail,E0594
-    /// struct Env<'a> { x: &'a &'a mut isize }
-    /// let mut z = 3;
-    /// let x: &mut isize = &mut z;
-    /// let y = (&mut Env { x: &x }, fn_ptr);  // Closure is pair of env and fn
-    /// fn fn_ptr(env: &mut Env) { **env.x += 5; }
-    /// ```
-    /// This is then illegal because you cannot mutate an `&mut` found
-    /// in an aliasable location. To solve, you'd have to translate with
-    /// an `&mut` borrow:
-    /// ```compile_fail,E0596
-    /// struct Env<'a> { x: &'a mut &'a mut isize }
-    /// let mut z = 3;
-    /// let x: &mut isize = &mut z;
-    /// let y = (&mut Env { x: &mut x }, fn_ptr); // changed from &x to &mut x
-    /// fn fn_ptr(env: &mut Env) { **env.x += 5; }
-    /// ```
-    /// Now the assignment to `**env.x` is legal, but creating a
-    /// mutable pointer to `x` is not because `x` is not mutable. We
-    /// could fix this by declaring `x` as `let mut x`. This is ok in
-    /// user code, if awkward, but extra weird for closures, since the
-    /// borrow is hidden.
-    ///
-    /// So we introduce a "unique imm" borrow -- the referent is
-    /// immutable, but not aliasable. This solves the problem. For
-    /// simplicity, we don't give users the way to express this
-    /// borrow, it's just used when translating closures.
-    Unique,
-
     /// Data is mutable and not aliasable.
-    Mut {
-        /// `true` if this borrow arose from method-call auto-ref
-        /// (i.e., `adjustment::Adjust::Borrow`).
-        allow_two_phase_borrow: bool,
-    },
+    Mut { kind: MutBorrowKind },
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
+pub enum MutBorrowKind {
+    Default,
+    /// This borrow arose from method-call auto-ref
+    /// (i.e., adjustment::Adjust::Borrow).
+    TwoPhasedBorrow,
+    /// Data must be immutable but not aliasable. This kind of borrow cannot currently
+    /// be expressed by the user and is used only in implicit closure bindings.
+    ClosureCapture,
 }
 
 impl BorrowKind {
     fn from_hir(m: hir_def::type_ref::Mutability) -> Self {
         match m {
             hir_def::type_ref::Mutability::Shared => BorrowKind::Shared,
-            hir_def::type_ref::Mutability::Mut => BorrowKind::Mut { allow_two_phase_borrow: false },
+            hir_def::type_ref::Mutability::Mut => BorrowKind::Mut { kind: MutBorrowKind::Default },
         }
     }
 
     fn from_chalk(m: Mutability) -> Self {
         match m {
             Mutability::Not => BorrowKind::Shared,
-            Mutability::Mut => BorrowKind::Mut { allow_two_phase_borrow: false },
+            Mutability::Mut => BorrowKind::Mut { kind: MutBorrowKind::Default },
         }
     }
 }
@@ -979,8 +956,8 @@ pub enum Rvalue {
     /// `dest = Foo { x: ..., y: ... }` from `dest.x = ...; dest.y = ...;` in the case that `Foo`
     /// has a destructor.
     ///
-    /// Disallowed after deaggregation for all aggregate kinds except `Array` and `Generator`. After
-    /// generator lowering, `Generator` aggregate kinds are disallowed too.
+    /// Disallowed after deaggregation for all aggregate kinds except `Array` and `Coroutine`. After
+    /// coroutine lowering, `Coroutine` aggregate kinds are disallowed too.
     Aggregate(AggregateKind, Box<[Operand]>),
 
     /// Transmutes a `*mut u8` into shallow-initialized `Box<T>`.
@@ -1007,7 +984,7 @@ pub enum Rvalue {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum StatementKind {
     Assign(Place, Rvalue),
-    //FakeRead(Box<(FakeReadCause, Place)>),
+    FakeRead(Place),
     //SetDiscriminant {
     //    place: Box<Place>,
     //    variant_index: VariantIdx,
@@ -1069,6 +1046,10 @@ pub struct MirBody {
 }
 
 impl MirBody {
+    pub fn local_to_binding_map(&self) -> ArenaMap<LocalId, BindingId> {
+        self.binding_locals.iter().map(|(it, y)| (*y, it)).collect()
+    }
+
     fn walk_places(&mut self, mut f: impl FnMut(&mut Place, &mut ProjectionStore)) {
         fn for_operand(
             op: &mut Operand,
@@ -1109,7 +1090,9 @@ impl MirBody {
                             }
                         }
                     }
-                    StatementKind::Deinit(p) => f(p, &mut self.projection_store),
+                    StatementKind::FakeRead(p) | StatementKind::Deinit(p) => {
+                        f(p, &mut self.projection_store)
+                    }
                     StatementKind::StorageLive(_)
                     | StatementKind::StorageDead(_)
                     | StatementKind::Nop => (),
@@ -1124,7 +1107,7 @@ impl MirBody {
                     | TerminatorKind::FalseUnwind { .. }
                     | TerminatorKind::Goto { .. }
                     | TerminatorKind::UnwindResume
-                    | TerminatorKind::GeneratorDrop
+                    | TerminatorKind::CoroutineDrop
                     | TerminatorKind::Abort
                     | TerminatorKind::Return
                     | TerminatorKind::Unreachable => (),
@@ -1182,7 +1165,14 @@ impl MirBody {
 pub enum MirSpan {
     ExprId(ExprId),
     PatId(PatId),
+    SelfParam,
     Unknown,
 }
 
 impl_from!(ExprId, PatId for MirSpan);
+
+impl From<&ExprId> for MirSpan {
+    fn from(value: &ExprId) -> Self {
+        (*value).into()
+    }
+}

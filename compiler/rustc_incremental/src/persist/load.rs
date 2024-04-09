@@ -1,4 +1,4 @@
-//! Code to save/load the dep-graph from files.
+//! Code to load the dep-graph from files.
 
 use crate::errors;
 use rustc_data_structures::memmap::Mmap;
@@ -8,9 +8,10 @@ use rustc_middle::query::on_disk_cache::OnDiskCache;
 use rustc_serialize::opaque::MemDecoder;
 use rustc_serialize::Decodable;
 use rustc_session::config::IncrementalStateAssertion;
-use rustc_session::{Session, StableCrateId};
-use rustc_span::{ErrorGuaranteed, Symbol};
+use rustc_session::Session;
+use rustc_span::ErrorGuaranteed;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::data::*;
 use super::file_format;
@@ -30,8 +31,6 @@ pub enum LoadResult<T> {
     DataOutOfDate,
     /// Loading the dep graph failed.
     LoadDepGraph(PathBuf, std::io::Error),
-    /// Decoding loaded incremental cache failed.
-    DecodeIncrCache(Box<dyn std::any::Any + Send>),
 }
 
 impl<T: Default> LoadResult<T> {
@@ -40,31 +39,26 @@ impl<T: Default> LoadResult<T> {
         // Check for errors when using `-Zassert-incremental-state`
         match (sess.opts.assert_incr_state, &self) {
             (Some(IncrementalStateAssertion::NotLoaded), LoadResult::Ok { .. }) => {
-                sess.emit_fatal(errors::AssertNotLoaded);
+                sess.dcx().emit_fatal(errors::AssertNotLoaded);
             }
             (
                 Some(IncrementalStateAssertion::Loaded),
-                LoadResult::LoadDepGraph(..)
-                | LoadResult::DecodeIncrCache(..)
-                | LoadResult::DataOutOfDate,
+                LoadResult::LoadDepGraph(..) | LoadResult::DataOutOfDate,
             ) => {
-                sess.emit_fatal(errors::AssertLoaded);
+                sess.dcx().emit_fatal(errors::AssertLoaded);
             }
             _ => {}
         };
 
         match self {
             LoadResult::LoadDepGraph(path, err) => {
-                sess.emit_warning(errors::LoadDepGraph { path, err });
-                Default::default()
-            }
-            LoadResult::DecodeIncrCache(err) => {
-                sess.emit_warning(errors::DecodeIncrCache { err: format!("{err:?}") });
+                sess.dcx().emit_warn(errors::LoadDepGraph { path, err });
                 Default::default()
             }
             LoadResult::DataOutOfDate => {
                 if let Err(err) = delete_all_session_dir_contents(sess) {
-                    sess.emit_err(errors::DeleteIncompatible { path: dep_graph_path(sess), err });
+                    sess.dcx()
+                        .emit_err(errors::DeleteIncompatible { path: dep_graph_path(sess), err });
                 }
                 Default::default()
             }
@@ -95,7 +89,7 @@ fn delete_dirty_work_product(sess: &Session, swp: SerializedWorkProduct) {
     work_product::delete_workproduct_files(sess, &swp.work_product);
 }
 
-fn load_dep_graph(sess: &Session) -> LoadResult<(SerializedDepGraph, WorkProductMap)> {
+fn load_dep_graph(sess: &Session) -> LoadResult<(Arc<SerializedDepGraph>, WorkProductMap)> {
     let prof = sess.prof.clone();
 
     if sess.opts.incremental.is_none() {
@@ -107,7 +101,7 @@ fn load_dep_graph(sess: &Session) -> LoadResult<(SerializedDepGraph, WorkProduct
 
     // Calling `sess.incr_comp_session_dir()` will panic if `sess.opts.incremental.is_none()`.
     // Fortunately, we just checked that this isn't the case.
-    let path = dep_graph_path(&sess);
+    let path = dep_graph_path(sess);
     let expected_hash = sess.opts.dep_tracking_hash(false);
 
     let mut prev_work_products = UnordMap::default();
@@ -150,7 +144,6 @@ fn load_dep_graph(sess: &Session) -> LoadResult<(SerializedDepGraph, WorkProduct
     match load_data(&path, sess) {
         LoadResult::DataOutOfDate => LoadResult::DataOutOfDate,
         LoadResult::LoadDepGraph(path, err) => LoadResult::LoadDepGraph(path, err),
-        LoadResult::DecodeIncrCache(err) => LoadResult::DecodeIncrCache(err),
         LoadResult::Ok { data: (bytes, start_pos) } => {
             let mut decoder = MemDecoder::new(&bytes, start_pos);
             let prev_commandline_args_hash = u64::decode(&mut decoder);
@@ -198,13 +191,9 @@ pub fn load_query_result_cache(sess: &Session) -> Option<OnDiskCache<'_>> {
 
 /// Setups the dependency graph by loading an existing graph from disk and set up streaming of a
 /// new graph to an incremental session directory.
-pub fn setup_dep_graph(
-    sess: &Session,
-    crate_name: Symbol,
-    stable_crate_id: StableCrateId,
-) -> Result<DepGraph, ErrorGuaranteed> {
+pub fn setup_dep_graph(sess: &Session) -> Result<DepGraph, ErrorGuaranteed> {
     // `load_dep_graph` can only be called after `prepare_session_directory`.
-    prepare_session_directory(sess, crate_name, stable_crate_id)?;
+    prepare_session_directory(sess)?;
 
     let res = sess.opts.build_dep_graph().then(|| load_dep_graph(sess));
 

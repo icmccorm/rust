@@ -9,7 +9,8 @@
 //      12
 //      1
 
-#![feature(auto_traits, lang_items, no_core, start, intrinsics)]
+#![feature(auto_traits, lang_items, no_core, start, intrinsics, rustc_attrs)]
+#![allow(internal_features)]
 
 #![no_std]
 #![no_core]
@@ -59,9 +60,6 @@ mod libc {
 
 #[lang = "structural_peq"]
 pub trait StructuralPartialEq {}
-
-#[lang = "structural_teq"]
-pub trait StructuralEq {}
 
 #[lang = "drop_in_place"]
 #[allow(unconditional_recursion)]

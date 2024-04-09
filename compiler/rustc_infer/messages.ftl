@@ -66,7 +66,6 @@ infer_await_both_futures = consider `await`ing on both `Future`s
 infer_await_future = consider `await`ing on the `Future`
 infer_await_note = calling an async function returns a future
 
-infer_borrowed_too_long = a value of type `{$ty}` is borrowed for too long
 infer_but_calling_introduces = {$has_param_name ->
     [true] `{$param_name}`
     *[false] `fn` parameter
@@ -170,7 +169,7 @@ infer_lifetime_param_suggestion_elided = each elided lifetime in input position 
 
 infer_meant_byte_literal = if you meant to write a byte literal, prefix with `b`
 infer_meant_char_literal = if you meant to write a `char` literal, use single quotes
-infer_meant_str_literal = if you meant to write a `str` literal, use double quotes
+infer_meant_str_literal = if you meant to write a string literal, use double quotes
 infer_mismatched_static_lifetime = incompatible lifetime on type
 infer_more_targeted = {$has_param_name ->
     [true] `{$param_name}`
@@ -181,22 +180,12 @@ infer_more_targeted = {$has_param_name ->
 } but calling `{$ident}` introduces an implicit `'static` lifetime requirement
 
 infer_msl_introduces_static = introduces a `'static` lifetime requirement
-infer_msl_trait_note = this has an implicit `'static` lifetime requirement
-infer_msl_trait_sugg = consider relaxing the implicit `'static` requirement
 infer_msl_unmet_req = because this has an unmet lifetime requirement
-infer_need_type_info_in_generator =
-    type inside {$generator_kind ->
-    [async_block] `async` block
-    [async_closure] `async` closure
-    [async_fn] `async fn` body
-    *[generator] generator
-    } must be known in this context
-
 
 infer_nothing = {""}
 
 infer_oc_cant_coerce = cannot coerce intrinsics to function pointers
-infer_oc_closure_selfref = closure/generator type that references itself
+infer_oc_closure_selfref = closure/coroutine type that references itself
 infer_oc_const_compat = const not compatible with trait
 infer_oc_fn_lang_correct_type = {$lang_item_name ->
         [panic_impl] `#[panic_handler]`
@@ -233,7 +222,6 @@ infer_prlf_known_limitation = this is a known limitation that will be removed in
 infer_prlf_must_outlive_with_sup = ...must outlive the lifetime `{$sup_symbol}` defined here
 infer_prlf_must_outlive_without_sup = ...must outlive the lifetime defined here
 infer_reborrow = ...so that reference does not outlive borrowed content
-infer_reborrow_upvar = ...so that closure can access `{$name}`
 infer_ref_longer_than_data = in type `{$ty}`, reference has a longer lifetime than the data it references
 
 infer_reference_outlives_referent = ...so that the reference type `{$name}` does not outlive the data it points at
@@ -282,13 +270,10 @@ infer_ril_introduced_by = requirement introduced by this return type
 infer_ril_introduced_here = `'static` requirement introduced here
 infer_ril_static_introduced_by = "`'static` lifetime requirement introduced by the return type
 
-infer_sbfrit_box_return_expr = if you change the return type to expect trait objects, box the returned expressions
-
-infer_sbfrit_change_return_type = you could change the return type to be a boxed trait object
 infer_source_kind_closure_return =
     try giving this closure an explicit return type
 
-# generator_kind  may need to be translated
+# coroutine_kind  may need to be translated
 infer_source_kind_fully_qualified =
     try using a fully qualified path to specify the expected types
 

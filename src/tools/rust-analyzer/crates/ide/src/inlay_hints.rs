@@ -1,5 +1,6 @@
 use std::{
     fmt::{self, Write},
+    hash::{BuildHasher, BuildHasherDefault},
     mem::take,
 };
 
@@ -8,7 +9,7 @@ use hir::{
     known, ClosureStyle, HasVisibility, HirDisplay, HirDisplayError, HirWrite, ModuleDef,
     ModuleDefId, Semantics,
 };
-use ide_db::{base_db::FileRange, famous_defs::FamousDefs, RootDatabase};
+use ide_db::{base_db::FileRange, famous_defs::FamousDefs, FxHasher, RootDatabase};
 use itertools::Itertools;
 use smallvec::{smallvec, SmallVec};
 use stdx::never;
@@ -25,12 +26,14 @@ mod bind_pat;
 mod binding_mode;
 mod chaining;
 mod closing_brace;
-mod closure_ret;
 mod closure_captures;
+mod closure_ret;
 mod discriminant;
 mod fn_lifetime_fn;
+mod implicit_drop;
 mod implicit_static;
 mod param_name;
+mod range_exclusive;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InlayHintsConfig {
@@ -45,10 +48,12 @@ pub struct InlayHintsConfig {
     pub closure_return_type_hints: ClosureReturnTypeHints,
     pub closure_capture_hints: bool,
     pub binding_mode_hints: bool,
+    pub implicit_drop_hints: bool,
     pub lifetime_elision_hints: LifetimeElisionHints,
     pub param_names_for_lifetime_elision_hints: bool,
     pub hide_named_constructor_hints: bool,
     pub hide_closure_initialization_hints: bool,
+    pub range_exclusive_hints: bool,
     pub closure_style: ClosureStyle,
     pub max_length: Option<usize>,
     pub closing_brace_hints_min_lines: Option<usize>,
@@ -112,7 +117,7 @@ pub enum AdjustmentHintsMode {
     PreferPostfix,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum InlayKind {
     Adjustment,
     BindingMode,
@@ -124,9 +129,11 @@ pub enum InlayKind {
     Lifetime,
     Parameter,
     Type,
+    Drop,
+    RangeExclusive,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash)]
 pub enum InlayHintPosition {
     Before,
     After,
@@ -145,13 +152,23 @@ pub struct InlayHint {
     pub label: InlayHintLabel,
     /// Text edit to apply when "accepting" this inlay hint.
     pub text_edit: Option<TextEdit>,
-    pub needs_resolve: bool,
+}
+
+impl std::hash::Hash for InlayHint {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.range.hash(state);
+        self.position.hash(state);
+        self.pad_left.hash(state);
+        self.pad_right.hash(state);
+        self.kind.hash(state);
+        self.label.hash(state);
+        self.text_edit.is_some().hash(state);
+    }
 }
 
 impl InlayHint {
     fn closing_paren_after(kind: InlayKind, range: TextRange) -> InlayHint {
         InlayHint {
-            needs_resolve: false,
             range,
             kind,
             label: InlayHintLabel::from(")"),
@@ -161,9 +178,9 @@ impl InlayHint {
             pad_right: false,
         }
     }
+
     fn opening_paren_before(kind: InlayKind, range: TextRange) -> InlayHint {
         InlayHint {
-            needs_resolve: false,
             range,
             kind,
             label: InlayHintLabel::from("("),
@@ -173,15 +190,19 @@ impl InlayHint {
             pad_right: false,
         }
     }
+
+    pub fn needs_resolve(&self) -> bool {
+        self.text_edit.is_some() || self.label.needs_resolve()
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash)]
 pub enum InlayTooltip {
     String(String),
     Markdown(String),
 }
 
-#[derive(Default)]
+#[derive(Default, Hash)]
 pub struct InlayHintLabel {
     pub parts: SmallVec<[InlayHintLabelPart; 1]>,
 }
@@ -259,6 +280,7 @@ impl fmt::Debug for InlayHintLabel {
     }
 }
 
+#[derive(Hash)]
 pub struct InlayHintLabelPart {
     pub text: String,
     /// Source location represented by this label part. The client will use this to fetch the part's
@@ -307,11 +329,10 @@ impl fmt::Write for InlayHintLabelBuilder<'_> {
 
 impl HirWrite for InlayHintLabelBuilder<'_> {
     fn start_location_link(&mut self, def: ModuleDefId) {
-        if self.location.is_some() {
-            never!("location link is already started");
-        }
+        never!(self.location.is_some(), "location link is already started");
         self.make_new_part();
         let Some(location) = ModuleDef::from(def).try_to_nav(self.db) else { return };
+        let location = location.call_site();
         let location =
             FileRange { file_id: location.file_id, range: location.focus_or_full_range() };
         self.location = Some(location);
@@ -350,7 +371,7 @@ fn label_of_ty(
         label_builder: &mut InlayHintLabelBuilder<'_>,
         config: &InlayHintsConfig,
     ) -> Result<(), HirDisplayError> {
-        let iter_item_type = hint_iterator(sema, famous_defs, &ty);
+        let iter_item_type = hint_iterator(sema, famous_defs, ty);
         match iter_item_type {
             Some((iter_trait, item, ty)) => {
                 const LABEL_START: &str = "impl ";
@@ -442,7 +463,7 @@ pub(crate) fn inlay_hints(
     range_limit: Option<TextRange>,
     config: &InlayHintsConfig,
 ) -> Vec<InlayHint> {
-    let _p = profile::span("inlay_hints");
+    let _p = tracing::span!(tracing::Level::INFO, "inlay_hints").entered();
     let sema = Semantics::new(db);
     let file = sema.parse(file_id);
     let file = file.syntax();
@@ -468,6 +489,39 @@ pub(crate) fn inlay_hints(
     acc
 }
 
+pub(crate) fn inlay_hints_resolve(
+    db: &RootDatabase,
+    file_id: FileId,
+    position: TextSize,
+    hash: u64,
+    config: &InlayHintsConfig,
+) -> Option<InlayHint> {
+    let _p = tracing::span!(tracing::Level::INFO, "inlay_hints").entered();
+    let sema = Semantics::new(db);
+    let file = sema.parse(file_id);
+    let file = file.syntax();
+
+    let scope = sema.scope(file)?;
+    let famous_defs = FamousDefs(&sema, scope.krate());
+    let mut acc = Vec::new();
+
+    let hints = |node| hints(&mut acc, &famous_defs, config, file_id, node);
+    match file.token_at_offset(position).left_biased() {
+        Some(token) => {
+            if let Some(parent_block) = token.parent_ancestors().find_map(ast::BlockExpr::cast) {
+                parent_block.syntax().descendants().for_each(hints)
+            } else if let Some(parent_item) = token.parent_ancestors().find_map(ast::Item::cast) {
+                parent_item.syntax().descendants().for_each(hints)
+            } else {
+                return None;
+            }
+        }
+        None => return None,
+    }
+
+    acc.into_iter().find(|hint| BuildHasherDefault::<FxHasher>::default().hash_one(hint) == hash)
+}
+
 fn hints(
     hints: &mut Vec<InlayHint>,
     famous_defs @ FamousDefs(sema, _): &FamousDefs<'_, '_>,
@@ -490,20 +544,30 @@ fn hints(
                         closure_captures::hints(hints, famous_defs, config, file_id, it.clone());
                         closure_ret::hints(hints, famous_defs, config, file_id, it)
                     },
+                    ast::Expr::RangeExpr(it) => range_exclusive::hints(hints, config, it),
                     _ => None,
                 }
             },
             ast::Pat(it) => {
                 binding_mode::hints(hints, sema, config, &it);
-                if let ast::Pat::IdentPat(it) = it {
-                    bind_pat::hints(hints, famous_defs, config, file_id, &it);
+                match it {
+                    ast::Pat::IdentPat(it) => {
+                        bind_pat::hints(hints, famous_defs, config, file_id, &it);
+                    }
+                    ast::Pat::RangePat(it) => {
+                        range_exclusive::hints(hints, config, it);
+                    }
+                    _ => {}
                 }
                 Some(())
             },
             ast::Item(it) => match it {
                 // FIXME: record impl lifetimes so they aren't being reused in assoc item lifetime inlay hints
                 ast::Item::Impl(_) => None,
-                ast::Item::Fn(it) => fn_lifetime_fn::hints(hints, config, it),
+                ast::Item::Fn(it) => {
+                    implicit_drop::hints(hints, sema, config, &it);
+                    fn_lifetime_fn::hints(hints, config, it)
+                },
                 // static type elisions
                 ast::Item::Static(it) => implicit_static::hints(hints, config, Either::Left(it)),
                 ast::Item::Const(it) => implicit_static::hints(hints, config, Either::Right(it)),
@@ -590,6 +654,8 @@ mod tests {
         max_length: None,
         closing_brace_hints_min_lines: None,
         fields_to_resolve: InlayFieldsToResolve::empty(),
+        implicit_drop_hints: false,
+        range_exclusive_hints: false,
     };
     pub(super) const TEST_CONFIG: InlayHintsConfig = InlayHintsConfig {
         type_hints: true,
@@ -620,13 +686,6 @@ mod tests {
         expected.sort_by_key(|(range, _)| range.start());
 
         assert_eq!(expected, actual, "\nExpected:\n{expected:#?}\n\nActual:\n{actual:#?}");
-    }
-
-    #[track_caller]
-    pub(super) fn check_expect(config: InlayHintsConfig, ra_fixture: &str, expect: Expect) {
-        let (analysis, file_id) = fixture::file(ra_fixture);
-        let inlay_hints = analysis.inlay_hints(&config, file_id, None).unwrap();
-        expect.assert_debug_eq(&inlay_hints)
     }
 
     /// Computes inlay hints for the fixture, applies all the provided text edits and then runs

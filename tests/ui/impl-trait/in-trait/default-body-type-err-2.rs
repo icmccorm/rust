@@ -1,7 +1,4 @@
-// edition:2021
-
-#![allow(incomplete_features)]
-#![feature(async_fn_in_trait)]
+//@ edition:2021
 
 pub trait Foo {
     async fn woopsie_async(&self) -> String {

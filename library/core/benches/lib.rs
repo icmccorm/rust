@@ -5,6 +5,7 @@
 #![feature(trusted_random_access)]
 #![feature(iter_array_chunks)]
 #![feature(iter_next_chunk)]
+#![feature(iter_advance_by)]
 
 extern crate test;
 
@@ -15,6 +16,7 @@ mod char;
 mod fmt;
 mod hash;
 mod iter;
+mod net;
 mod num;
 mod ops;
 mod pattern;

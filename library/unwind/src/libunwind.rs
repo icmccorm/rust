@@ -1,6 +1,6 @@
 #![allow(nonstandard_style)]
 
-use libc::{c_int, c_void, uintptr_t};
+use libc::{c_int, c_void};
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -19,8 +19,8 @@ pub enum _Unwind_Reason_Code {
 pub use _Unwind_Reason_Code::*;
 
 pub type _Unwind_Exception_Class = u64;
-pub type _Unwind_Word = uintptr_t;
-pub type _Unwind_Ptr = uintptr_t;
+pub type _Unwind_Word = *const u8;
+pub type _Unwind_Ptr = *const u8;
 pub type _Unwind_Trace_Fn =
     extern "C" fn(ctx: *mut _Unwind_Context, arg: *mut c_void) -> _Unwind_Reason_Code;
 
@@ -91,7 +91,7 @@ pub struct _Unwind_Exception {
 pub enum _Unwind_Context {}
 
 pub type _Unwind_Exception_Cleanup_Fn =
-    extern "C" fn(unwind_code: _Unwind_Reason_Code, exception: *mut _Unwind_Exception);
+    Option<extern "C" fn(unwind_code: _Unwind_Reason_Code, exception: *mut _Unwind_Exception)>;
 
 // FIXME: The `#[link]` attributes on `extern "C"` block marks those symbols declared in
 // the block are reexported in dylib build of std. This is needed when build rustc with
@@ -103,7 +103,10 @@ pub type _Unwind_Exception_Cleanup_Fn =
 // and RFC 2841
 #[cfg_attr(
     any(
-        all(feature = "llvm-libunwind", any(target_os = "fuchsia", target_os = "linux")),
+        all(
+            feature = "llvm-libunwind",
+            any(target_os = "fuchsia", target_os = "linux", target_os = "xous")
+        ),
         all(target_os = "windows", target_env = "gnu", target_abi = "llvm")
     ),
     link(name = "unwind", kind = "static", modifiers = "-bundle")
@@ -120,7 +123,7 @@ extern "C" {
 }
 
 cfg_if::cfg_if! {
-if #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "netbsd", not(target_arch = "arm")))] {
+if #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos", target_os = "netbsd", not(target_arch = "arm")))] {
     // Not ARM EHABI
     #[repr(C)]
     #[derive(Copy, Clone, PartialEq)]
@@ -134,7 +137,7 @@ if #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos", targe
     pub use _Unwind_Action::*;
 
     #[cfg_attr(
-        all(feature = "llvm-libunwind", any(target_os = "fuchsia", target_os = "linux")),
+        all(feature = "llvm-libunwind", any(target_os = "fuchsia", target_os = "linux", target_os = "xous")),
         link(name = "unwind", kind = "static", modifiers = "-bundle")
     )]
     extern "C" {
@@ -192,7 +195,7 @@ if #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos", targe
     pub const UNWIND_IP_REG: c_int = 15;
 
     #[cfg_attr(
-        all(feature = "llvm-libunwind", any(target_os = "fuchsia", target_os = "linux")),
+        all(feature = "llvm-libunwind", any(target_os = "fuchsia", target_os = "linux", target_os = "xous")),
         link(name = "unwind", kind = "static", modifiers = "-bundle")
     )]
     extern "C" {
@@ -214,29 +217,29 @@ if #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos", targe
     // On Android or ARM/Linux, these are implemented as macros:
 
     pub unsafe fn _Unwind_GetGR(ctx: *mut _Unwind_Context, reg_index: c_int) -> _Unwind_Word {
-        let mut val: _Unwind_Word = 0;
+        let mut val: _Unwind_Word = core::ptr::null();
         _Unwind_VRS_Get(ctx, _UVRSC_CORE, reg_index as _Unwind_Word, _UVRSD_UINT32,
-                        &mut val as *mut _ as *mut c_void);
+                        core::ptr::addr_of_mut!(val) as *mut c_void);
         val
     }
 
     pub unsafe fn _Unwind_SetGR(ctx: *mut _Unwind_Context, reg_index: c_int, value: _Unwind_Word) {
         let mut value = value;
         _Unwind_VRS_Set(ctx, _UVRSC_CORE, reg_index as _Unwind_Word, _UVRSD_UINT32,
-                        &mut value as *mut _ as *mut c_void);
+                        core::ptr::addr_of_mut!(value) as *mut c_void);
     }
 
     pub unsafe fn _Unwind_GetIP(ctx: *mut _Unwind_Context)
                                 -> _Unwind_Word {
         let val = _Unwind_GetGR(ctx, UNWIND_IP_REG);
-        (val & !1) as _Unwind_Word
+        val.map_addr(|v| v & !1)
     }
 
     pub unsafe fn _Unwind_SetIP(ctx: *mut _Unwind_Context,
                                 value: _Unwind_Word) {
         // Propagate thumb bit to instruction pointer
-        let thumb_state = _Unwind_GetGR(ctx, UNWIND_IP_REG) & 1;
-        let value = value | thumb_state;
+        let thumb_state = _Unwind_GetGR(ctx, UNWIND_IP_REG).addr() & 1;
+        let value = value.map_addr(|v| v | thumb_state);
         _Unwind_SetGR(ctx, UNWIND_IP_REG, value);
     }
 
@@ -258,14 +261,14 @@ cfg_if::cfg_if! {
 if #[cfg(not(all(target_os = "ios", target_arch = "arm")))] {
     // Not 32-bit iOS
     #[cfg_attr(
-        all(feature = "llvm-libunwind", any(target_os = "fuchsia", target_os = "linux")),
+        all(feature = "llvm-libunwind", any(target_os = "fuchsia", target_os = "linux", target_os = "xous")),
         link(name = "unwind", kind = "static", modifiers = "-bundle")
     )]
     extern "C-unwind" {
         pub fn _Unwind_RaiseException(exception: *mut _Unwind_Exception) -> _Unwind_Reason_Code;
     }
     #[cfg_attr(
-        all(feature = "llvm-libunwind", any(target_os = "fuchsia", target_os = "linux")),
+        all(feature = "llvm-libunwind", any(target_os = "fuchsia", target_os = "linux", target_os = "xous")),
         link(name = "unwind", kind = "static", modifiers = "-bundle")
     )]
     extern "C" {

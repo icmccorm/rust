@@ -9,8 +9,6 @@
       let mut _4: &i32;
       let _5: *const i32;
 +     let mut _6: &[&i32; 1];
-      scope 1 {
-      }
   
       bb0: {
           StorageLive(_1);
@@ -18,11 +16,11 @@
 -         StorageLive(_3);
 -         StorageLive(_4);
 -         StorageLive(_5);
--         _5 = const {alloc3: *const i32};
+-         _5 = const {ALLOC0: *const i32};
 -         _4 = &(*_5);
 -         _3 = [move _4];
 -         _2 = &_3;
-+         _6 = const _;
++         _6 = const FOO::promoted[0];
 +         _2 = &(*_6);
           _1 = move _2 as &[&i32] (PointerCoercion(Unsize));
 -         StorageDead(_4);
@@ -42,5 +40,5 @@
       }
   }
 - 
-- alloc3 (extern static: X)
+- ALLOC0 (extern static: X)
   

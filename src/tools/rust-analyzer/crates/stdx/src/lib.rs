@@ -1,19 +1,21 @@
 //! Missing batteries for standard libraries.
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![warn(rust_2018_idioms, unused_lifetimes)]
 
 use std::io as sio;
 use std::process::Command;
 use std::{cmp::Ordering, ops, time::Instant};
 
+pub mod anymap;
 mod macros;
-pub mod process;
-pub mod panic_context;
 pub mod non_empty_vec;
+pub mod panic_context;
+pub mod process;
 pub mod rand;
 pub mod thread;
 
 pub use always_assert::{always, never};
+pub use itertools;
 
 #[inline(always)]
 pub fn is_ci() -> bool {
@@ -21,12 +23,14 @@ pub fn is_ci() -> bool {
 }
 
 #[must_use]
+#[allow(clippy::print_stderr)]
 pub fn timeit(label: &'static str) -> impl Drop {
     let start = Instant::now();
     defer(move || eprintln!("{}: {:.2?}", label, start.elapsed()))
 }
 
 /// Prints backtrace to stderr, useful for debugging.
+#[allow(clippy::print_stderr)]
 pub fn print_backtrace() {
     #[cfg(feature = "backtrace")]
     eprintln!("{:?}", backtrace::Backtrace::new());
@@ -37,6 +41,35 @@ pub fn print_backtrace() {
 Uncomment `default = [ "backtrace" ]` in `crates/stdx/Cargo.toml`.
 "#
     );
+}
+
+pub trait TupleExt {
+    type Head;
+    type Tail;
+    fn head(self) -> Self::Head;
+    fn tail(self) -> Self::Tail;
+}
+
+impl<T, U> TupleExt for (T, U) {
+    type Head = T;
+    type Tail = U;
+    fn head(self) -> Self::Head {
+        self.0
+    }
+    fn tail(self) -> Self::Tail {
+        self.1
+    }
+}
+
+impl<T, U, V> TupleExt for (T, U, V) {
+    type Head = T;
+    type Tail = V;
+    fn head(self) -> Self::Head {
+        self.0
+    }
+    fn tail(self) -> Self::Tail {
+        self.2
+    }
 }
 
 pub fn to_lower_snake_case(s: &str) -> String {
@@ -87,6 +120,61 @@ where
     }
 
     words.join("_")
+}
+
+// Taken from rustc.
+pub fn to_camel_case(ident: &str) -> String {
+    ident
+        .trim_matches('_')
+        .split('_')
+        .filter(|component| !component.is_empty())
+        .map(|component| {
+            let mut camel_cased_component = String::with_capacity(component.len());
+
+            let mut new_word = true;
+            let mut prev_is_lower_case = true;
+
+            for c in component.chars() {
+                // Preserve the case if an uppercase letter follows a lowercase letter, so that
+                // `camelCase` is converted to `CamelCase`.
+                if prev_is_lower_case && c.is_uppercase() {
+                    new_word = true;
+                }
+
+                if new_word {
+                    camel_cased_component.extend(c.to_uppercase());
+                } else {
+                    camel_cased_component.extend(c.to_lowercase());
+                }
+
+                prev_is_lower_case = c.is_lowercase();
+                new_word = false;
+            }
+
+            camel_cased_component
+        })
+        .fold((String::new(), None), |(acc, prev): (_, Option<String>), next| {
+            // separate two components with an underscore if their boundary cannot
+            // be distinguished using an uppercase/lowercase case distinction
+            let join = prev
+                .and_then(|prev| {
+                    let f = next.chars().next()?;
+                    let l = prev.chars().last()?;
+                    Some(!char_has_case(l) && !char_has_case(f))
+                })
+                .unwrap_or(false);
+            (acc + if join { "_" } else { "" } + &next, Some(next))
+        })
+        .0
+}
+
+// Taken from rustc.
+pub fn char_has_case(c: char) -> bool {
+    c.is_lowercase() || c.is_uppercase()
+}
+
+pub fn is_upper_snake_case(s: &str) -> bool {
+    s.chars().all(|c| c.is_uppercase() || c == '_' || c.is_numeric())
 }
 
 pub fn replace(buf: &mut String, from: char, to: &str) {
@@ -212,6 +300,22 @@ where
 /// Returns all final segments of the argument, longest first.
 pub fn slice_tails<T>(this: &[T]) -> impl Iterator<Item = &[T]> {
     (0..this.len()).map(|i| &this[i..])
+}
+
+pub trait IsNoneOr {
+    type Type;
+    #[allow(clippy::wrong_self_convention)]
+    fn is_none_or(self, s: impl FnOnce(Self::Type) -> bool) -> bool;
+}
+#[allow(unstable_name_collisions)]
+impl<T> IsNoneOr for Option<T> {
+    type Type = T;
+    fn is_none_or(self, f: impl FnOnce(T) -> bool) -> bool {
+        match self {
+            Some(v) => f(v),
+            None => true,
+        }
+    }
 }
 
 #[cfg(test)]

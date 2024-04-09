@@ -255,9 +255,7 @@ fn is_literal_pat_start(p: &Parser<'_>) -> bool {
 fn literal_pat(p: &mut Parser<'_>) -> CompletedMarker {
     assert!(is_literal_pat_start(p));
     let m = p.start();
-    if p.at(T![-]) {
-        p.bump(T![-]);
-    }
+    p.eat(T![-]);
     expressions::literal(p);
     m.complete(p, LITERAL_PAT)
 }
@@ -321,6 +319,15 @@ fn record_pat_field(p: &mut Parser<'_>) {
         IDENT | INT_NUMBER if p.nth(1) == T![:] => {
             name_ref_or_index(p);
             p.bump(T![:]);
+            pattern(p);
+        }
+        // test_err record_pat_field_eq_recovery
+        // fn main() {
+        //     let S { field = foo };
+        // }
+        IDENT | INT_NUMBER if p.nth(1) == T![=] => {
+            name_ref_or_index(p);
+            p.err_and_bump("expected `:`");
             pattern(p);
         }
         T![box] => {
@@ -459,14 +466,12 @@ fn slice_pat(p: &mut Parser<'_>) -> CompletedMarker {
 fn pat_list(p: &mut Parser<'_>, ket: SyntaxKind) {
     while !p.at(EOF) && !p.at(ket) {
         pattern_top(p);
-        if !p.at(T![,]) {
+        if !p.eat(T![,]) {
             if p.at_ts(PAT_TOP_FIRST) {
                 p.error(format!("expected {:?}, got {:?}", T![,], p.current()));
             } else {
                 break;
             }
-        } else {
-            p.bump(T![,]);
         }
     }
 }

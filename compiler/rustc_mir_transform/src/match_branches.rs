@@ -1,4 +1,3 @@
-use crate::MirPass;
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 use std::iter;
@@ -175,7 +174,7 @@ impl<'tcx> MirPass<'tcx> for MatchBranchSimplification {
         }
 
         if should_cleanup {
-            simplify_cfg(tcx, body);
+            simplify_cfg(body);
         }
     }
 }

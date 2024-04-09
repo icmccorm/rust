@@ -6,20 +6,29 @@
 //! match those defined by C, so that code that interacts with C will
 //! refer to the correct types.
 
-#![stable(feature = "", since = "1.30.0")]
+#![stable(feature = "core_ffi", since = "1.30.0")]
 #![allow(non_camel_case_types)]
 
 use crate::fmt;
 use crate::marker::PhantomData;
-use crate::num::*;
 use crate::ops::{Deref, DerefMut};
 
+#[doc(no_inline)]
 #[stable(feature = "core_c_str", since = "1.64.0")]
-pub use self::c_str::{CStr, FromBytesUntilNulError, FromBytesWithNulError};
+pub use self::c_str::FromBytesWithNulError;
 
-mod c_str;
+#[doc(no_inline)]
+#[stable(feature = "cstr_from_bytes_until_nul", since = "1.69.0")]
+pub use self::c_str::FromBytesUntilNulError;
 
-macro_rules! type_alias_no_nz {
+#[doc(inline)]
+#[stable(feature = "core_c_str", since = "1.64.0")]
+pub use self::c_str::CStr;
+
+#[unstable(feature = "c_str_module", issue = "112134")]
+pub mod c_str;
+
+macro_rules! type_alias {
     {
       $Docfile:tt, $Alias:ident = $Real:ty;
       $( $Cfg:tt )*
@@ -31,49 +40,24 @@ macro_rules! type_alias_no_nz {
     }
 }
 
-// To verify that the NonZero types in this file's macro invocations correspond
-//
-//  perl -n < library/std/src/os/raw/mod.rs -e 'next unless m/type_alias\!/; die "$_ ?" unless m/, (c_\w+) = (\w+), NonZero_(\w+) = NonZero(\w+)/; die "$_ ?" unless $3 eq $1 and $4 eq ucfirst $2'
-//
-// NB this does not check that the main c_* types are right.
+type_alias! { "c_char.md", c_char = c_char_definition::c_char; #[doc(cfg(all()))] }
 
-macro_rules! type_alias {
-    {
-      $Docfile:tt, $Alias:ident = $Real:ty, $NZAlias:ident = $NZReal:ty;
-      $( $Cfg:tt )*
-    } => {
-        type_alias_no_nz! { $Docfile, $Alias = $Real; $( $Cfg )* }
+type_alias! { "c_schar.md", c_schar = i8; }
+type_alias! { "c_uchar.md", c_uchar = u8; }
+type_alias! { "c_short.md", c_short = i16; }
+type_alias! { "c_ushort.md", c_ushort = u16; }
 
-        #[doc = concat!("Type alias for `NonZero` version of [`", stringify!($Alias), "`]")]
-        #[unstable(feature = "raw_os_nonzero", issue = "82363")]
-        $( $Cfg )*
-        pub type $NZAlias = $NZReal;
-    }
-}
+type_alias! { "c_int.md", c_int = c_int_definition::c_int; #[doc(cfg(all()))] }
+type_alias! { "c_uint.md", c_uint = c_int_definition::c_uint; #[doc(cfg(all()))] }
 
-type_alias! { "c_char.md", c_char = c_char_definition::c_char, NonZero_c_char = c_char_definition::NonZero_c_char;
-#[doc(cfg(all()))] }
+type_alias! { "c_long.md", c_long = c_long_definition::c_long; #[doc(cfg(all()))] }
+type_alias! { "c_ulong.md", c_ulong = c_long_definition::c_ulong; #[doc(cfg(all()))] }
 
-type_alias! { "c_schar.md", c_schar = i8, NonZero_c_schar = NonZeroI8; }
-type_alias! { "c_uchar.md", c_uchar = u8, NonZero_c_uchar = NonZeroU8; }
-type_alias! { "c_short.md", c_short = i16, NonZero_c_short = NonZeroI16; }
-type_alias! { "c_ushort.md", c_ushort = u16, NonZero_c_ushort = NonZeroU16; }
+type_alias! { "c_longlong.md", c_longlong = i64; }
+type_alias! { "c_ulonglong.md", c_ulonglong = u64; }
 
-type_alias! { "c_int.md", c_int = c_int_definition::c_int, NonZero_c_int = c_int_definition::NonZero_c_int;
-#[doc(cfg(all()))] }
-type_alias! { "c_uint.md", c_uint = c_int_definition::c_uint, NonZero_c_uint = c_int_definition::NonZero_c_uint;
-#[doc(cfg(all()))] }
-
-type_alias! { "c_long.md", c_long = c_long_definition::c_long, NonZero_c_long = c_long_definition::NonZero_c_long;
-#[doc(cfg(all()))] }
-type_alias! { "c_ulong.md", c_ulong = c_long_definition::c_ulong, NonZero_c_ulong = c_long_definition::NonZero_c_ulong;
-#[doc(cfg(all()))] }
-
-type_alias! { "c_longlong.md", c_longlong = i64, NonZero_c_longlong = NonZeroI64; }
-type_alias! { "c_ulonglong.md", c_ulonglong = u64, NonZero_c_ulonglong = NonZeroU64; }
-
-type_alias_no_nz! { "c_float.md", c_float = f32; }
-type_alias_no_nz! { "c_double.md", c_double = f64; }
+type_alias! { "c_float.md", c_float = f32; }
+type_alias! { "c_double.md", c_double = f64; }
 
 /// Equivalent to C's `size_t` type, from `stddef.h` (or `cstddef` for C++).
 ///
@@ -152,11 +136,9 @@ mod c_char_definition {
             target_os = "horizon"
         ))] {
             pub type c_char = u8;
-            pub type NonZero_c_char = crate::num::NonZeroU8;
         } else {
             // On every other target, c_char is signed.
             pub type c_char = i8;
-            pub type NonZero_c_char = crate::num::NonZeroI8;
         }
     }
 }
@@ -165,14 +147,10 @@ mod c_int_definition {
     cfg_if! {
         if #[cfg(any(target_arch = "avr", target_arch = "msp430"))] {
             pub type c_int = i16;
-            pub type NonZero_c_int = crate::num::NonZeroI16;
             pub type c_uint = u16;
-            pub type NonZero_c_uint = crate::num::NonZeroU16;
         } else {
             pub type c_int = i32;
-            pub type NonZero_c_int = crate::num::NonZeroI32;
             pub type c_uint = u32;
-            pub type NonZero_c_uint = crate::num::NonZeroU32;
         }
     }
 }
@@ -181,15 +159,11 @@ mod c_long_definition {
     cfg_if! {
         if #[cfg(all(target_pointer_width = "64", not(windows)))] {
             pub type c_long = i64;
-            pub type NonZero_c_long = crate::num::NonZeroI64;
             pub type c_ulong = u64;
-            pub type NonZero_c_ulong = crate::num::NonZeroU64;
         } else {
             // The minimal size of `long` in the C standard is 32 bits
             pub type c_long = i32;
-            pub type NonZero_c_long = crate::num::NonZeroI32;
             pub type c_ulong = u32;
-            pub type NonZero_c_ulong = crate::num::NonZeroU32;
         }
     }
 }
@@ -241,7 +215,6 @@ impl fmt::Debug for c_void {
     ),
     all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios", target_os = "tvos")),
     target_family = "wasm",
-    target_arch = "asmjs",
     target_os = "uefi",
     windows,
 ))]
@@ -270,7 +243,6 @@ pub struct VaListImpl<'f> {
     ),
     all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios", target_os = "tvos")),
     target_family = "wasm",
-    target_arch = "asmjs",
     target_os = "uefi",
     windows,
 ))]
@@ -395,7 +367,6 @@ pub struct VaList<'a, 'f: 'a> {
             any(target_os = "macos", target_os = "ios", target_os = "tvos")
         ),
         target_family = "wasm",
-        target_arch = "asmjs",
         target_os = "uefi",
         windows,
     ))]
@@ -413,7 +384,6 @@ pub struct VaList<'a, 'f: 'a> {
             not(any(target_os = "macos", target_os = "ios", target_os = "tvos"))
         ),
         not(target_family = "wasm"),
-        not(target_arch = "asmjs"),
         not(target_os = "uefi"),
         not(windows),
     ))]
@@ -431,7 +401,6 @@ pub struct VaList<'a, 'f: 'a> {
     ),
     all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios", target_os = "tvos")),
     target_family = "wasm",
-    target_arch = "asmjs",
     target_os = "uefi",
     windows,
 ))]
@@ -461,7 +430,6 @@ impl<'f> VaListImpl<'f> {
         not(any(target_os = "macos", target_os = "ios", target_os = "tvos"))
     ),
     not(target_family = "wasm"),
-    not(target_arch = "asmjs"),
     not(target_os = "uefi"),
     not(windows),
 ))]

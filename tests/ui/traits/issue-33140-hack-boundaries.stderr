@@ -60,7 +60,7 @@ error[E0119]: conflicting implementations of trait `Trait5` for type `(dyn Send 
 LL | impl Trait5 for dyn Send {}
    | ------------------------ first implementation here
 LL | impl Trait5 for dyn Send where u32: Copy {}
-   | ^^^^^^^^^^^^^^^^^^^^^^^^ conflicting implementation for `(dyn Send + 'static)`
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ conflicting implementation for `(dyn Send + 'static)`
 
 error: aborting due to 8 previous errors
 
@@ -77,9 +77,4 @@ LL | impl Trait0 for dyn Send {}
    |
    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
    = note: for more information, see issue #56484 <https://github.com/rust-lang/rust/issues/56484>
-note: the lint level is defined here
-  --> $DIR/issue-33140-hack-boundaries.rs:2:10
-   |
-LL | #![allow(order_dependent_trait_objects)]
-   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

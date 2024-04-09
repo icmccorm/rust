@@ -391,11 +391,11 @@ pub use self::traits::Iterator;
 pub use self::range::Step;
 
 #[unstable(
-    feature = "iter_from_generator",
+    feature = "iter_from_coroutine",
     issue = "43122",
-    reason = "generators are unstable"
+    reason = "coroutines are unstable"
 )]
-pub use self::sources::from_generator;
+pub use self::sources::from_coroutine;
 #[stable(feature = "iter_empty", since = "1.2.0")]
 pub use self::sources::{empty, Empty};
 #[stable(feature = "iter_from_fn", since = "1.34.0")]
@@ -417,6 +417,8 @@ pub use self::sources::{successors, Successors};
 pub use self::traits::FusedIterator;
 #[unstable(issue = "none", feature = "inplace_iteration")]
 pub use self::traits::InPlaceIterable;
+#[unstable(issue = "none", feature = "trusted_fused")]
+pub use self::traits::TrustedFused;
 #[unstable(feature = "trusted_len", issue = "37572")]
 pub use self::traits::TrustedLen;
 #[unstable(feature = "trusted_step", issue = "85731")]

@@ -1,13 +1,9 @@
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
-
 use crate::region_infer::RegionInferenceContext;
-use crate::Upvar;
 use rustc_index::IndexSlice;
 use rustc_middle::mir::{Body, Local};
-use rustc_middle::ty::{RegionVid, TyCtxt};
-use rustc_span::source_map::Span;
+use rustc_middle::ty::{self, RegionVid, TyCtxt};
 use rustc_span::symbol::Symbol;
+use rustc_span::Span;
 
 impl<'tcx> RegionInferenceContext<'tcx> {
     pub(crate) fn get_var_name_and_span_for_region(
@@ -15,7 +11,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         local_names: &IndexSlice<Local, Option<Symbol>>,
-        upvars: &[Upvar<'tcx>],
+        upvars: &[&ty::CapturedPlace<'tcx>],
         fr: RegionVid,
     ) -> Option<(Option<Symbol>, Span)> {
         debug!("get_var_name_and_span_for_region(fr={fr:?})");
@@ -66,10 +62,10 @@ impl<'tcx> RegionInferenceContext<'tcx> {
     pub(crate) fn get_upvar_name_and_span_for_region(
         &self,
         tcx: TyCtxt<'tcx>,
-        upvars: &[Upvar<'tcx>],
+        upvars: &[&ty::CapturedPlace<'tcx>],
         upvar_index: usize,
     ) -> (Symbol, Span) {
-        let upvar_hir_id = upvars[upvar_index].place.get_root_variable();
+        let upvar_hir_id = upvars[upvar_index].get_root_variable();
         debug!("get_upvar_name_and_span_for_region: upvar_hir_id={upvar_hir_id:?}");
 
         let upvar_name = tcx.hir().name(upvar_hir_id);

@@ -4,14 +4,15 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
+# tidy-alphabetical-start
+rustc_abi = { path = "../rustc_abi" }
+rustc_data_structures = { path = "../rustc_data_structures" }
 rustc_hir = { path = "../rustc_hir" }
 rustc_middle = { path = "../rustc_middle" }
+rustc_session = { path = "../rustc_session" }
 rustc_span = { path = "../rustc_span" }
 rustc_target = { path = "../rustc_target" }
-rustc_driver = { path = "../rustc_driver" }
-rustc_interface = { path = "../rustc_interface" }
-rustc_session = {path = "../rustc_session" }
-tracing = "0.1"
+scoped-tls = "1.0"
 stable_mir = {path = "../stable_mir" }
-
-[features]
+tracing = "0.1"
+# tidy-alphabetical-end

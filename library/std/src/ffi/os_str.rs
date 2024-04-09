@@ -1,3 +1,5 @@
+//! The [`OsStr`] and [`OsString`] types and associated utilities.
+
 #[cfg(test)]
 mod tests;
 
@@ -6,8 +8,9 @@ use crate::cmp;
 use crate::collections::TryReserveError;
 use crate::fmt;
 use crate::hash::{Hash, Hasher};
-use crate::ops;
+use crate::ops::{self, Range};
 use crate::rc::Rc;
+use crate::slice;
 use crate::str::FromStr;
 use crate::sync::Arc;
 
@@ -154,7 +157,7 @@ impl OsString {
     /// # Safety
     ///
     /// As the encoding is unspecified, callers must pass in bytes that originated as a mixture of
-    /// validated UTF-8 and bytes from [`OsStr::as_encoded_bytes`] from within the same rust version
+    /// validated UTF-8 and bytes from [`OsStr::as_encoded_bytes`] from within the same Rust version
     /// built for the same target platform.  For example, reconstructing an `OsString` from bytes sent
     /// over the network or stored in a file will likely violate these safety rules.
     ///
@@ -179,7 +182,7 @@ impl OsString {
     ///
     /// [conversions]: super#conversions
     #[inline]
-    #[stable(feature = "os_str_bytes", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "os_str_bytes", since = "1.74.0")]
     pub unsafe fn from_encoded_bytes_unchecked(bytes: Vec<u8>) -> Self {
         OsString { inner: Buf::from_encoded_bytes_unchecked(bytes) }
     }
@@ -210,14 +213,14 @@ impl OsString {
     /// ASCII.
     ///
     /// Note: As the encoding is unspecified, any sub-slice of bytes that is not valid UTF-8 should
-    /// be treated as opaque and only comparable within the same rust version built for the same
+    /// be treated as opaque and only comparable within the same Rust version built for the same
     /// target platform.  For example, sending the bytes over the network or storing it in a file
     /// will likely result in incompatible data.  See [`OsString`] for more encoding details
     /// and [`std::ffi`] for platform-specific, specified conversions.
     ///
     /// [`std::ffi`]: crate::ffi
     #[inline]
-    #[stable(feature = "os_str_bytes", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "os_str_bytes", since = "1.74.0")]
     pub fn into_encoded_bytes(self) -> Vec<u8> {
         self.inner.into_encoded_bytes()
     }
@@ -254,6 +257,7 @@ impl OsString {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
+    #[rustc_confusables("append", "put")]
     pub fn push<T: AsRef<OsStr>>(&mut self, s: T) {
         self.inner.push_slice(&s.as_ref().inner)
     }
@@ -743,7 +747,7 @@ impl OsStr {
     /// # Safety
     ///
     /// As the encoding is unspecified, callers must pass in bytes that originated as a mixture of
-    /// validated UTF-8 and bytes from [`OsStr::as_encoded_bytes`] from within the same rust version
+    /// validated UTF-8 and bytes from [`OsStr::as_encoded_bytes`] from within the same Rust version
     /// built for the same target platform.  For example, reconstructing an `OsStr` from bytes sent
     /// over the network or stored in a file will likely violate these safety rules.
     ///
@@ -768,7 +772,7 @@ impl OsStr {
     ///
     /// [conversions]: super#conversions
     #[inline]
-    #[stable(feature = "os_str_bytes", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "os_str_bytes", since = "1.74.0")]
     pub unsafe fn from_encoded_bytes_unchecked(bytes: &[u8]) -> &Self {
         Self::from_inner(Slice::from_encoded_bytes_unchecked(bytes))
     }
@@ -951,16 +955,66 @@ impl OsStr {
     /// ASCII.
     ///
     /// Note: As the encoding is unspecified, any sub-slice of bytes that is not valid UTF-8 should
-    /// be treated as opaque and only comparable within the same rust version built for the same
+    /// be treated as opaque and only comparable within the same Rust version built for the same
     /// target platform.  For example, sending the slice over the network or storing it in a file
     /// will likely result in incompatible byte slices.  See [`OsString`] for more encoding details
     /// and [`std::ffi`] for platform-specific, specified conversions.
     ///
     /// [`std::ffi`]: crate::ffi
     #[inline]
-    #[stable(feature = "os_str_bytes", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "os_str_bytes", since = "1.74.0")]
     pub fn as_encoded_bytes(&self) -> &[u8] {
         self.inner.as_encoded_bytes()
+    }
+
+    /// Takes a substring based on a range that corresponds to the return value of
+    /// [`OsStr::as_encoded_bytes`].
+    ///
+    /// The range's start and end must lie on valid `OsStr` boundaries.
+    /// A valid `OsStr` boundary is one of:
+    /// - The start of the string
+    /// - The end of the string
+    /// - Immediately before a valid non-empty UTF-8 substring
+    /// - Immediately after a valid non-empty UTF-8 substring
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` does not lie on valid `OsStr` boundaries or if it
+    /// exceeds the end of the string.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// #![feature(os_str_slice)]
+    ///
+    /// use std::ffi::OsStr;
+    ///
+    /// let os_str = OsStr::new("foo=bar");
+    /// let bytes = os_str.as_encoded_bytes();
+    /// if let Some(index) = bytes.iter().position(|b| *b == b'=') {
+    ///     let key = os_str.slice_encoded_bytes(..index);
+    ///     let value = os_str.slice_encoded_bytes(index + 1..);
+    ///     assert_eq!(key, "foo");
+    ///     assert_eq!(value, "bar");
+    /// }
+    /// ```
+    #[unstable(feature = "os_str_slice", issue = "118485")]
+    pub fn slice_encoded_bytes<R: ops::RangeBounds<usize>>(&self, range: R) -> &Self {
+        let encoded_bytes = self.as_encoded_bytes();
+        let Range { start, end } = slice::range(range, ..encoded_bytes.len());
+
+        // `check_public_boundary` should panic if the index does not lie on an
+        // `OsStr` boundary as described above. It's possible to do this in an
+        // encoding-agnostic way, but details of the internal encoding might
+        // permit a more efficient implementation.
+        self.inner.check_public_boundary(start);
+        self.inner.check_public_boundary(end);
+
+        // SAFETY: `slice::range` ensures that `start` and `end` are valid
+        let slice = unsafe { encoded_bytes.get_unchecked(start..end) };
+
+        // SAFETY: `slice` comes from `self` and we validated the boundaries
+        unsafe { Self::from_encoded_bytes_unchecked(slice) }
     }
 
     /// Converts this string to its ASCII lower case equivalent in-place.
@@ -1094,6 +1148,32 @@ impl OsStr {
     #[stable(feature = "osstring_ascii", since = "1.53.0")]
     pub fn eq_ignore_ascii_case<S: AsRef<OsStr>>(&self, other: S) -> bool {
         self.inner.eq_ignore_ascii_case(&other.as_ref().inner)
+    }
+
+    /// Returns an object that implements [`Display`] for safely printing an
+    /// [`OsStr`] that may contain non-Unicode data. This may perform lossy
+    /// conversion, depending on the platform.  If you would like an
+    /// implementation which escapes the [`OsStr`] please use [`Debug`]
+    /// instead.
+    ///
+    /// [`Display`]: fmt::Display
+    /// [`Debug`]: fmt::Debug
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(os_str_display)]
+    /// use std::ffi::OsStr;
+    ///
+    /// let s = OsStr::new("Hello, world!");
+    /// println!("{}", s.display());
+    /// ```
+    #[unstable(feature = "os_str_display", issue = "120048")]
+    #[must_use = "this does not display the `OsStr`; \
+                  it returns an object that can be displayed"]
+    #[inline]
+    pub fn display(&self) -> Display<'_> {
+        Display { os_str: self }
     }
 }
 
@@ -1389,9 +1469,42 @@ impl fmt::Debug for OsStr {
     }
 }
 
-impl OsStr {
-    pub(crate) fn display(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.inner, formatter)
+/// Helper struct for safely printing an [`OsStr`] with [`format!`] and `{}`.
+///
+/// An [`OsStr`] might contain non-Unicode data. This `struct` implements the
+/// [`Display`] trait in a way that mitigates that. It is created by the
+/// [`display`](OsStr::display) method on [`OsStr`]. This may perform lossy
+/// conversion, depending on the platform. If you would like an implementation
+/// which escapes the [`OsStr`] please use [`Debug`] instead.
+///
+/// # Examples
+///
+/// ```
+/// #![feature(os_str_display)]
+/// use std::ffi::OsStr;
+///
+/// let s = OsStr::new("Hello, world!");
+/// println!("{}", s.display());
+/// ```
+///
+/// [`Display`]: fmt::Display
+/// [`format!`]: crate::format
+#[unstable(feature = "os_str_display", issue = "120048")]
+pub struct Display<'a> {
+    os_str: &'a OsStr,
+}
+
+#[unstable(feature = "os_str_display", issue = "120048")]
+impl fmt::Debug for Display<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.os_str, f)
+    }
+}
+
+#[unstable(feature = "os_str_display", issue = "120048")]
+impl fmt::Display for Display<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.os_str.inner, f)
     }
 }
 

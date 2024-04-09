@@ -31,8 +31,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let mut relative_clocks;
 
         match this.tcx.sess.target.os.as_ref() {
-            "linux" => {
-                // Linux has two main kinds of clocks. REALTIME clocks return the actual time since the
+            "linux" | "freebsd" => {
+                // Linux and FreeBSD have two main kinds of clocks. REALTIME clocks return the actual time since the
                 // Unix epoch, including effects which may cause time to move backwards such as NTP.
                 // Linux further distinguishes regular and "coarse" clocks, but the "coarse" version
                 // is just specified to be "faster and less precise", so we implement both the same way.
@@ -51,13 +51,10 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             "macos" => {
                 absolute_clocks = vec![this.eval_libc_i32("CLOCK_REALTIME")];
                 relative_clocks = vec![this.eval_libc_i32("CLOCK_MONOTONIC")];
-                // Some clocks only seem to exist in the aarch64 version of the target.
-                if this.tcx.sess.target.arch == "aarch64" {
-                    // `CLOCK_UPTIME_RAW` supposed to not increment while the system is asleep... but
-                    // that's not really something a program running inside Miri can tell, anyway.
-                    // We need to support it because std uses it.
-                    relative_clocks.push(this.eval_libc_i32("CLOCK_UPTIME_RAW"));
-                }
+                // `CLOCK_UPTIME_RAW` supposed to not increment while the system is asleep... but
+                // that's not really something a program running inside Miri can tell, anyway.
+                // We need to support it because std uses it.
+                relative_clocks.push(this.eval_libc_i32("CLOCK_UPTIME_RAW"));
             }
             target => throw_unsup_format!("`clock_gettime` is not supported on target OS {target}"),
         }
@@ -68,7 +65,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         } else if relative_clocks.contains(&clk_id) {
             this.machine.clock.now().duration_since(this.machine.clock.anchor())
         } else {
-            // Unsupported clock.
             let einval = this.eval_libc("EINVAL");
             this.set_last_error(einval)?;
             return Ok(Scalar::from_i32(-1));
@@ -114,12 +110,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     #[allow(non_snake_case, clippy::arithmetic_side_effects)]
     fn GetSystemTimeAsFileTime(
         &mut self,
+        shim_name: &str,
         LPFILETIME_op: &OpTy<'tcx, Provenance>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
-        this.assert_target_os("windows", "GetSystemTimeAsFileTime");
-        this.check_no_isolation("`GetSystemTimeAsFileTime`")?;
+        this.assert_target_os("windows", shim_name);
+        this.check_no_isolation(shim_name)?;
 
         let filetime = this.deref_pointer_as(LPFILETIME_op, this.windows_ty_layout("FILETIME"))?;
 
@@ -278,8 +275,8 @@ struct UnblockCallback {
     thread_to_unblock: ThreadId,
 }
 
-impl VisitTags for UnblockCallback {
-    fn visit_tags(&self, _visit: &mut dyn FnMut(BorTag)) {}
+impl VisitProvenance for UnblockCallback {
+    fn visit_provenance(&self, _visit: &mut VisitWith<'_>) {}
 }
 
 impl<'mir, 'tcx: 'mir> MachineCallback<'mir, 'tcx> for UnblockCallback {

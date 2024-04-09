@@ -4,11 +4,11 @@
 //! ```
 use ide_db::{syntax_helpers::node_ext::walk_ty, FxHashMap};
 use itertools::Itertools;
-use syntax::SmolStr;
 use syntax::{
     ast::{self, AstNode, HasGenericParams, HasName},
     SyntaxToken,
 };
+use syntax::{format_smolstr, SmolStr};
 
 use crate::{InlayHint, InlayHintPosition, InlayHintsConfig, InlayKind, LifetimeElisionHints};
 
@@ -22,7 +22,6 @@ pub(super) fn hints(
     }
 
     let mk_lt_hint = |t: SyntaxToken, label: String| InlayHint {
-        needs_resolve: false,
         range: t.text_range(),
         kind: InlayKind::Lifetime,
         label: label.into(),
@@ -80,7 +79,7 @@ pub(super) fn hints(
     let mut gen_idx_name = {
         let mut gen = (0u8..).map(|idx| match idx {
             idx if idx < 10 => SmolStr::from_iter(['\'', (idx + 48) as char]),
-            idx => format!("'{idx}").into(),
+            idx => format_smolstr!("'{idx}"),
         });
         move || gen.next().unwrap_or_default()
     };
@@ -98,15 +97,13 @@ pub(super) fn hints(
         };
     {
         let mut potential_lt_refs = potential_lt_refs.iter().filter(|&&(.., is_elided)| is_elided);
-        if let Some(_) = &self_param {
-            if let Some(_) = potential_lt_refs.next() {
-                allocated_lifetimes.push(if config.param_names_for_lifetime_elision_hints {
-                    // self can't be used as a lifetime, so no need to check for collisions
-                    "'self".into()
-                } else {
-                    gen_idx_name()
-                });
-            }
+        if self_param.is_some() && potential_lt_refs.next().is_some() {
+            allocated_lifetimes.push(if config.param_names_for_lifetime_elision_hints {
+                // self can't be used as a lifetime, so no need to check for collisions
+                "'self".into()
+            } else {
+                gen_idx_name()
+            });
         }
         potential_lt_refs.for_each(|(name, ..)| {
             let name = match name {
@@ -130,11 +127,11 @@ pub(super) fn hints(
         [(_, _, lifetime, _), ..] if self_param.is_some() || potential_lt_refs.len() == 1 => {
             match lifetime {
                 Some(lt) => match lt.text().as_str() {
-                    "'_" => allocated_lifetimes.get(0).cloned(),
+                    "'_" => allocated_lifetimes.first().cloned(),
                     "'static" => None,
                     name => Some(name.into()),
                 },
-                None => allocated_lifetimes.get(0).cloned(),
+                None => allocated_lifetimes.first().cloned(),
             }
         }
         [..] => None,
@@ -186,7 +183,6 @@ pub(super) fn hints(
             let angle_tok = gpl.l_angle_token()?;
             let is_empty = gpl.generic_params().next().is_none();
             acc.push(InlayHint {
-                needs_resolve: false,
                 range: angle_tok.text_range(),
                 kind: InlayKind::Lifetime,
                 label: format!(
@@ -202,7 +198,6 @@ pub(super) fn hints(
             });
         }
         (None, allocated_lifetimes) => acc.push(InlayHint {
-            needs_resolve: false,
             range: func.name()?.syntax().text_range(),
             kind: InlayKind::GenericParamList,
             label: format!("<{}>", allocated_lifetimes.iter().format(", "),).into(),

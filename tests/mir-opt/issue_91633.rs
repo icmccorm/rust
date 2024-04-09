@@ -1,4 +1,5 @@
-// compile-flags: -Z mir-opt-level=0
+// skip-filecheck
+//@ compile-flags: -Z mir-opt-level=0
 // EMIT_MIR issue_91633.hey.built.after.mir
 fn hey<T> (it: &[T])
  where

@@ -25,7 +25,7 @@ use build_helper::git::{get_git_modified_files, get_git_untracked_files};
 use core::panic;
 use getopts::Options;
 use lazycell::AtomicLazyCell;
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -81,11 +81,12 @@ pub fn parse_config(args: Vec<String>) -> Config {
         )
         .optopt("", "run", "whether to execute run-* tests", "auto | always | never")
         .optflag("", "ignored", "run tests marked as ignored")
+        .optflag("", "with-debug-assertions", "whether to run tests with `ignore-debug` header")
         .optmulti("", "skip", "skip tests matching SUBSTRING. Can be passed multiple times", "SUBSTRING")
         .optflag("", "exact", "filters match exactly")
         .optopt(
             "",
-            "runtool",
+            "runner",
             "supervisor program to run tests under \
              (eg. emulator, valgrind)",
             "PROGRAM",
@@ -141,10 +142,13 @@ pub fn parse_config(args: Vec<String>) -> Config {
         .optflag("", "force-rerun", "rerun tests even if the inputs are unchanged")
         .optflag("", "only-modified", "only run tests that result been modified")
         .optflag("", "nocapture", "")
+        .optflag("", "profiler-support", "is the profiler runtime enabled for this target")
         .optflag("h", "help", "show this message")
         .reqopt("", "channel", "current Rust channel", "CHANNEL")
         .optflag("", "git-hash", "run tests which rely on commit version being compiled into the binaries")
-        .optopt("", "edition", "default Rust edition", "EDITION");
+        .optopt("", "edition", "default Rust edition", "EDITION")
+        .reqopt("", "git-repository", "name of the git repository", "ORG/REPO")
+        .reqopt("", "nightly-branch", "name of the git branch for nightly", "BRANCH");
 
     let (argv0, args_) = args.split_first().unwrap();
     if args.len() == 1 || args[1] == "-h" || args[1] == "--help" {
@@ -201,6 +205,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
 
     let src_base = opt_path(matches, "src-base");
     let run_ignored = matches.opt_present("ignored");
+    let with_debug_assertions = matches.opt_present("with-debug-assertions");
     let mode = matches.opt_str("mode").unwrap().parse().expect("invalid mode");
     let has_tidy = if mode == Mode::Rustdoc {
         Command::new("tidy")
@@ -236,6 +241,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
         suite: matches.opt_str("suite").unwrap(),
         debugger: None,
         run_ignored,
+        with_debug_assertions,
         filters: matches.free.clone(),
         skip: matches.opt_strs("skip"),
         filter_exact: matches.opt_present("exact"),
@@ -250,7 +256,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
             _ => panic!("unknown `--run` option `{}` given", mode),
         }),
         logfile: matches.opt_str("logfile").map(|s| PathBuf::from(&s)),
-        runtool: matches.opt_str("runtool"),
+        runner: matches.opt_str("runner"),
         host_rustcflags: matches.opt_strs("host-rustcflags"),
         target_rustcflags: matches.opt_strs("target-rustcflags"),
         optimize_tests: matches.opt_present("optimize-tests"),
@@ -307,6 +313,11 @@ pub fn parse_config(args: Vec<String>) -> Config {
         target_cfgs: AtomicLazyCell::new(),
 
         nocapture: matches.opt_present("nocapture"),
+
+        git_repository: matches.opt_str("git-repository").unwrap(),
+        nightly_branch: matches.opt_str("nightly-branch").unwrap(),
+
+        profiler_support: matches.opt_present("profiler-support"),
     }
 }
 
@@ -330,7 +341,7 @@ pub fn log_config(config: &Config) {
         c,
         format!("force_pass_mode: {}", opt_str(&config.force_pass_mode.map(|m| format!("{}", m))),),
     );
-    logv(c, format!("runtool: {}", opt_str(&config.runtool)));
+    logv(c, format!("runner: {}", opt_str(&config.runner)));
     logv(c, format!("host-rustcflags: {:?}", config.host_rustcflags));
     logv(c, format!("target-rustcflags: {:?}", config.target_rustcflags));
     logv(c, format!("target: {}", config.target));
@@ -404,7 +415,7 @@ pub fn run_tests(config: Arc<Config>) {
 
     let mut tests = Vec::new();
     for c in configs {
-        let mut found_paths = BTreeSet::new();
+        let mut found_paths = HashSet::new();
         make_tests(c, &mut tests, &mut found_paths);
         check_overlapping_tests(&found_paths);
     }
@@ -539,7 +550,7 @@ pub fn test_opts(config: &Config) -> test::TestOpts {
 pub fn make_tests(
     config: Arc<Config>,
     tests: &mut Vec<test::TestDescAndFn>,
-    found_paths: &mut BTreeSet<PathBuf>,
+    found_paths: &mut HashSet<PathBuf>,
 ) {
     debug!("making tests from {:?}", config.src_base.display());
     let inputs = common_inputs_stamp(&config);
@@ -560,7 +571,9 @@ pub fn make_tests(
         &modified_tests,
         &mut poisoned,
     )
-    .unwrap_or_else(|_| panic!("Could not read tests from {}", config.src_base.display()));
+    .unwrap_or_else(|reason| {
+        panic!("Could not read tests from {}: {reason}", config.src_base.display())
+    });
 
     if poisoned {
         eprintln!();
@@ -598,6 +611,8 @@ fn common_inputs_stamp(config: &Config) -> Stamp {
         stamp.add_path(&rust_src_dir.join("src/etc/htmldocck.py"));
     }
 
+    stamp.add_dir(&rust_src_dir.join("src/tools/run-make-support"));
+
     // Compiletest itself.
     stamp.add_dir(&rust_src_dir.join("src/tools/compiletest/"));
 
@@ -609,9 +624,10 @@ fn modified_tests(config: &Config, dir: &Path) -> Result<Vec<PathBuf>, String> {
         return Ok(vec![]);
     }
     let files =
-        get_git_modified_files(Some(dir), &vec!["rs", "stderr", "fixed"])?.unwrap_or(vec![]);
+        get_git_modified_files(&config.git_config(), Some(dir), &vec!["rs", "stderr", "fixed"])?
+            .unwrap_or(vec![]);
     // Add new test cases to the list, it will be convenient in daily development.
-    let untracked_files = get_git_untracked_files(None)?.unwrap_or(vec![]);
+    let untracked_files = get_git_untracked_files(&config.git_config(), None)?.unwrap_or(vec![]);
 
     let all_paths = [&files[..], &untracked_files[..]].concat();
     let full_paths = {
@@ -634,7 +650,7 @@ fn collect_tests_from_dir(
     relative_dir_path: &Path,
     inputs: &Stamp,
     tests: &mut Vec<test::TestDescAndFn>,
-    found_paths: &mut BTreeSet<PathBuf>,
+    found_paths: &mut HashSet<PathBuf>,
     modified_tests: &Vec<PathBuf>,
     poisoned: &mut bool,
 ) -> io::Result<()> {
@@ -643,13 +659,21 @@ fn collect_tests_from_dir(
         return Ok(());
     }
 
-    if config.mode == Mode::RunMake && dir.join("Makefile").exists() {
-        let paths = TestPaths {
-            file: dir.to_path_buf(),
-            relative_dir: relative_dir_path.parent().unwrap().to_path_buf(),
-        };
-        tests.extend(make_test(config, cache, &paths, inputs, poisoned));
-        return Ok(());
+    if config.mode == Mode::RunMake {
+        if dir.join("Makefile").exists() && dir.join("rmake.rs").exists() {
+            return Err(io::Error::other(
+                "run-make tests cannot have both `Makefile` and `rmake.rs`",
+            ));
+        }
+
+        if dir.join("Makefile").exists() || dir.join("rmake.rs").exists() {
+            let paths = TestPaths {
+                file: dir.to_path_buf(),
+                relative_dir: relative_dir_path.parent().unwrap().to_path_buf(),
+            };
+            tests.extend(make_test(config, cache, &paths, inputs, poisoned));
+            return Ok(());
+        }
     }
 
     // If we find a test foo/bar.rs, we have to build the
@@ -663,6 +687,8 @@ fn collect_tests_from_dir(
 
     // Add each `.rs` file as a test, and recurse further on any
     // subdirectories we find, except for `aux` directories.
+    // FIXME: this walks full tests tree, even if we have something to ignore
+    // use walkdir/ignore like in tidy?
     for file in fs::read_dir(dir)? {
         let file = file?;
         let file_path = file.path();
@@ -719,8 +745,17 @@ fn make_test(
     poisoned: &mut bool,
 ) -> Vec<test::TestDescAndFn> {
     let test_path = if config.mode == Mode::RunMake {
-        // Parse directives in the Makefile
-        testpaths.file.join("Makefile")
+        if testpaths.file.join("rmake.rs").exists() && testpaths.file.join("Makefile").exists() {
+            panic!("run-make tests cannot have both `rmake.rs` and `Makefile`");
+        }
+
+        if testpaths.file.join("rmake.rs").exists() {
+            // Parse directives in rmake.rs.
+            testpaths.file.join("rmake.rs")
+        } else {
+            // Parse directives in the Makefile.
+            testpaths.file.join("Makefile")
+        }
     } else {
         PathBuf::from(&testpaths.file)
     };
@@ -731,7 +766,7 @@ fn make_test(
     let revisions = if early_props.revisions.is_empty() || config.mode == Mode::Incremental {
         vec![None]
     } else {
-        early_props.revisions.iter().map(Some).collect()
+        early_props.revisions.iter().map(|r| Some(r.as_str())).collect()
     };
 
     revisions
@@ -739,20 +774,13 @@ fn make_test(
         .map(|revision| {
             let src_file =
                 std::fs::File::open(&test_path).expect("open test file to parse ignores");
-            let cfg = revision.map(|v| &**v);
             let test_name = crate::make_test_name(&config, testpaths, revision);
             let mut desc = make_test_description(
-                &config, cache, test_name, &test_path, src_file, cfg, poisoned,
+                &config, cache, test_name, &test_path, src_file, revision, poisoned,
             );
             // Ignore tests that already run and are up to date with respect to inputs.
             if !config.force_rerun {
-                desc.ignore |= is_up_to_date(
-                    &config,
-                    testpaths,
-                    &early_props,
-                    revision.map(|s| s.as_str()),
-                    inputs,
-                );
+                desc.ignore |= is_up_to_date(&config, testpaths, &early_props, revision, inputs);
             }
             test::TestDescAndFn {
                 desc,
@@ -865,7 +893,7 @@ impl Stamp {
 fn make_test_name(
     config: &Config,
     testpaths: &TestPaths,
-    revision: Option<&String>,
+    revision: Option<&str>,
 ) -> test::TestName {
     // Print the name of the file, relative to the repository root.
     // `src_base` looks like `/path/to/rust/tests/ui`
@@ -893,11 +921,11 @@ fn make_test_name(
 fn make_test_closure(
     config: Arc<Config>,
     testpaths: &TestPaths,
-    revision: Option<&String>,
+    revision: Option<&str>,
 ) -> test::TestFn {
     let config = config.clone();
     let testpaths = testpaths.clone();
-    let revision = revision.cloned();
+    let revision = revision.map(str::to_owned);
     test::DynTestFn(Box::new(move || {
         runtest::run(config, &testpaths, revision.as_deref());
         Ok(())
@@ -1116,7 +1144,7 @@ fn not_a_digit(c: char) -> bool {
     !c.is_digit(10)
 }
 
-fn check_overlapping_tests(found_paths: &BTreeSet<PathBuf>) {
+fn check_overlapping_tests(found_paths: &HashSet<PathBuf>) {
     let mut collisions = Vec::new();
     for path in found_paths {
         for ancestor in path.ancestors().skip(1) {
@@ -1126,6 +1154,7 @@ fn check_overlapping_tests(found_paths: &BTreeSet<PathBuf>) {
         }
     }
     if !collisions.is_empty() {
+        collisions.sort();
         let collisions: String = collisions
             .into_iter()
             .map(|(path, check_parent)| format!("test {path:?} clashes with {check_parent:?}\n"))

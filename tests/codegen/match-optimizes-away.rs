@@ -1,6 +1,5 @@
 //
-// no-system-llvm
-// compile-flags: -O
+//@ compile-flags: -O
 #![crate_type="lib"]
 
 pub enum Three { A, B, C }

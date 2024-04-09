@@ -24,6 +24,8 @@ impl FromRawHandle for process::Stdio {
 
 #[stable(feature = "io_safety", since = "1.63.0")]
 impl From<OwnedHandle> for process::Stdio {
+    /// Takes ownership of a handle and returns a [`Stdio`](process::Stdio)
+    /// that can attach a stream to it.
     fn from(handle: OwnedHandle) -> process::Stdio {
         let handle = sys::handle::Handle::from_inner(handle);
         let io = sys::process::Stdio::Handle(handle);
@@ -56,6 +58,7 @@ impl IntoRawHandle for process::Child {
 
 #[stable(feature = "io_safety", since = "1.63.0")]
 impl From<process::Child> for OwnedHandle {
+    /// Takes ownership of a [`Child`](process::Child)'s process handle.
     fn from(child: process::Child) -> OwnedHandle {
         child.into_inner().into_handle().into_inner()
     }
@@ -110,7 +113,7 @@ impl IntoRawHandle for process::ChildStderr {
 ///
 /// The provided handle must be asynchronous, as reading and
 /// writing from and to it is implemented using asynchronous APIs.
-#[stable(feature = "child_stream_from_fd", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "child_stream_from_fd", since = "1.74.0")]
 impl From<OwnedHandle> for process::ChildStdin {
     fn from(handle: OwnedHandle) -> process::ChildStdin {
         let handle = sys::handle::Handle::from_inner(handle);
@@ -123,7 +126,7 @@ impl From<OwnedHandle> for process::ChildStdin {
 ///
 /// The provided handle must be asynchronous, as reading and
 /// writing from and to it is implemented using asynchronous APIs.
-#[stable(feature = "child_stream_from_fd", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "child_stream_from_fd", since = "1.74.0")]
 impl From<OwnedHandle> for process::ChildStdout {
     fn from(handle: OwnedHandle) -> process::ChildStdout {
         let handle = sys::handle::Handle::from_inner(handle);
@@ -136,7 +139,7 @@ impl From<OwnedHandle> for process::ChildStdout {
 ///
 /// The provided handle must be asynchronous, as reading and
 /// writing from and to it is implemented using asynchronous APIs.
-#[stable(feature = "child_stream_from_fd", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "child_stream_from_fd", since = "1.74.0")]
 impl From<OwnedHandle> for process::ChildStderr {
     fn from(handle: OwnedHandle) -> process::ChildStderr {
         let handle = sys::handle::Handle::from_inner(handle);
@@ -347,7 +350,7 @@ impl ChildExt for process::Child {
 ///
 /// This trait is sealed: it cannot be implemented outside the standard library.
 /// This is so that future additional methods are not breaking changes.
-#[unstable(feature = "windows_process_exit_code_from", issue = "none")]
+#[unstable(feature = "windows_process_exit_code_from", issue = "111688")]
 pub trait ExitCodeExt: Sealed {
     /// Creates a new `ExitCode` from the raw underlying `u32` return value of
     /// a process.
@@ -355,11 +358,11 @@ pub trait ExitCodeExt: Sealed {
     /// The exit code should not be 259, as this conflicts with the `STILL_ACTIVE`
     /// macro returned from the `GetExitCodeProcess` function to signal that the
     /// process has yet to run to completion.
-    #[unstable(feature = "windows_process_exit_code_from", issue = "none")]
+    #[unstable(feature = "windows_process_exit_code_from", issue = "111688")]
     fn from_raw(raw: u32) -> Self;
 }
 
-#[unstable(feature = "windows_process_exit_code_from", issue = "none")]
+#[unstable(feature = "windows_process_exit_code_from", issue = "111688")]
 impl ExitCodeExt for process::ExitCode {
     fn from_raw(raw: u32) -> Self {
         process::ExitCode::from_inner(From::from(raw))

@@ -1,7 +1,6 @@
 //! Name resolution for expressions.
 use hir_expand::name::Name;
-use la_arena::{Arena, Idx, IdxRange, RawIdx};
-use rustc_hash::FxHashMap;
+use la_arena::{Arena, ArenaMap, Idx, IdxRange, RawIdx};
 use triomphe::Arc;
 
 use crate::{
@@ -17,7 +16,7 @@ pub type ScopeId = Idx<ScopeData>;
 pub struct ExprScopes {
     scopes: Arena<ScopeData>,
     scope_entries: Arena<ScopeEntry>,
-    scope_by_expr: FxHashMap<ExprId, ScopeId>,
+    scope_by_expr: ArenaMap<ExprId, ScopeId>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -77,10 +76,10 @@ impl ExprScopes {
     }
 
     pub fn scope_for(&self, expr: ExprId) -> Option<ScopeId> {
-        self.scope_by_expr.get(&expr).copied()
+        self.scope_by_expr.get(expr).copied()
     }
 
-    pub fn scope_by_expr(&self) -> &FxHashMap<ExprId, ScopeId> {
+    pub fn scope_by_expr(&self) -> &ArenaMap<ExprId, ScopeId> {
         &self.scope_by_expr
     }
 }
@@ -94,9 +93,12 @@ impl ExprScopes {
         let mut scopes = ExprScopes {
             scopes: Arena::default(),
             scope_entries: Arena::default(),
-            scope_by_expr: FxHashMap::default(),
+            scope_by_expr: ArenaMap::with_capacity(body.exprs.len()),
         };
         let mut root = scopes.root_scope();
+        if let Some(self_param) = body.self_param {
+            scopes.add_bindings(body, root, self_param);
+        }
         scopes.add_params_bindings(body, root, &body.params);
         compute_expr_scopes(body.body_expr, body, &mut scopes, &mut root);
         scopes
@@ -198,6 +200,7 @@ fn compute_block_scopes(
             Statement::Expr { expr, .. } => {
                 compute_expr_scopes(*expr, body, scopes, scope);
             }
+            Statement::Item => (),
         }
     }
     if let Some(expr) = tail {
@@ -268,9 +271,10 @@ fn compute_expr_scopes(expr: ExprId, body: &Body, scopes: &mut ExprScopes, scope
 
 #[cfg(test)]
 mod tests {
-    use base_db::{fixture::WithFixture, FileId, SourceDatabase};
+    use base_db::{FileId, SourceDatabase};
     use hir_expand::{name::AsName, InFile};
     use syntax::{algo::find_node_at_offset, ast, AstNode};
+    use test_fixture::WithFixture;
     use test_utils::{assert_eq_text, extract_offset};
 
     use crate::{db::DefDatabase, test_db::TestDB, FunctionId, ModuleDefId};
@@ -476,10 +480,7 @@ fn foo() {
             .pat_syntax(*body.bindings[resolved.binding()].definitions.first().unwrap())
             .unwrap();
 
-        let local_name = pat_src.value.either(
-            |it| it.syntax_node_ptr().to_node(file.syntax()),
-            |it| it.syntax_node_ptr().to_node(file.syntax()),
-        );
+        let local_name = pat_src.value.syntax_node_ptr().to_node(file.syntax());
         assert_eq!(local_name.text_range(), expected_name.syntax().text_range());
     }
 

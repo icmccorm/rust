@@ -1,4 +1,4 @@
-use crate::common::{CompareMode, Config, Debugger};
+use crate::common::{CompareMode, Config, Debugger, Mode};
 use crate::header::IgnoreDecision;
 use std::collections::HashSet;
 
@@ -146,19 +146,13 @@ pub(super) fn parse_cfg_name_directive<'a>(
     }
 
     // `wasm32-bare` is an alias to refer to just wasm32-unknown-unknown
-    // (in contrast to `wasm32` which also matches non-bare targets like
-    // asmjs-unknown-emscripten).
+    // (in contrast to `wasm32` which also matches non-bare targets)
     condition! {
         name: "wasm32-bare",
         condition: config.target == "wasm32-unknown-unknown",
         message: "when the target is WASM"
     }
 
-    condition! {
-        name: "asmjs",
-        condition: config.target.starts_with("asmjs"),
-        message: "when the architecture is asm.js",
-    }
     condition! {
         name: "thumb",
         condition: config.target.starts_with("thumb"),
@@ -196,8 +190,8 @@ pub(super) fn parse_cfg_name_directive<'a>(
     }
     condition! {
         name: "debug",
-        condition: cfg!(debug_assertions),
-        message: "when building with debug assertions",
+        condition: config.with_debug_assertions,
+        message: "when running tests with `ignore-debug` header",
     }
     condition! {
         name: config.debugger.as_ref().map(|d| d.to_str()),
@@ -213,6 +207,17 @@ pub(super) fn parse_cfg_name_directive<'a>(
             inner: CompareMode::STR_VARIANTS,
         },
         message: "when comparing with {name}",
+    }
+    // Coverage tests run the same test file in multiple modes.
+    // If a particular test should not be run in one of the modes, ignore it
+    // with "ignore-mode-coverage-map" or "ignore-mode-coverage-run".
+    condition! {
+        name: format!("mode-{}", config.mode.to_str()),
+        allowed_names: ContainsPrefixed {
+            prefix: "mode-",
+            inner: Mode::STR_VARIANTS,
+        },
+        message: "when the test mode is {name}",
     }
 
     if prefix == "ignore" && outcome == MatchOutcome::Invalid {

@@ -1,4 +1,3 @@
-#![feature(return_position_impl_trait_in_trait, async_fn_in_trait)]
 #![deny(refining_impl_trait)]
 
 pub trait Foo {
@@ -26,6 +25,7 @@ impl Foo for C {
 struct Private;
 impl Foo for Private {
     fn bar() -> () {}
+    //~^ ERROR impl method signature does not match trait method signature
 }
 
 pub trait Arg<A> {
@@ -33,6 +33,7 @@ pub trait Arg<A> {
 }
 impl Arg<Private> for A {
     fn bar() -> () {}
+    //~^ ERROR impl method signature does not match trait method signature
 }
 
 pub trait Late {
@@ -43,6 +44,18 @@ pub struct D;
 impl Late for D {
     fn bar(&self) -> impl Copy + '_ {}
     //~^ ERROR impl method signature does not match trait method signature
+}
+
+mod unreachable {
+    pub trait UnreachablePub {
+        fn bar() -> impl Sized;
+    }
+
+    struct E;
+    impl UnreachablePub for E {
+        fn bar() {}
+        //~^ ERROR impl method signature does not match trait method signature
+    }
 }
 
 fn main() {}

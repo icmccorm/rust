@@ -51,7 +51,7 @@ single stack.
 By default, the UEFI targets use the `link`-flavor of the LLVM linker `lld` to
 link binaries into the final PE32+ file suffixed with `*.efi`. The PE subsystem
 is set to `EFI_APPLICATION`, but can be modified by passing `/subsystem:<...>`
-to the linker. Similarly, the entry-point is to to `efi_main` but can be
+to the linker. Similarly, the entry-point is set to `efi_main` but can be
 changed via `/entry:<...>`. The panic-strategy is set to `abort`,
 
 The UEFI specification is available online for free:
@@ -82,13 +82,29 @@ rustup target add x86_64-unknown-uefi
 cargo build --target x86_64-unknown-uefi
 ```
 
+### Building a driver
+
+There are three types of UEFI executables: application, boot service
+driver, and runtime driver. All of Rust's UEFI targets default to
+producing applications. To build a driver instead, pass a
+[`subsystem`][linker-subsystem] linker flag with a value of
+`efi_boot_service_driver` or `efi_runtime_driver`.
+
+Example:
+
+```toml
+# In .cargo/config.toml:
+[build]
+rustflags = ["-C", "link-args=/subsystem:efi_runtime_driver"]
+```
+
 ## Testing
 
 UEFI applications can be copied into the ESP on any UEFI system and executed
 via the firmware boot menu. The qemu suite allows emulating UEFI systems and
 executing UEFI applications as well. See its documentation for details.
 
-The [uefi-run](https://github.com/Richard-W/uefi-run) rust tool is a simple
+The [uefi-run] rust tool is a simple
 wrapper around `qemu` that can spawn UEFI applications in qemu. You can install
 it via `cargo install uefi-run` and execute qemu applications as
 `uefi-run ./application.efi`.
@@ -132,19 +148,19 @@ have been developed to provide access to UEFI protocols and make UEFI
 programming more ergonomic in rust. The following list is a short overview (in
 alphabetical ordering):
 
-- **efi**: *Ergonomic Rust bindings for writing UEFI applications*. Provides
+- **[efi][efi-crate]**: *Ergonomic Rust bindings for writing UEFI applications*. Provides
   _rustified_ access to UEFI protocols, implements allocators and a safe
   environment to write UEFI applications.
-- **r-efi**: *UEFI Reference Specification Protocol Constants and Definitions*.
+- **[r-efi]**: *UEFI Reference Specification Protocol Constants and Definitions*.
   A pure transpose of the UEFI specification into rust. This provides the raw
   definitions from the specification, without any extended helpers or
   _rustification_. It serves as baseline to implement any more elaborate rust
   UEFI layers.
-- **uefi-rs**: *Safe and easy-to-use wrapper for building UEFI apps*. An
+- **[uefi-rs]**: *Safe and easy-to-use wrapper for building UEFI apps*. An
   elaborate library providing safe abstractions for UEFI protocols and
   features. It implements allocators and provides an execution environment to
   UEFI applications written in rust.
-- **uefi-run**: *Run UEFI applications*. A small wrapper around _qemu_ to spawn
+- **[uefi-run]**: *Run UEFI applications*. A small wrapper around _qemu_ to spawn
   UEFI applications in an emulated `x86_64` machine.
 
 ## Example: Freestanding
@@ -265,9 +281,14 @@ cargo build --target x86_64-unknown-uefi -Zbuild-std=std,panic_abort
 #### os_str
 - While the strings in UEFI should be valid UCS-2, in practice, many implementations just do not care and use UTF-16 strings.
 - Thus, the current implementation supports full UTF-16 strings.
+#### stdio
+- Uses `Simple Text Input Protocol` and `Simple Text Output Protocol`.
+- Note: UEFI uses CRLF for new line. This means Enter key is registered as CR instead of LF.
+#### args
+- Uses `EFI_LOADED_IMAGE_PROTOCOL->LoadOptions`
 
 ## Example: Hello World With std
-The following code features a valid UEFI application, including stdio and `alloc` (`OsString` and `Vec`):
+The following code features a valid UEFI application, including `stdio` and `alloc` (`OsString` and `Vec`):
 
 This example can be compiled as binary crate via `cargo` using the toolchain
 compiled from the above source (named custom):
@@ -286,6 +307,9 @@ use std::{
 };
 
 pub fn main() {
+  println!("Starting Rust Application...");
+
+  // Use System Table Directly
   let st = env::system_table().as_ptr() as *mut efi::SystemTable;
   let mut s: Vec<u16> = OsString::from("Hello World!\n").encode_wide().collect();
   s.push(0);
@@ -303,3 +327,9 @@ pub fn main() {
 The current implementation of std makes `BootServices` unavailable once `ExitBootServices` is called. Refer to [Runtime Drivers](https://edk2-docs.gitbook.io/edk-ii-uefi-driver-writer-s-guide/7_driver_entry_point/711_runtime_drivers) for more information regarding how to handle switching from using physical addresses to using virtual addresses.
 
 Note: It should be noted that it is up to the user to drop all allocated memory before `ExitBootServices` is called.
+
+[efi-crate]: https://github.com/gurry/efi
+[linker-subsystem]: https://learn.microsoft.com/en-us/cpp/build/reference/subsystem
+[r-efi]: https://github.com/r-efi/r-efi
+[uefi-rs]: https://github.com/rust-osdev/uefi-rs
+[uefi-run]: https://github.com/Richard-W/uefi-run

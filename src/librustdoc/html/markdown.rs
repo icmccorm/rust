@@ -27,7 +27,7 @@
 //! ```
 
 use rustc_data_structures::fx::FxHashMap;
-use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
+use rustc_errors::{Diag, DiagMessage};
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::TyCtxt;
 pub(crate) use rustc_resolve::rustdoc::main_body_opts;
@@ -45,6 +45,7 @@ use std::str::{self, CharIndices};
 
 use crate::clean::RenderedLink;
 use crate::doctest;
+use crate::doctest::GlobalTestOptions;
 use crate::html::escape::Escape;
 use crate::html::format::Buffer;
 use crate::html::highlight;
@@ -234,10 +235,6 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for CodeBlocks<'_, 'a, I> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let event = self.inner.next();
-        let compile_fail;
-        let should_panic;
-        let ignore;
-        let edition;
         let Some(Event::Start(Tag::CodeBlock(kind))) = event else {
             return event;
         };
@@ -253,48 +250,43 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for CodeBlocks<'_, 'a, I> {
             }
         }
 
-        let parse_result = match kind {
-            CodeBlockKind::Fenced(ref lang) => {
-                let parse_result = LangString::parse_without_check(
-                    lang,
-                    self.check_error_codes,
-                    false,
-                    self.custom_code_classes_in_docs,
-                );
-                if !parse_result.rust {
-                    let added_classes = parse_result.added_classes;
-                    let lang_string = if let Some(lang) = parse_result.unknown.first() {
-                        format!("language-{}", lang)
-                    } else {
-                        String::new()
-                    };
-                    let whitespace = if added_classes.is_empty() { "" } else { " " };
-                    return Some(Event::Html(
-                        format!(
-                            "<div class=\"example-wrap\">\
+        let LangString { added_classes, compile_fail, should_panic, ignore, edition, .. } =
+            match kind {
+                CodeBlockKind::Fenced(ref lang) => {
+                    let parse_result = LangString::parse_without_check(
+                        lang,
+                        self.check_error_codes,
+                        false,
+                        self.custom_code_classes_in_docs,
+                    );
+                    if !parse_result.rust {
+                        let added_classes = parse_result.added_classes;
+                        let lang_string = if let Some(lang) = parse_result.unknown.first() {
+                            format!("language-{}", lang)
+                        } else {
+                            String::new()
+                        };
+                        let whitespace = if added_classes.is_empty() { "" } else { " " };
+                        return Some(Event::Html(
+                            format!(
+                                "<div class=\"example-wrap\">\
                                  <pre class=\"{lang_string}{whitespace}{added_classes}\">\
                                      <code>{text}</code>\
                                  </pre>\
                              </div>",
-                            added_classes = added_classes.join(" "),
-                            text = Escape(&original_text),
-                        )
-                        .into(),
-                    ));
+                                added_classes = added_classes.join(" "),
+                                text = Escape(&original_text),
+                            )
+                            .into(),
+                        ));
+                    }
+                    parse_result
                 }
-                parse_result
-            }
-            CodeBlockKind::Indented => Default::default(),
-        };
+                CodeBlockKind::Indented => Default::default(),
+            };
 
-        let added_classes = parse_result.added_classes;
         let lines = original_text.lines().filter_map(|l| map_line(l).for_html());
         let text = lines.intersperse("\n".into()).collect::<String>();
-
-        compile_fail = parse_result.compile_fail;
-        should_panic = parse_result.should_panic;
-        ignore = parse_result.ignore;
-        edition = parse_result.edition;
 
         let explicit_edition = edition.is_some();
         let edition = edition.unwrap_or(self.edition);
@@ -311,8 +303,10 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for CodeBlocks<'_, 'a, I> {
                 .intersperse("\n".into())
                 .collect::<String>();
             let krate = krate.as_ref().map(|s| s.as_str());
-            let (test, _, _) =
-                doctest::make_test(&test, krate, false, &Default::default(), edition, None);
+
+            let mut opts: GlobalTestOptions = Default::default();
+            opts.insert_indent_space = true;
+            let (test, _, _) = doctest::make_test(&test, krate, false, &opts, edition, None);
             let channel = if test.contains("#![feature(") { "&amp;version=nightly" } else { "" };
 
             let test_escaped = small_url_encode(test);
@@ -539,7 +533,6 @@ impl<'a, 'b, 'ids, I: Iterator<Item = SpannedEvent<'a>>> Iterator
             for event in &mut self.inner {
                 match &event.0 {
                     Event::End(Tag::Heading(..)) => break,
-                    Event::Start(Tag::Link(_, _, _)) | Event::End(Tag::Link(..)) => {}
                     Event::Text(text) | Event::Code(text) => {
                         id.extend(text.chars().filter_map(slugify));
                         self.buf.push_back(event);
@@ -558,12 +551,10 @@ impl<'a, 'b, 'ids, I: Iterator<Item = SpannedEvent<'a>>> Iterator
 
             let level =
                 std::cmp::min(level as u32 + (self.heading_offset as u32), MAX_HEADER_LEVEL);
-            self.buf.push_back((Event::Html(format!("</a></h{level}>").into()), 0..0));
+            self.buf.push_back((Event::Html(format!("</h{level}>").into()), 0..0));
 
-            let start_tags = format!(
-                "<h{level} id=\"{id}\">\
-                    <a href=\"#{id}\">",
-            );
+            let start_tags =
+                format!("<h{level} id=\"{id}\"><a class=\"doc-anchor\" href=\"#{id}\">§</a>");
             return Some((Event::Html(start_tags.into()), 0..0));
         }
         event
@@ -837,30 +828,30 @@ impl<'tcx> ExtraInfo<'tcx> {
         ExtraInfo { def_id, sp, tcx }
     }
 
-    fn error_invalid_codeblock_attr(&self, msg: impl Into<DiagnosticMessage>) {
+    fn error_invalid_codeblock_attr(&self, msg: impl Into<DiagMessage>) {
         if let Some(def_id) = self.def_id.as_local() {
-            self.tcx.struct_span_lint_hir(
+            self.tcx.node_span_lint(
                 crate::lint::INVALID_CODEBLOCK_ATTRIBUTES,
-                self.tcx.hir().local_def_id_to_hir_id(def_id),
+                self.tcx.local_def_id_to_hir_id(def_id),
                 self.sp,
                 msg,
-                |l| l,
+                |_| {},
             );
         }
     }
 
     fn error_invalid_codeblock_attr_with_help(
         &self,
-        msg: impl Into<DiagnosticMessage>,
-        help: impl Into<SubdiagnosticMessage>,
+        msg: impl Into<DiagMessage>,
+        f: impl for<'a, 'b> FnOnce(&'b mut Diag<'a, ()>),
     ) {
         if let Some(def_id) = self.def_id.as_local() {
-            self.tcx.struct_span_lint_hir(
+            self.tcx.node_span_lint(
                 crate::lint::INVALID_CODEBLOCK_ATTRIBUTES,
-                self.tcx.hir().local_def_id_to_hir_id(def_id),
+                self.tcx.local_def_id_to_hir_id(def_id),
                 self.sp,
                 msg,
-                |lint| lint.help(help),
+                f,
             );
         }
     }
@@ -961,7 +952,7 @@ impl<'a, 'tcx> TagIterator<'a, 'tcx> {
         Self { inner: data.char_indices().peekable(), data, is_in_attribute_block: false, extra }
     }
 
-    fn emit_error(&self, err: impl Into<DiagnosticMessage>) {
+    fn emit_error(&self, err: impl Into<DiagMessage>) {
         if let Some(extra) = self.extra {
             extra.error_invalid_codeblock_attr(err);
         }
@@ -1119,10 +1110,10 @@ impl<'a, 'tcx> TagIterator<'a, 'tcx> {
                     return None;
                 }
                 let indices = self.parse_string(pos)?;
-                if let Some((_, c)) = self.inner.peek().copied() &&
-                    c != '{' &&
-                    !is_separator(c) &&
-                    c != '('
+                if let Some((_, c)) = self.inner.peek().copied()
+                    && c != '{'
+                    && !is_separator(c)
+                    && c != '('
                 {
                     self.emit_error(format!("expected ` `, `{{` or `,` after `\"`, found `{c}`"));
                     return None;
@@ -1294,6 +1285,21 @@ impl LangString {
                         data.edition = x[7..].parse::<Edition>().ok();
                     }
                     LangStringToken::LangToken(x)
+                        if x.starts_with("rust") && x[4..].parse::<Edition>().is_ok() =>
+                    {
+                        if let Some(extra) = extra {
+                            extra.error_invalid_codeblock_attr_with_help(
+                                format!("unknown attribute `{x}`"),
+                                |lint| {
+                                    lint.help(format!(
+                                        "there is an attribute with a similar name: `edition{}`",
+                                        &x[4..],
+                                    ));
+                                },
+                            );
+                        }
+                    }
+                    LangStringToken::LangToken(x)
                         if allow_error_code_check && x.starts_with('E') && x.len() == 5 =>
                     {
                         if x[1..].parse::<u32>().is_ok() {
@@ -1337,8 +1343,13 @@ impl LangString {
                         } {
                             if let Some(extra) = extra {
                                 extra.error_invalid_codeblock_attr_with_help(
-                                    format!("unknown attribute `{x}`. Did you mean `{flag}`?"),
-                                    help,
+                                    format!("unknown attribute `{x}`"),
+                                    |lint| {
+                                        lint.help(format!(
+                                            "there is an attribute with a similar name: `{flag}`"
+                                        ))
+                                        .help(help);
+                                    },
                                 );
                             }
                         }
@@ -1370,7 +1381,7 @@ impl LangString {
         };
 
         if custom_code_classes_in_docs {
-            call(&mut TagIterator::new(string, extra).into_iter())
+            call(&mut TagIterator::new(string, extra))
         } else {
             call(&mut tokens(string))
         }
@@ -1750,7 +1761,7 @@ pub(crate) fn markdown_links<'md, R>(
         }
         // do not actually include braces in the span
         let range = (open_brace + 1)..close_brace;
-        MarkdownLinkRange::Destination(range.clone())
+        MarkdownLinkRange::Destination(range)
     };
 
     let span_for_offset_forward = |span: Range<usize>, open: u8, close: u8| {
@@ -1786,7 +1797,7 @@ pub(crate) fn markdown_links<'md, R>(
         }
         // do not actually include braces in the span
         let range = (open_brace + 1)..close_brace;
-        MarkdownLinkRange::Destination(range.clone())
+        MarkdownLinkRange::Destination(range)
     };
 
     let mut broken_link_callback = |link: BrokenLink<'md>| Some((link.reference, "".into()));
@@ -2000,6 +2011,7 @@ fn init_id_map() -> FxHashMap<Cow<'static, str>, usize> {
     map.insert("themeStyle".into(), 1);
     map.insert("settings-menu".into(), 1);
     map.insert("help-button".into(), 1);
+    map.insert("sidebar-button".into(), 1);
     map.insert("main-content".into(), 1);
     map.insert("toggle-all-docs".into(), 1);
     map.insert("all-types".into(), 1);
@@ -2024,6 +2036,7 @@ fn init_id_map() -> FxHashMap<Cow<'static, str>, usize> {
     map.insert("required-associated-consts".into(), 1);
     map.insert("required-methods".into(), 1);
     map.insert("provided-methods".into(), 1);
+    map.insert("object-safety".into(), 1);
     map.insert("implementors".into(), 1);
     map.insert("synthetic-implementors".into(), 1);
     map.insert("implementations-list".into(), 1);

@@ -281,11 +281,12 @@ pub enum ExprPrecedence {
     ForLoop,
     Loop,
     Match,
+    PostfixMatch,
     ConstBlock,
     Block,
     TryBlock,
     Struct,
-    Async,
+    Gen,
     Await,
     Err,
 }
@@ -334,7 +335,8 @@ impl ExprPrecedence {
             | ExprPrecedence::InlineAsm
             | ExprPrecedence::Mac
             | ExprPrecedence::FormatArgs
-            | ExprPrecedence::OffsetOf => PREC_POSTFIX,
+            | ExprPrecedence::OffsetOf
+            | ExprPrecedence::PostfixMatch => PREC_POSTFIX,
 
             // Never need parens
             ExprPrecedence::Array
@@ -351,7 +353,7 @@ impl ExprPrecedence {
             | ExprPrecedence::ConstBlock
             | ExprPrecedence::Block
             | ExprPrecedence::TryBlock
-            | ExprPrecedence::Async
+            | ExprPrecedence::Gen
             | ExprPrecedence::Struct
             | ExprPrecedence::Err => PREC_PAREN,
         }
@@ -390,7 +392,8 @@ pub fn contains_exterior_struct_lit(value: &ast::Expr) -> bool {
         | ast::ExprKind::Cast(x, _)
         | ast::ExprKind::Type(x, _)
         | ast::ExprKind::Field(x, _)
-        | ast::ExprKind::Index(x, _, _) => {
+        | ast::ExprKind::Index(x, _, _)
+        | ast::ExprKind::Match(x, _, ast::MatchKind::Postfix) => {
             // &X { y: 1 }, X { y: 1 }.y
             contains_exterior_struct_lit(x)
         }

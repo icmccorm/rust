@@ -96,8 +96,8 @@ pub enum GenericArg {
 impl Path {
     /// Converts an `ast::Path` to `Path`. Works with use trees.
     /// It correctly handles `$crate` based path from macro call.
-    pub fn from_src(path: ast::Path, ctx: &LowerCtx<'_>) -> Option<Path> {
-        lower::lower_path(path, ctx)
+    pub fn from_src(ctx: &LowerCtx<'_>, path: ast::Path) -> Option<Path> {
+        lower::lower_path(ctx, path)
     }
 
     /// Converts a known mod path to `Path`.
@@ -154,7 +154,7 @@ impl Path {
 
     pub fn mod_path(&self) -> Option<&ModPath> {
         match self {
-            Path::Normal { mod_path, .. } => Some(&mod_path),
+            Path::Normal { mod_path, .. } => Some(mod_path),
             Path::LangItem(..) => None,
         }
     }
@@ -219,13 +219,13 @@ impl<'a> PathSegments<'a> {
     }
     pub fn skip(&self, len: usize) -> PathSegments<'a> {
         PathSegments {
-            segments: &self.segments.get(len..).unwrap_or(&[]),
+            segments: self.segments.get(len..).unwrap_or(&[]),
             generic_args: self.generic_args.and_then(|it| it.get(len..)),
         }
     }
     pub fn take(&self, len: usize) -> PathSegments<'a> {
         PathSegments {
-            segments: &self.segments.get(..len).unwrap_or(&self.segments),
+            segments: self.segments.get(..len).unwrap_or(self.segments),
             generic_args: self.generic_args.map(|it| it.get(..len).unwrap_or(it)),
         }
     }

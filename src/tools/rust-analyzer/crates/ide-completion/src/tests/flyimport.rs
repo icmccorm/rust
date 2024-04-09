@@ -106,7 +106,7 @@ fn main() {
 }
 "#,
         r#"
-use dep::{FirstStruct, some_module::{SecondStruct, ThirdStruct}};
+use dep::{some_module::{SecondStruct, ThirdStruct}, FirstStruct};
 
 fn main() {
     ThirdStruct
@@ -116,19 +116,47 @@ fn main() {
 }
 
 #[test]
-fn short_paths_are_ignored() {
-    cov_mark::check!(flyimport_exact_on_short_path);
+fn short_paths_are_prefix_matched() {
+    cov_mark::check!(flyimport_prefix_on_short_path);
 
     check(
         r#"
 //- /lib.rs crate:dep
-pub struct Bar;
+pub struct Barc;
 pub struct Rcar;
 pub struct Rc;
+pub const RC: () = ();
 pub mod some_module {
     pub struct Bar;
     pub struct Rcar;
     pub struct Rc;
+    pub const RC: () = ();
+}
+
+//- /main.rs crate:main deps:dep
+fn main() {
+    Rc$0
+}
+"#,
+        expect![[r#"
+            st Rc (use dep::Rc)       Rc
+            st Rcar (use dep::Rcar)   Rcar
+            st Rc (use dep::some_module::Rc) Rc
+            st Rcar (use dep::some_module::Rcar) Rcar
+        "#]],
+    );
+    check(
+        r#"
+//- /lib.rs crate:dep
+pub struct Barc;
+pub struct Rcar;
+pub struct Rc;
+pub const RC: () = ();
+pub mod some_module {
+    pub struct Bar;
+    pub struct Rcar;
+    pub struct Rc;
+    pub const RC: () = ();
 }
 
 //- /main.rs crate:main deps:dep
@@ -137,8 +165,36 @@ fn main() {
 }
 "#,
         expect![[r#"
-            st Rc (use dep::Rc)
-            st Rc (use dep::some_module::Rc)
+            ct RC (use dep::RC)       ()
+            st Rc (use dep::Rc)       Rc
+            st Rcar (use dep::Rcar)   Rcar
+            ct RC (use dep::some_module::RC) ()
+            st Rc (use dep::some_module::Rc) Rc
+            st Rcar (use dep::some_module::Rcar) Rcar
+        "#]],
+    );
+    check(
+        r#"
+//- /lib.rs crate:dep
+pub struct Barc;
+pub struct Rcar;
+pub struct Rc;
+pub const RC: () = ();
+pub mod some_module {
+    pub struct Bar;
+    pub struct Rcar;
+    pub struct Rc;
+    pub const RC: () = ();
+}
+
+//- /main.rs crate:main deps:dep
+fn main() {
+    RC$0
+}
+"#,
+        expect![[r#"
+            ct RC (use dep::RC)       ()
+            ct RC (use dep::some_module::RC) ()
         "#]],
     );
 }
@@ -171,10 +227,10 @@ fn main() {
 }
 "#,
         expect![[r#"
-                st ThirdStruct (use dep::some_module::ThirdStruct)
-                st AfterThirdStruct (use dep::some_module::AfterThirdStruct)
-                st ThiiiiiirdStruct (use dep::some_module::ThiiiiiirdStruct)
-            "#]],
+            st ThirdStruct (use dep::some_module::ThirdStruct) ThirdStruct
+            st AfterThirdStruct (use dep::some_module::AfterThirdStruct) AfterThirdStruct
+            st ThiiiiiirdStruct (use dep::some_module::ThiiiiiirdStruct) ThiiiiiirdStruct
+        "#]],
     );
 }
 
@@ -253,7 +309,7 @@ fn trait_const_fuzzy_completion() {
     check(
         fixture,
         expect![[r#"
-            ct SPECIAL_CONST (use dep::test_mod::TestTrait)
+            ct SPECIAL_CONST (use dep::test_mod::TestTrait) u8
         "#]],
     );
 
@@ -315,6 +371,135 @@ fn main() {
     test_struct.random_method()$0
 }
 "#,
+    );
+}
+
+#[test]
+fn trait_method_fuzzy_completion_aware_of_fundamental_boxes() {
+    let fixture = r#"
+//- /fundamental.rs crate:fundamental
+#[lang = "owned_box"]
+#[fundamental]
+pub struct Box<T>(T);
+//- /foo.rs crate:foo
+pub trait TestTrait {
+    fn some_method(&self);
+}
+//- /main.rs crate:main deps:foo,fundamental
+struct TestStruct;
+
+impl foo::TestTrait for fundamental::Box<TestStruct> {
+    fn some_method(&self) {}
+}
+
+fn main() {
+    let t = fundamental::Box(TestStruct);
+    t.$0
+}
+"#;
+
+    check(
+        fixture,
+        expect![[r#"
+        me some_method() (use foo::TestTrait) fn(&self)
+    "#]],
+    );
+
+    check_edit(
+        "some_method",
+        fixture,
+        r#"
+use foo::TestTrait;
+
+struct TestStruct;
+
+impl foo::TestTrait for fundamental::Box<TestStruct> {
+    fn some_method(&self) {}
+}
+
+fn main() {
+    let t = fundamental::Box(TestStruct);
+    t.some_method()$0
+}
+"#,
+    );
+}
+
+#[test]
+fn trait_method_fuzzy_completion_aware_of_fundamental_references() {
+    let fixture = r#"
+//- /foo.rs crate:foo
+pub trait TestTrait {
+    fn some_method(&self);
+}
+//- /main.rs crate:main deps:foo
+struct TestStruct;
+
+impl foo::TestTrait for &TestStruct {
+    fn some_method(&self) {}
+}
+
+fn main() {
+    let t = &TestStruct;
+    t.$0
+}
+"#;
+
+    check(
+        fixture,
+        expect![[r#"
+        me some_method() (use foo::TestTrait) fn(&self)
+    "#]],
+    );
+
+    check_edit(
+        "some_method",
+        fixture,
+        r#"
+use foo::TestTrait;
+
+struct TestStruct;
+
+impl foo::TestTrait for &TestStruct {
+    fn some_method(&self) {}
+}
+
+fn main() {
+    let t = &TestStruct;
+    t.some_method()$0
+}
+"#,
+    );
+}
+
+#[test]
+fn trait_method_fuzzy_completion_aware_of_unit_type() {
+    let fixture = r#"
+//- /test_trait.rs crate:test_trait
+pub trait TestInto<T> {
+    fn into(self) -> T;
+}
+
+//- /main.rs crate:main deps:test_trait
+struct A;
+
+impl test_trait::TestInto<A> for () {
+    fn into(self) -> A {
+        A
+    }
+}
+
+fn main() {
+    let a = ();
+    a.$0
+}
+"#;
+
+    check(
+        fixture,
+        expect![[r#"
+    me into() (use test_trait::TestInto) fn(self) -> T
+    "#]],
     );
 }
 
@@ -541,8 +726,9 @@ fn main() {
 }
 "#,
         expect![[r#"
-            ct SPECIAL_CONST (use dep::test_mod::TestTrait) DEPRECATED
             fn weird_function() (use dep::test_mod::TestTrait) fn() DEPRECATED
+            ct SPECIAL_CONST (use dep::test_mod::TestTrait) u8 DEPRECATED
+            me random_method(…) (use dep::test_mod::TestTrait) fn(&self) DEPRECATED
         "#]],
     );
 }
@@ -661,7 +847,7 @@ fn main() {
     check(
         fixture,
         expect![[r#"
-        st Item (use foo::bar::baz::Item)
+            st Item (use foo::bar) Item
         "#]],
     );
 
@@ -669,19 +855,19 @@ fn main() {
         "Item",
         fixture,
         r#"
-        use foo::bar;
+use foo::bar;
 
-        mod foo {
-            pub mod bar {
-                pub mod baz {
-                    pub struct Item;
-                }
-            }
+mod foo {
+    pub mod bar {
+        pub mod baz {
+            pub struct Item;
         }
+    }
+}
 
-        fn main() {
-            bar::baz::Item
-        }"#,
+fn main() {
+    bar::baz::Item
+}"#,
     );
 }
 
@@ -703,7 +889,7 @@ fn main() {
     check(
         fixture,
         expect![[r#"
-        ct TEST_ASSOC (use foo::Item)
+            ct TEST_ASSOC (use foo::Item) usize
         "#]],
     );
 
@@ -747,8 +933,8 @@ fn main() {
     check(
         fixture,
         expect![[r#"
-        ct TEST_ASSOC (use foo::bar::Item)
-    "#]],
+            ct TEST_ASSOC (use foo::bar) usize
+        "#]],
     );
 
     check_edit(
@@ -841,8 +1027,8 @@ fn main() {
     TES$0
 }"#,
         expect![[r#"
-        ct TEST_CONST (use foo::TEST_CONST)
-    "#]],
+            ct TEST_CONST (use foo::TEST_CONST) usize
+        "#]],
     );
 
     check(
@@ -858,9 +1044,9 @@ fn main() {
     tes$0
 }"#,
         expect![[r#"
-        ct TEST_CONST (use foo::TEST_CONST)
-        fn test_function() (use foo::test_function) fn() -> i32
-    "#]],
+            ct TEST_CONST (use foo::TEST_CONST) usize
+            fn test_function() (use foo::test_function) fn() -> i32
+        "#]],
     );
 
     check(
@@ -873,9 +1059,9 @@ mod foo {
 }
 
 fn main() {
-    Te$0
+    Tes$0
 }"#,
-        expect![[]],
+        expect![""],
     );
 }
 
@@ -1082,8 +1268,8 @@ mod mud {
 }
 "#,
         expect![[r#"
-                st Struct (use crate::Struct)
-            "#]],
+            st Struct (use crate::Struct) Struct
+        "#]],
     );
 }
 
@@ -1194,7 +1380,7 @@ enum Foo {
 }
 }"#,
         expect![[r#"
-            st Barbara (use foo::Barbara)
+            st Barbara (use foo::Barbara) Barbara
         "#]],
     )
 }
@@ -1337,6 +1523,25 @@ pub use bridge2::server2::Span2;
         expect![[r#"
             tt Span (use dep::Span)
             tt Span2 (use dep::Span2)
+        "#]],
+    );
+}
+
+#[test]
+fn flyimport_only_traits_in_impl_trait_block() {
+    check(
+        r#"
+//- /main.rs crate:main deps:dep
+pub struct Bar;
+
+impl Foo$0 for Bar { }
+//- /lib.rs crate:dep
+pub trait FooTrait;
+
+pub struct FooStruct;
+"#,
+        expect![[r#"
+            tt FooTrait (use dep::FooTrait)
         "#]],
     );
 }

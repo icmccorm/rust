@@ -331,10 +331,28 @@ $ llvm-cov report \
 
 ## `-C instrument-coverage=<options>`
 
--   `-C instrument-coverage=all`: Instrument all functions, including unused functions and unused generics. (This is the same as `-C instrument-coverage`, with no value.)
--   `-C instrument-coverage=off`: Do not instrument any functions. (This is the same as simply not including the `-C instrument-coverage` option.)
--   `-Zunstable-options -C instrument-coverage=except-unused-generics`: Instrument all functions except unused generics.
--   `-Zunstable-options -C instrument-coverage=except-unused-functions`: Instrument only used (called) functions and instantiated generic functions.
+- `-C instrument-coverage=no` (or `n`/`off`/`false`):
+  Don't enable coverage instrumentation. No functions will be instrumented for coverage.
+  - This is the same as not using the `-C instrument-coverage` flag at all.
+- `-C instrument-coverage=yes` (or `y`/`on`/`true`):
+  Enable coverage instrumentation with the default behaviour.
+  Currently this instruments all functions, including unused functions and unused generics.
+  - This is the same as `-C instrument-coverage` with no value.
+
+### Other values
+
+- `-C instrument-coverage=all`:
+  Currently an alias for `yes`, but may behave differently in the future if
+  more fine-grained coverage options are added.
+  Using this value is currently not recommended.
+
+## `-Z coverage-options=<options>`
+
+This unstable option provides finer control over some aspects of coverage
+instrumentation. Pass one or more of the following values, separated by commas.
+
+- `branch` or `no-branch`
+  - Enables or disables branch coverage instrumentation.
 
 ## Other references
 

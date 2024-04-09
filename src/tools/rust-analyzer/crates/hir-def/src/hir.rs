@@ -12,8 +12,8 @@
 //!
 //! See also a neighboring `body` module.
 
-pub mod type_ref;
 pub mod format_args;
+pub mod type_ref;
 
 use std::fmt;
 
@@ -101,7 +101,7 @@ pub enum Literal {
 /// Used in range patterns.
 pub enum LiteralOrConst {
     Literal(Literal),
-    Const(Path),
+    Const(PatId),
 }
 
 impl Literal {
@@ -182,6 +182,7 @@ pub enum Expr {
         tail: Option<ExprId>,
     },
     Const(ConstBlockId),
+    // FIXME: Fold this into Block with an unsafe flag?
     Unsafe {
         id: Option<BlockId>,
         statements: Box<[Statement]>,
@@ -215,6 +216,9 @@ pub enum Expr {
     },
     Return {
         expr: Option<ExprId>,
+    },
+    Become {
+        expr: ExprId,
     },
     Yield {
         expr: Option<ExprId>,
@@ -265,6 +269,7 @@ pub enum Expr {
     Index {
         base: ExprId,
         index: ExprId,
+        is_assignee_expr: bool,
     },
     Closure {
         args: Box<[PatId]>,
@@ -299,7 +304,7 @@ pub struct InlineAsm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClosureKind {
     Closure,
-    Generator(Movability),
+    Coroutine(Movability),
     Async,
 }
 
@@ -348,6 +353,9 @@ pub enum Statement {
         expr: ExprId,
         has_semi: bool,
     },
+    // At the moment, we only use this to figure out if a return expression
+    // is really the last statement of a block. See #16566
+    Item,
 }
 
 impl Expr {
@@ -381,6 +389,7 @@ impl Expr {
                             }
                         }
                         Statement::Expr { expr: expression, .. } => f(*expression),
+                        Statement::Item => (),
                     }
                 }
                 if let &Some(expr) = tail {
@@ -409,6 +418,7 @@ impl Expr {
                     f(expr);
                 }
             }
+            Expr::Become { expr } => f(*expr),
             Expr::RecordLit { fields, spread, .. } => {
                 for field in fields.iter() {
                     f(field.expr);
@@ -432,7 +442,7 @@ impl Expr {
                     f(rhs);
                 }
             }
-            Expr::Index { base, index } => {
+            Expr::Index { base, index, .. } => {
                 f(*base);
                 f(*index);
             }

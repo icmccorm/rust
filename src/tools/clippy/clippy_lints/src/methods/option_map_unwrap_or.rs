@@ -1,16 +1,15 @@
+use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::snippet_with_applicability;
 use clippy_utils::ty::{is_copy, is_type_diagnostic_item};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::Applicability;
 use rustc_hir::def::Res;
 use rustc_hir::intravisit::{walk_path, Visitor};
-use rustc_hir::{self, ExprKind, HirId, Node, PatKind, Path, QPath};
+use rustc_hir::{ExprKind, HirId, Node, PatKind, Path, QPath};
 use rustc_lint::LateContext;
 use rustc_middle::hir::nested_filter;
-use rustc_span::source_map::Span;
-use rustc_span::sym;
+use rustc_span::{sym, Span};
 
 use super::MAP_UNWRAP_OR;
 
@@ -68,12 +67,12 @@ pub(super) fn check<'tcx>(
             }
         }
 
-        if unwrap_arg.span.ctxt() != map_span.ctxt() {
+        if !unwrap_arg.span.eq_ctxt(map_span) {
             return;
         }
 
         // is_some_and is stabilised && `unwrap_or` argument is false; suggest `is_some_and` instead
-        let suggest_is_some_and = msrv.meets(msrvs::OPTION_IS_SOME_AND)
+        let suggest_is_some_and = msrv.meets(msrvs::OPTION_RESULT_IS_VARIANT_AND)
             && matches!(&unwrap_arg.kind, ExprKind::Lit(lit)
             if matches!(lit.node, rustc_ast::LitKind::Bool(false)));
 
@@ -98,10 +97,7 @@ pub(super) fn check<'tcx>(
         } else {
             "map_or(<a>, <f>)"
         };
-        let msg = &format!(
-            "called `map(<f>).unwrap_or({arg})` on an `Option` value. \
-            This can be done more directly by calling `{suggest}` instead"
-        );
+        let msg = format!("called `map(<f>).unwrap_or({arg})` on an `Option` value");
 
         span_lint_and_then(cx, MAP_UNWRAP_OR, expr.span, msg, |diag| {
             let map_arg_span = map_arg.span;
@@ -139,7 +135,7 @@ impl<'a, 'tcx> Visitor<'tcx> for UnwrapVisitor<'a, 'tcx> {
 
     fn visit_path(&mut self, path: &Path<'tcx>, _: HirId) {
         if let Res::Local(local_id) = path.res
-            && let Some(Node::Pat(pat)) = self.cx.tcx.hir().find(local_id)
+            && let Node::Pat(pat) = self.cx.tcx.hir_node(local_id)
             && let PatKind::Binding(_, local_id, ..) = pat.kind
         {
             self.identifiers.insert(local_id);
@@ -170,7 +166,7 @@ impl<'a, 'tcx> Visitor<'tcx> for ReferenceVisitor<'a, 'tcx> {
                 && let ExprKind::Path(ref path) = expr.kind
                 && let QPath::Resolved(_, path) = path
                 && let Res::Local(local_id) = path.res
-                && let Some(Node::Pat(pat)) = self.cx.tcx.hir().find(local_id)
+                && let Node::Pat(pat) = self.cx.tcx.hir_node(local_id)
                 && let PatKind::Binding(_, local_id, ..) = pat.kind
                 && self.identifiers.contains(&local_id)
             {

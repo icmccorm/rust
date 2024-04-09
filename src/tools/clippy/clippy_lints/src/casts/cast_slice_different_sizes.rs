@@ -1,7 +1,6 @@
+use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source;
-use if_chain::if_chain;
 use rustc_ast::Mutability;
 use rustc_hir::{Expr, ExprKind, Node};
 use rustc_lint::LateContext;
@@ -36,7 +35,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>, msrv: &Msrv
                     cx,
                     CAST_SLICE_DIFFERENT_SIZES,
                     expr.span,
-                    &format!(
+                    format!(
                         "casting between raw pointers to `[{}]` (element size {from_size}) and `[{}]` (element size {to_size}) does not adjust the count",
                         start_ty.ty, end_ty.ty,
                     ),
@@ -68,35 +67,27 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>, msrv: &Msrv
 }
 
 fn is_child_of_cast(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
-    let map = cx.tcx.hir();
-    if_chain! {
-        if let Some(parent_id) = map.opt_parent_id(expr.hir_id);
-        if let Some(parent) = map.find(parent_id);
-        then {
-            let expr = match parent {
-                Node::Block(block) => {
-                    if let Some(parent_expr) = block.expr {
-                        parent_expr
-                    } else {
-                        return false;
-                    }
-                },
-                Node::Expr(expr) => expr,
-                _ => return false,
-            };
+    let parent = cx.tcx.parent_hir_node(expr.hir_id);
+    let expr = match parent {
+        Node::Block(block) => {
+            if let Some(parent_expr) = block.expr {
+                parent_expr
+            } else {
+                return false;
+            }
+        },
+        Node::Expr(expr) => expr,
+        _ => return false,
+    };
 
-            matches!(expr.kind, ExprKind::Cast(..))
-        } else {
-            false
-        }
-    }
+    matches!(expr.kind, ExprKind::Cast(..))
 }
 
 /// Returns the type T of the pointed to *const [T] or *mut [T] and the mutability of the slice if
 /// the type is one of those slices
 fn get_raw_slice_ty_mut(ty: Ty<'_>) -> Option<TypeAndMut<'_>> {
     match ty.kind() {
-        ty::RawPtr(TypeAndMut { ty: slice_ty, mutbl }) => match slice_ty.kind() {
+        ty::RawPtr(slice_ty, mutbl) => match slice_ty.kind() {
             ty::Slice(ty) => Some(TypeAndMut { ty: *ty, mutbl: *mutbl }),
             _ => None,
         },

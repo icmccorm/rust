@@ -17,7 +17,7 @@ fn main() { column!(); }
 #[rustc_builtin_macro]
 macro_rules! column {() => {}}
 
-fn main() { 0 as u32; }
+fn main() { 0u32; }
 "#]],
     );
 }
@@ -74,7 +74,7 @@ fn main() { line!() }
 #[rustc_builtin_macro]
 macro_rules! line {() => {}}
 
-fn main() { 0 as u32 }
+fn main() { 0u32 }
 "#]],
     );
 }
@@ -136,7 +136,7 @@ fn main() { option_env!("TEST_ENV_VAR"); }
 #[rustc_builtin_macro]
 macro_rules! option_env {() => {}}
 
-fn main() { ::core::option::Option::None:: < &str>; }
+fn main() { $crate::option::Option::None:: < &str>; }
 "#]],
     );
 }
@@ -163,31 +163,43 @@ fn main() { ""; }
 fn test_assert_expand() {
     check(
         r#"
-#[rustc_builtin_macro]
-macro_rules! assert {
-    ($cond:expr) => ({ /* compiler built-in */ });
-    ($cond:expr, $($args:tt)*) => ({ /* compiler built-in */ })
-}
-
+//- minicore: assert
 fn main() {
     assert!(true, "{} {:?}", arg1(a, b, c), arg2);
 }
 "#,
-        expect![[r##"
-#[rustc_builtin_macro]
-macro_rules! assert {
-    ($cond:expr) => ({ /* compiler built-in */ });
-    ($cond:expr, $($args:tt)*) => ({ /* compiler built-in */ })
-}
-
+        expect![[r#"
 fn main() {
      {
         if !(true ) {
-            $crate::panic!("{} {:?}", arg1(a, b, c), arg2);
+            $crate::panic::panic_2021!("{} {:?}", arg1(a, b, c), arg2);
         }
     };
 }
-"##]],
+"#]],
+    );
+}
+
+// FIXME: This is the wrong expansion, see FIXME on `builtin_fn_macro::use_panic_2021`
+#[test]
+fn test_assert_expand_2015() {
+    check(
+        r#"
+//- minicore: assert
+//- /main.rs edition:2015
+fn main() {
+    assert!(true, "{} {:?}", arg1(a, b, c), arg2);
+}
+"#,
+        expect![[r#"
+fn main() {
+     {
+        if !(true ) {
+            $crate::panic::panic_2021!("{} {:?}", arg1(a, b, c), arg2);
+        }
+    };
+}
+"#]],
     );
 }
 
@@ -448,13 +460,13 @@ fn test_concat_expand() {
 #[rustc_builtin_macro]
 macro_rules! concat {}
 
-fn main() { concat!("foo", "r", 0, r#"bar"#, "\n", false, '"', '\0'); }
+fn main() { concat!("fo", "o", 0, r#"bar"#, "\n", false, '"', '\0'); }
 "##,
         expect![[r##"
 #[rustc_builtin_macro]
 macro_rules! concat {}
 
-fn main() { "foor0bar\nfalse\"\u{0}"; }
+fn main() { "foo0bar\nfalse\"\u{0}"; }
 "##]],
     );
 }
@@ -468,12 +480,12 @@ macro_rules! concat_bytes {}
 
 fn main() { concat_bytes!(b'A', b"BC", [68, b'E', 70]); }
 "##,
-        expect![[r##"
+        expect![[r#"
 #[rustc_builtin_macro]
 macro_rules! concat_bytes {}
 
 fn main() { [b'A', 66, 67, 68, b'E', 70]; }
-"##]],
+"#]],
     );
 }
 

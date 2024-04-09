@@ -1,5 +1,5 @@
 error: question mark operator was used
-  --> $DIR/question_mark_used.rs:11:5
+  --> tests/ui/question_mark_used.rs:11:5
    |
 LL |     other_function()?;
    |     ^^^^^^^^^^^^^^^^^
@@ -8,5 +8,5 @@ LL |     other_function()?;
    = note: `-D clippy::question-mark-used` implied by `-D warnings`
    = help: to override `-D warnings` add `#[allow(clippy::question_mark_used)]`
 
-error: aborting due to previous error
+error: aborting due to 1 previous error
 

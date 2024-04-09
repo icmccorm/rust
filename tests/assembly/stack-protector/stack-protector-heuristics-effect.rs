@@ -1,14 +1,15 @@
-// revisions: all strong basic none missing
-// assembly-output: emit-asm
-// ignore-macos slightly different policy on stack protection of arrays
-// ignore-windows stack check code uses different function names
-// ignore-nvptx64 stack protector is not supported
-// ignore-wasm32-bare
-// [all] compile-flags: -Z stack-protector=all
-// [strong] compile-flags: -Z stack-protector=strong
-// [basic] compile-flags: -Z stack-protector=basic
-// [none] compile-flags: -Z stack-protector=none
-// compile-flags: -C opt-level=2 -Z merge-functions=disabled
+//@ revisions: all strong basic none missing
+//@ assembly-output: emit-asm
+//@ ignore-macos slightly different policy on stack protection of arrays
+//@ ignore-msvc stack check code uses different function names
+//@ ignore-nvptx64 stack protector is not supported
+//@ ignore-wasm32-bare
+//@ [all] compile-flags: -Z stack-protector=all
+//@ [strong] compile-flags: -Z stack-protector=strong
+//@ [basic] compile-flags: -Z stack-protector=basic
+//@ [none] compile-flags: -Z stack-protector=none
+//@ compile-flags: -C opt-level=2 -Z merge-functions=disabled
+//@ min-llvm-version: 17.0.2
 
 #![crate_type = "lib"]
 
@@ -371,7 +372,7 @@ pub fn unsized_fn_param(s: [u8], l: bool, f: fn([u8])) {
 
 
     // all: __stack_chk_fail
-    // strong: __stack_chk_fail
+    // strong-NOT: __stack_chk_fail
     // basic-NOT: __stack_chk_fail
     // none-NOT: __stack_chk_fail
     // missing-NOT: __stack_chk_fail

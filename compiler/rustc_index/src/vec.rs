@@ -13,8 +13,28 @@ use crate::{Idx, IndexSlice};
 
 /// An owned contiguous collection of `T`s, indexed by `I` rather than by `usize`.
 ///
+/// ## Why use this instead of a `Vec`?
+///
+/// An `IndexVec` allows element access only via a specific associated index type, meaning that
+/// trying to use the wrong index type (possibly accessing an invalid element) will fail at
+/// compile time.
+///
+/// It also documents what the index is indexing: in a `HashMap<usize, Something>` it's not
+/// immediately clear what the `usize` means, while a `HashMap<FieldIdx, Something>` makes it obvious.
+///
+/// ```compile_fail
+/// use rustc_index::{Idx, IndexVec};
+///
+/// fn f<I1: Idx, I2: Idx>(vec1: IndexVec<I1, u8>, idx1: I1, idx2: I2) {
+///   &vec1[idx1]; // Ok
+///   &vec1[idx2]; // Compile error!
+/// }
+/// ```
+///
 /// While it's possible to use `u32` or `usize` directly for `I`,
 /// you almost certainly want to use a [`newtype_index!`]-generated type instead.
+///
+/// This allows to index the IndexVec with the new index type.
 ///
 /// [`newtype_index!`]: ../macro.newtype_index.html
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -25,11 +45,13 @@ pub struct IndexVec<I: Idx, T> {
 }
 
 impl<I: Idx, T> IndexVec<I, T> {
+    /// Constructs a new, empty `IndexVec<I, T>`.
     #[inline]
     pub const fn new() -> Self {
         IndexVec::from_raw(Vec::new())
     }
 
+    /// Constructs a new `IndexVec<I, T>` from a `Vec<T>`.
     #[inline]
     pub const fn from_raw(raw: Vec<T>) -> Self {
         IndexVec { raw, _marker: PhantomData }
@@ -59,6 +81,7 @@ impl<I: Idx, T> IndexVec<I, T> {
         IndexVec::from_raw(vec![elem; universe.len()])
     }
 
+    /// Creates a new IndexVec with n copies of the `elem`.
     #[inline]
     pub fn from_elem_n(elem: T, n: usize) -> Self
     where
@@ -85,6 +108,7 @@ impl<I: Idx, T> IndexVec<I, T> {
         IndexSlice::from_raw_mut(&mut self.raw)
     }
 
+    /// Pushes an element to the array returning the index where it was pushed to.
     #[inline]
     pub fn push(&mut self, d: T) -> I {
         let idx = self.next_index();
@@ -135,10 +159,6 @@ impl<I: Idx, T> IndexVec<I, T> {
     #[inline]
     pub fn truncate(&mut self, a: usize) {
         self.raw.truncate(a)
-    }
-
-    pub fn convert_index_type<Ix: Idx>(self) -> IndexVec<Ix, T> {
-        IndexVec::from_raw(self.raw)
     }
 
     /// Grows the index vector so that it contains an entry for

@@ -1,21 +1,13 @@
 //! Orphan checker: every impl either implements a trait defined in this
 //! crate or pertains to a type defined in this crate.
 
-use rustc_data_structures::fx::FxHashSet;
-use rustc_errors::{struct_span_err, DelayDm};
-use rustc_errors::{Diagnostic, ErrorGuaranteed};
+use crate::errors;
+use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
-use rustc_middle::ty::util::CheckRegions;
-use rustc_middle::ty::GenericArgs;
-use rustc_middle::ty::{
-    self, AliasKind, ImplPolarity, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt,
-    TypeVisitor,
-};
-use rustc_session::lint;
-use rustc_span::def_id::{DefId, LocalDefId};
+use rustc_middle::ty::{self, AliasKind, TyCtxt, TypeVisitableExt};
+use rustc_span::def_id::LocalDefId;
 use rustc_span::Span;
-use rustc_trait_selection::traits;
-use std::ops::ControlFlow;
+use rustc_trait_selection::traits::{self, IsFirstInputType};
 
 #[instrument(skip(tcx), level = "debug")]
 pub(crate) fn orphan_check_impl(
@@ -25,30 +17,17 @@ pub(crate) fn orphan_check_impl(
     let trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap().instantiate_identity();
     trait_ref.error_reported()?;
 
-    let ret = do_orphan_check_impl(tcx, trait_ref, impl_def_id);
-    if tcx.trait_is_auto(trait_ref.def_id) {
-        lint_auto_trait_impl(tcx, trait_ref, impl_def_id);
-    }
-
-    ret
-}
-
-fn do_orphan_check_impl<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    trait_ref: ty::TraitRef<'tcx>,
-    def_id: LocalDefId,
-) -> Result<(), ErrorGuaranteed> {
     let trait_def_id = trait_ref.def_id;
 
-    match traits::orphan_check(tcx, def_id.to_def_id()) {
+    match traits::orphan_check(tcx, impl_def_id.to_def_id()) {
         Ok(()) => {}
         Err(err) => {
-            let item = tcx.hir().expect_item(def_id);
+            let item = tcx.hir().expect_item(impl_def_id);
             let hir::ItemKind::Impl(impl_) = item.kind else {
-                bug!("{:?} is not an impl: {:?}", def_id, item);
+                bug!("{:?} is not an impl: {:?}", impl_def_id, item);
             };
             let tr = impl_.of_trait.as_ref().unwrap();
-            let sp = tcx.def_span(def_id);
+            let sp = tcx.def_span(impl_def_id);
 
             emit_orphan_check_error(
                 tcx,
@@ -57,7 +36,7 @@ fn do_orphan_check_impl<'tcx>(
                 tr.path.span,
                 trait_ref,
                 impl_.self_ty.span,
-                &impl_.generics,
+                impl_.generics,
                 err,
             )?
         }
@@ -192,7 +171,7 @@ fn do_orphan_check_impl<'tcx>(
             // impl<T> AutoTrait for T {}
             // impl<T: ?Sized> AutoTrait for T {}
             ty::Param(..) => (
-                if self_ty.is_sized(tcx, tcx.param_env(def_id)) {
+                if self_ty.is_sized(tcx, tcx.param_env(impl_def_id)) {
                     LocalImpl::Allow
                 } else {
                     LocalImpl::Disallow { problematic_kind: "generic type" }
@@ -243,12 +222,13 @@ fn do_orphan_check_impl<'tcx>(
             | ty::Tuple(..) => (LocalImpl::Allow, NonlocalImpl::DisallowOther),
 
             ty::Closure(..)
-            | ty::Generator(..)
-            | ty::GeneratorWitness(..)
+            | ty::CoroutineClosure(..)
+            | ty::Coroutine(..)
+            | ty::CoroutineWitness(..)
             | ty::Bound(..)
             | ty::Placeholder(..)
             | ty::Infer(..) => {
-                let sp = tcx.def_span(def_id);
+                let sp = tcx.def_span(impl_def_id);
                 span_bug!(sp, "weird self type for autotrait impl")
             }
 
@@ -259,49 +239,30 @@ fn do_orphan_check_impl<'tcx>(
             match local_impl {
                 LocalImpl::Allow => {}
                 LocalImpl::Disallow { problematic_kind } => {
-                    let msg = format!(
-                        "traits with a default impl, like `{trait}`, \
-                                cannot be implemented for {problematic_kind} `{self_ty}`",
-                        trait = tcx.def_path_str(trait_def_id),
-                    );
-                    let label = format!(
-                        "a trait object implements `{trait}` if and only if `{trait}` \
-                                is one of the trait object's trait bounds",
-                        trait = tcx.def_path_str(trait_def_id),
-                    );
-                    let sp = tcx.def_span(def_id);
-                    let reported =
-                        struct_span_err!(tcx.sess, sp, E0321, "{}", msg).note(label).emit();
-                    return Err(reported);
+                    return Err(tcx.dcx().emit_err(errors::TraitsWithDefaultImpl {
+                        span: tcx.def_span(impl_def_id),
+                        traits: tcx.def_path_str(trait_def_id),
+                        problematic_kind,
+                        self_ty,
+                    }));
                 }
             }
         } else {
-            if let Some((msg, label)) = match nonlocal_impl {
-                NonlocalImpl::Allow => None,
-                NonlocalImpl::DisallowBecauseNonlocal => Some((
-                    format!(
-                        "cross-crate traits with a default impl, like `{}`, \
-                                can only be implemented for a struct/enum type \
-                                defined in the current crate",
-                        tcx.def_path_str(trait_def_id)
-                    ),
-                    "can't implement cross-crate trait for type in another crate",
-                )),
-                NonlocalImpl::DisallowOther => Some((
-                    format!(
-                        "cross-crate traits with a default impl, like `{}`, can \
-                                only be implemented for a struct/enum type, not `{}`",
-                        tcx.def_path_str(trait_def_id),
-                        self_ty
-                    ),
-                    "can't implement cross-crate trait with a default impl for \
-                            non-struct/enum type",
-                )),
-            } {
-                let sp = tcx.def_span(def_id);
-                let reported =
-                    struct_span_err!(tcx.sess, sp, E0321, "{}", msg).span_label(sp, label).emit();
-                return Err(reported);
+            match nonlocal_impl {
+                NonlocalImpl::Allow => {}
+                NonlocalImpl::DisallowBecauseNonlocal => {
+                    return Err(tcx.dcx().emit_err(errors::CrossCrateTraitsDefined {
+                        span: tcx.def_span(impl_def_id),
+                        traits: tcx.def_path_str(trait_def_id),
+                    }));
+                }
+                NonlocalImpl::DisallowOther => {
+                    return Err(tcx.dcx().emit_err(errors::CrossCrateTraits {
+                        span: tcx.def_span(impl_def_id),
+                        traits: tcx.def_path_str(trait_def_id),
+                        self_ty,
+                    }));
+                }
             }
         }
     }
@@ -322,73 +283,104 @@ fn emit_orphan_check_error<'tcx>(
     let self_ty = trait_ref.self_ty();
     Err(match err {
         traits::OrphanCheckErr::NonLocalInputType(tys) => {
-            let msg = match self_ty.kind() {
-                ty::Adt(..) => "can be implemented for types defined outside of the crate",
-                _ if self_ty.is_primitive() => "can be implemented for primitive types",
-                _ => "can be implemented for arbitrary types",
-            };
-            let mut err = struct_span_err!(
-                tcx.sess,
-                sp,
-                E0117,
-                "only traits defined in the current crate {msg}"
-            );
-            err.span_label(sp, "impl doesn't use only types from inside the current crate");
+            let mut diag = tcx.dcx().create_err(match self_ty.kind() {
+                ty::Adt(..) => errors::OnlyCurrentTraits::Outside { span: sp, note: () },
+                _ if self_ty.is_primitive() => {
+                    errors::OnlyCurrentTraits::Primitive { span: sp, note: () }
+                }
+                _ => errors::OnlyCurrentTraits::Arbitrary { span: sp, note: () },
+            });
+
             for &(mut ty, is_target_ty) in &tys {
-                ty = tcx.erase_regions(ty);
-                ty = match ty.kind() {
-                    // Remove the type arguments from the output, as they are not relevant.
-                    // You can think of this as the reverse of `resolve_vars_if_possible`.
-                    // That way if we had `Vec<MyType>`, we will properly attribute the
-                    // problem to `Vec<T>` and avoid confusing the user if they were to see
-                    // `MyType` in the error.
-                    ty::Adt(def, _) => Ty::new_adt(tcx, *def, ty::List::empty()),
-                    _ => ty,
-                };
-                let msg = |ty: &str, postfix: &str| {
-                    format!("{ty} is not defined in the current crate{postfix}")
-                };
-
-                let this = |name: &str| {
-                    if !trait_ref.def_id.is_local() && !is_target_ty {
-                        msg("this", " because this is a foreign trait")
-                    } else {
-                        msg("this", &format!(" because {name} are always foreign"))
-                    }
-                };
-                let msg = match &ty.kind() {
-                    ty::Slice(_) => this("slices"),
-                    ty::Array(..) => this("arrays"),
-                    ty::Tuple(..) => this("tuples"),
-                    ty::Alias(ty::Opaque, ..) => {
-                        "type alias impl trait is treated as if it were foreign, \
-                        because its hidden type could be from a foreign crate"
-                            .to_string()
-                    }
-                    ty::RawPtr(ptr_ty) => {
-                        emit_newtype_suggestion_for_raw_ptr(
-                            full_impl_span,
-                            self_ty,
-                            self_ty_span,
-                            ptr_ty,
-                            &mut err,
-                        );
-
-                        msg(&format!("`{ty}`"), " because raw pointers are always foreign")
-                    }
-                    _ => msg(&format!("`{ty}`"), ""),
-                };
-
-                if is_target_ty {
+                let span = if matches!(is_target_ty, IsFirstInputType::Yes) {
                     // Point at `D<A>` in `impl<A, B> for C<B> in D<A>`
-                    err.span_label(self_ty_span, msg);
+                    self_ty_span
                 } else {
                     // Point at `C<B>` in `impl<A, B> for C<B> in D<A>`
-                    err.span_label(trait_span, msg);
+                    trait_span
+                };
+
+                ty = tcx.erase_regions(ty);
+
+                let is_foreign =
+                    !trait_ref.def_id.is_local() && matches!(is_target_ty, IsFirstInputType::No);
+
+                match *ty.kind() {
+                    ty::Slice(_) => {
+                        if is_foreign {
+                            diag.subdiagnostic(
+                                tcx.dcx(),
+                                errors::OnlyCurrentTraitsForeign { span },
+                            );
+                        } else {
+                            diag.subdiagnostic(
+                                tcx.dcx(),
+                                errors::OnlyCurrentTraitsName { span, name: "slices" },
+                            );
+                        }
+                    }
+                    ty::Array(..) => {
+                        if is_foreign {
+                            diag.subdiagnostic(
+                                tcx.dcx(),
+                                errors::OnlyCurrentTraitsForeign { span },
+                            );
+                        } else {
+                            diag.subdiagnostic(
+                                tcx.dcx(),
+                                errors::OnlyCurrentTraitsName { span, name: "arrays" },
+                            );
+                        }
+                    }
+                    ty::Tuple(..) => {
+                        if is_foreign {
+                            diag.subdiagnostic(
+                                tcx.dcx(),
+                                errors::OnlyCurrentTraitsForeign { span },
+                            );
+                        } else {
+                            diag.subdiagnostic(
+                                tcx.dcx(),
+                                errors::OnlyCurrentTraitsName { span, name: "tuples" },
+                            );
+                        }
+                    }
+                    ty::Alias(ty::Opaque, ..) => {
+                        diag.subdiagnostic(tcx.dcx(), errors::OnlyCurrentTraitsOpaque { span });
+                    }
+                    ty::RawPtr(ptr_ty, mutbl) => {
+                        if !self_ty.has_param() {
+                            diag.subdiagnostic(
+                                tcx.dcx(),
+                                errors::OnlyCurrentTraitsPointerSugg {
+                                    wrapper_span: self_ty_span,
+                                    struct_span: full_impl_span.shrink_to_lo(),
+                                    mut_key: mutbl.prefix_str(),
+                                    ptr_ty,
+                                },
+                            );
+                        }
+                        diag.subdiagnostic(
+                            tcx.dcx(),
+                            errors::OnlyCurrentTraitsPointer { span, pointer: ty },
+                        );
+                    }
+                    ty::Adt(adt_def, _) => {
+                        diag.subdiagnostic(
+                            tcx.dcx(),
+                            errors::OnlyCurrentTraitsAdt {
+                                span,
+                                name: tcx.def_path_str(adt_def.did()),
+                            },
+                        );
+                    }
+                    _ => {
+                        diag.subdiagnostic(tcx.dcx(), errors::OnlyCurrentTraitsTy { span, ty });
+                    }
                 }
             }
-            err.note("define and implement a trait or new type instead");
-            err.emit()
+
+            diag.emit()
         }
         traits::OrphanCheckErr::UncoveredTy(param_ty, local_type) => {
             let mut sp = sp;
@@ -399,218 +391,14 @@ fn emit_orphan_check_error<'tcx>(
             }
 
             match local_type {
-                Some(local_type) => struct_span_err!(
-                    tcx.sess,
-                    sp,
-                    E0210,
-                    "type parameter `{}` must be covered by another type \
-                    when it appears before the first local type (`{}`)",
+                Some(local_type) => tcx.dcx().emit_err(errors::TyParamFirstLocal {
+                    span: sp,
+                    note: (),
                     param_ty,
-                    local_type
-                )
-                .span_label(
-                    sp,
-                    format!(
-                        "type parameter `{param_ty}` must be covered by another type \
-                    when it appears before the first local type (`{local_type}`)"
-                    ),
-                )
-                .note(
-                    "implementing a foreign trait is only possible if at \
-                        least one of the types for which it is implemented is local, \
-                        and no uncovered type parameters appear before that first \
-                        local type",
-                )
-                .note(
-                    "in this case, 'before' refers to the following order: \
-                        `impl<..> ForeignTrait<T1, ..., Tn> for T0`, \
-                        where `T0` is the first and `Tn` is the last",
-                )
-                .emit(),
-                None => struct_span_err!(
-                    tcx.sess,
-                    sp,
-                    E0210,
-                    "type parameter `{}` must be used as the type parameter for some \
-                    local type (e.g., `MyStruct<{}>`)",
-                    param_ty,
-                    param_ty
-                )
-                .span_label(
-                    sp,
-                    format!(
-                        "type parameter `{param_ty}` must be used as the type parameter for some \
-                    local type",
-                    ),
-                )
-                .note(
-                    "implementing a foreign trait is only possible if at \
-                        least one of the types for which it is implemented is local",
-                )
-                .note(
-                    "only traits defined in the current crate can be \
-                        implemented for a type parameter",
-                )
-                .emit(),
+                    local_type,
+                }),
+                None => tcx.dcx().emit_err(errors::TyParamSome { span: sp, note: (), param_ty }),
             }
         }
     })
-}
-
-fn emit_newtype_suggestion_for_raw_ptr(
-    full_impl_span: Span,
-    self_ty: Ty<'_>,
-    self_ty_span: Span,
-    ptr_ty: &ty::TypeAndMut<'_>,
-    diag: &mut Diagnostic,
-) {
-    if !self_ty.has_param() {
-        let mut_key = ptr_ty.mutbl.prefix_str();
-        let msg_sugg = "consider introducing a new wrapper type".to_owned();
-        let sugg = vec![
-            (
-                full_impl_span.shrink_to_lo(),
-                format!("struct WrapperType(*{}{});\n\n", mut_key, ptr_ty.ty),
-            ),
-            (self_ty_span, "WrapperType".to_owned()),
-        ];
-        diag.multipart_suggestion(msg_sugg, sugg, rustc_errors::Applicability::MaybeIncorrect);
-    }
-}
-
-/// Lint impls of auto traits if they are likely to have
-/// unsound or surprising effects on auto impls.
-fn lint_auto_trait_impl<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    trait_ref: ty::TraitRef<'tcx>,
-    impl_def_id: LocalDefId,
-) {
-    assert_eq!(trait_ref.args.len(), 1);
-    let self_ty = trait_ref.self_ty();
-    let (self_type_did, args) = match self_ty.kind() {
-        ty::Adt(def, args) => (def.did(), args),
-        _ => {
-            // FIXME: should also lint for stuff like `&i32` but
-            // considering that auto traits are unstable, that
-            // isn't too important for now as this only affects
-            // crates using `nightly`, and std.
-            return;
-        }
-    };
-
-    // Impls which completely cover a given root type are fine as they
-    // disable auto impls entirely. So only lint if the args
-    // are not a permutation of the identity args.
-    let Err(arg) = tcx.uses_unique_generic_params(args, CheckRegions::No) else {
-        // ok
-        return;
-    };
-
-    // Ideally:
-    //
-    // - compute the requirements for the auto impl candidate
-    // - check whether these are implied by the non covering impls
-    // - if not, emit the lint
-    //
-    // What we do here is a bit simpler:
-    //
-    // - badly check if an auto impl candidate definitely does not apply
-    //   for the given simplified type
-    // - if so, do not lint
-    if fast_reject_auto_impl(tcx, trait_ref.def_id, self_ty) {
-        // ok
-        return;
-    }
-
-    tcx.struct_span_lint_hir(
-        lint::builtin::SUSPICIOUS_AUTO_TRAIT_IMPLS,
-        tcx.hir().local_def_id_to_hir_id(impl_def_id),
-        tcx.def_span(impl_def_id),
-        DelayDm(|| {
-            format!(
-                "cross-crate traits with a default impl, like `{}`, \
-                         should not be specialized",
-                tcx.def_path_str(trait_ref.def_id),
-            )
-        }),
-        |lint| {
-            let item_span = tcx.def_span(self_type_did);
-            let self_descr = tcx.def_descr(self_type_did);
-            match arg {
-                ty::util::NotUniqueParam::DuplicateParam(arg) => {
-                    lint.note(format!("`{arg}` is mentioned multiple times"));
-                }
-                ty::util::NotUniqueParam::NotParam(arg) => {
-                    lint.note(format!("`{arg}` is not a generic parameter"));
-                }
-            }
-            lint.span_note(
-                item_span,
-                format!(
-                    "try using the same sequence of generic parameters as the {self_descr} definition",
-                ),
-            )
-        },
-    );
-}
-
-fn fast_reject_auto_impl<'tcx>(tcx: TyCtxt<'tcx>, trait_def_id: DefId, self_ty: Ty<'tcx>) -> bool {
-    struct DisableAutoTraitVisitor<'tcx> {
-        tcx: TyCtxt<'tcx>,
-        trait_def_id: DefId,
-        self_ty_root: Ty<'tcx>,
-        seen: FxHashSet<DefId>,
-    }
-
-    impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for DisableAutoTraitVisitor<'tcx> {
-        type BreakTy = ();
-        fn visit_ty(&mut self, ty: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
-            let tcx = self.tcx;
-            if ty != self.self_ty_root {
-                for impl_def_id in tcx.non_blanket_impls_for_ty(self.trait_def_id, ty) {
-                    match tcx.impl_polarity(impl_def_id) {
-                        ImplPolarity::Negative => return ControlFlow::Break(()),
-                        ImplPolarity::Reservation => {}
-                        // FIXME(@lcnr): That's probably not good enough, idk
-                        //
-                        // We might just want to take the rustdoc code and somehow avoid
-                        // explicit impls for `Self`.
-                        ImplPolarity::Positive => return ControlFlow::Continue(()),
-                    }
-                }
-            }
-
-            match ty.kind() {
-                ty::Adt(def, args) if def.is_phantom_data() => args.visit_with(self),
-                ty::Adt(def, args) => {
-                    // @lcnr: This is the only place where cycles can happen. We avoid this
-                    // by only visiting each `DefId` once.
-                    //
-                    // This will be is incorrect in subtle cases, but I don't care :)
-                    if self.seen.insert(def.did()) {
-                        for ty in def.all_fields().map(|field| field.ty(tcx, args)) {
-                            ty.visit_with(self)?;
-                        }
-                    }
-
-                    ControlFlow::Continue(())
-                }
-                _ => ty.super_visit_with(self),
-            }
-        }
-    }
-
-    let self_ty_root = match self_ty.kind() {
-        ty::Adt(def, _) => Ty::new_adt(tcx, *def, GenericArgs::identity_for_item(tcx, def.did())),
-        _ => unimplemented!("unexpected self ty {:?}", self_ty),
-    };
-
-    self_ty_root
-        .visit_with(&mut DisableAutoTraitVisitor {
-            tcx,
-            self_ty_root,
-            trait_def_id,
-            seen: FxHashSet::default(),
-        })
-        .is_break()
 }

@@ -1,5 +1,5 @@
-// only-x86_64
-// compile-flags: -Copt-level=3
+//@ only-x86_64
+//@ compile-flags: -Copt-level=3
 
 #![crate_type = "lib"]
 #![feature(target_feature_11)]
@@ -31,3 +31,7 @@ unsafe fn without_avx(x: __m256) -> __m256 {
     };
     add(x, x)
 }
+
+// Don't allow the above CHECK-NOT to accidentally match a commit hash in the
+// compiler version.
+// CHECK-LABEL: rustc version

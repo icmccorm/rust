@@ -1,5 +1,5 @@
 error: usage of `process::exit`
-  --> $DIR/exit1.rs:5:9
+  --> tests/ui/exit1.rs:5:9
    |
 LL |         std::process::exit(4);
    |         ^^^^^^^^^^^^^^^^^^^^^
@@ -7,5 +7,5 @@ LL |         std::process::exit(4);
    = note: `-D clippy::exit` implied by `-D warnings`
    = help: to override `-D warnings` add `#[allow(clippy::exit)]`
 
-error: aborting due to previous error
+error: aborting due to 1 previous error
 

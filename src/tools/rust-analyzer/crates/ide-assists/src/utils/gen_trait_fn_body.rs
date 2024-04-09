@@ -415,7 +415,7 @@ fn gen_partial_eq(adt: &ast::Adt, func: &ast::Fn, trait_ref: Option<TraitRef>) -
     }
 
     fn gen_record_pat(record_name: ast::Path, fields: Vec<ast::RecordPatField>) -> ast::RecordPat {
-        let list = make::record_pat_field_list(fields);
+        let list = make::record_pat_field_list(fields, None);
         make::record_pat_with_fields(record_name, list)
     }
 
@@ -648,7 +648,7 @@ fn gen_partial_ord(adt: &ast::Adt, func: &ast::Fn, trait_ref: Option<TraitRef>) 
                     .into_iter()
                     .map(gen_partial_eq_match)
                     .collect::<Option<Vec<ast::Stmt>>>()?;
-                make::block_expr(stmts.into_iter(), tail).indent(ast::edit::IndentLevel(1))
+                make::block_expr(stmts, tail).indent(ast::edit::IndentLevel(1))
             }
 
             Some(ast::FieldList::TupleFieldList(field_list)) => {
@@ -667,7 +667,7 @@ fn gen_partial_ord(adt: &ast::Adt, func: &ast::Fn, trait_ref: Option<TraitRef>) 
                     .into_iter()
                     .map(gen_partial_eq_match)
                     .collect::<Option<Vec<ast::Stmt>>>()?;
-                make::block_expr(stmts.into_iter(), tail).indent(ast::edit::IndentLevel(1))
+                make::block_expr(stmts, tail).indent(ast::edit::IndentLevel(1))
             }
 
             // No fields in the body means there's nothing to compare.

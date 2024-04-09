@@ -1,5 +1,4 @@
-// compile-flags: -C opt-level=1
-// ignore-debug (the extra assertions get in the way)
+//@ compile-flags: -C opt-level=1
 
 #![crate_type = "lib"]
 #![feature(ascii_char)]
@@ -14,7 +13,7 @@ pub fn unwrap_digit_from_remainder(v: u32) -> AsciiChar {
 
     // CHECK: %[[R:.+]] = urem i32 %v, 10
     // CHECK-NEXT: %[[T:.+]] = trunc i32 %[[R]] to i8
-    // CHECK-NEXT: %[[D:.+]] = or i8 %[[T]], 48
+    // CHECK-NEXT: %[[D:.+]] = or{{( disjoint)?}} i8 %[[T]], 48
     // CHECK-NEXT: ret i8 %[[D]]
 
     // CHECK-NOT: icmp

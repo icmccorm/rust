@@ -10,6 +10,7 @@ members = [
   "src/tools/clippy",
   "src/tools/clippy/clippy_dev",
   "src/tools/compiletest",
+  "src/tools/run-make-support",
   "src/tools/error_index_generator",
   "src/tools/linkchecker",
   "src/tools/lint-docs",
@@ -33,6 +34,7 @@ members = [
   "src/tools/expand-yaml-anchors",
   "src/tools/jsondocck",
   "src/tools/jsondoclint",
+  "src/tools/llvm-bitcode-linker",
   "src/tools/html-checker",
   "src/tools/bump-stage0",
   "src/tools/replace-version-placeholder",
@@ -64,15 +66,6 @@ exclude = [
 ]
 
 [profile.release.package.compiler_builtins]
-# The compiler-builtins crate cannot reference libcore, and it's own CI will
-# verify that this is the case. This requires, however, that the crate is built
-# without overflow checks and debug assertions. Forcefully disable debug
-# assertions and overflow checks here which should ensure that even if these
-# assertions are enabled for libstd we won't enable them for compiler_builtins
-# which should ensure we still link everything correctly.
-debug-assertions = false
-overflow-checks = false
-
 # For compiler-builtins we always use a high number of codegen units.
 # The goal here is to place every single intrinsic into its own object
 # file to avoid symbol clashes with the system libgcc if possible. Note
@@ -103,6 +96,14 @@ adler.debug = 0
 gimli.debug = 0
 miniz_oxide.debug = 0
 object.debug = 0
+
+# These are very thin wrappers around executing lld with the right binary name.
+# Basically nothing within them can go wrong without having been explicitly logged anyway.
+# We ship these in every rustc tarball and even after compression they add up
+# to around 0.6MB of data every user needs to download (and 15MB on disk).
+[profile.release.package.lld-wrapper]
+debug = 0
+strip = true
 
 [patch.crates-io]
 # See comments in `library/rustc-std-workspace-core/README.md` for what's going on

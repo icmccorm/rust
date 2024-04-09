@@ -1,3 +1,5 @@
+//! [`CString`] and its related types.
+
 #[cfg(test)]
 mod tests;
 
@@ -11,7 +13,7 @@ use core::borrow::Borrow;
 use core::ffi::{c_char, CStr};
 use core::fmt;
 use core::mem;
-use core::num::NonZeroU8;
+use core::num::NonZero;
 use core::ops;
 use core::ptr;
 use core::slice;
@@ -406,7 +408,7 @@ impl CString {
                 fn strlen(s: *const c_char) -> usize;
             }
             let len = strlen(ptr) + 1; // Including the NUL byte
-            let slice = slice::from_raw_parts_mut(ptr, len as usize);
+            let slice = slice::from_raw_parts_mut(ptr, len);
             CString { inner: Box::from_raw(slice as *mut [c_char] as *mut [u8]) }
         }
     }
@@ -421,7 +423,7 @@ impl CString {
     /// Failure to call [`CString::from_raw`] will lead to a memory leak.
     ///
     /// The C side must **not** modify the length of the string (by writing a
-    /// `null` somewhere inside the string or removing the final one) before
+    /// nul byte somewhere inside the string or removing the final one) before
     /// it makes it back into Rust using [`CString::from_raw`]. See the safety section
     /// in [`CString::from_raw`].
     ///
@@ -795,22 +797,22 @@ impl From<Box<CStr>> for CString {
 }
 
 #[stable(feature = "cstring_from_vec_of_nonzerou8", since = "1.43.0")]
-impl From<Vec<NonZeroU8>> for CString {
-    /// Converts a <code>[Vec]<[NonZeroU8]></code> into a [`CString`] without
-    /// copying nor checking for inner null bytes.
+impl From<Vec<NonZero<u8>>> for CString {
+    /// Converts a <code>[Vec]<[NonZero]<[u8]>></code> into a [`CString`] without
+    /// copying nor checking for inner nul bytes.
     #[inline]
-    fn from(v: Vec<NonZeroU8>) -> CString {
+    fn from(v: Vec<NonZero<u8>>) -> CString {
         unsafe {
-            // Transmute `Vec<NonZeroU8>` to `Vec<u8>`.
+            // Transmute `Vec<NonZero<u8>>` to `Vec<u8>`.
             let v: Vec<u8> = {
                 // SAFETY:
-                //   - transmuting between `NonZeroU8` and `u8` is sound;
-                //   - `alloc::Layout<NonZeroU8> == alloc::Layout<u8>`.
-                let (ptr, len, cap): (*mut NonZeroU8, _, _) = Vec::into_raw_parts(v);
+                //   - transmuting between `NonZero<u8>` and `u8` is sound;
+                //   - `alloc::Layout<NonZero<u8>> == alloc::Layout<u8>`.
+                let (ptr, len, cap): (*mut NonZero<u8>, _, _) = Vec::into_raw_parts(v);
                 Vec::from_raw_parts(ptr.cast::<u8>(), len, cap)
             };
-            // SAFETY: `v` cannot contain null bytes, given the type-level
-            // invariant of `NonZeroU8`.
+            // SAFETY: `v` cannot contain nul bytes, given the type-level
+            // invariant of `NonZero<u8>`.
             Self::_from_vec_unchecked(v)
         }
     }
@@ -1024,6 +1026,8 @@ impl ToOwned for CStr {
 
 #[stable(feature = "cstring_asref", since = "1.7.0")]
 impl From<&CStr> for CString {
+    /// Converts a <code>&[CStr]</code> into a [`CString`]
+    /// by copying the contents into a new allocation.
     fn from(s: &CStr) -> CString {
         s.to_owned()
     }

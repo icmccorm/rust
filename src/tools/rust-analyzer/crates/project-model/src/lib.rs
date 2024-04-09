@@ -15,17 +15,17 @@
 //!   procedural macros).
 //! * Lowering of concrete model to a [`base_db::CrateGraph`]
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![warn(rust_2018_idioms, unused_lifetimes)]
 
-mod manifest_path;
+mod build_scripts;
 mod cargo_workspace;
 mod cfg_flag;
+mod manifest_path;
 mod project_json;
-mod sysroot;
-mod workspace;
 mod rustc_cfg;
-mod build_scripts;
+mod sysroot;
 pub mod target_data_layout;
+mod workspace;
 
 #[cfg(test)]
 mod tests;
@@ -127,8 +127,8 @@ impl ProjectManifest {
                 .filter_map(Result::ok)
                 .map(|it| it.path().join("Cargo.toml"))
                 .filter(|it| it.exists())
-                .map(AbsPathBuf::assert)
-                .filter_map(|it| it.try_into().ok())
+                .map(AbsPathBuf::try_from)
+                .filter_map(|it| it.ok()?.try_into().ok())
                 .collect()
         }
     }
@@ -167,7 +167,7 @@ fn utf8_stdout(mut cmd: Command) -> anyhow::Result<String> {
         }
     }
     let stdout = String::from_utf8(output.stdout)?;
-    Ok(stdout.trim().to_string())
+    Ok(stdout.trim().to_owned())
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]

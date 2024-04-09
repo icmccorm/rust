@@ -1,12 +1,12 @@
-// edition: 2021
-// revisions: cfg no
+//@ edition: 2021
+//@ revisions: cfg no
 
-// [no] check-pass
+//@ [no] check-pass
 // Since we're not adding new syntax, `cfg`'d out RTN must pass.
 
-#![feature(async_fn_in_trait)]
 
 trait Trait {
+    #[allow(async_fn_in_trait)]
     async fn m();
 }
 
@@ -14,7 +14,7 @@ trait Trait {
 fn foo<T: Trait<m(): Send>>() {}
 //[cfg]~^ ERROR return type notation is experimental
 //[cfg]~| ERROR parenthesized generic arguments cannot be used in associated type constraints
-//[cfg]~| ERROR associated type `m` not found for `Trait`
+//[cfg]~| ERROR expected type, found function
 //[no]~^^^^ WARN return type notation is experimental
 //[no]~| WARN unstable syntax can change at any point in the future, causing a hard error!
 

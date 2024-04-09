@@ -4,7 +4,6 @@
 #![feature(io_error_more)]
 #![feature(io_error_uncategorized)]
 
-use std::convert::TryInto;
 use std::ffi::CString;
 use std::fs::{canonicalize, remove_dir_all, remove_file, File};
 use std::io::{Error, ErrorKind, Write};
@@ -17,12 +16,17 @@ mod utils;
 fn main() {
     test_dup_stdout_stderr();
     test_canonicalize_too_long();
+    test_rename();
+    test_ftruncate::<libc::off_t>(libc::ftruncate);
+    #[cfg(target_os = "linux")]
+    test_ftruncate::<libc::off64_t>(libc::ftruncate64);
     test_readlink();
     test_file_open_unix_allow_two_args();
     test_file_open_unix_needs_three_args();
     test_file_open_unix_extra_third_arg();
     #[cfg(target_os = "linux")]
     test_o_tmpfile_flag();
+    test_posix_mkstemp();
 }
 
 /// Prepare: compute filename and make sure the file does not exist.
@@ -133,6 +137,65 @@ fn test_readlink() {
     assert_eq!(Error::last_os_error().kind(), ErrorKind::NotFound);
 }
 
+fn test_rename() {
+    let path1 = prepare("miri_test_libc_fs_source.txt");
+    let path2 = prepare("miri_test_libc_fs_rename_destination.txt");
+
+    let file = File::create(&path1).unwrap();
+    drop(file);
+
+    let c_path1 = CString::new(path1.as_os_str().as_bytes()).expect("CString::new failed");
+    let c_path2 = CString::new(path2.as_os_str().as_bytes()).expect("CString::new failed");
+
+    // Renaming should succeed
+    unsafe { libc::rename(c_path1.as_ptr(), c_path2.as_ptr()) };
+    // Check that old file path isn't present
+    assert_eq!(ErrorKind::NotFound, path1.metadata().unwrap_err().kind());
+    // Check that the file has moved successfully
+    assert!(path2.metadata().unwrap().is_file());
+
+    // Renaming a nonexistent file should fail
+    let res = unsafe { libc::rename(c_path1.as_ptr(), c_path2.as_ptr()) };
+    assert_eq!(res, -1);
+    assert_eq!(Error::last_os_error().kind(), ErrorKind::NotFound);
+
+    remove_file(&path2).unwrap();
+}
+
+fn test_ftruncate<T: From<i32>>(
+    ftruncate: unsafe extern "C" fn(fd: libc::c_int, length: T) -> libc::c_int,
+) {
+    // libc::off_t is i32 in target i686-unknown-linux-gnu
+    // https://docs.rs/libc/latest/i686-unknown-linux-gnu/libc/type.off_t.html
+
+    let bytes = b"hello";
+    let path = prepare("miri_test_libc_fs_ftruncate.txt");
+    let mut file = File::create(&path).unwrap();
+    file.write(bytes).unwrap();
+    file.sync_all().unwrap();
+    assert_eq!(file.metadata().unwrap().len(), 5);
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).expect("CString::new failed");
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
+
+    // Truncate to a bigger size
+    let mut res = unsafe { ftruncate(fd, T::from(10)) };
+    assert_eq!(res, 0);
+    assert_eq!(file.metadata().unwrap().len(), 10);
+
+    // Write after truncate
+    file.write(b"dup").unwrap();
+    file.sync_all().unwrap();
+    assert_eq!(file.metadata().unwrap().len(), 10);
+
+    // Truncate to smaller size
+    res = unsafe { ftruncate(fd, T::from(2)) };
+    assert_eq!(res, 0);
+    assert_eq!(file.metadata().unwrap().len(), 2);
+
+    remove_file(&path).unwrap();
+}
+
 #[cfg(target_os = "linux")]
 fn test_o_tmpfile_flag() {
     use std::fs::{create_dir, OpenOptions};
@@ -150,4 +213,46 @@ fn test_o_tmpfile_flag() {
             .unwrap_err()
             .raw_os_error(),
     );
+}
+
+fn test_posix_mkstemp() {
+    use std::ffi::OsStr;
+    use std::os::unix::io::FromRawFd;
+    use std::path::Path;
+
+    let valid_template = "fooXXXXXX";
+    // C needs to own this as `mkstemp(3)` says:
+    // "Since it will be modified, `template` must not be a string constant, but
+    // should be declared as a character array."
+    // There seems to be no `as_mut_ptr` on `CString` so we need to use `into_raw`.
+    let ptr = CString::new(valid_template).unwrap().into_raw();
+    let fd = unsafe { libc::mkstemp(ptr) };
+    // Take ownership back in Rust to not leak memory.
+    let slice = unsafe { CString::from_raw(ptr) };
+    assert!(fd > 0);
+    let osstr = OsStr::from_bytes(slice.to_bytes());
+    let path: &Path = osstr.as_ref();
+    let name = path.file_name().unwrap().to_string_lossy();
+    assert!(name.ne("fooXXXXXX"));
+    assert!(name.starts_with("foo"));
+    assert_eq!(name.len(), 9);
+    assert_eq!(
+        name.chars().skip(3).filter(char::is_ascii_alphanumeric).collect::<Vec<char>>().len(),
+        6
+    );
+    let file = unsafe { File::from_raw_fd(fd) };
+    assert!(file.set_len(0).is_ok());
+
+    let invalid_templates = vec!["foo", "barXX", "XXXXXXbaz", "whatXXXXXXever", "X"];
+    for t in invalid_templates {
+        let ptr = CString::new(t).unwrap().into_raw();
+        let fd = unsafe { libc::mkstemp(ptr) };
+        let _ = unsafe { CString::from_raw(ptr) };
+        // "On error, -1 is returned, and errno is set to
+        // indicate the error"
+        assert_eq!(fd, -1);
+        let e = std::io::Error::last_os_error();
+        assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+    }
 }

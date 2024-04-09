@@ -1,7 +1,7 @@
 use rustc_ast::ast;
+use rustc_errors::codes::*;
 use rustc_macros::Diagnostic;
 use rustc_session::Limit;
-use rustc_span::edition::Edition;
 use rustc_span::symbol::{Ident, MacroRulesNormalizedIdent};
 use rustc_span::{Span, Symbol};
 use std::borrow::Cow;
@@ -57,6 +57,13 @@ pub(crate) struct ResolveRelativePath {
     #[primary_span]
     pub span: Span,
     pub path: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(expand_collapse_debuginfo_illegal)]
+pub(crate) struct CollapseMacroDebuginfoIllegal {
+    #[primary_span]
+    pub span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -169,16 +176,7 @@ pub(crate) struct TakesNoArguments<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(expand_feature_included_in_edition, code = "E0705")]
-pub(crate) struct FeatureIncludedInEdition {
-    #[primary_span]
-    pub span: Span,
-    pub feature: Symbol,
-    pub edition: Edition,
-}
-
-#[derive(Diagnostic)]
-#[diag(expand_feature_removed, code = "E0557")]
+#[diag(expand_feature_removed, code = E0557)]
 pub(crate) struct FeatureRemoved<'a> {
     #[primary_span]
     #[label]
@@ -194,7 +192,7 @@ pub(crate) struct FeatureRemovedReason<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(expand_feature_not_allowed, code = "E0725")]
+#[diag(expand_feature_not_allowed, code = E0725)]
 pub(crate) struct FeatureNotAllowed {
     #[primary_span]
     pub span: Span,
@@ -213,7 +211,7 @@ pub(crate) struct RecursionLimitReached<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(expand_malformed_feature_attribute, code = "E0556")]
+#[diag(expand_malformed_feature_attribute, code = E0556)]
 pub(crate) struct MalformedFeatureAttribute {
     #[primary_span]
     pub span: Span,
@@ -304,6 +302,8 @@ pub(crate) struct IncompleteParse<'a> {
     pub label_span: Span,
     pub macro_path: &'a ast::Path,
     pub kind_name: &'a str,
+    #[note(expand_macro_expands_to_match_arm)]
+    pub expands_to_match_arm: Option<()>,
 
     #[suggestion(
         expand_suggestion_add_semi,
@@ -348,8 +348,9 @@ pub(crate) struct ModuleInBlockName {
 }
 
 #[derive(Diagnostic)]
-#[diag(expand_module_file_not_found, code = "E0583")]
+#[diag(expand_module_file_not_found, code = E0583)]
 #[help]
+#[note]
 pub(crate) struct ModuleFileNotFound {
     #[primary_span]
     pub span: Span,
@@ -359,7 +360,7 @@ pub(crate) struct ModuleFileNotFound {
 }
 
 #[derive(Diagnostic)]
-#[diag(expand_module_multiple_candidates, code = "E0761")]
+#[diag(expand_module_multiple_candidates, code = E0761)]
 #[help]
 pub(crate) struct ModuleMultipleCandidates {
     #[primary_span]
@@ -392,6 +393,36 @@ pub(crate) struct ProcMacroPanickedHelp {
 }
 
 #[derive(Diagnostic)]
+#[diag(expand_proc_macro_derive_panicked)]
+pub(crate) struct ProcMacroDerivePanicked {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub message: Option<ProcMacroDerivePanickedHelp>,
+}
+
+#[derive(Subdiagnostic)]
+#[help(expand_help)]
+pub(crate) struct ProcMacroDerivePanickedHelp {
+    pub message: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(expand_custom_attribute_panicked)]
+pub(crate) struct CustomAttributePanicked {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub message: Option<CustomAttributePanickedHelp>,
+}
+
+#[derive(Subdiagnostic)]
+#[help(expand_help)]
+pub(crate) struct CustomAttributePanickedHelp {
+    pub message: String,
+}
+
+#[derive(Diagnostic)]
 #[diag(expand_proc_macro_derive_tokens)]
 pub struct ProcMacroDeriveTokens {
     #[primary_span]
@@ -406,4 +437,22 @@ pub struct DuplicateMatcherBinding {
     pub span: Span,
     #[label(expand_label2)]
     pub prev: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(expand_invalid_fragment_specifier)]
+#[help]
+pub struct InvalidFragmentSpecifier {
+    #[primary_span]
+    pub span: Span,
+    pub fragment: Ident,
+    pub help: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(expand_expected_paren_or_brace)]
+pub struct ExpectedParenOrBrace<'a> {
+    #[primary_span]
+    pub span: Span,
+    pub token: Cow<'a, str>,
 }

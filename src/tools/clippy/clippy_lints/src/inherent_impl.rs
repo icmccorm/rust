@@ -6,7 +6,7 @@ use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::{Item, ItemKind, Node};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 use rustc_span::Span;
 use std::collections::hash_map::Entry;
 
@@ -18,7 +18,7 @@ declare_clippy_lint! {
     /// Splitting the implementation of a type makes the code harder to navigate.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// struct X;
     /// impl X {
     ///     fn one() {}
@@ -30,7 +30,7 @@ declare_clippy_lint! {
     ///
     /// Could be written:
     ///
-    /// ```rust
+    /// ```no_run
     /// struct X;
     /// impl X {
     ///     fn one() {}
@@ -53,9 +53,12 @@ impl<'tcx> LateLintPass<'tcx> for MultipleInherentImpl {
         // List of spans to lint. (lint_span, first_span)
         let mut lint_spans = Vec::new();
 
+        let Ok(impls) = cx.tcx.crate_inherent_impls(()) else {
+            return;
+        };
         let inherent_impls = cx
             .tcx
-            .with_stable_hashing_context(|hcx| cx.tcx.crate_inherent_impls(()).inherent_impls.to_sorted(&hcx, true));
+            .with_stable_hashing_context(|hcx| impls.inherent_impls.to_sorted(&hcx, true));
 
         for (_, impl_ids) in inherent_impls.into_iter().filter(|(&id, impls)| {
             impls.len() > 1
@@ -63,7 +66,7 @@ impl<'tcx> LateLintPass<'tcx> for MultipleInherentImpl {
             && !is_lint_allowed(
                 cx,
                 MULTIPLE_INHERENT_IMPL,
-                cx.tcx.hir().local_def_id_to_hir_id(id),
+                cx.tcx.local_def_id_to_hir_id(id),
             )
         }) {
             for impl_id in impl_ids.iter().map(|id| id.expect_local()) {
@@ -117,12 +120,12 @@ impl<'tcx> LateLintPass<'tcx> for MultipleInherentImpl {
 
 /// Gets the span for the given impl block unless it's not being considered by the lint.
 fn get_impl_span(cx: &LateContext<'_>, id: LocalDefId) -> Option<Span> {
-    let id = cx.tcx.hir().local_def_id_to_hir_id(id);
+    let id = cx.tcx.local_def_id_to_hir_id(id);
     if let Node::Item(&Item {
         kind: ItemKind::Impl(impl_item),
         span,
         ..
-    }) = cx.tcx.hir().get(id)
+    }) = cx.tcx.hir_node(id)
     {
         (!span.from_expansion()
             && impl_item.generics.params.is_empty()

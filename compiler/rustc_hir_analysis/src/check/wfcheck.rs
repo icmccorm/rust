@@ -1,18 +1,20 @@
 use crate::autoderef::Autoderef;
+use crate::collect::CollectItemTypesVisitor;
 use crate::constrained_generic_params::{identify_constrained_generic_params, Parameter};
+use crate::errors;
 
+use hir::intravisit::Visitor;
 use rustc_ast as ast;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexSet};
-use rustc_errors::{pluralize, struct_span_err, Applicability, DiagnosticBuilder, ErrorGuaranteed};
+use rustc_errors::{codes::*, pluralize, struct_span_code_err, Applicability, ErrorGuaranteed};
 use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LocalDefId, LocalModDefId};
 use rustc_hir::lang_items::LangItem;
 use rustc_hir::ItemKind;
-use rustc_infer::infer::outlives::env::{OutlivesEnvironment, RegionBoundPairs};
-use rustc_infer::infer::outlives::obligations::TypeOutlives;
+use rustc_infer::infer::outlives::env::OutlivesEnvironment;
 use rustc_infer::infer::{self, InferCtxt, TyCtxtInferExt};
-use rustc_middle::mir::ConstraintCategory;
 use rustc_middle::query::Providers;
+use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::trait_def::TraitSpecializationKind;
 use rustc_middle::ty::{
     self, AdtKind, GenericParamDefKind, ToPredicate, Ty, TyCtxt, TypeFoldable, TypeSuperVisitable,
@@ -20,9 +22,10 @@ use rustc_middle::ty::{
 };
 use rustc_middle::ty::{GenericArgKind, GenericArgs};
 use rustc_session::parse::feature_err;
-use rustc_span::symbol::{sym, Ident, Symbol};
+use rustc_span::symbol::{sym, Ident};
 use rustc_span::{Span, DUMMY_SP};
 use rustc_target::spec::abi::Abi;
+use rustc_trait_selection::regions::InferCtxtRegionExt;
 use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt;
 use rustc_trait_selection::traits::misc::{
     type_allowed_to_implement_const_param_ty, ConstParamTyImplementationError,
@@ -32,6 +35,7 @@ use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _
 use rustc_trait_selection::traits::{
     self, ObligationCause, ObligationCauseCode, ObligationCtxt, WellFormedLoc,
 };
+use rustc_type_ir::TypeFlags;
 
 use std::cell::LazyCell;
 use std::ops::{ControlFlow, Deref};
@@ -92,8 +96,9 @@ pub(super) fn enter_wf_checking_ctxt<'tcx, F>(
     span: Span,
     body_def_id: LocalDefId,
     f: F,
-) where
-    F: for<'a> FnOnce(&WfCheckingCtxt<'a, 'tcx>),
+) -> Result<(), ErrorGuaranteed>
+where
+    F: for<'a> FnOnce(&WfCheckingCtxt<'a, 'tcx>) -> Result<(), ErrorGuaranteed>,
 {
     let param_env = tcx.param_env(body_def_id);
     let infcx = &tcx.infer_ctxt().build();
@@ -104,42 +109,102 @@ pub(super) fn enter_wf_checking_ctxt<'tcx, F>(
     if !tcx.features().trivial_bounds {
         wfcx.check_false_global_bounds()
     }
-    f(&mut wfcx);
+    f(&mut wfcx)?;
 
-    let assumed_wf_types = match wfcx.ocx.assumed_wf_types_and_report_errors(param_env, body_def_id)
-    {
-        Ok(wf_types) => wf_types,
-        Err(_guar) => return,
-    };
-
-    let implied_bounds = infcx.implied_bounds_tys(param_env, body_def_id, assumed_wf_types);
+    let assumed_wf_types = wfcx.ocx.assumed_wf_types_and_report_errors(param_env, body_def_id)?;
 
     let errors = wfcx.select_all_or_error();
     if !errors.is_empty() {
-        infcx.err_ctxt().report_fulfillment_errors(&errors);
-        return;
+        let err = infcx.err_ctxt().report_fulfillment_errors(errors);
+        if tcx.dcx().has_errors().is_some() {
+            return Err(err);
+        } else {
+            // HACK(oli-obk): tests/ui/specialization/min_specialization/specialize_on_type_error.rs
+            // causes an delayed bug during normalization, without reporting an error, so we need
+            // to act as if no error happened, in order to let our callers continue and report an
+            // error later in check_impl_items_against_trait.
+            return Ok(());
+        }
     }
 
+    debug!(?assumed_wf_types);
+
+    let infcx_compat = infcx.fork();
+
+    // We specifically want to call the non-compat version of `implied_bounds_tys`; we do this always.
+    let implied_bounds =
+        infcx.implied_bounds_tys_compat(param_env, body_def_id, &assumed_wf_types, false);
     let outlives_env = OutlivesEnvironment::with_bounds(param_env, implied_bounds);
 
-    let _ = wfcx.ocx.resolve_regions_and_report_errors(body_def_id, &outlives_env);
+    let errors = infcx.resolve_regions(&outlives_env);
+    if errors.is_empty() {
+        return Ok(());
+    }
+
+    let is_bevy = 'is_bevy: {
+        // We don't want to emit this for dependents of Bevy, for now.
+        // See #119956
+        let is_bevy_paramset = |def: ty::AdtDef<'_>| {
+            let adt_did = with_no_trimmed_paths!(infcx.tcx.def_path_str(def.0.did));
+            adt_did.contains("ParamSet")
+        };
+        for ty in assumed_wf_types.iter() {
+            match ty.kind() {
+                ty::Adt(def, _) => {
+                    if is_bevy_paramset(*def) {
+                        break 'is_bevy true;
+                    }
+                }
+                ty::Ref(_, ty, _) => match ty.kind() {
+                    ty::Adt(def, _) => {
+                        if is_bevy_paramset(*def) {
+                            break 'is_bevy true;
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        false
+    };
+
+    // If we have set `no_implied_bounds_compat`, then do not attempt compatibility.
+    // We could also just always enter if `is_bevy`, and call `implied_bounds_tys`,
+    // but that does result in slightly more work when this option is set and
+    // just obscures what we mean here anyways. Let's just be explicit.
+    if is_bevy && !infcx.tcx.sess.opts.unstable_opts.no_implied_bounds_compat {
+        let implied_bounds =
+            infcx_compat.implied_bounds_tys_compat(param_env, body_def_id, &assumed_wf_types, true);
+        let outlives_env = OutlivesEnvironment::with_bounds(param_env, implied_bounds);
+        let errors_compat = infcx_compat.resolve_regions(&outlives_env);
+        if errors_compat.is_empty() {
+            Ok(())
+        } else {
+            Err(infcx_compat.err_ctxt().report_region_errors(body_def_id, &errors_compat))
+        }
+    } else {
+        Err(infcx.err_ctxt().report_region_errors(body_def_id, &errors))
+    }
 }
 
-fn check_well_formed(tcx: TyCtxt<'_>, def_id: hir::OwnerId) {
-    let node = tcx.hir().owner(def_id);
-    match node {
-        hir::OwnerNode::Crate(_) => {}
+fn check_well_formed(tcx: TyCtxt<'_>, def_id: hir::OwnerId) -> Result<(), ErrorGuaranteed> {
+    let node = tcx.hir_owner_node(def_id);
+    let mut res = match node {
+        hir::OwnerNode::Crate(_) => bug!("check_well_formed cannot be applied to the crate root"),
         hir::OwnerNode::Item(item) => check_item(tcx, item),
         hir::OwnerNode::TraitItem(item) => check_trait_item(tcx, item),
         hir::OwnerNode::ImplItem(item) => check_impl_item(tcx, item),
         hir::OwnerNode::ForeignItem(item) => check_foreign_item(tcx, item),
-    }
+        hir::OwnerNode::Synthetic => unreachable!(),
+    };
 
     if let Some(generics) = node.generics() {
         for param in generics.params {
-            check_param_wf(tcx, param)
+            res = res.and(check_param_wf(tcx, param));
         }
     }
+    res
 }
 
 /// Checks that the field types (in a struct def'n) or argument types (in an enum def'n) are
@@ -156,15 +221,16 @@ fn check_well_formed(tcx: TyCtxt<'_>, def_id: hir::OwnerId) {
 /// not included it frequently leads to confusing errors in fn bodies. So it's better to check
 /// the types first.
 #[instrument(skip(tcx), level = "debug")]
-fn check_item<'tcx>(tcx: TyCtxt<'tcx>, item: &'tcx hir::Item<'tcx>) {
+fn check_item<'tcx>(tcx: TyCtxt<'tcx>, item: &'tcx hir::Item<'tcx>) -> Result<(), ErrorGuaranteed> {
     let def_id = item.owner_id.def_id;
 
     debug!(
         ?item.owner_id,
         item.name = ? tcx.def_path_str(def_id)
     );
+    CollectItemTypesVisitor { tcx }.visit_item(item);
 
-    match item.kind {
+    let res = match item.kind {
         // Right now we check that every default trait implementation
         // has an implementation of itself. Basically, a case like:
         //
@@ -183,85 +249,104 @@ fn check_item<'tcx>(tcx: TyCtxt<'tcx>, item: &'tcx hir::Item<'tcx>) {
         // won't be allowed unless there's an *explicit* implementation of `Send`
         // for `T`
         hir::ItemKind::Impl(impl_) => {
-            let is_auto = tcx
-                .impl_trait_ref(def_id)
-                .is_some_and(|trait_ref| tcx.trait_is_auto(trait_ref.skip_binder().def_id));
+            let header = tcx.impl_trait_header(def_id);
+            let is_auto = header
+                .is_some_and(|header| tcx.trait_is_auto(header.trait_ref.skip_binder().def_id));
+
+            crate::impl_wf_check::check_impl_wf(tcx, def_id)?;
+            let mut res = Ok(());
             if let (hir::Defaultness::Default { .. }, true) = (impl_.defaultness, is_auto) {
                 let sp = impl_.of_trait.as_ref().map_or(item.span, |t| t.path.span);
-                let mut err =
-                    tcx.sess.struct_span_err(sp, "impls of auto traits cannot be default");
-                err.span_labels(impl_.defaultness_span, "default because of this");
-                err.span_label(sp, "auto trait");
-                err.emit();
+                res = Err(tcx
+                    .dcx()
+                    .struct_span_err(sp, "impls of auto traits cannot be default")
+                    .with_span_labels(impl_.defaultness_span, "default because of this")
+                    .with_span_label(sp, "auto trait")
+                    .emit());
             }
             // We match on both `ty::ImplPolarity` and `ast::ImplPolarity` just to get the `!` span.
-            match (tcx.impl_polarity(def_id), impl_.polarity) {
-                (ty::ImplPolarity::Positive, _) => {
-                    check_impl(tcx, item, impl_.self_ty, &impl_.of_trait);
+            match header.map(|h| h.polarity) {
+                // `None` means this is an inherent impl
+                Some(ty::ImplPolarity::Positive) | None => {
+                    res = res.and(check_impl(tcx, item, impl_.self_ty, &impl_.of_trait));
                 }
-                (ty::ImplPolarity::Negative, ast::ImplPolarity::Negative(span)) => {
+                Some(ty::ImplPolarity::Negative) => {
+                    let ast::ImplPolarity::Negative(span) = impl_.polarity else {
+                        bug!("impl_polarity query disagrees with impl's polarity in HIR");
+                    };
                     // FIXME(#27579): what amount of WF checking do we need for neg impls?
                     if let hir::Defaultness::Default { .. } = impl_.defaultness {
                         let mut spans = vec![span];
                         spans.extend(impl_.defaultness_span);
-                        struct_span_err!(
-                            tcx.sess,
+                        res = Err(struct_span_code_err!(
+                            tcx.dcx(),
                             spans,
                             E0750,
                             "negative impls cannot be default impls"
                         )
-                        .emit();
+                        .emit());
                     }
                 }
-                (ty::ImplPolarity::Reservation, _) => {
+                Some(ty::ImplPolarity::Reservation) => {
                     // FIXME: what amount of WF checking do we need for reservation impls?
                 }
-                _ => unreachable!(),
             }
+            res
         }
         hir::ItemKind::Fn(ref sig, ..) => {
-            check_item_fn(tcx, def_id, item.ident, item.span, sig.decl);
+            check_item_fn(tcx, def_id, item.ident, item.span, sig.decl)
         }
         hir::ItemKind::Static(ty, ..) => {
-            check_item_type(tcx, def_id, ty.span, UnsizedHandling::Forbid);
+            check_item_type(tcx, def_id, ty.span, UnsizedHandling::Forbid)
         }
         hir::ItemKind::Const(ty, ..) => {
-            check_item_type(tcx, def_id, ty.span, UnsizedHandling::Forbid);
+            check_item_type(tcx, def_id, ty.span, UnsizedHandling::Forbid)
         }
-        hir::ItemKind::Struct(_, ast_generics) => {
-            check_type_defn(tcx, item, false);
-            check_variances_for_type_defn(tcx, item, ast_generics);
+        hir::ItemKind::Struct(_, hir_generics) => {
+            let res = check_type_defn(tcx, item, false);
+            check_variances_for_type_defn(tcx, item, hir_generics);
+            res
         }
-        hir::ItemKind::Union(_, ast_generics) => {
-            check_type_defn(tcx, item, true);
-            check_variances_for_type_defn(tcx, item, ast_generics);
+        hir::ItemKind::Union(_, hir_generics) => {
+            let res = check_type_defn(tcx, item, true);
+            check_variances_for_type_defn(tcx, item, hir_generics);
+            res
         }
-        hir::ItemKind::Enum(_, ast_generics) => {
-            check_type_defn(tcx, item, true);
-            check_variances_for_type_defn(tcx, item, ast_generics);
+        hir::ItemKind::Enum(_, hir_generics) => {
+            let res = check_type_defn(tcx, item, true);
+            check_variances_for_type_defn(tcx, item, hir_generics);
+            res
         }
-        hir::ItemKind::Trait(..) => {
-            check_trait(tcx, item);
-        }
-        hir::ItemKind::TraitAlias(..) => {
-            check_trait(tcx, item);
-        }
+        hir::ItemKind::Trait(..) => check_trait(tcx, item),
+        hir::ItemKind::TraitAlias(..) => check_trait(tcx, item),
         // `ForeignItem`s are handled separately.
-        hir::ItemKind::ForeignMod { .. } => {}
-        hir::ItemKind::TyAlias(hir_ty, ast_generics) => {
+        hir::ItemKind::ForeignMod { .. } => Ok(()),
+        hir::ItemKind::TyAlias(hir_ty, hir_generics) => {
             if tcx.type_alias_is_lazy(item.owner_id) {
                 // Bounds of lazy type aliases and of eager ones that contain opaque types are respected.
                 // E.g: `type X = impl Trait;`, `type X = (impl Trait, Y);`.
-                check_item_type(tcx, def_id, hir_ty.span, UnsizedHandling::Allow);
-                check_variances_for_type_defn(tcx, item, ast_generics);
+                let res = check_item_type(tcx, def_id, hir_ty.span, UnsizedHandling::Allow);
+                check_variances_for_type_defn(tcx, item, hir_generics);
+                res
+            } else {
+                Ok(())
             }
         }
-        _ => {}
-    }
+        _ => Ok(()),
+    };
+
+    crate::check::check::check_item_type(tcx, def_id);
+
+    res
 }
 
-fn check_foreign_item(tcx: TyCtxt<'_>, item: &hir::ForeignItem<'_>) {
+fn check_foreign_item<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    item: &'tcx hir::ForeignItem<'tcx>,
+) -> Result<(), ErrorGuaranteed> {
     let def_id = item.owner_id.def_id;
+
+    CollectItemTypesVisitor { tcx }.visit_foreign_item(item);
 
     debug!(
         ?item.owner_id,
@@ -275,12 +360,17 @@ fn check_foreign_item(tcx: TyCtxt<'_>, item: &hir::ForeignItem<'_>) {
         hir::ForeignItemKind::Static(ty, ..) => {
             check_item_type(tcx, def_id, ty.span, UnsizedHandling::AllowIfForeignTail)
         }
-        hir::ForeignItemKind::Type => (),
+        hir::ForeignItemKind::Type => Ok(()),
     }
 }
 
-fn check_trait_item(tcx: TyCtxt<'_>, trait_item: &hir::TraitItem<'_>) {
+fn check_trait_item<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    trait_item: &'tcx hir::TraitItem<'tcx>,
+) -> Result<(), ErrorGuaranteed> {
     let def_id = trait_item.owner_id.def_id;
+
+    CollectItemTypesVisitor { tcx }.visit_trait_item(trait_item);
 
     let (method_sig, span) = match trait_item.kind {
         hir::TraitItemKind::Fn(ref sig, _) => (Some(sig), trait_item.span),
@@ -288,18 +378,19 @@ fn check_trait_item(tcx: TyCtxt<'_>, trait_item: &hir::TraitItem<'_>) {
         _ => (None, trait_item.span),
     };
     check_object_unsafe_self_trait_by_name(tcx, trait_item);
-    check_associated_item(tcx, def_id, span, method_sig);
+    let mut res = check_associated_item(tcx, def_id, span, method_sig);
 
     if matches!(trait_item.kind, hir::TraitItemKind::Fn(..)) {
         for &assoc_ty_def_id in tcx.associated_types_for_impl_traits_in_associated_fn(def_id) {
-            check_associated_item(
+            res = res.and(check_associated_item(
                 tcx,
                 assoc_ty_def_id.expect_local(),
                 tcx.def_span(assoc_ty_def_id),
                 None,
-            );
+            ));
         }
     }
+    res
 }
 
 /// Require that the user writes where clauses on GATs for the implicit
@@ -314,9 +405,10 @@ fn check_trait_item(tcx: TyCtxt<'_>, trait_item: &hir::TraitItem<'_>) {
 ///     fn into_iter<'a>(&'a self) -> Self::Iter<'a>;
 /// }
 /// ```
-fn check_gat_where_clauses(tcx: TyCtxt<'_>, associated_items: &[hir::TraitItemRef]) {
+fn check_gat_where_clauses(tcx: TyCtxt<'_>, trait_def_id: LocalDefId) {
     // Associates every GAT's def_id to a list of possibly missing bounds detected by this lint.
     let mut required_bounds_by_item = FxHashMap::default();
+    let associated_items = tcx.associated_items(trait_def_id);
 
     // Loop over all GATs together, because if this lint suggests adding a where-clause bound
     // to one GAT, it might then require us to an additional bound on another GAT.
@@ -325,8 +417,8 @@ fn check_gat_where_clauses(tcx: TyCtxt<'_>, associated_items: &[hir::TraitItemRe
     // those GATs.
     loop {
         let mut should_continue = false;
-        for gat_item in associated_items {
-            let gat_def_id = gat_item.id.owner_id;
+        for gat_item in associated_items.in_definition_order() {
+            let gat_def_id = gat_item.def_id.expect_local();
             let gat_item = tcx.associated_item(gat_def_id);
             // If this item is not an assoc ty, or has no args, then it's not a GAT
             if gat_item.kind != ty::AssocKind::Type {
@@ -342,8 +434,8 @@ fn check_gat_where_clauses(tcx: TyCtxt<'_>, associated_items: &[hir::TraitItemRe
             // This is calculated by taking the intersection of the bounds that each item
             // constrains the GAT with individually.
             let mut new_required_bounds: Option<FxHashSet<ty::Clause<'_>>> = None;
-            for item in associated_items {
-                let item_def_id = item.id.owner_id;
+            for item in associated_items.in_definition_order() {
+                let item_def_id = item.def_id.expect_local();
                 // Skip our own GAT, since it does not constrain itself at all.
                 if item_def_id == gat_def_id {
                     continue;
@@ -351,9 +443,9 @@ fn check_gat_where_clauses(tcx: TyCtxt<'_>, associated_items: &[hir::TraitItemRe
 
                 let param_env = tcx.param_env(item_def_id);
 
-                let item_required_bounds = match item.kind {
+                let item_required_bounds = match tcx.associated_item(item_def_id).kind {
                     // In our example, this corresponds to `into_iter` method
-                    hir::AssocItemKind::Fn { .. } => {
+                    ty::AssocKind::Fn => {
                         // For methods, we check the function signature's return type for any GATs
                         // to constrain. In the `into_iter` case, we see that the return type
                         // `Self::Iter<'a>` is a GAT we want to gather any potential missing bounds from.
@@ -369,12 +461,12 @@ fn check_gat_where_clauses(tcx: TyCtxt<'_>, associated_items: &[hir::TraitItemRe
                             // We also assume that all of the function signature's parameter types
                             // are well formed.
                             &sig.inputs().iter().copied().collect(),
-                            gat_def_id.def_id,
+                            gat_def_id,
                             gat_generics,
                         )
                     }
                     // In our example, this corresponds to the `Iter` and `Item` associated types
-                    hir::AssocItemKind::Type => {
+                    ty::AssocKind::Type => {
                         // If our associated item is a GAT with missing bounds, add them to
                         // the param-env here. This allows this GAT to propagate missing bounds
                         // to other GATs.
@@ -391,11 +483,11 @@ fn check_gat_where_clauses(tcx: TyCtxt<'_>, associated_items: &[hir::TraitItemRe
                                 .instantiate_identity_iter_copied()
                                 .collect::<Vec<_>>(),
                             &FxIndexSet::default(),
-                            gat_def_id.def_id,
+                            gat_def_id,
                             gat_generics,
                         )
                     }
-                    hir::AssocItemKind::Const => None,
+                    ty::AssocKind::Const => None,
                 };
 
                 if let Some(item_required_bounds) = item_required_bounds {
@@ -431,7 +523,12 @@ fn check_gat_where_clauses(tcx: TyCtxt<'_>, associated_items: &[hir::TraitItemRe
     }
 
     for (gat_def_id, required_bounds) in required_bounds_by_item {
-        let gat_item_hir = tcx.hir().expect_trait_item(gat_def_id.def_id);
+        // Don't suggest adding `Self: 'a` to a GAT that can't be named
+        if tcx.is_impl_trait_in_trait(gat_def_id.to_def_id()) {
+            continue;
+        }
+
+        let gat_item_hir = tcx.hir().expect_trait_item(gat_def_id);
         debug!(?required_bounds);
         let param_env = tcx.param_env(gat_def_id);
 
@@ -441,21 +538,16 @@ fn check_gat_where_clauses(tcx: TyCtxt<'_>, associated_items: &[hir::TraitItemRe
                 ty::ClauseKind::RegionOutlives(ty::OutlivesPredicate(a, b)) => {
                     !region_known_to_outlive(
                         tcx,
-                        gat_def_id.def_id,
+                        gat_def_id,
                         param_env,
                         &FxIndexSet::default(),
                         a,
                         b,
                     )
                 }
-                ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(a, b)) => !ty_known_to_outlive(
-                    tcx,
-                    gat_def_id.def_id,
-                    param_env,
-                    &FxIndexSet::default(),
-                    a,
-                    b,
-                ),
+                ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(a, b)) => {
+                    !ty_known_to_outlive(tcx, gat_def_id, param_env, &FxIndexSet::default(), a, b)
+                }
                 _ => bug!("Unexpected ClauseKind"),
             })
             .map(|clause| clause.to_string())
@@ -466,35 +558,32 @@ fn check_gat_where_clauses(tcx: TyCtxt<'_>, associated_items: &[hir::TraitItemRe
 
         if !unsatisfied_bounds.is_empty() {
             let plural = pluralize!(unsatisfied_bounds.len());
-            let mut err = tcx.sess.struct_span_err(
-                gat_item_hir.span,
-                format!("missing required bound{} on `{}`", plural, gat_item_hir.ident),
-            );
-
             let suggestion = format!(
                 "{} {}",
                 gat_item_hir.generics.add_where_or_trailing_comma(),
                 unsatisfied_bounds.join(", "),
             );
-            err.span_suggestion(
-                gat_item_hir.generics.tail_span_for_predicate_suggestion(),
-                format!("add the required where clause{plural}"),
-                suggestion,
-                Applicability::MachineApplicable,
-            );
-
             let bound =
                 if unsatisfied_bounds.len() > 1 { "these bounds are" } else { "this bound is" };
-            err.note(format!(
-                "{bound} currently required to ensure that impls have maximum flexibility"
-            ));
-            err.note(
-                "we are soliciting feedback, see issue #87479 \
-                 <https://github.com/rust-lang/rust/issues/87479> \
-                 for more information",
-            );
-
-            err.emit();
+            tcx.dcx()
+                .struct_span_err(
+                    gat_item_hir.span,
+                    format!("missing required bound{} on `{}`", plural, gat_item_hir.ident),
+                )
+                .with_span_suggestion(
+                    gat_item_hir.generics.tail_span_for_predicate_suggestion(),
+                    format!("add the required where clause{plural}"),
+                    suggestion,
+                    Applicability::MachineApplicable,
+                )
+                .with_note(format!(
+                    "{bound} currently required to ensure that impls have maximum flexibility"
+                ))
+                .with_note(
+                    "we are soliciting feedback, see issue #87479 \
+                     <https://github.com/rust-lang/rust/issues/87479> for more information",
+                )
+                .emit();
         }
     }
 }
@@ -534,7 +623,7 @@ fn augment_param_env<'tcx>(
 fn gather_gat_bounds<'tcx, T: TypeFoldable<TyCtxt<'tcx>>>(
     tcx: TyCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
-    item_def_id: hir::OwnerId,
+    item_def_id: LocalDefId,
     to_check: T,
     wf_tys: &FxIndexSet<Ty<'tcx>>,
     gat_def_id: LocalDefId,
@@ -543,7 +632,7 @@ fn gather_gat_bounds<'tcx, T: TypeFoldable<TyCtxt<'tcx>>>(
     // The bounds we that we would require from `to_check`
     let mut bounds = FxHashSet::default();
 
-    let (regions, types) = GATSubstCollector::visit(gat_def_id.to_def_id(), to_check);
+    let (regions, types) = GATArgsCollector::visit(gat_def_id.to_def_id(), to_check);
 
     // If both regions and types are empty, then this GAT isn't in the
     // set of types we are checking, and we shouldn't try to do clause analysis
@@ -567,7 +656,7 @@ fn gather_gat_bounds<'tcx, T: TypeFoldable<TyCtxt<'tcx>>>(
         // reflected in a where clause on the GAT itself.
         for (ty, ty_idx) in &types {
             // In our example, requires that `Self: 'a`
-            if ty_known_to_outlive(tcx, item_def_id.def_id, param_env, &wf_tys, *ty, *region_a) {
+            if ty_known_to_outlive(tcx, item_def_id, param_env, wf_tys, *ty, *region_a) {
                 debug!(?ty_idx, ?region_a_idx);
                 debug!("required clause: {ty} must outlive {region_a}");
                 // Translate into the generic parameters of the GAT. In
@@ -578,9 +667,9 @@ fn gather_gat_bounds<'tcx, T: TypeFoldable<TyCtxt<'tcx>>>(
                 // Same for the region. In our example, 'a corresponds
                 // to the 'me parameter.
                 let region_param = gat_generics.param_at(*region_a_idx, tcx);
-                let region_param = ty::Region::new_early_bound(
+                let region_param = ty::Region::new_early_param(
                     tcx,
-                    ty::EarlyBoundRegion {
+                    ty::EarlyParamRegion {
                         def_id: region_param.def_id,
                         index: region_param.index,
                         name: region_param.name,
@@ -606,21 +695,14 @@ fn gather_gat_bounds<'tcx, T: TypeFoldable<TyCtxt<'tcx>>>(
             if matches!(**region_b, ty::ReStatic | ty::ReError(_)) || region_a == region_b {
                 continue;
             }
-            if region_known_to_outlive(
-                tcx,
-                item_def_id.def_id,
-                param_env,
-                &wf_tys,
-                *region_a,
-                *region_b,
-            ) {
+            if region_known_to_outlive(tcx, item_def_id, param_env, wf_tys, *region_a, *region_b) {
                 debug!(?region_a_idx, ?region_b_idx);
                 debug!("required clause: {region_a} must outlive {region_b}");
                 // Translate into the generic parameters of the GAT.
                 let region_a_param = gat_generics.param_at(*region_a_idx, tcx);
-                let region_a_param = ty::Region::new_early_bound(
+                let region_a_param = ty::Region::new_early_param(
                     tcx,
-                    ty::EarlyBoundRegion {
+                    ty::EarlyParamRegion {
                         def_id: region_a_param.def_id,
                         index: region_a_param.index,
                         name: region_a_param.name,
@@ -628,9 +710,9 @@ fn gather_gat_bounds<'tcx, T: TypeFoldable<TyCtxt<'tcx>>>(
                 );
                 // Same for the region.
                 let region_b_param = gat_generics.param_at(*region_b_idx, tcx);
-                let region_b_param = ty::Region::new_early_bound(
+                let region_b_param = ty::Region::new_early_param(
                     tcx,
-                    ty::EarlyBoundRegion {
+                    ty::EarlyParamRegion {
                         def_id: region_b_param.def_id,
                         index: region_b_param.index,
                         name: region_b_param.name,
@@ -661,10 +743,12 @@ fn ty_known_to_outlive<'tcx>(
     ty: Ty<'tcx>,
     region: ty::Region<'tcx>,
 ) -> bool {
-    resolve_regions_with_wf_tys(tcx, id, param_env, &wf_tys, |infcx, region_bound_pairs| {
-        let origin = infer::RelateParamBound(DUMMY_SP, ty, None);
-        let outlives = &mut TypeOutlives::new(infcx, tcx, region_bound_pairs, None, param_env);
-        outlives.type_must_outlive(origin, ty, region, ConstraintCategory::BoringNoLocation);
+    test_region_obligations(tcx, id, param_env, wf_tys, |infcx| {
+        infcx.register_region_obligation(infer::RegionObligation {
+            sub_region: region,
+            sup_type: ty,
+            origin: infer::RelateParamBound(DUMMY_SP, ty, None),
+        });
     })
 }
 
@@ -678,40 +762,32 @@ fn region_known_to_outlive<'tcx>(
     region_a: ty::Region<'tcx>,
     region_b: ty::Region<'tcx>,
 ) -> bool {
-    resolve_regions_with_wf_tys(tcx, id, param_env, &wf_tys, |mut infcx, _| {
-        use rustc_infer::infer::outlives::obligations::TypeOutlivesDelegate;
-        let origin = infer::RelateRegionParamBound(DUMMY_SP);
-        // `region_a: region_b` -> `region_b <= region_a`
-        infcx.push_sub_region_constraint(
-            origin,
-            region_b,
-            region_a,
-            ConstraintCategory::BoringNoLocation,
-        );
+    test_region_obligations(tcx, id, param_env, wf_tys, |infcx| {
+        infcx.sub_regions(infer::RelateRegionParamBound(DUMMY_SP), region_b, region_a);
     })
 }
 
 /// Given a known `param_env` and a set of well formed types, set up an
 /// `InferCtxt`, call the passed function (to e.g. set up region constraints
 /// to be tested), then resolve region and return errors
-fn resolve_regions_with_wf_tys<'tcx>(
+fn test_region_obligations<'tcx>(
     tcx: TyCtxt<'tcx>,
     id: LocalDefId,
     param_env: ty::ParamEnv<'tcx>,
     wf_tys: &FxIndexSet<Ty<'tcx>>,
-    add_constraints: impl for<'a> FnOnce(&'a InferCtxt<'tcx>, &'a RegionBoundPairs<'tcx>),
+    add_constraints: impl FnOnce(&InferCtxt<'tcx>),
 ) -> bool {
     // Unfortunately, we have to use a new `InferCtxt` each call, because
     // region constraints get added and solved there and we need to test each
     // call individually.
     let infcx = tcx.infer_ctxt().build();
+
+    add_constraints(&infcx);
+
     let outlives_environment = OutlivesEnvironment::with_bounds(
         param_env,
-        infcx.implied_bounds_tys(param_env, id, wf_tys.clone()),
+        infcx.implied_bounds_tys(param_env, id, wf_tys),
     );
-    let region_bound_pairs = outlives_environment.region_bound_pairs();
-
-    add_constraints(&infcx, region_bound_pairs);
 
     let errors = infcx.resolve_regions(&outlives_environment);
     debug!(?errors, "errors");
@@ -725,35 +801,33 @@ fn resolve_regions_with_wf_tys<'tcx>(
 /// `<P0 as Trait<P1..Pn>>::GAT<Pn..Pm>` and adds the arguments `P0..Pm` into
 /// the two vectors, `regions` and `types` (depending on their kind). For each
 /// parameter `Pi` also track the index `i`.
-struct GATSubstCollector<'tcx> {
+struct GATArgsCollector<'tcx> {
     gat: DefId,
-    // Which region appears and which parameter index its substituted for
+    // Which region appears and which parameter index its instantiated with
     regions: FxHashSet<(ty::Region<'tcx>, usize)>,
-    // Which params appears and which parameter index its substituted for
+    // Which params appears and which parameter index its instantiated with
     types: FxHashSet<(Ty<'tcx>, usize)>,
 }
 
-impl<'tcx> GATSubstCollector<'tcx> {
+impl<'tcx> GATArgsCollector<'tcx> {
     fn visit<T: TypeFoldable<TyCtxt<'tcx>>>(
         gat: DefId,
         t: T,
     ) -> (FxHashSet<(ty::Region<'tcx>, usize)>, FxHashSet<(Ty<'tcx>, usize)>) {
         let mut visitor =
-            GATSubstCollector { gat, regions: FxHashSet::default(), types: FxHashSet::default() };
+            GATArgsCollector { gat, regions: FxHashSet::default(), types: FxHashSet::default() };
         t.visit_with(&mut visitor);
         (visitor.regions, visitor.types)
     }
 }
 
-impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for GATSubstCollector<'tcx> {
-    type BreakTy = !;
-
-    fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
+impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for GATArgsCollector<'tcx> {
+    fn visit_ty(&mut self, t: Ty<'tcx>) {
         match t.kind() {
             ty::Alias(ty::Projection, p) if p.def_id == self.gat => {
-                for (idx, subst) in p.args.iter().enumerate() {
-                    match subst.unpack() {
-                        GenericArgKind::Lifetime(lt) if !lt.is_late_bound() => {
+                for (idx, arg) in p.args.iter().enumerate() {
+                    match arg.unpack() {
+                        GenericArgKind::Lifetime(lt) if !lt.is_bound() => {
                             self.regions.insert((lt, idx));
                         }
                         GenericArgKind::Type(t) => {
@@ -783,7 +857,7 @@ fn could_be_self(trait_def_id: LocalDefId, ty: &hir::Ty<'_>) -> bool {
 /// When this is done, suggest using `Self` instead.
 fn check_object_unsafe_self_trait_by_name(tcx: TyCtxt<'_>, item: &hir::TraitItem<'_>) {
     let (trait_name, trait_def_id) =
-        match tcx.hir().get_by_def_id(tcx.hir().get_parent_item(item.hir_id()).def_id) {
+        match tcx.hir_node_by_def_id(tcx.hir().get_parent_item(item.hir_id()).def_id) {
             hir::Node::Item(item) => match item.kind {
                 hir::ItemKind::Trait(..) => (item.ident, item.owner_id),
                 _ => return,
@@ -817,13 +891,13 @@ fn check_object_unsafe_self_trait_by_name(tcx: TyCtxt<'_>, item: &hir::TraitItem
             return;
         }
         let sugg = trait_should_be_self.iter().map(|span| (*span, "Self".to_string())).collect();
-        tcx.sess
+        tcx.dcx()
             .struct_span_err(
                 trait_should_be_self,
                 "associated item referring to unboxed trait object for its own trait",
             )
-            .span_label(trait_name.span, "in this trait")
-            .multipart_suggestion(
+            .with_span_label(trait_name.span, "in this trait")
+            .with_multipart_suggestion(
                 "you might have meant to use `Self` to refer to the implementing type",
                 sugg,
                 Applicability::MachineApplicable,
@@ -832,7 +906,12 @@ fn check_object_unsafe_self_trait_by_name(tcx: TyCtxt<'_>, item: &hir::TraitItem
     }
 }
 
-fn check_impl_item(tcx: TyCtxt<'_>, impl_item: &hir::ImplItem<'_>) {
+fn check_impl_item<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    impl_item: &'tcx hir::ImplItem<'tcx>,
+) -> Result<(), ErrorGuaranteed> {
+    CollectItemTypesVisitor { tcx }.visit_impl_item(impl_item);
+
     let (method_sig, span) = match impl_item.kind {
         hir::ImplItemKind::Fn(ref sig, _) => (Some(sig), impl_item.span),
         // Constrain binding and overflow error spans to `<Ty>` in `type foo = <Ty>`.
@@ -840,16 +919,16 @@ fn check_impl_item(tcx: TyCtxt<'_>, impl_item: &hir::ImplItem<'_>) {
         _ => (None, impl_item.span),
     };
 
-    check_associated_item(tcx, impl_item.owner_id.def_id, span, method_sig);
+    check_associated_item(tcx, impl_item.owner_id.def_id, span, method_sig)
 }
 
-fn check_param_wf(tcx: TyCtxt<'_>, param: &hir::GenericParam<'_>) {
+fn check_param_wf(tcx: TyCtxt<'_>, param: &hir::GenericParam<'_>) -> Result<(), ErrorGuaranteed> {
     match param.kind {
         // We currently only check wf of const params here.
-        hir::GenericParamKind::Lifetime { .. } | hir::GenericParamKind::Type { .. } => (),
+        hir::GenericParamKind::Lifetime { .. } | hir::GenericParamKind::Type { .. } => Ok(()),
 
         // Const parameters are well formed if their type is structural match.
-        hir::GenericParamKind::Const { ty: hir_ty, default: _ } => {
+        hir::GenericParamKind::Const { ty: hir_ty, default: _, is_host_effect: _ } => {
             let ty = tcx.type_of(param.def_id).instantiate_identity();
 
             if tcx.features().adt_const_params {
@@ -866,68 +945,72 @@ fn check_param_wf(tcx: TyCtxt<'_>, param: &hir::GenericParam<'_>) {
                         ty,
                         trait_def_id,
                     );
-                });
+                    Ok(())
+                })
             } else {
-                let diag = match ty.kind() {
-                    ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Error(_) => None,
-                    ty::FnPtr(_) => Some(tcx.sess.struct_span_err(
+                let mut diag = match ty.kind() {
+                    ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Error(_) => return Ok(()),
+                    ty::FnPtr(_) => tcx.dcx().struct_span_err(
                         hir_ty.span,
                         "using function pointers as const generic parameters is forbidden",
-                    )),
-                    ty::RawPtr(_) => Some(tcx.sess.struct_span_err(
+                    ),
+                    ty::RawPtr(_, _) => tcx.dcx().struct_span_err(
                         hir_ty.span,
                         "using raw pointers as const generic parameters is forbidden",
-                    )),
-                    _ => Some(tcx.sess.struct_span_err(
+                    ),
+                    _ => tcx.dcx().struct_span_err(
                         hir_ty.span,
                         format!("`{}` is forbidden as the type of a const generic parameter", ty),
-                    )),
+                    ),
                 };
 
-                if let Some(mut diag) = diag {
-                    diag.note("the only supported types are integers, `bool` and `char`");
+                diag.note("the only supported types are integers, `bool` and `char`");
 
-                    let cause = ObligationCause::misc(hir_ty.span, param.def_id);
-                    let may_suggest_feature = match type_allowed_to_implement_const_param_ty(
-                        tcx,
-                        tcx.param_env(param.def_id),
-                        ty,
-                        cause,
-                    ) {
-                        // Can never implement `ConstParamTy`, don't suggest anything.
-                        Err(ConstParamTyImplementationError::NotAnAdtOrBuiltinAllowed) => false,
-                        // May be able to implement `ConstParamTy`. Only emit the feature help
-                        // if the type is local, since the user may be able to fix the local type.
-                        Err(ConstParamTyImplementationError::InfrigingFields(..)) => {
-                            fn ty_is_local(ty: Ty<'_>) -> bool {
-                                match ty.kind() {
-                                    ty::Adt(adt_def, ..) => adt_def.did().is_local(),
-                                    // Arrays and slices use the inner type's `ConstParamTy`.
-                                    ty::Array(ty, ..) => ty_is_local(*ty),
-                                    ty::Slice(ty) => ty_is_local(*ty),
-                                    // `&` references use the inner type's `ConstParamTy`.
-                                    // `&mut` are not supported.
-                                    ty::Ref(_, ty, ast::Mutability::Not) => ty_is_local(*ty),
-                                    // Say that a tuple is local if any of its components are local.
-                                    // This is not strictly correct, but it's likely that the user can fix the local component.
-                                    ty::Tuple(tys) => tys.iter().any(|ty| ty_is_local(ty)),
-                                    _ => false,
-                                }
+                let cause = ObligationCause::misc(hir_ty.span, param.def_id);
+                let may_suggest_feature = match type_allowed_to_implement_const_param_ty(
+                    tcx,
+                    tcx.param_env(param.def_id),
+                    ty,
+                    cause,
+                ) {
+                    // Can never implement `ConstParamTy`, don't suggest anything.
+                    Err(ConstParamTyImplementationError::NotAnAdtOrBuiltinAllowed) => false,
+                    // May be able to implement `ConstParamTy`. Only emit the feature help
+                    // if the type is local, since the user may be able to fix the local type.
+                    Err(ConstParamTyImplementationError::InfrigingFields(..)) => {
+                        fn ty_is_local(ty: Ty<'_>) -> bool {
+                            match ty.kind() {
+                                ty::Adt(adt_def, ..) => adt_def.did().is_local(),
+                                // Arrays and slices use the inner type's `ConstParamTy`.
+                                ty::Array(ty, ..) => ty_is_local(*ty),
+                                ty::Slice(ty) => ty_is_local(*ty),
+                                // `&` references use the inner type's `ConstParamTy`.
+                                // `&mut` are not supported.
+                                ty::Ref(_, ty, ast::Mutability::Not) => ty_is_local(*ty),
+                                // Say that a tuple is local if any of its components are local.
+                                // This is not strictly correct, but it's likely that the user can fix the local component.
+                                ty::Tuple(tys) => tys.iter().any(|ty| ty_is_local(ty)),
+                                _ => false,
                             }
-
-                            ty_is_local(ty)
                         }
-                        // Implments `ConstParamTy`, suggest adding the feature to enable.
-                        Ok(..) => true,
-                    };
-                    if may_suggest_feature && tcx.sess.is_nightly_build() {
-                        diag.help(
-                            "add `#![feature(adt_const_params)]` to the crate attributes to enable more complex and user defined types",
-                        );
-                    }
 
-                    diag.emit();
+                        ty_is_local(ty)
+                    }
+                    // Implments `ConstParamTy`, suggest adding the feature to enable.
+                    Ok(..) => true,
+                };
+                if may_suggest_feature {
+                    tcx.disabled_nightly_features(
+                        &mut diag,
+                        Some(param.hir_id),
+                        [(
+                            " more complex and user defined types".to_string(),
+                            sym::adt_const_params,
+                        )],
+                    );
                 }
+
+                Err(diag.emit())
             }
         }
     }
@@ -939,10 +1022,15 @@ fn check_associated_item(
     item_id: LocalDefId,
     span: Span,
     sig_if_method: Option<&hir::FnSig<'_>>,
-) {
+) -> Result<(), ErrorGuaranteed> {
     let loc = Some(WellFormedLoc::Ty(item_id));
     enter_wf_checking_ctxt(tcx, span, item_id, |wfcx| {
         let item = tcx.associated_item(item_id);
+
+        // Avoid bogus "type annotations needed `Foo: Bar`" errors on `impl Bar for Foo` in case
+        // other `Foo` impls are incoherent.
+        tcx.ensure()
+            .coherent_trait(tcx.parent(item.trait_item_def_id.unwrap_or(item_id.into())))?;
 
         let self_ty = match item.container {
             ty::TraitContainer => tcx.types.self_param,
@@ -954,6 +1042,7 @@ fn check_associated_item(
                 let ty = tcx.type_of(item.def_id).instantiate_identity();
                 let ty = wfcx.normalize(span, Some(WellFormedLoc::Ty(item_id)), ty);
                 wfcx.register_wf_obligation(span, loc, ty.into());
+                Ok(())
             }
             ty::AssocKind::Fn => {
                 let sig = tcx.fn_sig(item.def_id).instantiate_identity();
@@ -965,7 +1054,7 @@ fn check_associated_item(
                     hir_sig.decl,
                     item.def_id.expect_local(),
                 );
-                check_method_receiver(wfcx, hir_sig, item, self_ty);
+                check_method_receiver(wfcx, hir_sig, item, self_ty)
             }
             ty::AssocKind::Type => {
                 if let ty::AssocItemContainer::TraitContainer = item.container {
@@ -976,22 +1065,18 @@ fn check_associated_item(
                     let ty = wfcx.normalize(span, Some(WellFormedLoc::Ty(item_id)), ty);
                     wfcx.register_wf_obligation(span, loc, ty.into());
                 }
+                Ok(())
             }
         }
     })
 }
 
-fn item_adt_kind(kind: &ItemKind<'_>) -> Option<AdtKind> {
-    match kind {
-        ItemKind::Struct(..) => Some(AdtKind::Struct),
-        ItemKind::Union(..) => Some(AdtKind::Union),
-        ItemKind::Enum(..) => Some(AdtKind::Enum),
-        _ => None,
-    }
-}
-
 /// In a type definition, we check that to ensure that the types of the fields are well-formed.
-fn check_type_defn<'tcx>(tcx: TyCtxt<'tcx>, item: &hir::Item<'tcx>, all_sized: bool) {
+fn check_type_defn<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    item: &hir::Item<'tcx>,
+    all_sized: bool,
+) -> Result<(), ErrorGuaranteed> {
     let _ = tcx.representability(item.owner_id.def_id);
     let adt_def = tcx.adt_def(item.owner_id);
 
@@ -1004,7 +1089,7 @@ fn check_type_defn<'tcx>(tcx: TyCtxt<'tcx>, item: &hir::Item<'tcx>, all_sized: b
             for field in &variant.fields {
                 let field_id = field.did.expect_local();
                 let hir::FieldDef { ty: hir_ty, .. } =
-                    tcx.hir().get_by_def_id(field_id).expect_field();
+                    tcx.hir_node_by_def_id(field_id).expect_field();
                 let ty = wfcx.normalize(
                     hir_ty.span,
                     None,
@@ -1023,14 +1108,8 @@ fn check_type_defn<'tcx>(tcx: TyCtxt<'tcx>, item: &hir::Item<'tcx>, all_sized: b
                 packed && {
                     let ty = tcx.type_of(variant.tail().did).instantiate_identity();
                     let ty = tcx.erase_regions(ty);
-                    if ty.has_infer() {
-                        tcx.sess
-                            .delay_span_bug(item.span, format!("inference variables in {ty:?}"));
-                        // Just treat unresolved type expression as if it needs drop.
-                        true
-                    } else {
-                        ty.needs_drop(tcx, tcx.param_env(item.owner_id))
-                    }
+                    assert!(!ty.has_infer());
+                    ty.needs_drop(tcx, tcx.param_env(item.owner_id))
                 }
             };
             // All fields (except for possibly the last) should be sized.
@@ -1042,7 +1121,7 @@ fn check_type_defn<'tcx>(tcx: TyCtxt<'tcx>, item: &hir::Item<'tcx>, all_sized: b
                 let last = idx == variant.fields.len() - 1;
                 let field_id = field.did.expect_local();
                 let hir::FieldDef { ty: hir_ty, .. } =
-                    tcx.hir().get_by_def_id(field_id).expect_field();
+                    tcx.hir_node_by_def_id(field_id).expect_field();
                 let ty = wfcx.normalize(
                     hir_ty.span,
                     None,
@@ -1053,9 +1132,14 @@ fn check_type_defn<'tcx>(tcx: TyCtxt<'tcx>, item: &hir::Item<'tcx>, all_sized: b
                         hir_ty.span,
                         wfcx.body_def_id,
                         traits::FieldSized {
-                            adt_kind: match item_adt_kind(&item.kind) {
-                                Some(i) => i,
-                                None => bug!(),
+                            adt_kind: match &item.kind {
+                                ItemKind::Struct(..) => AdtKind::Struct,
+                                ItemKind::Union(..) => AdtKind::Union,
+                                ItemKind::Enum(..) => AdtKind::Enum,
+                                kind => span_bug!(
+                                    item.span,
+                                    "should be wfchecking an ADT, got {kind:?}"
+                                ),
                             },
                             span: hir_ty.span,
                             last,
@@ -1086,11 +1170,12 @@ fn check_type_defn<'tcx>(tcx: TyCtxt<'tcx>, item: &hir::Item<'tcx>, all_sized: b
         }
 
         check_where_clauses(wfcx, item.span, item.owner_id.def_id);
-    });
+        Ok(())
+    })
 }
 
 #[instrument(skip(tcx, item))]
-fn check_trait(tcx: TyCtxt<'_>, item: &hir::Item<'_>) {
+fn check_trait(tcx: TyCtxt<'_>, item: &hir::Item<'_>) -> Result<(), ErrorGuaranteed> {
     debug!(?item.owner_id);
 
     let def_id = item.owner_id.def_id;
@@ -1099,8 +1184,8 @@ fn check_trait(tcx: TyCtxt<'_>, item: &hir::Item<'_>) {
         || matches!(trait_def.specialization_kind, TraitSpecializationKind::Marker)
     {
         for associated_def_id in &*tcx.associated_item_def_ids(def_id) {
-            struct_span_err!(
-                tcx.sess,
+            struct_span_code_err!(
+                tcx.dcx(),
                 tcx.def_span(*associated_def_id),
                 E0714,
                 "marker traits cannot have associated items",
@@ -1109,14 +1194,16 @@ fn check_trait(tcx: TyCtxt<'_>, item: &hir::Item<'_>) {
         }
     }
 
-    enter_wf_checking_ctxt(tcx, item.span, def_id, |wfcx| {
-        check_where_clauses(wfcx, item.span, def_id)
+    let res = enter_wf_checking_ctxt(tcx, item.span, def_id, |wfcx| {
+        check_where_clauses(wfcx, item.span, def_id);
+        Ok(())
     });
 
     // Only check traits, don't check trait aliases
-    if let hir::ItemKind::Trait(_, _, _, _, items) = item.kind {
-        check_gat_where_clauses(tcx, items);
+    if let hir::ItemKind::Trait(..) = item.kind {
+        check_gat_where_clauses(tcx, item.owner_id.def_id);
     }
+    res
 }
 
 /// Checks all associated type defaults of trait `trait_def_id`.
@@ -1130,11 +1217,11 @@ fn check_associated_type_bounds(wfcx: &WfCheckingCtxt<'_, '_>, item: ty::AssocIt
     let wf_obligations =
         bounds.instantiate_identity_iter_copied().flat_map(|(bound, bound_span)| {
             let normalized_bound = wfcx.normalize(span, None, bound);
-            traits::wf::predicate_obligations(
+            traits::wf::clause_obligations(
                 wfcx.infcx,
                 wfcx.param_env,
                 wfcx.body_def_id,
-                normalized_bound.as_predicate(),
+                normalized_bound,
                 bound_span,
             )
         });
@@ -1148,10 +1235,11 @@ fn check_item_fn(
     ident: Ident,
     span: Span,
     decl: &hir::FnDecl<'_>,
-) {
+) -> Result<(), ErrorGuaranteed> {
     enter_wf_checking_ctxt(tcx, span, def_id, |wfcx| {
         let sig = tcx.fn_sig(def_id).instantiate_identity();
         check_fn_or_method(wfcx, ident.span, sig, decl, def_id);
+        Ok(())
     })
 }
 
@@ -1166,7 +1254,7 @@ fn check_item_type(
     item_id: LocalDefId,
     ty_span: Span,
     unsized_handling: UnsizedHandling,
-) {
+) -> Result<(), ErrorGuaranteed> {
     debug!("check_item_type: {:?}", item_id);
 
     enter_wf_checking_ctxt(tcx, ty_span, item_id, |wfcx| {
@@ -1206,43 +1294,57 @@ fn check_item_type(
                 tcx.require_lang_item(LangItem::Sync, Some(ty_span)),
             );
         }
-    });
+        Ok(())
+    })
 }
 
-#[instrument(level = "debug", skip(tcx, ast_self_ty, ast_trait_ref))]
+#[instrument(level = "debug", skip(tcx, hir_self_ty, hir_trait_ref))]
 fn check_impl<'tcx>(
     tcx: TyCtxt<'tcx>,
     item: &'tcx hir::Item<'tcx>,
-    ast_self_ty: &hir::Ty<'_>,
-    ast_trait_ref: &Option<hir::TraitRef<'_>>,
-) {
+    hir_self_ty: &hir::Ty<'_>,
+    hir_trait_ref: &Option<hir::TraitRef<'_>>,
+) -> Result<(), ErrorGuaranteed> {
     enter_wf_checking_ctxt(tcx, item.span, item.owner_id.def_id, |wfcx| {
-        match ast_trait_ref {
-            Some(ast_trait_ref) => {
+        match hir_trait_ref {
+            Some(hir_trait_ref) => {
                 // `#[rustc_reservation_impl]` impls are not real impls and
                 // therefore don't need to be WF (the trait's `Self: Trait` predicate
                 // won't hold).
                 let trait_ref = tcx.impl_trait_ref(item.owner_id).unwrap().instantiate_identity();
+                // Avoid bogus "type annotations needed `Foo: Bar`" errors on `impl Bar for Foo` in case
+                // other `Foo` impls are incoherent.
+                tcx.ensure().coherent_trait(trait_ref.def_id)?;
+                let trait_span = hir_trait_ref.path.span;
                 let trait_ref = wfcx.normalize(
-                    ast_trait_ref.path.span,
+                    trait_span,
                     Some(WellFormedLoc::Ty(item.hir_id().expect_owner().def_id)),
                     trait_ref,
                 );
                 let trait_pred =
-                    ty::TraitPredicate { trait_ref, polarity: ty::ImplPolarity::Positive };
+                    ty::TraitPredicate { trait_ref, polarity: ty::PredicatePolarity::Positive };
                 let mut obligations = traits::wf::trait_obligations(
                     wfcx.infcx,
                     wfcx.param_env,
                     wfcx.body_def_id,
-                    &trait_pred,
-                    ast_trait_ref.path.span,
+                    trait_pred,
+                    trait_span,
                     item,
                 );
                 for obligation in &mut obligations {
+                    if obligation.cause.span != trait_span {
+                        // We already have a better span.
+                        continue;
+                    }
                     if let Some(pred) = obligation.predicate.to_opt_poly_trait_pred()
-                        && pred.self_ty().skip_binder() == trait_ref.self_ty()
+                        && pred.skip_binder().self_ty() == trait_ref.self_ty()
                     {
-                        obligation.cause.span = ast_self_ty.span;
+                        obligation.cause.span = hir_self_ty.span;
+                    }
+                    if let Some(pred) = obligation.predicate.to_opt_poly_projection_pred()
+                        && pred.skip_binder().self_ty() == trait_ref.self_ty()
+                    {
+                        obligation.cause.span = hir_self_ty.span;
                     }
                 }
                 debug!(?obligations);
@@ -1256,7 +1358,7 @@ fn check_impl<'tcx>(
                     self_ty,
                 );
                 wfcx.register_wf_obligation(
-                    ast_self_ty.span,
+                    hir_self_ty.span,
                     Some(WellFormedLoc::Ty(item.hir_id().expect_owner().def_id)),
                     self_ty.into(),
                 );
@@ -1264,7 +1366,8 @@ fn check_impl<'tcx>(
         }
 
         check_where_clauses(wfcx, item.span, item.owner_id.def_id);
-    });
+        Ok(())
+    })
 }
 
 /// Checks where-clauses and inline bounds that are declared on `def_id`.
@@ -1281,7 +1384,9 @@ fn check_where_clauses<'tcx>(wfcx: &WfCheckingCtxt<'_, 'tcx>, span: Span, def_id
         | GenericParamDefKind::Const { has_default, .. } => {
             has_default && def.index >= generics.parent_count as u32
         }
-        GenericParamDefKind::Lifetime => unreachable!(),
+        GenericParamDefKind::Lifetime => {
+            span_bug!(tcx.def_span(def.def_id), "lifetime params can have no default")
+        }
     };
 
     // Check that concrete defaults are well-formed. See test `type-check-defaults.rs`.
@@ -1328,14 +1433,14 @@ fn check_where_clauses<'tcx>(wfcx: &WfCheckingCtxt<'_, 'tcx>, span: Span, def_id
         }
     }
 
-    // Check that trait predicates are WF when params are substituted by their defaults.
+    // Check that trait predicates are WF when params are instantiated with their defaults.
     // We don't want to overly constrain the predicates that may be written but we want to
     // catch cases where a default my never be applied such as `struct Foo<T: Copy = String>`.
     // Therefore we check if a predicate which contains a single type param
-    // with a concrete default is WF with that default substituted.
+    // with a concrete default is WF with that default instantiated.
     // For more examples see tests `defaults-well-formedness.rs` and `type-check-defaults.rs`.
     //
-    // First we build the defaulted substitution.
+    // First we build the defaulted generic parameters.
     let args = GenericArgs::for_item(tcx, def_id.to_def_id(), |param, _| {
         match param.kind {
             GenericParamDefKind::Lifetime => {
@@ -1349,7 +1454,7 @@ fn check_where_clauses<'tcx>(wfcx: &WfCheckingCtxt<'_, 'tcx>, span: Span, def_id
                     let default_ty = tcx.type_of(param.def_id).instantiate_identity();
                     // ... and it's not a dependent default, ...
                     if !default_ty.has_param() {
-                        // ... then substitute it with the default.
+                        // ... then instantiate it with the default.
                         return default_ty.into();
                     }
                 }
@@ -1362,7 +1467,7 @@ fn check_where_clauses<'tcx>(wfcx: &WfCheckingCtxt<'_, 'tcx>, span: Span, def_id
                     let default_ct = tcx.const_param_default(param.def_id).instantiate_identity();
                     // ... and it's not a dependent default, ...
                     if !default_ct.has_param() {
-                        // ... then substitute it with the default.
+                        // ... then instantiate it with the default.
                         return default_ct.into();
                     }
                 }
@@ -1372,7 +1477,7 @@ fn check_where_clauses<'tcx>(wfcx: &WfCheckingCtxt<'_, 'tcx>, span: Span, def_id
         }
     });
 
-    // Now we build the substituted predicates.
+    // Now we build the instantiated predicates.
     let default_obligations = predicates
         .predicates
         .iter()
@@ -1382,20 +1487,19 @@ fn check_where_clauses<'tcx>(wfcx: &WfCheckingCtxt<'_, 'tcx>, span: Span, def_id
                 params: FxHashSet<u32>,
             }
             impl<'tcx> ty::visit::TypeVisitor<TyCtxt<'tcx>> for CountParams {
-                type BreakTy = ();
-
-                fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
+                type Result = ControlFlow<()>;
+                fn visit_ty(&mut self, t: Ty<'tcx>) -> Self::Result {
                     if let ty::Param(param) = t.kind() {
                         self.params.insert(param.index);
                     }
                     t.super_visit_with(self)
                 }
 
-                fn visit_region(&mut self, _: ty::Region<'tcx>) -> ControlFlow<Self::BreakTy> {
+                fn visit_region(&mut self, _: ty::Region<'tcx>) -> Self::Result {
                     ControlFlow::Break(())
                 }
 
-                fn visit_const(&mut self, c: ty::Const<'tcx>) -> ControlFlow<Self::BreakTy> {
+                fn visit_const(&mut self, c: ty::Const<'tcx>) -> Self::Result {
                     if let ty::ConstKind::Param(param) = c.kind() {
                         self.params.insert(param.index);
                     }
@@ -1404,23 +1508,25 @@ fn check_where_clauses<'tcx>(wfcx: &WfCheckingCtxt<'_, 'tcx>, span: Span, def_id
             }
             let mut param_count = CountParams::default();
             let has_region = pred.visit_with(&mut param_count).is_break();
-            let substituted_pred = ty::EarlyBinder::bind(pred).instantiate(tcx, args);
+            let instantiated_pred = ty::EarlyBinder::bind(pred).instantiate(tcx, args);
             // Don't check non-defaulted params, dependent defaults (including lifetimes)
             // or preds with multiple params.
-            if substituted_pred.has_non_region_param() || param_count.params.len() > 1 || has_region
+            if instantiated_pred.has_non_region_param()
+                || param_count.params.len() > 1
+                || has_region
             {
                 None
-            } else if predicates.predicates.iter().any(|&(p, _)| p == substituted_pred) {
+            } else if predicates.predicates.iter().any(|&(p, _)| p == instantiated_pred) {
                 // Avoid duplication of predicates that contain no parameters, for example.
                 None
             } else {
-                Some((substituted_pred, sp))
+                Some((instantiated_pred, sp))
             }
         })
         .map(|(pred, sp)| {
             // Convert each of those into an obligation. So if you have
             // something like `struct Foo<T: Copy = String>`, we would
-            // take that predicate `T: Copy`, substitute to `String: Copy`
+            // take that predicate `T: Copy`, instantiated with `String: Copy`
             // (actually that happens in the previous `flat_map` call),
             // and then try to prove it (in this case, we'll fail).
             //
@@ -1443,13 +1549,7 @@ fn check_where_clauses<'tcx>(wfcx: &WfCheckingCtxt<'_, 'tcx>, span: Span, def_id
     debug!(?predicates.predicates);
     assert_eq!(predicates.predicates.len(), predicates.spans.len());
     let wf_obligations = predicates.into_iter().flat_map(|(p, sp)| {
-        traits::wf::predicate_obligations(
-            infcx,
-            wfcx.param_env,
-            wfcx.body_def_id,
-            p.as_predicate(),
-            sp,
-        )
+        traits::wf::clause_obligations(infcx, wfcx.param_env, wfcx.body_def_id, p, sp)
     });
     let obligations: Vec<_> = wf_obligations.chain(default_obligations).collect();
     wfcx.register_obligations(obligations);
@@ -1517,14 +1617,14 @@ fn check_fn_or_method<'tcx>(
                 tcx.require_lang_item(hir::LangItem::Sized, Some(span)),
             );
         } else {
-            tcx.sess.span_err(
+            tcx.dcx().span_err(
                 hir_decl.inputs.last().map_or(span, |input| input.span),
                 "functions with the \"rust-call\" ABI must take a single non-self tuple argument",
             );
         }
         // No more inputs other than the `self` type and the tuple type
         if inputs.next().is_some() {
-            tcx.sess.span_err(
+            tcx.dcx().span_err(
                 hir_decl.inputs.last().map_or(span, |input| input.span),
                 "functions with the \"rust-call\" ABI must take a single non-self tuple argument",
             );
@@ -1542,11 +1642,11 @@ fn check_method_receiver<'tcx>(
     fn_sig: &hir::FnSig<'_>,
     method: ty::AssocItem,
     self_ty: Ty<'tcx>,
-) {
+) -> Result<(), ErrorGuaranteed> {
     let tcx = wfcx.tcx();
 
     if !method.fn_has_self_parameter {
-        return;
+        return Ok(());
     }
 
     let span = fn_sig.decl.inputs[0].span;
@@ -1562,17 +1662,23 @@ fn check_method_receiver<'tcx>(
     let receiver_ty = sig.inputs()[0];
     let receiver_ty = wfcx.normalize(span, None, receiver_ty);
 
+    // If the receiver already has errors reported, consider it valid to avoid
+    // unnecessary errors (#58712).
+    if receiver_ty.references_error() {
+        return Ok(());
+    }
+
     if tcx.features().arbitrary_self_types {
         if !receiver_is_valid(wfcx, span, receiver_ty, self_ty, true) {
             // Report error; `arbitrary_self_types` was enabled.
-            e0307(tcx, span, receiver_ty);
+            return Err(e0307(tcx, span, receiver_ty));
         }
     } else {
         if !receiver_is_valid(wfcx, span, receiver_ty, self_ty, false) {
-            if receiver_is_valid(wfcx, span, receiver_ty, self_ty, true) {
+            return Err(if receiver_is_valid(wfcx, span, receiver_ty, self_ty, true) {
                 // Report error; would have worked with `arbitrary_self_types`.
                 feature_err(
-                    &tcx.sess.parse_sess,
+                    &tcx.sess,
                     sym::arbitrary_self_types,
                     span,
                     format!(
@@ -1580,26 +1686,22 @@ fn check_method_receiver<'tcx>(
                          the `arbitrary_self_types` feature",
                     ),
                 )
-                .help(HELP_FOR_SELF_TYPE)
-                .emit();
+                .with_help(HELP_FOR_SELF_TYPE)
+                .emit()
             } else {
                 // Report error; would not have worked with `arbitrary_self_types`.
-                e0307(tcx, span, receiver_ty);
-            }
+                e0307(tcx, span, receiver_ty)
+            });
         }
     }
+    Ok(())
 }
 
-fn e0307(tcx: TyCtxt<'_>, span: Span, receiver_ty: Ty<'_>) {
-    struct_span_err!(
-        tcx.sess.diagnostic(),
-        span,
-        E0307,
-        "invalid `self` parameter type: {receiver_ty}"
-    )
-    .note("type of `self` must be `Self` or a type that dereferences to it")
-    .help(HELP_FOR_SELF_TYPE)
-    .emit();
+fn e0307(tcx: TyCtxt<'_>, span: Span, receiver_ty: Ty<'_>) -> ErrorGuaranteed {
+    struct_span_code_err!(tcx.dcx(), span, E0307, "invalid `self` parameter type: {receiver_ty}")
+        .with_note("type of `self` must be `Self` or a type that dereferences to it")
+        .with_help(HELP_FOR_SELF_TYPE)
+        .emit()
 }
 
 /// Returns whether `receiver_ty` would be considered a valid receiver type for `self_ty`. If
@@ -1680,9 +1782,7 @@ fn receiver_is_valid<'tcx>(
             }
         } else {
             debug!("receiver_is_valid: type `{:?}` does not deref to `{:?}`", receiver_ty, self_ty);
-            // If the receiver already has errors reported due to it, consider it valid to avoid
-            // unnecessary errors (#58712).
-            return receiver_ty.references_error();
+            return false;
         }
     }
 
@@ -1721,7 +1821,7 @@ fn receiver_is_implemented<'tcx>(
 fn check_variances_for_type_defn<'tcx>(
     tcx: TyCtxt<'tcx>,
     item: &hir::Item<'tcx>,
-    hir_generics: &hir::Generics<'_>,
+    hir_generics: &hir::Generics<'tcx>,
 ) {
     let identity_args = ty::GenericArgs::identity_for_item(tcx, item.owner_id);
 
@@ -1734,15 +1834,15 @@ fn check_variances_for_type_defn<'tcx>(
             }
         }
         ItemKind::TyAlias(..) => {
-            if tcx.type_alias_is_lazy(item.owner_id) {
-                if tcx.type_of(item.owner_id).skip_binder().references_error() {
-                    return;
-                }
-            } else {
-                bug!();
+            assert!(
+                tcx.type_alias_is_lazy(item.owner_id),
+                "should not be computing variance of non-weak type alias"
+            );
+            if tcx.type_of(item.owner_id).skip_binder().references_error() {
+                return;
             }
         }
-        _ => bug!(),
+        kind => span_bug!(item.span, "cannot compute the variances of {kind:?}"),
     }
 
     let ty_predicates = tcx.predicates_of(item.owner_id);
@@ -1766,7 +1866,7 @@ fn check_variances_for_type_defn<'tcx>(
             .iter()
             .filter_map(|predicate| match predicate {
                 hir::WherePredicate::BoundPredicate(predicate) => {
-                    match icx.to_ty(predicate.bounded_ty).kind() {
+                    match icx.lower_ty(predicate.bounded_ty).kind() {
                         ty::Param(data) => Some(Parameter(data.index)),
                         _ => None,
                     }
@@ -1789,15 +1889,17 @@ fn check_variances_for_type_defn<'tcx>(
         let hir_param = &hir_generics.params[index];
 
         if ty_param.def_id != hir_param.def_id.into() {
-            // valid programs always have lifetimes before types in the generic parameter list
+            // Valid programs always have lifetimes before types in the generic parameter list.
             // ty_generics are normalized to be in this required order, and variances are built
             // from ty generics, not from hir generics. but we need hir generics to get
-            // a span out
+            // a span out.
             //
-            // if they aren't in the same order, then the user has written invalid code, and already
-            // got an error about it (or I'm wrong about this)
-            tcx.sess
-                .delay_span_bug(hir_param.span, "hir generics and ty generics in different order");
+            // If they aren't in the same order, then the user has written invalid code, and already
+            // got an error about it (or I'm wrong about this).
+            tcx.dcx().span_delayed_bug(
+                hir_param.span,
+                "hir generics and ty generics in different order",
+            );
             continue;
         }
 
@@ -1805,7 +1907,7 @@ fn check_variances_for_type_defn<'tcx>(
             hir::ParamName::Error => {}
             _ => {
                 let has_explicit_bounds = explicitly_bounded_params.contains(&parameter);
-                report_bivariance(tcx, hir_param, has_explicit_bounds);
+                report_bivariance(tcx, hir_param, has_explicit_bounds, item.kind);
             }
         }
     }
@@ -1815,30 +1917,38 @@ fn report_bivariance(
     tcx: TyCtxt<'_>,
     param: &rustc_hir::GenericParam<'_>,
     has_explicit_bounds: bool,
+    item_kind: ItemKind<'_>,
 ) -> ErrorGuaranteed {
-    let span = param.span;
-    let param_name = param.name.ident().name;
-    let mut err = error_392(tcx, span, param_name);
+    let param_name = param.name.ident();
 
-    let suggested_marker_id = tcx.lang_items().phantom_data();
-    // Help is available only in presence of lang items.
-    let msg = if let Some(def_id) = suggested_marker_id {
-        format!(
-            "consider removing `{}`, referring to it in a field, or using a marker such as `{}`",
-            param_name,
-            tcx.def_path_str(def_id),
-        )
-    } else {
-        format!("consider removing `{param_name}` or referring to it in a field")
+    let help = match item_kind {
+        ItemKind::Enum(..) | ItemKind::Struct(..) | ItemKind::Union(..) => {
+            if let Some(def_id) = tcx.lang_items().phantom_data() {
+                errors::UnusedGenericParameterHelp::Adt {
+                    param_name,
+                    phantom_data: tcx.def_path_str(def_id),
+                }
+            } else {
+                errors::UnusedGenericParameterHelp::AdtNoPhantomData { param_name }
+            }
+        }
+        ItemKind::TyAlias(..) => errors::UnusedGenericParameterHelp::TyAlias { param_name },
+        item_kind => bug!("report_bivariance: unexpected item kind: {item_kind:?}"),
     };
-    err.help(msg);
 
-    if matches!(param.kind, hir::GenericParamKind::Type { .. }) && !has_explicit_bounds {
-        err.help(format!(
-            "if you intended `{param_name}` to be a const parameter, use `const {param_name}: usize` instead"
-        ));
-    }
-    err.emit()
+    let const_param_help =
+        matches!(param.kind, hir::GenericParamKind::Type { .. } if !has_explicit_bounds)
+            .then_some(());
+
+    let mut diag = tcx.dcx().create_err(errors::UnusedGenericParameter {
+        span: param.span,
+        param_name,
+        param_def_kind: tcx.def_descr(param.def_id.to_def_id()),
+        help,
+        const_param_help,
+    });
+    diag.code(E0392);
+    diag.emit()
 }
 
 impl<'tcx> WfCheckingCtxt<'_, 'tcx> {
@@ -1862,15 +1972,12 @@ impl<'tcx> WfCheckingCtxt<'_, 'tcx> {
                 continue;
             }
             // Match the existing behavior.
-            if pred.is_global() && !pred.has_late_bound_vars() {
+            if pred.is_global() && !pred.has_type_flags(TypeFlags::HAS_BINDER_VARS) {
                 let pred = self.normalize(span, None, pred);
-                let hir_node = tcx.hir().find_by_def_id(self.body_def_id);
 
                 // only use the span of the predicate clause (#90869)
-
-                if let Some(hir::Generics { predicates, .. }) =
-                    hir_node.and_then(|node| node.generics())
-                {
+                let hir_node = tcx.hir_node_by_def_id(self.body_def_id);
+                if let Some(hir::Generics { predicates, .. }) = hir_node.generics() {
                     span = predicates
                         .iter()
                         // There seems to be no better way to find out which predicate we are in
@@ -1891,22 +1998,16 @@ impl<'tcx> WfCheckingCtxt<'_, 'tcx> {
     }
 }
 
-fn check_mod_type_wf(tcx: TyCtxt<'_>, module: LocalModDefId) {
+fn check_mod_type_wf(tcx: TyCtxt<'_>, module: LocalModDefId) -> Result<(), ErrorGuaranteed> {
     let items = tcx.hir_module_items(module);
-    items.par_items(|item| tcx.ensure().check_well_formed(item.owner_id));
-    items.par_impl_items(|item| tcx.ensure().check_well_formed(item.owner_id));
-    items.par_trait_items(|item| tcx.ensure().check_well_formed(item.owner_id));
-    items.par_foreign_items(|item| tcx.ensure().check_well_formed(item.owner_id));
-}
-
-fn error_392(
-    tcx: TyCtxt<'_>,
-    span: Span,
-    param_name: Symbol,
-) -> DiagnosticBuilder<'_, ErrorGuaranteed> {
-    let mut err = struct_span_err!(tcx.sess, span, E0392, "parameter `{param_name}` is never used");
-    err.span_label(span, "unused parameter");
-    err
+    let mut res = items.par_items(|item| tcx.ensure().check_well_formed(item.owner_id));
+    res = res.and(items.par_impl_items(|item| tcx.ensure().check_well_formed(item.owner_id)));
+    res = res.and(items.par_trait_items(|item| tcx.ensure().check_well_formed(item.owner_id)));
+    res = res.and(items.par_foreign_items(|item| tcx.ensure().check_well_formed(item.owner_id)));
+    if module == LocalModDefId::CRATE_DEF_ID {
+        super::entry::check_for_entry_fn(tcx);
+    }
+    res
 }
 
 pub fn provide(providers: &mut Providers) {

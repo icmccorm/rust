@@ -1,8 +1,8 @@
 use crate::iter::adapters::{
     zip::try_get_unchecked, SourceIter, TrustedRandomAccess, TrustedRandomAccessNoCoerce,
 };
-use crate::iter::{FusedIterator, InPlaceIterable, TrustedLen};
-use crate::num::NonZeroUsize;
+use crate::iter::{FusedIterator, InPlaceIterable, TrustedFused, TrustedLen};
+use crate::num::NonZero;
 use crate::ops::Try;
 
 /// An iterator that yields the current count and the element during iteration.
@@ -115,7 +115,7 @@ where
 
     #[inline]
     #[rustc_inherit_overflow_checks]
-    fn advance_by(&mut self, n: usize) -> Result<(), NonZeroUsize> {
+    fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
         let remaining = self.iter.advance_by(n);
         let advanced = match remaining {
             Ok(()) => n,
@@ -206,7 +206,7 @@ where
     }
 
     #[inline]
-    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZeroUsize> {
+    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
         // we do not need to update the count since that only tallies the number of items
         // consumed from the front. consuming items from the back can never reduce that.
         self.iter.advance_back_by(n)
@@ -243,6 +243,9 @@ where
 #[stable(feature = "fused", since = "1.26.0")]
 impl<I> FusedIterator for Enumerate<I> where I: FusedIterator {}
 
+#[unstable(issue = "none", feature = "trusted_fused")]
+unsafe impl<I: TrustedFused> TrustedFused for Enumerate<I> {}
+
 #[unstable(feature = "trusted_len", issue = "37572")]
 unsafe impl<I> TrustedLen for Enumerate<I> where I: TrustedLen {}
 
@@ -261,7 +264,10 @@ where
 }
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<I: InPlaceIterable> InPlaceIterable for Enumerate<I> {}
+unsafe impl<I: InPlaceIterable> InPlaceIterable for Enumerate<I> {
+    const EXPAND_BY: Option<NonZero<usize>> = I::EXPAND_BY;
+    const MERGE_BY: Option<NonZero<usize>> = I::MERGE_BY;
+}
 
 #[stable(feature = "default_iters", since = "1.70.0")]
 impl<I: Default> Default for Enumerate<I> {

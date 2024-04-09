@@ -1,7 +1,6 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet_with_applicability;
 use clippy_utils::{match_def_path, path_def_id};
-use if_chain::if_chain;
 use rustc_ast::ast;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
@@ -51,7 +50,7 @@ pub fn check(
         super::MANUAL_SATURATING_ARITHMETIC,
         expr.span,
         "manual saturating arithmetic",
-        &format!("try using `saturating_{arith}`"),
+        format!("consider using `saturating_{arith}`"),
         format!(
             "{}.saturating_{arith}({})",
             snippet_with_applicability(cx, arith_lhs.span, "..", &mut applicability),
@@ -69,16 +68,14 @@ enum MinMax {
 
 fn is_min_or_max(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<MinMax> {
     // `T::max_value()` `T::min_value()` inherent methods
-    if_chain! {
-        if let hir::ExprKind::Call(func, args) = &expr.kind;
-        if args.is_empty();
-        if let hir::ExprKind::Path(hir::QPath::TypeRelative(_, segment)) = &func.kind;
-        then {
-            match segment.ident.as_str() {
-                "max_value" => return Some(MinMax::Max),
-                "min_value" => return Some(MinMax::Min),
-                _ => {}
-            }
+    if let hir::ExprKind::Call(func, args) = &expr.kind
+        && args.is_empty()
+        && let hir::ExprKind::Path(hir::QPath::TypeRelative(_, segment)) = &func.kind
+    {
+        match segment.ident.as_str() {
+            "max_value" => return Some(MinMax::Max),
+            "min_value" => return Some(MinMax::Min),
+            _ => {},
         }
     }
 

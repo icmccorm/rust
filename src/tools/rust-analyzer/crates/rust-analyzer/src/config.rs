@@ -7,7 +7,7 @@
 //! configure the server itself, feature flags are passed into analysis, and
 //! tweak things like automatic insertion of `()` in completions.
 
-use std::{fmt, iter, ops::Not, path::PathBuf};
+use std::{fmt, iter, ops::Not};
 
 use cfg::{CfgAtom, CfgDiff};
 use flycheck::FlycheckConfig;
@@ -23,11 +23,14 @@ use ide_db::{
 };
 use itertools::Itertools;
 use lsp_types::{ClientCapabilities, MarkupKind};
+use paths::{Utf8Path, Utf8PathBuf};
 use project_model::{
     CargoConfig, CargoFeatures, ProjectJson, ProjectJsonData, ProjectManifest, RustLibSource,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use semver::Version;
 use serde::{de::DeserializeOwned, Deserialize};
+use stdx::format_to_acc;
 use vfs::{AbsPath, AbsPathBuf};
 
 use crate::{
@@ -91,6 +94,12 @@ config_data! {
         /// and should therefore include `--message-format=json` or a similar
         /// option.
         ///
+        /// If there are multiple linked projects/workspaces, this command is invoked for
+        /// each of them, with the working directory being the workspace root
+        /// (i.e., the folder containing the `Cargo.toml`). This can be overwritten
+        /// by changing `#rust-analyzer.cargo.buildScripts.invocationStrategy#` and
+        /// `#rust-analyzer.cargo.buildScripts.invocationLocation#`.
+        ///
         /// By default, a cargo invocation will be constructed for the configured
         /// targets and features, with the following base command line:
         ///
@@ -99,6 +108,9 @@ config_data! {
         /// ```
         /// .
         cargo_buildScripts_overrideCommand: Option<Vec<String>> = "null",
+        /// Rerun proc-macros building/build-scripts running when proc-macro
+        /// or build-script sources change and are saved.
+        cargo_buildScripts_rebuildOnSave: bool = "true",
         /// Use `RUSTC_WRAPPER=rust-analyzer` when running build scripts to
         /// avoid checking unnecessary things.
         cargo_buildScripts_useRustcWrapper: bool = "true",
@@ -122,6 +134,13 @@ config_data! {
         ///
         /// This option does not take effect until rust-analyzer is restarted.
         cargo_sysroot: Option<String>    = "\"discover\"",
+        /// Whether to run cargo metadata on the sysroot library allowing rust-analyzer to analyze
+        /// third-party dependencies of the standard libraries.
+        ///
+        /// This will cause `cargo` to create a lockfile in your sysroot directory. rust-analyzer
+        /// will attempt to clean up afterwards, but nevertheless requires the location to be
+        /// writable to.
+        cargo_sysrootQueryMetadata: bool     = "false",
         /// Relative path to the sysroot library sources. If left unset, this will default to
         /// `{cargo.sysroot}/lib/rustlib/src/rust/library`.
         ///
@@ -131,6 +150,13 @@ config_data! {
         // FIXME(@poliorcetics): move to multiple targets here too, but this will need more work
         // than `checkOnSave_target`
         cargo_target: Option<String>     = "null",
+        /// Optional path to a rust-analyzer specific target directory.
+        /// This prevents rust-analyzer's `cargo check` and initial build-script and proc-macro
+        /// building from locking the `Cargo.lock` at the expense of duplicating build artifacts.
+        ///
+        /// Set to `true` to use a subdirectory of the existing target directory or
+        /// set to a path relative to the workspace to use that path.
+        cargo_targetDir | rust_analyzerTargetDir: Option<TargetDirectory> = "null",
         /// Unsets the implicit `#[cfg(test)]` for the specified crates.
         cargo_unsetTest: Vec<String>     = "[\"core\"]",
 
@@ -158,15 +184,15 @@ config_data! {
         /// Specifies the working directory for running checks.
         /// - "workspace": run checks for workspaces in the corresponding workspaces' root directories.
         // FIXME: Ideally we would support this in some way
-        ///   This falls back to "root" if `#rust-analyzer.cargo.check.invocationStrategy#` is set to `once`.
+        ///   This falls back to "root" if `#rust-analyzer.check.invocationStrategy#` is set to `once`.
         /// - "root": run checks in the project's root directory.
-        /// This config only has an effect when `#rust-analyzer.cargo.check.overrideCommand#`
+        /// This config only has an effect when `#rust-analyzer.check.overrideCommand#`
         /// is set.
         check_invocationLocation | checkOnSave_invocationLocation: InvocationLocation = "\"workspace\"",
         /// Specifies the invocation strategy to use when running the check command.
         /// If `per_workspace` is set, the command will be executed for each workspace.
         /// If `once` is set, the command will be executed once.
-        /// This config only has an effect when `#rust-analyzer.cargo.check.overrideCommand#`
+        /// This config only has an effect when `#rust-analyzer.check.overrideCommand#`
         /// is set.
         check_invocationStrategy | checkOnSave_invocationStrategy: InvocationStrategy = "\"per_workspace\"",
         /// Whether to pass `--no-default-features` to Cargo. Defaults to
@@ -182,9 +208,16 @@ config_data! {
         /// Cargo, you might also want to change
         /// `#rust-analyzer.cargo.buildScripts.overrideCommand#`.
         ///
-        /// If there are multiple linked projects, this command is invoked for
-        /// each of them, with the working directory being the project root
-        /// (i.e., the folder containing the `Cargo.toml`).
+        /// If there are multiple linked projects/workspaces, this command is invoked for
+        /// each of them, with the working directory being the workspace root
+        /// (i.e., the folder containing the `Cargo.toml`). This can be overwritten
+        /// by changing `#rust-analyzer.check.invocationStrategy#` and
+        /// `#rust-analyzer.check.invocationLocation#`.
+        ///
+        /// If `$saved_file` is part of the command, rust-analyzer will pass
+        /// the absolute path of the saved file to the provided command. This is
+        /// intended to be used with non-Cargo build systems.
+        /// Note that `$saved_file` is experimental and may be removed in the futureg.
         ///
         /// An example command would be:
         ///
@@ -200,6 +233,9 @@ config_data! {
         ///
         /// Aliased as `"checkOnSave.targets"`.
         check_targets | checkOnSave_targets | checkOnSave_target: Option<CheckOnSaveTargets> = "null",
+        /// Whether `--workspace` should be passed to `cargo check`.
+        /// If false, `-p <package>` will be passed instead.
+        check_workspace: bool = "true",
 
         /// Toggles the additional completions that automatically add imports when completed.
         /// Note that your client must specify the `additionalTextEdits` LSP client capability to truly have this feature enabled.
@@ -209,6 +245,8 @@ config_data! {
         completion_autoself_enable: bool        = "true",
         /// Whether to add parenthesis and argument snippets when completing function.
         completion_callable_snippets: CallableCompletionDef  = "\"fill_arguments\"",
+        /// Whether to show full function/method signatures in completion docs.
+        completion_fullFunctionSignatures_enable: bool = "false",
         /// Maximum number of completions to return. If `None`, the limit is infinite.
         completion_limit: Option<usize> = "null",
         /// Whether to show postfix snippets like `dbg`, `if`, `not`, etc.
@@ -258,6 +296,8 @@ config_data! {
                 "scope": "expr"
             }
         }"#,
+        /// Whether to enable term search based snippets like `Some(foo.bar().baz())`.
+        completion_termSearch_enable: bool = "false",
 
         /// List of rust-analyzer diagnostics to disable.
         diagnostics_disabled: FxHashSet<String> = "[]",
@@ -269,6 +309,8 @@ config_data! {
         /// Map of prefixes to be substituted when parsing diagnostic file paths.
         /// This should be the reverse mapping of what is passed to `rustc` as `--remap-path-prefix`.
         diagnostics_remapPrefix: FxHashMap<String, String> = "{}",
+        /// Whether to run additional style lints.
+        diagnostics_styleLints_enable: bool =    "false",
         /// List of warnings that should be displayed with hint severity.
         ///
         /// The warnings will be indicated by faded text or three dots in code
@@ -282,7 +324,7 @@ config_data! {
         /// These directories will be ignored by rust-analyzer. They are
         /// relative to the workspace root, and globs are not supported. You may
         /// also need to add the folders to Code's `files.watcherExclude`.
-        files_excludeDirs: Vec<PathBuf> = "[]",
+        files_excludeDirs: Vec<Utf8PathBuf> = "[]",
         /// Controls file watching implementation.
         files_watcher: FilesWatcherDef = "\"client\"",
 
@@ -333,6 +375,11 @@ config_data! {
         /// How to render the size information in a memory layout hover.
         hover_memoryLayout_size: Option<MemoryLayoutHoverRenderKindDef> = "\"both\"",
 
+        /// How many fields of a struct to display when hovering a struct.
+        hover_show_structFields: Option<usize> = "null",
+        /// How many associated items of a trait to display when hovering a trait.
+        hover_show_traitAssocItems: Option<usize> = "null",
+
         /// Whether to enforce the import granularity setting for all files. If set to false rust-analyzer will try to keep import styles consistent per file.
         imports_granularity_enforce: bool              = "false",
         /// How imports should be grouped into use statements.
@@ -342,7 +389,9 @@ config_data! {
         /// Whether to allow import insertion to merge new imports into single path glob imports like `use std::fmt::*;`.
         imports_merge_glob: bool           = "true",
         /// Prefer to unconditionally use imports of the core and alloc crate, over the std crate.
-        imports_prefer_no_std: bool                     = "false",
+        imports_preferNoStd | imports_prefer_no_std: bool = "false",
+        /// Whether to prefer import paths containing a `prelude` module.
+        imports_preferPrelude: bool                       = "false",
         /// The path structure for newly inserted paths to use.
         imports_prefix: ImportPrefixDef               = "\"plain\"",
 
@@ -369,6 +418,8 @@ config_data! {
         inlayHints_expressionAdjustmentHints_hideOutsideUnsafe: bool = "false",
         /// Whether to show inlay hints as postfix ops (`.*` instead of `*`, etc).
         inlayHints_expressionAdjustmentHints_mode: AdjustmentHintsModeDef = "\"prefix\"",
+        /// Whether to show implicit drop hints.
+        inlayHints_implicitDrops_enable: bool                      = "false",
         /// Whether to show inlay type hints for elided lifetimes in function signatures.
         inlayHints_lifetimeElisionHints_enable: LifetimeElisionDef = "\"never\"",
         /// Whether to prefer using parameter names as the name for elided lifetime hints if possible.
@@ -378,6 +429,8 @@ config_data! {
         /// Whether to show function parameter name inlay hints at the call
         /// site.
         inlayHints_parameterHints_enable: bool                     = "true",
+        /// Whether to show exclusive range inlay hints.
+        inlayHints_rangeExclusiveHints_enable: bool                = "false",
         /// Whether to show inlay hints for compiler inserted reborrows.
         /// This setting is deprecated in favor of #rust-analyzer.inlayHints.expressionAdjustmentHints.enable#.
         inlayHints_reborrowHints_enable: ReborrowHintsDef          = "\"never\"",
@@ -447,6 +500,9 @@ config_data! {
         /// Whether to show `can't find Cargo.toml` error message.
         notifications_cargoTomlNotFound: bool      = "true",
 
+        /// Whether to send an UnindexedProject notification to the client.
+        notifications_unindexedProject: bool      = "false",
+
         /// How many worker threads in the main loop. The default `null` means to pick automatically.
         numThreads: Option<usize> = "null",
 
@@ -459,10 +515,13 @@ config_data! {
         /// This config takes a map of crate names with the exported proc-macro names to ignore as values.
         procMacro_ignored: FxHashMap<Box<str>, Box<[Box<str>]>>          = "{}",
         /// Internal config, path to proc-macro server executable.
-        procMacro_server: Option<PathBuf>          = "null",
+        procMacro_server: Option<Utf8PathBuf>          = "null",
 
         /// Exclude imports from find-all-references.
         references_excludeImports: bool = "false",
+
+        /// Exclude tests from find-all-references.
+        references_excludeTests: bool = "false",
 
         /// Command to be executed instead of 'cargo' for runnables.
         runnables_command: Option<String> = "null",
@@ -565,6 +624,7 @@ pub struct Config {
     data: ConfigData,
     detached_files: Vec<AbsPathBuf>,
     snippets: Vec<Snippet>,
+    visual_studio_code_version: Option<Version>,
 }
 
 type ParallelCachePrimingNumThreads = u8;
@@ -698,6 +758,7 @@ pub enum FilesWatcher {
 #[derive(Debug, Clone)]
 pub struct NotificationsConfig {
     pub cargo_toml_not_found: bool,
+    pub unindexed_project: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -755,11 +816,14 @@ impl fmt::Display for ConfigError {
     }
 }
 
+impl std::error::Error for ConfigError {}
+
 impl Config {
     pub fn new(
         root_path: AbsPathBuf,
         caps: ClientCapabilities,
         workspace_roots: Vec<AbsPathBuf>,
+        visual_studio_code_version: Option<Version>,
     ) -> Self {
         Config {
             caps,
@@ -769,6 +833,7 @@ impl Config {
             root_path,
             snippets: Default::default(),
             workspace_roots,
+            visual_studio_code_version,
         }
     }
 
@@ -798,7 +863,7 @@ impl Config {
         }
         let mut errors = Vec::new();
         self.detached_files =
-            get_field::<Vec<PathBuf>>(&mut json, &mut errors, "detachedFiles", None, "[]")
+            get_field::<Vec<Utf8PathBuf>>(&mut json, &mut errors, "detachedFiles", None, "[]")
                 .into_iter()
                 .map(AbsPathBuf::assert)
                 .collect();
@@ -846,7 +911,7 @@ impl Config {
         use serde::de::Error;
         if self.data.check_command.is_empty() {
             error_sink.push((
-                "/check/command".to_string(),
+                "/check/command".to_owned(),
                 serde_json::Error::custom("expected a non-empty string"),
             ));
         }
@@ -890,7 +955,19 @@ impl Config {
     pub fn has_linked_projects(&self) -> bool {
         !self.data.linkedProjects.is_empty()
     }
-    pub fn linked_projects(&self) -> Vec<LinkedProject> {
+    pub fn linked_manifests(&self) -> impl Iterator<Item = &Utf8Path> + '_ {
+        self.data.linkedProjects.iter().filter_map(|it| match it {
+            ManifestOrProjectJson::Manifest(p) => Some(&**p),
+            ManifestOrProjectJson::ProjectJson(_) => None,
+        })
+    }
+    pub fn has_linked_project_jsons(&self) -> bool {
+        self.data
+            .linkedProjects
+            .iter()
+            .any(|it| matches!(it, ManifestOrProjectJson::ProjectJson(_)))
+    }
+    pub fn linked_or_discovered_projects(&self) -> Vec<LinkedProject> {
         match self.data.linkedProjects.as_slice() {
             [] => {
                 let exclude_dirs: Vec<_> =
@@ -925,15 +1002,6 @@ impl Config {
         }
     }
 
-    pub fn add_linked_projects(&mut self, linked_projects: Vec<ProjectJsonData>) {
-        let mut linked_projects = linked_projects
-            .into_iter()
-            .map(ManifestOrProjectJson::ProjectJson)
-            .collect::<Vec<ManifestOrProjectJson>>();
-
-        self.data.linkedProjects.append(&mut linked_projects);
-    }
-
     pub fn did_save_text_document_dynamic_registration(&self) -> bool {
         let caps = try_or_def!(self.caps.text_document.as_ref()?.synchronization.clone()?);
         caps.did_save == Some(true) && caps.dynamic_registration == Some(true)
@@ -942,6 +1010,17 @@ impl Config {
     pub fn did_change_watched_files_dynamic_registration(&self) -> bool {
         try_or_def!(
             self.caps.workspace.as_ref()?.did_change_watched_files.as_ref()?.dynamic_registration?
+        )
+    }
+
+    pub fn did_change_watched_files_relative_pattern_support(&self) -> bool {
+        try_or_def!(
+            self.caps
+                .workspace
+                .as_ref()?
+                .did_change_watched_files
+                .as_ref()?
+                .relative_pattern_support?
         )
     }
 
@@ -1078,6 +1157,10 @@ impl Config {
         self.experimental("colorDiagnosticOutput")
     }
 
+    pub fn test_explorer(&self) -> bool {
+        self.experimental("testExplorer")
+    }
+
     pub fn publish_diagnostics(&self) -> bool {
         self.data.diagnostics_enable
     }
@@ -1094,7 +1177,9 @@ impl Config {
                 ExprFillDefaultDef::Default => ExprFillDefaultMode::Default,
             },
             insert_use: self.insert_use_config(),
-            prefer_no_std: self.data.imports_prefer_no_std,
+            prefer_no_std: self.data.imports_preferNoStd,
+            prefer_prelude: self.data.imports_preferPrelude,
+            style_lints: self.data.diagnostics_styleLints_enable,
         }
     }
 
@@ -1132,15 +1217,15 @@ impl Config {
     }
 
     pub fn lru_query_capacities(&self) -> Option<&FxHashMap<Box<str>, usize>> {
-        self.data.lru_query_capacities.is_empty().not().then(|| &self.data.lru_query_capacities)
+        self.data.lru_query_capacities.is_empty().not().then_some(&self.data.lru_query_capacities)
     }
 
     pub fn proc_macro_srv(&self) -> Option<AbsPathBuf> {
         let path = self.data.procMacro_server.clone()?;
-        Some(AbsPathBuf::try_from(path).unwrap_or_else(|path| self.root_path.join(&path)))
+        Some(AbsPathBuf::try_from(path).unwrap_or_else(|path| self.root_path.join(path)))
     }
 
-    pub fn dummy_replacements(&self) -> &FxHashMap<Box<str>, Box<[Box<str>]>> {
+    pub fn ignored_proc_macros(&self) -> &FxHashMap<Box<str>, Box<[Box<str>]>> {
         &self.data.procMacro_ignored
     }
 
@@ -1165,7 +1250,10 @@ impl Config {
     }
 
     pub fn notifications(&self) -> NotificationsConfig {
-        NotificationsConfig { cargo_toml_not_found: self.data.notifications_cargoTomlNotFound }
+        NotificationsConfig {
+            cargo_toml_not_found: self.data.notifications_cargoTomlNotFound,
+            unindexed_project: self.data.notifications_unindexedProject,
+        }
     }
 
     pub fn cargo_autoreload(&self) -> bool {
@@ -1193,6 +1281,7 @@ impl Config {
         });
         let sysroot_src =
             self.data.cargo_sysrootSrc.as_ref().map(|sysroot| self.root_path.join(sysroot));
+        let sysroot_query_metadata = self.data.cargo_sysrootQueryMetadata;
 
         CargoConfig {
             features: match &self.data.cargo_features {
@@ -1204,6 +1293,7 @@ impl Config {
             },
             target: self.data.cargo_target.clone(),
             sysroot,
+            sysroot_query_metadata,
             sysroot_src,
             rustc_source,
             cfg_overrides: project_model::CfgOverrides {
@@ -1248,6 +1338,7 @@ impl Config {
             run_build_script_command: self.data.cargo_buildScripts_overrideCommand.clone(),
             extra_args: self.data.cargo_extraArgs.clone(),
             extra_env: self.data.cargo_extraEnv.clone(),
+            target_dir: self.target_dir_from_config(),
         }
     }
 
@@ -1263,6 +1354,10 @@ impl Config {
                 enable_range_formatting: self.data.rustfmt_rangeFormatting_enable,
             },
         }
+    }
+
+    pub fn flycheck_workspace(&self) -> bool {
+        self.data.check_workspace
     }
 
     pub fn flycheck(&self) -> FlycheckConfig {
@@ -1320,12 +1415,28 @@ impl Config {
                 extra_args: self.check_extra_args(),
                 extra_env: self.check_extra_env(),
                 ansi_color_output: self.color_diagnostic_output(),
+                target_dir: self.target_dir_from_config(),
             },
         }
     }
 
+    fn target_dir_from_config(&self) -> Option<Utf8PathBuf> {
+        self.data.cargo_targetDir.as_ref().and_then(|target_dir| match target_dir {
+            TargetDirectory::UseSubdirectory(true) => {
+                Some(Utf8PathBuf::from("target/rust-analyzer"))
+            }
+            TargetDirectory::UseSubdirectory(false) => None,
+            TargetDirectory::Directory(dir) if dir.is_relative() => Some(dir.clone()),
+            TargetDirectory::Directory(_) => None,
+        })
+    }
+
     pub fn check_on_save(&self) -> bool {
         self.data.checkOnSave
+    }
+
+    pub fn script_rebuild_on_save(&self) -> bool {
+        self.data.cargo_buildScripts_rebuildOnSave
     }
 
     pub fn runnables(&self) -> RunnablesConfig {
@@ -1353,6 +1464,7 @@ impl Config {
             type_hints: self.data.inlayHints_typeHints_enable,
             parameter_hints: self.data.inlayHints_parameterHints_enable,
             chaining_hints: self.data.inlayHints_chainingHints_enable,
+            implicit_drop_hints: self.data.inlayHints_implicitDrops_enable,
             discriminant_hints: match self.data.inlayHints_discriminantHints_enable {
                 DiscriminantHintsDef::Always => ide::DiscriminantHints::Always,
                 DiscriminantHintsDef::Never => ide::DiscriminantHints::Never,
@@ -1408,6 +1520,7 @@ impl Config {
             } else {
                 None
             },
+            range_exclusive_hints: self.data.inlayHints_rangeExclusiveHints_enable,
             fields_to_resolve: InlayFieldsToResolve {
                 resolve_text_edits: client_capability_fields.contains("textEdits"),
                 resolve_hint_tooltip: client_capability_fields.contains("tooltip"),
@@ -1425,6 +1538,7 @@ impl Config {
                 ImportGranularityDef::Item => ImportGranularity::Item,
                 ImportGranularityDef::Crate => ImportGranularity::Crate,
                 ImportGranularityDef::Module => ImportGranularity::Module,
+                ImportGranularityDef::One => ImportGranularity::One,
             },
             enforce_granularity: self.data.imports_granularity_enforce,
             prefix_kind: match self.data.imports_prefix {
@@ -1444,13 +1558,16 @@ impl Config {
                 && completion_item_edit_resolve(&self.caps),
             enable_self_on_the_fly: self.data.completion_autoself_enable,
             enable_private_editable: self.data.completion_privateEditable_enable,
+            enable_term_search: self.data.completion_termSearch_enable,
+            full_function_signatures: self.data.completion_fullFunctionSignatures_enable,
             callable: match self.data.completion_callable_snippets {
                 CallableCompletionDef::FillArguments => Some(CallableSnippets::FillArguments),
                 CallableCompletionDef::AddParentheses => Some(CallableSnippets::AddParentheses),
                 CallableCompletionDef::None => None,
             },
             insert_use: self.insert_use_config(),
-            prefer_no_std: self.data.imports_prefer_no_std,
+            prefer_no_std: self.data.imports_preferNoStd,
+            prefer_prelude: self.data.imports_preferPrelude,
             snippet_cap: SnippetCap::new(try_or_def!(
                 self.caps
                     .text_document
@@ -1470,6 +1587,10 @@ impl Config {
         self.data.references_excludeImports
     }
 
+    pub fn find_all_refs_exclude_tests(&self) -> bool {
+        self.data.references_excludeTests
+    }
+
     pub fn snippet_cap(&self) -> bool {
         self.experimental("snippetTextEdit")
     }
@@ -1479,7 +1600,8 @@ impl Config {
             snippet_cap: SnippetCap::new(self.experimental("snippetTextEdit")),
             allowed: None,
             insert_use: self.insert_use_config(),
-            prefer_no_std: self.data.imports_prefer_no_std,
+            prefer_no_std: self.data.imports_preferNoStd,
+            prefer_prelude: self.data.imports_preferPrelude,
             assist_emit_must_use: self.data.assist_emitMustUse,
         }
     }
@@ -1580,6 +1702,8 @@ impl Config {
                 }
             },
             keywords: self.data.hover_documentation_keywords_enable,
+            max_trait_assoc_items_count: self.data.hover_show_traitAssocItems,
+            max_struct_field_count: self.data.hover_show_structFields,
         }
     }
 
@@ -1661,11 +1785,17 @@ impl Config {
     }
 
     pub fn main_loop_num_threads(&self) -> usize {
-        self.data.numThreads.unwrap_or(num_cpus::get_physical().try_into().unwrap_or(1))
+        self.data.numThreads.unwrap_or(num_cpus::get_physical())
     }
 
     pub fn typing_autoclose_angle(&self) -> bool {
         self.data.typing_autoClosingAngleBrackets_enable
+    }
+
+    // VSCode is our reference implementation, so we allow ourselves to work around issues by
+    // special casing certain versions
+    pub fn visual_studio_code_version(&self) -> Option<&Version> {
+        self.visual_studio_code_version.as_ref()
     }
 }
 // Deserialization definitions
@@ -1777,16 +1907,12 @@ mod de_unit_v {
 
 #[derive(Deserialize, Debug, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 enum SnippetScopeDef {
+    #[default]
     Expr,
     Item,
     Type,
-}
-
-impl Default for SnippetScopeDef {
-    fn default() -> Self {
-        SnippetScopeDef::Expr
-    }
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -1838,7 +1964,7 @@ where
 #[derive(Deserialize, Debug, Clone)]
 #[serde(untagged)]
 enum ManifestOrProjectJson {
-    Manifest(PathBuf),
+    Manifest(Utf8PathBuf),
     ProjectJson(ProjectJsonData),
 }
 
@@ -1856,6 +1982,7 @@ enum ImportGranularityDef {
     Item,
     Crate,
     Module,
+    One,
 }
 
 #[derive(Deserialize, Debug, Copy, Clone)]
@@ -2015,6 +2142,14 @@ pub enum MemoryLayoutHoverRenderKindDef {
     Both,
 }
 
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
+pub enum TargetDirectory {
+    UseSubdirectory(bool),
+    Directory(Utf8PathBuf),
+}
+
 macro_rules! _config_data {
     (struct $name:ident {
         $(
@@ -2141,7 +2276,7 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
             "type": "array",
             "items": { "type": "string" },
         },
-        "Vec<PathBuf>" => set! {
+        "Vec<Utf8PathBuf>" => set! {
             "type": "array",
             "items": { "type": "string" },
         },
@@ -2169,7 +2304,7 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
         "Option<String>" => set! {
             "type": ["null", "string"],
         },
-        "Option<PathBuf>" => set! {
+        "Option<Utf8PathBuf>" => set! {
             "type": ["null", "string"],
         },
         "Option<bool>" => set! {
@@ -2189,12 +2324,13 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
         },
         "ImportGranularityDef" => set! {
             "type": "string",
-            "enum": ["preserve", "crate", "module", "item"],
+            "enum": ["preserve", "crate", "module", "item", "one"],
             "enumDescriptions": [
                 "Do not change the granularity of any imports and preserve the original structure written by the developer.",
                 "Merge imports from the same crate into a single use statement. Conversely, imports from different crates are split into separate statements.",
                 "Merge imports from the same module into a single use statement. Conversely, imports from different modules are split into separate statements.",
-                "Flatten imports so that each has its own use statement."
+                "Flatten imports so that each has its own use statement.",
+                "Merge all imports into a single use statement as long as they have the same visibility and attributes."
             ],
         },
         "ImportPrefixDef" => set! {
@@ -2443,6 +2579,19 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
                 },
             ],
         },
+        "Option<TargetDirectory>" => set! {
+            "anyOf": [
+                {
+                    "type": "null"
+                },
+                {
+                    "type": "boolean"
+                },
+                {
+                    "type": "string"
+                },
+            ],
+        },
         _ => panic!("missing entry for {ty}: {default}"),
     }
 
@@ -2451,14 +2600,13 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
 
 #[cfg(test)]
 fn manual(fields: &[(&'static str, &'static str, &[&str], &str)]) -> String {
-    fields
-        .iter()
-        .map(|(field, _ty, doc, default)| {
-            let name = format!("rust-analyzer.{}", field.replace('_', "."));
-            let doc = doc_comment_to_string(doc);
-            if default.contains('\n') {
-                format!(
-                    r#"[[{name}]]{name}::
+    fields.iter().fold(String::new(), |mut acc, (field, _ty, doc, default)| {
+        let name = format!("rust-analyzer.{}", field.replace('_', "."));
+        let doc = doc_comment_to_string(doc);
+        if default.contains('\n') {
+            format_to_acc!(
+                acc,
+                r#"[[{name}]]{name}::
 +
 --
 Default:
@@ -2468,16 +2616,17 @@ Default:
 {doc}
 --
 "#
-                )
-            } else {
-                format!("[[{name}]]{name} (default: `{default}`)::\n+\n--\n{doc}--\n")
-            }
-        })
-        .collect::<String>()
+            )
+        } else {
+            format_to_acc!(acc, "[[{name}]]{name} (default: `{default}`)::\n+\n--\n{doc}--\n")
+        }
+    })
 }
 
 fn doc_comment_to_string(doc: &[&str]) -> String {
-    doc.iter().map(|it| it.strip_prefix(' ').unwrap_or(it)).map(|it| format!("{it}\n")).collect()
+    doc.iter()
+        .map(|it| it.strip_prefix(' ').unwrap_or(it))
+        .fold(String::new(), |mut acc, it| format_to_acc!(acc, "{it}\n"))
 }
 
 #[cfg(test)]
@@ -2499,7 +2648,7 @@ mod tests {
             .replace('\n', "\n            ")
             .trim_start_matches('\n')
             .trim_end()
-            .to_string();
+            .to_owned();
         schema.push_str(",\n");
 
         // Transform the asciidoc form link to markdown style.
@@ -2555,8 +2704,12 @@ mod tests {
 
     #[test]
     fn proc_macro_srv_null() {
-        let mut config =
-            Config::new(AbsPathBuf::try_from(project_root()).unwrap(), Default::default(), vec![]);
+        let mut config = Config::new(
+            AbsPathBuf::try_from(project_root()).unwrap(),
+            Default::default(),
+            vec![],
+            None,
+        );
         config
             .update(serde_json::json!({
                 "procMacro_server": null,
@@ -2567,8 +2720,12 @@ mod tests {
 
     #[test]
     fn proc_macro_srv_abs() {
-        let mut config =
-            Config::new(AbsPathBuf::try_from(project_root()).unwrap(), Default::default(), vec![]);
+        let mut config = Config::new(
+            AbsPathBuf::try_from(project_root()).unwrap(),
+            Default::default(),
+            vec![],
+            None,
+        );
         config
             .update(serde_json::json!({
                 "procMacro": {"server": project_root().display().to_string()}
@@ -2579,8 +2736,12 @@ mod tests {
 
     #[test]
     fn proc_macro_srv_rel() {
-        let mut config =
-            Config::new(AbsPathBuf::try_from(project_root()).unwrap(), Default::default(), vec![]);
+        let mut config = Config::new(
+            AbsPathBuf::try_from(project_root()).unwrap(),
+            Default::default(),
+            vec![],
+            None,
+        );
         config
             .update(serde_json::json!({
                 "procMacro": {"server": "./server"}
@@ -2589,6 +2750,66 @@ mod tests {
         assert_eq!(
             config.proc_macro_srv(),
             Some(AbsPathBuf::try_from(project_root().join("./server")).unwrap())
+        );
+    }
+
+    #[test]
+    fn cargo_target_dir_unset() {
+        let mut config = Config::new(
+            AbsPathBuf::try_from(project_root()).unwrap(),
+            Default::default(),
+            vec![],
+            None,
+        );
+        config
+            .update(serde_json::json!({
+                "rust": { "analyzerTargetDir": null }
+            }))
+            .unwrap();
+        assert_eq!(config.data.cargo_targetDir, None);
+        assert!(
+            matches!(config.flycheck(), FlycheckConfig::CargoCommand { target_dir, .. } if target_dir.is_none())
+        );
+    }
+
+    #[test]
+    fn cargo_target_dir_subdir() {
+        let mut config = Config::new(
+            AbsPathBuf::try_from(project_root()).unwrap(),
+            Default::default(),
+            vec![],
+            None,
+        );
+        config
+            .update(serde_json::json!({
+                "rust": { "analyzerTargetDir": true }
+            }))
+            .unwrap();
+        assert_eq!(config.data.cargo_targetDir, Some(TargetDirectory::UseSubdirectory(true)));
+        assert!(
+            matches!(config.flycheck(), FlycheckConfig::CargoCommand { target_dir, .. } if target_dir == Some(Utf8PathBuf::from("target/rust-analyzer")))
+        );
+    }
+
+    #[test]
+    fn cargo_target_dir_relative_dir() {
+        let mut config = Config::new(
+            AbsPathBuf::try_from(project_root()).unwrap(),
+            Default::default(),
+            vec![],
+            None,
+        );
+        config
+            .update(serde_json::json!({
+                "rust": { "analyzerTargetDir": "other_folder" }
+            }))
+            .unwrap();
+        assert_eq!(
+            config.data.cargo_targetDir,
+            Some(TargetDirectory::Directory(Utf8PathBuf::from("other_folder")))
+        );
+        assert!(
+            matches!(config.flycheck(), FlycheckConfig::CargoCommand { target_dir, .. } if target_dir == Some(Utf8PathBuf::from("other_folder")))
         );
     }
 }

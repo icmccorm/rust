@@ -1,7 +1,5 @@
-// run-pass
+//@ run-pass
 // Test that the call operator autoderefs when calling a bounded type parameter.
-
-use std::ops::FnMut;
 
 fn call_with_2<F>(x: &mut F) -> isize
     where F : FnMut(isize) -> isize

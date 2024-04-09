@@ -1,17 +1,12 @@
 #!/bin/bash
-# Download and install MSYS2, needed primarily for the test suite (run-make) but
-# also used by the MinGW toolchain for assembling things.
+# Clean up and prepare the MSYS2 installation. MSYS2 is needed primarily for
+# the test suite (run-make), but is also used by the MinGW toolchain for assembling things.
 
 set -euo pipefail
 IFS=$'\n\t'
 
 source "$(cd "$(dirname "$0")" && pwd)/../shared.sh"
-
 if isWindows; then
-    msys2Path="c:/msys64"
-    mkdir -p "${msys2Path}/home/${USERNAME}"
-    ciCommandAddPath "${msys2Path}/usr/bin"
-
     # Detect the native Python version installed on the agent. On GitHub
     # Actions, the C:\hostedtoolcache\windows\Python directory contains a
     # subdirectory for each installed Python version.
@@ -29,4 +24,38 @@ if isWindows; then
     fi
     ciCommandAddPath "C:\\hostedtoolcache\\windows\\Python\\${native_python_version}\\x64"
     ciCommandAddPath "C:\\hostedtoolcache\\windows\\Python\\${native_python_version}\\x64\\Scripts"
+
+    # Install pacboy for easily installing packages
+    pacman -S --noconfirm pactoys
+
+    # Remove these pre-installed tools so we can't accidentally use them, because we are using the
+    # MSYS2 setup action versions instead. Because `rm -r`-ing them is slow, we mv them off path
+    # instead.
+    # Remove pre-installed version of MSYS2
+    echo "Cleaning up existing tools in PATH"
+    notpath="/c/NOT/ON/PATH/"
+    mkdir --parents "$notpath"
+    mv -t "$notpath" "/c/msys64/"
+    # Remove Strawberry Perl, which contains a version of mingw
+    mv -t "$notpath" "/c/Strawberry/"
+    # Remove these other copies of mingw, I don't even know where they come from.
+    mv -t "$notpath" "/c/mingw64/"
+    mv -t "$notpath" "/c/mingw32/"
+    echo "Finished cleaning up tools in PATH"
+
+    if isKnownToBeMingwBuild; then
+        # Use the mingw version of CMake for mingw builds.
+        # However, the MSVC build needs native CMake, as it fails with the mingw one.
+        # Delete native CMake
+        rm -r "/c/Program Files/CMake/"
+        # Install mingw-w64-$arch-cmake
+        pacboy -S --noconfirm cmake:p
+
+        # It would be nice to use MSYS's git in MinGW builds so that it's tested and known to
+        # work. But it makes everything extremely slow, so it's commented out for now.
+        # # Delete Windows-Git
+        # rm -r "/c/Program Files/Git/"
+        # # Install MSYS2 git
+        # pacman -S --noconfirm git
+    fi
 fi

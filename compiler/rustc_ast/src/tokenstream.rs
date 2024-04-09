@@ -21,32 +21,21 @@ use crate::AttrVec;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_data_structures::sync::{self, Lrc};
 use rustc_macros::HashStable_Generic;
-use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
-use rustc_span::{sym, Span, Symbol, DUMMY_SP};
+use rustc_serialize::{Decodable, Encodable};
+use rustc_span::{sym, Span, SpanDecoder, SpanEncoder, Symbol, DUMMY_SP};
 use smallvec::{smallvec, SmallVec};
 
 use std::borrow::Cow;
-use std::{cmp, fmt, iter, mem};
+use std::{cmp, fmt, iter};
 
-/// When the main Rust parser encounters a syntax-extension invocation, it
-/// parses the arguments to the invocation as a token tree. This is a very
-/// loose structure, such that all sorts of different AST fragments can
-/// be passed to syntax extensions using a uniform type.
-///
-/// If the syntax extension is an MBE macro, it will attempt to match its
-/// LHS token tree against the provided token tree, and if it finds a
-/// match, will transcribe the RHS token tree, splicing in any captured
-/// `macro_parser::matched_nonterminals` into the `SubstNt`s it finds.
-///
-/// The RHS of an MBE macro is the only place `SubstNt`s are substituted.
-/// Nothing special happens to misnamed or misplaced `SubstNt`s.
+/// Part of a `TokenStream`.
 #[derive(Debug, Clone, PartialEq, Encodable, Decodable, HashStable_Generic)]
 pub enum TokenTree {
     /// A single token. Should never be `OpenDelim` or `CloseDelim`, because
     /// delimiters are implicitly represented by `Delimited`.
     Token(Token, Spacing),
     /// A delimited sequence of token trees.
-    Delimited(DelimSpan, Delimiter, TokenStream),
+    Delimited(DelimSpan, DelimSpacing, Delimiter, TokenStream),
 }
 
 // Ensure all fields of `TokenTree` are `DynSend` and `DynSync`.
@@ -62,11 +51,11 @@ where
 }
 
 impl TokenTree {
-    /// Checks if this `TokenTree` is equal to the other, regardless of span information.
+    /// Checks if this `TokenTree` is equal to the other, regardless of span/spacing information.
     pub fn eq_unspanned(&self, other: &TokenTree) -> bool {
         match (self, other) {
             (TokenTree::Token(token, _), TokenTree::Token(token2, _)) => token.kind == token2.kind,
-            (TokenTree::Delimited(_, delim, tts), TokenTree::Delimited(_, delim2, tts2)) => {
+            (TokenTree::Delimited(.., delim, tts), TokenTree::Delimited(.., delim2, tts2)) => {
                 delim == delim2 && tts.eq_unspanned(tts2)
             }
             _ => false,
@@ -81,14 +70,6 @@ impl TokenTree {
         }
     }
 
-    /// Modify the `TokenTree`'s span in-place.
-    pub fn set_span(&mut self, span: Span) {
-        match self {
-            TokenTree::Token(token, _) => token.span = span,
-            TokenTree::Delimited(dspan, ..) => *dspan = DelimSpan::from_single(span),
-        }
-    }
-
     /// Create a `TokenTree::Token` with alone spacing.
     pub fn token_alone(kind: TokenKind, span: Span) -> TokenTree {
         TokenTree::Token(Token::new(kind, span), Spacing::Alone)
@@ -97,6 +78,11 @@ impl TokenTree {
     /// Create a `TokenTree::Token` with joint spacing.
     pub fn token_joint(kind: TokenKind, span: Span) -> TokenTree {
         TokenTree::Token(Token::new(kind, span), Spacing::Joint)
+    }
+
+    /// Create a `TokenTree::Token` with joint-hidden spacing.
+    pub fn token_joint_hidden(kind: TokenKind, span: Span) -> TokenTree {
+        TokenTree::Token(Token::new(kind, span), Spacing::JointHidden)
     }
 
     pub fn uninterpolate(&self) -> Cow<'_, TokenTree> {
@@ -153,14 +139,14 @@ impl fmt::Debug for LazyAttrTokenStream {
     }
 }
 
-impl<S: Encoder> Encodable<S> for LazyAttrTokenStream {
+impl<S: SpanEncoder> Encodable<S> for LazyAttrTokenStream {
     fn encode(&self, s: &mut S) {
         // Used by AST json printing.
         Encodable::encode(&self.to_attr_token_stream(), s);
     }
 }
 
-impl<D: Decoder> Decodable<D> for LazyAttrTokenStream {
+impl<D: SpanDecoder> Decodable<D> for LazyAttrTokenStream {
     fn decode(_d: &mut D) -> Self {
         panic!("Attempted to decode LazyAttrTokenStream");
     }
@@ -183,7 +169,7 @@ pub struct AttrTokenStream(pub Lrc<Vec<AttrTokenTree>>);
 #[derive(Clone, Debug, Encodable, Decodable)]
 pub enum AttrTokenTree {
     Token(Token, Spacing),
-    Delimited(DelimSpan, Delimiter, AttrTokenStream),
+    Delimited(DelimSpan, DelimSpacing, Delimiter, AttrTokenStream),
     /// Stores the attributes for an attribute target,
     /// along with the tokens for that attribute target.
     /// See `AttributesData` for more information
@@ -208,9 +194,14 @@ impl AttrTokenStream {
                 AttrTokenTree::Token(inner, spacing) => {
                     smallvec![TokenTree::Token(inner.clone(), *spacing)].into_iter()
                 }
-                AttrTokenTree::Delimited(span, delim, stream) => {
-                    smallvec![TokenTree::Delimited(*span, *delim, stream.to_tokenstream()),]
-                        .into_iter()
+                AttrTokenTree::Delimited(span, spacing, delim, stream) => {
+                    smallvec![TokenTree::Delimited(
+                        *span,
+                        *spacing,
+                        *delim,
+                        stream.to_tokenstream()
+                    ),]
+                    .into_iter()
                 }
                 AttrTokenTree::Attributes(data) => {
                     let idx = data
@@ -230,7 +221,7 @@ impl AttrTokenStream {
                         let mut found = false;
                         // Check the last two trees (to account for a trailing semi)
                         for tree in target_tokens.iter_mut().rev().take(2) {
-                            if let TokenTree::Delimited(span, delim, delim_tokens) = tree {
+                            if let TokenTree::Delimited(span, spacing, delim, delim_tokens) = tree {
                                 // Inner attributes are only supported on extern blocks, functions,
                                 // impls, and modules. All of these have their inner attributes
                                 // placed at the beginning of the rightmost outermost braced group:
@@ -250,7 +241,7 @@ impl AttrTokenStream {
                                     stream.push_stream(inner_attr.tokens());
                                 }
                                 stream.push_stream(delim_tokens.clone());
-                                *tree = TokenTree::Delimited(*span, *delim, stream);
+                                *tree = TokenTree::Delimited(*span, *spacing, *delim, stream);
                                 found = true;
                                 break;
                             }
@@ -303,21 +294,64 @@ pub struct AttributesData {
 #[derive(Clone, Debug, Default, Encodable, Decodable)]
 pub struct TokenStream(pub(crate) Lrc<Vec<TokenTree>>);
 
-/// Similar to `proc_macro::Spacing`, but for tokens.
-///
-/// Note that all `ast::TokenTree::Token` instances have a `Spacing`, but when
-/// we convert to `proc_macro::TokenTree` for proc macros only `Punct`
-/// `TokenTree`s have a `proc_macro::Spacing`.
+/// Indicates whether a token can join with the following token to form a
+/// compound token. Used for conversions to `proc_macro::Spacing`. Also used to
+/// guide pretty-printing, which is where the `JointHidden` value (which isn't
+/// part of `proc_macro::Spacing`) comes in useful.
 #[derive(Clone, Copy, Debug, PartialEq, Encodable, Decodable, HashStable_Generic)]
 pub enum Spacing {
-    /// The token is not immediately followed by an operator token (as
-    /// determined by `Token::is_op`). E.g. a `+` token is `Alone` in `+ =`,
-    /// `+/*foo*/=`, `+ident`, and `+()`.
+    /// The token cannot join with the following token to form a compound
+    /// token.
+    ///
+    /// In token streams parsed from source code, the compiler will use `Alone`
+    /// for any token immediately followed by whitespace, a non-doc comment, or
+    /// EOF.
+    ///
+    /// When constructing token streams within the compiler, use this for each
+    /// token that (a) should be pretty-printed with a space after it, or (b)
+    /// is the last token in the stream. (In the latter case the choice of
+    /// spacing doesn't matter because it is never used for the last token. We
+    /// arbitrarily use `Alone`.)
+    ///
+    /// Converts to `proc_macro::Spacing::Alone`, and
+    /// `proc_macro::Spacing::Alone` converts back to this.
     Alone,
 
-    /// The token is immediately followed by an operator token. E.g. a `+`
-    /// token is `Joint` in `+=` and `++`.
+    /// The token can join with the following token to form a compound token.
+    ///
+    /// In token streams parsed from source code, the compiler will use `Joint`
+    /// for any token immediately followed by punctuation (as determined by
+    /// `Token::is_punct`).
+    ///
+    /// When constructing token streams within the compiler, use this for each
+    /// token that (a) should be pretty-printed without a space after it, and
+    /// (b) is followed by a punctuation token.
+    ///
+    /// Converts to `proc_macro::Spacing::Joint`, and
+    /// `proc_macro::Spacing::Joint` converts back to this.
     Joint,
+
+    /// The token can join with the following token to form a compound token,
+    /// but this will not be visible at the proc macro level. (This is what the
+    /// `Hidden` means; see below.)
+    ///
+    /// In token streams parsed from source code, the compiler will use
+    /// `JointHidden` for any token immediately followed by anything not
+    /// covered by the `Alone` and `Joint` cases: an identifier, lifetime,
+    /// literal, delimiter, doc comment.
+    ///
+    /// When constructing token streams, use this for each token that (a)
+    /// should be pretty-printed without a space after it, and (b) is followed
+    /// by a non-punctuation token.
+    ///
+    /// Converts to `proc_macro::Spacing::Alone`, but
+    /// `proc_macro::Spacing::Alone` converts back to `token::Spacing::Alone`.
+    /// Because of that, pretty-printing of `TokenStream`s produced by proc
+    /// macros is unavoidably uglier (with more whitespace between tokens) than
+    /// pretty-printing of `TokenStream`'s produced by other means (i.e. parsed
+    /// source code, internally constructed token streams, and token streams
+    /// produced by declarative macros).
+    JointHidden,
 }
 
 impl TokenStream {
@@ -408,32 +442,12 @@ impl TokenStream {
         t1.next().is_none() && t2.next().is_none()
     }
 
-    /// Applies the supplied function to each `TokenTree` and its index in `self`, returning a new `TokenStream`
-    ///
-    /// It is equivalent to `TokenStream::new(self.trees().cloned().enumerate().map(|(i, tt)| f(i, tt)).collect())`.
-    pub fn map_enumerated_owned(
-        mut self,
-        mut f: impl FnMut(usize, TokenTree) -> TokenTree,
-    ) -> TokenStream {
-        let owned = Lrc::make_mut(&mut self.0); // clone if necessary
-        // rely on vec's in-place optimizations to avoid another allocation
-        *owned = mem::take(owned).into_iter().enumerate().map(|(i, tree)| f(i, tree)).collect();
-        self
-    }
-
-    /// Create a token stream containing a single token with alone spacing.
+    /// Create a token stream containing a single token with alone spacing. The
+    /// spacing used for the final token in a constructed stream doesn't matter
+    /// because it's never used. In practice we arbitrarily use
+    /// `Spacing::Alone`.
     pub fn token_alone(kind: TokenKind, span: Span) -> TokenStream {
         TokenStream::new(vec![TokenTree::token_alone(kind, span)])
-    }
-
-    /// Create a token stream containing a single token with joint spacing.
-    pub fn token_joint(kind: TokenKind, span: Span) -> TokenStream {
-        TokenStream::new(vec![TokenTree::token_joint(kind, span)])
-    }
-
-    /// Create a token stream containing a single `Delimited`.
-    pub fn delimited(span: DelimSpan, delim: Delimiter, tts: TokenStream) -> TokenStream {
-        TokenStream::new(vec![TokenTree::Delimited(span, delim, tts)])
     }
 
     pub fn from_ast(node: &(impl HasAttrs + HasSpan + HasTokens + fmt::Debug)) -> TokenStream {
@@ -477,13 +491,14 @@ impl TokenStream {
 
     fn flatten_token(token: &Token, spacing: Spacing) -> TokenTree {
         match &token.kind {
-            token::Interpolated(nt) if let token::NtIdent(ident, is_raw) = **nt => {
+            token::Interpolated(nt) if let token::NtIdent(ident, is_raw) = nt.0 => {
                 TokenTree::Token(Token::new(token::Ident(ident.name, is_raw), ident.span), spacing)
             }
             token::Interpolated(nt) => TokenTree::Delimited(
                 DelimSpan::from_single(token.span),
+                DelimSpacing::new(Spacing::JointHidden, spacing),
                 Delimiter::Invisible,
-                TokenStream::from_nonterminal_ast(nt).flattened(),
+                TokenStream::from_nonterminal_ast(&nt.0).flattened(),
             ),
             _ => TokenTree::Token(token.clone(), spacing),
         }
@@ -492,8 +507,8 @@ impl TokenStream {
     fn flatten_token_tree(tree: &TokenTree) -> TokenTree {
         match tree {
             TokenTree::Token(token, spacing) => TokenStream::flatten_token(token, *spacing),
-            TokenTree::Delimited(span, delim, tts) => {
-                TokenTree::Delimited(*span, *delim, tts.flattened())
+            TokenTree::Delimited(span, spacing, delim, tts) => {
+                TokenTree::Delimited(*span, *spacing, *delim, tts.flattened())
             }
         }
     }
@@ -503,7 +518,7 @@ impl TokenStream {
         fn can_skip(stream: &TokenStream) -> bool {
             stream.trees().all(|tree| match tree {
                 TokenTree::Token(token, _) => !matches!(token.kind, token::Interpolated(_)),
-                TokenTree::Delimited(_, _, inner) => can_skip(inner),
+                TokenTree::Delimited(.., inner) => can_skip(inner),
             })
         }
 
@@ -517,7 +532,7 @@ impl TokenStream {
     // If `vec` is not empty, try to glue `tt` onto its last token. The return
     // value indicates if gluing took place.
     fn try_glue_to_last(vec: &mut Vec<TokenTree>, tt: &TokenTree) -> bool {
-        if let Some(TokenTree::Token(last_tok, Spacing::Joint)) = vec.last()
+        if let Some(TokenTree::Token(last_tok, Spacing::Joint | Spacing::JointHidden)) = vec.last()
             && let TokenTree::Token(tok, spacing) = tt
             && let Some(glued_tok) = last_tok.glue(tok)
         {
@@ -550,7 +565,9 @@ impl TokenStream {
 
         let stream_iter = stream.0.iter().cloned();
 
-        if let Some(first) = stream.0.first() && Self::try_glue_to_last(vec_mut, first) {
+        if let Some(first) = stream.0.first()
+            && Self::try_glue_to_last(vec_mut, first)
+        {
             // Now skip the first token tree from `stream`.
             vec_mut.extend(stream_iter.skip(1));
         } else {
@@ -590,9 +607,10 @@ impl TokenStream {
 
                     &TokenTree::Token(..) => i += 1,
 
-                    &TokenTree::Delimited(sp, delim, ref delim_stream) => {
+                    &TokenTree::Delimited(sp, spacing, delim, ref delim_stream) => {
                         if let Some(desugared_delim_stream) = desugar_inner(delim_stream.clone()) {
-                            let new_tt = TokenTree::Delimited(sp, delim, desugared_delim_stream);
+                            let new_tt =
+                                TokenTree::Delimited(sp, spacing, delim, desugared_delim_stream);
                             Lrc::make_mut(&mut stream.0)[i] = new_tt;
                             modified = true;
                         }
@@ -620,13 +638,14 @@ impl TokenStream {
                 num_of_hashes = cmp::max(num_of_hashes, count);
             }
 
-            // `/// foo` becomes `doc = r"foo"`.
+            // `/// foo` becomes `[doc = r"foo"]`.
             let delim_span = DelimSpan::from_single(span);
             let body = TokenTree::Delimited(
                 delim_span,
+                DelimSpacing::new(Spacing::JointHidden, Spacing::Alone),
                 Delimiter::Bracket,
                 [
-                    TokenTree::token_alone(token::Ident(sym::doc, false), span),
+                    TokenTree::token_alone(token::Ident(sym::doc, token::IdentIsRaw::No), span),
                     TokenTree::token_alone(token::Eq, span),
                     TokenTree::token_alone(
                         TokenKind::lit(token::StrRaw(num_of_hashes), data, None),
@@ -639,7 +658,7 @@ impl TokenStream {
 
             if attr_style == AttrStyle::Inner {
                 vec![
-                    TokenTree::token_alone(token::Pound, span),
+                    TokenTree::token_joint(token::Pound, span),
                     TokenTree::token_alone(token::Not, span),
                     body,
                 ]
@@ -736,8 +755,20 @@ impl DelimSpan {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Encodable, Decodable, HashStable_Generic)]
+pub struct DelimSpacing {
+    pub open: Spacing,
+    pub close: Spacing,
+}
+
+impl DelimSpacing {
+    pub fn new(open: Spacing, close: Spacing) -> DelimSpacing {
+        DelimSpacing { open, close }
+    }
+}
+
 // Some types are used a lot. Make sure they don't unintentionally get bigger.
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_pointer_width = "64"))]
 mod size_asserts {
     use super::*;
     use rustc_data_structures::static_assert_size;

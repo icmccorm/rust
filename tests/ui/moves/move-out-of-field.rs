@@ -1,6 +1,4 @@
-// run-pass
-
-use std::string::String;
+//@ run-pass
 
 struct StringBuffer {
     s: String,

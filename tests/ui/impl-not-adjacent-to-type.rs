@@ -1,8 +1,9 @@
-// run-pass
+//@ run-pass
 
 mod foo {
     pub struct Point {
         pub x: i32,
+        #[allow(dead_code)]
         pub y: i32,
     }
 }

@@ -9,7 +9,7 @@ use crate::marker::ConstParamTy;
 #[lang = "transmute_trait"]
 #[rustc_deny_explicit_impl(implement_via_object = false)]
 #[rustc_coinductive]
-pub unsafe trait BikeshedIntrinsicFrom<Src, Context, const ASSUME: Assume = { Assume::NOTHING }>
+pub unsafe trait BikeshedIntrinsicFrom<Src, const ASSUME: Assume = { Assume::NOTHING }>
 where
     Src: ?Sized,
 {
@@ -28,8 +28,9 @@ pub struct Assume {
     /// that violates Rust's memory model.
     pub lifetimes: bool,
 
-    /// When `true`, the compiler assumes that *you* have ensured that it is safe for you to violate the
-    /// type and field privacy of the destination type (and sometimes of the source type, too).
+    /// When `true`, the compiler assumes that *you* have ensured that no
+    /// unsoundness will arise from violating the safety invariants of the
+    /// destination type (and sometimes of the source type, too).
     pub safety: bool,
 
     /// When `true`, the compiler assumes that *you* are ensuring that the source type is actually a valid

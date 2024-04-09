@@ -21,9 +21,11 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     }
 
     pub fn eval_mir_constant(&self, constant: &mir::ConstOperand<'tcx>) -> mir::ConstValue<'tcx> {
+        // `MirUsedCollector` visited all required_consts before codegen began, so if we got here
+        // there can be no more constants that fail to evaluate.
         self.monomorphize(constant.const_)
-            .eval(self.cx.tcx(), ty::ParamEnv::reveal_all(), Some(constant.span))
-            .expect("erroneous constant not captured by required_consts")
+            .eval(self.cx.tcx(), ty::ParamEnv::reveal_all(), constant.span)
+            .expect("erroneous constant missed by mono item collection")
     }
 
     /// This is a convenience helper for `simd_shuffle_indices`. It has the precondition
@@ -54,11 +56,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             other => span_bug!(constant.span, "{other:#?}"),
         };
         let uv = self.monomorphize(uv);
-        self.cx.tcx().const_eval_resolve_for_typeck(
-            ty::ParamEnv::reveal_all(),
-            uv,
-            Some(constant.span),
-        )
+        self.cx.tcx().const_eval_resolve_for_typeck(ty::ParamEnv::reveal_all(), uv, constant.span)
     }
 
     /// process constant containing SIMD shuffle indices
@@ -92,7 +90,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 bx.const_struct(&values, false)
             })
             .unwrap_or_else(|| {
-                bx.tcx().sess.emit_err(errors::ShuffleIndicesEvaluation { span: constant.span });
+                bx.tcx().dcx().emit_err(errors::ShuffleIndicesEvaluation { span: constant.span });
                 // We've errored, so we don't have to produce working code.
                 let llty = bx.backend_type(bx.layout_of(ty));
                 bx.const_undef(llty)

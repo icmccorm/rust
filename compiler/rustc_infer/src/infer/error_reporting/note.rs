@@ -5,9 +5,7 @@ use crate::errors::{
 use crate::fluent_generated as fluent;
 use crate::infer::error_reporting::{note_and_explain_region, TypeErrCtxt};
 use crate::infer::{self, SubregionOrigin};
-use rustc_errors::{
-    AddToDiagnostic, Diagnostic, DiagnosticBuilder, ErrorGuaranteed, IntoDiagnostic,
-};
+use rustc_errors::{Diag, Subdiagnostic};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::traits::ObligationCauseCode;
 use rustc_middle::ty::error::TypeError;
@@ -17,20 +15,20 @@ use rustc_span::symbol::kw;
 use super::ObligationCauseAsDiagArg;
 
 impl<'tcx> TypeErrCtxt<'_, 'tcx> {
-    pub(super) fn note_region_origin(&self, err: &mut Diagnostic, origin: &SubregionOrigin<'tcx>) {
+    pub(super) fn note_region_origin(&self, err: &mut Diag<'_>, origin: &SubregionOrigin<'tcx>) {
         match *origin {
             infer::Subtype(ref trace) => RegionOriginNote::WithRequirement {
                 span: trace.cause.span,
                 requirement: ObligationCauseAsDiagArg(trace.cause.clone()),
-                expected_found: self.values_str(trace.values).map(|(e, f, _, _)| (e, f)),
+                expected_found: self.values_str(trace.values).map(|(e, f, _)| (e, f)),
             }
-            .add_to_diagnostic(err),
+            .add_to_diag(err),
             infer::Reborrow(span) => {
-                RegionOriginNote::Plain { span, msg: fluent::infer_reborrow }.add_to_diagnostic(err)
+                RegionOriginNote::Plain { span, msg: fluent::infer_reborrow }.add_to_diag(err)
             }
             infer::RelateObjectBound(span) => {
                 RegionOriginNote::Plain { span, msg: fluent::infer_relate_object_bound }
-                    .add_to_diagnostic(err);
+                    .add_to_diag(err);
             }
             infer::ReferenceOutlivesReferent(ty, span) => {
                 RegionOriginNote::WithName {
@@ -39,7 +37,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     name: &self.ty_to_string(ty),
                     continues: false,
                 }
-                .add_to_diagnostic(err);
+                .add_to_diag(err);
             }
             infer::RelateParamBound(span, ty, opt_span) => {
                 RegionOriginNote::WithName {
@@ -48,29 +46,29 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     name: &self.ty_to_string(ty),
                     continues: opt_span.is_some(),
                 }
-                .add_to_diagnostic(err);
+                .add_to_diag(err);
                 if let Some(span) = opt_span {
                     RegionOriginNote::Plain { span, msg: fluent::infer_relate_param_bound_2 }
-                        .add_to_diagnostic(err);
+                        .add_to_diag(err);
                 }
             }
             infer::RelateRegionParamBound(span) => {
                 RegionOriginNote::Plain { span, msg: fluent::infer_relate_region_param_bound }
-                    .add_to_diagnostic(err);
+                    .add_to_diag(err);
             }
             infer::CompareImplItemObligation { span, .. } => {
                 RegionOriginNote::Plain { span, msg: fluent::infer_compare_impl_item_obligation }
-                    .add_to_diagnostic(err);
+                    .add_to_diag(err);
             }
             infer::CheckAssociatedTypeBounds { ref parent, .. } => {
-                self.note_region_origin(err, &parent);
+                self.note_region_origin(err, parent);
             }
             infer::AscribeUserTypeProvePredicate(span) => {
                 RegionOriginNote::Plain {
                     span,
                     msg: fluent::infer_ascribe_user_type_prove_predicate,
                 }
-                .add_to_diagnostic(err);
+                .add_to_diag(err);
             }
         }
     }
@@ -80,7 +78,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         origin: SubregionOrigin<'tcx>,
         sub: Region<'tcx>,
         sup: Region<'tcx>,
-    ) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
+    ) -> Diag<'tcx> {
         let mut err = match origin {
             infer::Subtype(box trace) => {
                 let terr = TypeError::RegionsDoesNotOutlive(sup, sub);
@@ -136,11 +134,10 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     note_and_explain::PrefixKind::ContentValidFor,
                     note_and_explain::SuffixKind::Empty,
                 );
-                OutlivesContent {
+                self.dcx().create_err(OutlivesContent {
                     span,
                     notes: reference_valid.into_iter().chain(content_valid).collect(),
-                }
-                .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic)
+                })
             }
             infer::RelateObjectBound(span) => {
                 let object_valid = note_and_explain::RegionExplanation::new(
@@ -157,11 +154,10 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     note_and_explain::PrefixKind::SourcePointerValidFor,
                     note_and_explain::SuffixKind::Empty,
                 );
-                OutlivesBound {
+                self.dcx().create_err(OutlivesBound {
                     span,
                     notes: object_valid.into_iter().chain(pointer_valid).collect(),
-                }
-                .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic)
+                })
             }
             infer::RelateParamBound(span, ty, opt_span) => {
                 let prefix = match *sub {
@@ -176,8 +172,11 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 let note = note_and_explain::RegionExplanation::new(
                     self.tcx, sub, opt_span, prefix, suffix,
                 );
-                FulfillReqLifetime { span, ty: self.resolve_vars_if_possible(ty), note }
-                    .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic)
+                self.dcx().create_err(FulfillReqLifetime {
+                    span,
+                    ty: self.resolve_vars_if_possible(ty),
+                    note,
+                })
             }
             infer::RelateRegionParamBound(span) => {
                 let param_instantiated = note_and_explain::RegionExplanation::new(
@@ -194,11 +193,10 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     note_and_explain::PrefixKind::LfParamMustOutlive,
                     note_and_explain::SuffixKind::Empty,
                 );
-                LfBoundNotSatisfied {
+                self.dcx().create_err(LfBoundNotSatisfied {
                     span,
                     notes: param_instantiated.into_iter().chain(param_must_outlive).collect(),
-                }
-                .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic)
+                })
             }
             infer::ReferenceOutlivesReferent(ty, span) => {
                 let pointer_valid = note_and_explain::RegionExplanation::new(
@@ -215,12 +213,11 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     note_and_explain::PrefixKind::DataValidFor,
                     note_and_explain::SuffixKind::Empty,
                 );
-                RefLongerThanData {
+                self.dcx().create_err(RefLongerThanData {
                     span,
                     ty: self.resolve_vars_if_possible(ty),
                     notes: pointer_valid.into_iter().chain(data_valid).collect(),
-                }
-                .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic)
+                })
             }
             infer::CompareImplItemObligation { span, impl_item_def_id, trait_item_def_id } => {
                 let mut err = self.report_extra_impl_obligation(
@@ -277,15 +274,14 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     note_and_explain::PrefixKind::LfMustOutlive,
                     note_and_explain::SuffixKind::Empty,
                 );
-                LfBoundNotSatisfied {
+                self.dcx().create_err(LfBoundNotSatisfied {
                     span,
                     notes: instantiated.into_iter().chain(must_outlive).collect(),
-                }
-                .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic)
+                })
             }
         };
         if sub.is_error() || sup.is_error() {
-            err.delay_as_bug();
+            err.downgrade_to_delayed_bug();
         }
         err
     }
@@ -294,7 +290,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         &self,
         trait_item_def_id: DefId,
         impl_item_def_id: LocalDefId,
-        err: &mut Diagnostic,
+        err: &mut Diag<'_>,
     ) {
         // FIXME(compiler-errors): Right now this is only being used for region
         // predicate mismatches. Ideally, we'd use it for *all* predicate mismatches,
@@ -346,7 +342,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 trait_predicates: trait_predicates.join(", "),
             }
         };
-        err.subdiagnostic(suggestion);
+        err.subdiagnostic(self.dcx(), suggestion);
     }
 
     pub(super) fn report_placeholder_failure(
@@ -354,7 +350,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         placeholder_origin: SubregionOrigin<'tcx>,
         sub: Region<'tcx>,
         sup: Region<'tcx>,
-    ) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
+    ) -> Diag<'tcx> {
         // I can't think how to do better than this right now. -nikomatsakis
         debug!(?placeholder_origin, ?sub, ?sup, "report_placeholder_failure");
         match placeholder_origin {
@@ -371,11 +367,12 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     &trace.cause.code().peel_derives()
                 {
                     let span = *span;
-                    let mut err = self.report_concrete_failure(placeholder_origin, sub, sup);
-                    err.span_note(span, "the lifetime requirement is introduced here");
-                    err
+                    self.report_concrete_failure(placeholder_origin, sub, sup)
+                        .with_span_note(span, "the lifetime requirement is introduced here")
                 } else {
-                    unreachable!()
+                    unreachable!(
+                        "control flow ensures we have a `BindingObligation` or `ExprBindingObligation` here..."
+                    )
                 }
             }
             infer::Subtype(box trace) => {

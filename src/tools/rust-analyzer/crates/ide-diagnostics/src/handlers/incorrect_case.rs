@@ -27,7 +27,7 @@ pub(crate) fn incorrect_case(ctx: &DiagnosticsContext<'_>, d: &hir::IncorrectCas
             "{} `{}` should have {} name, e.g. `{}`",
             d.ident_type, d.ident_text, d.expected_case, d.suggested_text
         ),
-        InFile::new(d.file, d.ident.clone().into()),
+        InFile::new(d.file, d.ident.into()),
     )
     .with_fixes(fixes(ctx, d))
 }
@@ -38,7 +38,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::IncorrectCase) -> Option<Vec<Ass
     let def = NameClass::classify(&ctx.sema, &name_node)?.defined()?;
 
     let name_node = InFile::new(d.file, name_node.syntax());
-    let frange = name_node.original_file_range(ctx.sema.db);
+    let frange = name_node.original_file_range_rooted(ctx.sema.db);
 
     let label = format!("Rename to {}", d.suggested_text);
     let mut res = unresolved_fix("change_case", &label, frange.range);
@@ -52,7 +52,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::IncorrectCase) -> Option<Vec<Ass
 
 #[cfg(test)]
 mod change_case {
-    use crate::tests::{check_diagnostics, check_fix};
+    use crate::tests::{check_diagnostics, check_diagnostics_with_disabled, check_fix};
 
     #[test]
     fn test_rename_incorrect_case() {
@@ -110,6 +110,31 @@ fn some_fn() {
 fn some_fn() {
     let what_aweird_formatting = 10;
     another_func(what_aweird_formatting);
+}
+"#,
+        );
+
+        check_fix(
+            r#"
+static S: i32 = M::A;
+
+mod $0M {
+    pub const A: i32 = 10;
+}
+
+mod other {
+    use crate::M::A;
+}
+"#,
+            r#"
+static S: i32 = m::A;
+
+mod m {
+    pub const A: i32 = 10;
+}
+
+mod other {
+    use crate::m::A;
 }
 "#,
         );
@@ -175,10 +200,10 @@ fn NonSnakeCaseName() {}
     fn incorrect_function_params() {
         check_diagnostics(
             r#"
-fn foo(SomeParam: u8) {}
+fn foo(SomeParam: u8) { _ = SomeParam; }
     // ^^^^^^^^^ 💡 warn: Parameter `SomeParam` should have snake_case name, e.g. `some_param`
 
-fn foo2(ok_param: &str, CAPS_PARAM: u8) {}
+fn foo2(ok_param: &str, CAPS_PARAM: u8) { _ = (ok_param, CAPS_PARAM); }
                      // ^^^^^^^^^^ 💡 warn: Parameter `CAPS_PARAM` should have snake_case name, e.g. `caps_param`
 "#,
         );
@@ -188,6 +213,7 @@ fn foo2(ok_param: &str, CAPS_PARAM: u8) {}
     fn incorrect_variable_names() {
         check_diagnostics(
             r#"
+#[allow(unused)]
 fn foo() {
     let SOME_VALUE = 10;
      // ^^^^^^^^^^ 💡 warn: Variable `SOME_VALUE` should have snake_case name, e.g. `some_value`
@@ -294,6 +320,7 @@ impl someStruct {
     // ^^^^^^^^ 💡 warn: Function `SomeFunc` should have snake_case name, e.g. `some_func`
         let WHY_VAR_IS_CAPS = 10;
          // ^^^^^^^^^^^^^^^ 💡 warn: Variable `WHY_VAR_IS_CAPS` should have snake_case name, e.g. `why_var_is_caps`
+        _ = WHY_VAR_IS_CAPS;
     }
 }
 "#,
@@ -306,6 +333,7 @@ impl someStruct {
             r#"
 enum Option { Some, None }
 
+#[allow(unused)]
 fn main() {
     match Option::None {
         None => (),
@@ -322,6 +350,7 @@ fn main() {
             r#"
 enum Option { Some, None }
 
+#[allow(unused)]
 fn main() {
     match Option::None {
         SOME_VAR @ None => (),
@@ -349,7 +378,9 @@ enum E {
 }
 
 mod F {
-    fn CheckItWorksWithCrateAttr(BAD_NAME_HI: u8) {}
+    fn CheckItWorksWithCrateAttr(BAD_NAME_HI: u8) {
+        _ = BAD_NAME_HI;
+    }
 }
     "#,
         );
@@ -357,14 +388,13 @@ mod F {
 
     #[test]
     fn complex_ignore() {
-        // FIXME: this should trigger errors for the second case.
         check_diagnostics(
             r#"
 trait T { fn a(); }
 struct U {}
 impl T for U {
     fn a() {
-        #[allow(non_snake_case)]
+        #[allow(non_snake_case, non_upper_case_globals)]
         trait __BitFlagsOk {
             const HiImAlsoBad: u8 = 2;
             fn Dirty(&self) -> bool { false }
@@ -372,7 +402,9 @@ impl T for U {
 
         trait __BitFlagsBad {
             const HiImAlsoBad: u8 = 2;
+               // ^^^^^^^^^^^ 💡 warn: Constant `HiImAlsoBad` should have UPPER_SNAKE_CASE name, e.g. `HI_IM_ALSO_BAD`
             fn Dirty(&self) -> bool { false }
+            // ^^^^^💡 warn: Function `Dirty` should have snake_case name, e.g. `dirty`
         }
     }
 }
@@ -395,7 +427,7 @@ fn qualify() {
 
     #[test] // Issue #8809.
     fn parenthesized_parameter() {
-        check_diagnostics(r#"fn f((O): _) {}"#)
+        check_diagnostics(r#"fn f((O): _) { _ = O; }"#)
     }
 
     #[test]
@@ -431,16 +463,56 @@ extern {
     }
 
     #[test]
-    fn bug_traits_arent_checked() {
-        // FIXME: Traits and functions in traits aren't currently checked by
-        // r-a, even though rustc will complain about them.
+    fn incorrect_trait_and_assoc_item_names() {
         check_diagnostics(
             r#"
 trait BAD_TRAIT {
+   // ^^^^^^^^^ 💡 warn: Trait `BAD_TRAIT` should have CamelCase name, e.g. `BadTrait`
+    const bad_const: u8;
+       // ^^^^^^^^^ 💡 warn: Constant `bad_const` should have UPPER_SNAKE_CASE name, e.g. `BAD_CONST`
+    type BAD_TYPE;
+      // ^^^^^^^^ 💡 warn: Type alias `BAD_TYPE` should have CamelCase name, e.g. `BadType`
     fn BAD_FUNCTION();
+    // ^^^^^^^^^^^^ 💡 warn: Function `BAD_FUNCTION` should have snake_case name, e.g. `bad_function`
     fn BadFunction();
+    // ^^^^^^^^^^^ 💡 warn: Function `BadFunction` should have snake_case name, e.g. `bad_function`
 }
     "#,
+        );
+    }
+
+    #[test]
+    fn no_diagnostics_for_trait_impl_assoc_items_except_pats_in_body() {
+        cov_mark::check!(trait_impl_assoc_const_incorrect_case_ignored);
+        cov_mark::check!(trait_impl_assoc_type_incorrect_case_ignored);
+        cov_mark::check_count!(trait_impl_assoc_func_name_incorrect_case_ignored, 2);
+        check_diagnostics_with_disabled(
+            r#"
+trait BAD_TRAIT {
+   // ^^^^^^^^^ 💡 warn: Trait `BAD_TRAIT` should have CamelCase name, e.g. `BadTrait`
+    const bad_const: u8;
+       // ^^^^^^^^^ 💡 warn: Constant `bad_const` should have UPPER_SNAKE_CASE name, e.g. `BAD_CONST`
+    type BAD_TYPE;
+      // ^^^^^^^^ 💡 warn: Type alias `BAD_TYPE` should have CamelCase name, e.g. `BadType`
+    fn BAD_FUNCTION(BAD_PARAM: u8);
+    // ^^^^^^^^^^^^ 💡 warn: Function `BAD_FUNCTION` should have snake_case name, e.g. `bad_function`
+                 // ^^^^^^^^^ 💡 warn: Parameter `BAD_PARAM` should have snake_case name, e.g. `bad_param`
+    fn BadFunction();
+    // ^^^^^^^^^^^ 💡 warn: Function `BadFunction` should have snake_case name, e.g. `bad_function`
+}
+
+impl BAD_TRAIT for () {
+    const bad_const: u8 = 0;
+    type BAD_TYPE = ();
+    fn BAD_FUNCTION(BAD_PARAM: u8) {
+                 // ^^^^^^^^^ 💡 warn: Parameter `BAD_PARAM` should have snake_case name, e.g. `bad_param`
+        let BAD_VAR = 0;
+         // ^^^^^^^ 💡 warn: Variable `BAD_VAR` should have snake_case name, e.g. `bad_var`
+    }
+    fn BadFunction() {}
+}
+    "#,
+            &["unused_variables"],
         );
     }
 
@@ -472,7 +544,9 @@ mod CheckBadStyle {
 
 mod F {
     #![allow(non_snake_case)]
-    fn CheckItWorksWithModAttr(BAD_NAME_HI: u8) {}
+    fn CheckItWorksWithModAttr(BAD_NAME_HI: u8) {
+        _ = BAD_NAME_HI;
+    }
 }
 
 #[allow(non_snake_case, non_camel_case_types)]
@@ -486,6 +560,14 @@ pub const some_const: u8 = 10;
 
 #[allow(non_upper_case_globals)]
 pub static SomeStatic: u8 = 10;
+
+#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+trait BAD_TRAIT {
+    const bad_const: u8;
+    type BAD_TYPE;
+    fn BAD_FUNCTION(BAD_PARAM: u8);
+    fn BadFunction();
+}
     "#,
         );
     }
@@ -510,17 +592,20 @@ fn NonSnakeCaseName(some_var: u8) -> u8 {
 
 #[deny(nonstandard_style)]
 mod CheckNonstandardStyle {
+  //^^^^^^^^^^^^^^^^^^^^^ 💡 error: Module `CheckNonstandardStyle` should have snake_case name, e.g. `check_nonstandard_style`
     fn HiImABadFnName() {}
      //^^^^^^^^^^^^^^ 💡 error: Function `HiImABadFnName` should have snake_case name, e.g. `hi_im_abad_fn_name`
 }
 
 #[deny(warnings)]
 mod CheckBadStyle {
+  //^^^^^^^^^^^^^ 💡 error: Module `CheckBadStyle` should have snake_case name, e.g. `check_bad_style`
     struct fooo;
          //^^^^ 💡 error: Structure `fooo` should have CamelCase name, e.g. `Fooo`
 }
 
 mod F {
+  //^ 💡 warn: Module `F` should have snake_case name, e.g. `f`
     #![deny(non_snake_case)]
     fn CheckItWorksWithModAttr() {}
      //^^^^^^^^^^^^^^^^^^^^^^^ 💡 error: Function `CheckItWorksWithModAttr` should have snake_case name, e.g. `check_it_works_with_mod_attr`
@@ -542,6 +627,20 @@ pub const some_const: u8 = 10;
 #[deny(non_upper_case_globals)]
 pub static SomeStatic: u8 = 10;
          //^^^^^^^^^^ 💡 error: Static variable `SomeStatic` should have UPPER_SNAKE_CASE name, e.g. `SOME_STATIC`
+
+#[deny(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+trait BAD_TRAIT {
+   // ^^^^^^^^^ 💡 error: Trait `BAD_TRAIT` should have CamelCase name, e.g. `BadTrait`
+    const bad_const: u8;
+       // ^^^^^^^^^ 💡 error: Constant `bad_const` should have UPPER_SNAKE_CASE name, e.g. `BAD_CONST`
+    type BAD_TYPE;
+      // ^^^^^^^^ 💡 error: Type alias `BAD_TYPE` should have CamelCase name, e.g. `BadType`
+    fn BAD_FUNCTION(BAD_PARAM: u8);
+    // ^^^^^^^^^^^^ 💡 error: Function `BAD_FUNCTION` should have snake_case name, e.g. `bad_function`
+                 // ^^^^^^^^^ 💡 error: Parameter `BAD_PARAM` should have snake_case name, e.g. `bad_param`
+    fn BadFunction();
+    // ^^^^^^^^^^^ 💡 error: Function `BadFunction` should have snake_case name, e.g. `bad_function`
+}
     "#,
         );
     }
@@ -563,12 +662,12 @@ fn main() {
              //^^^ 💡 warn: Static variable `bar` should have UPPER_SNAKE_CASE name, e.g. `BAR`
         fn BAZ() {
          //^^^ 💡 warn: Function `BAZ` should have snake_case name, e.g. `baz`
-            let INNER_INNER = 42;
-              //^^^^^^^^^^^ 💡 warn: Variable `INNER_INNER` should have snake_case name, e.g. `inner_inner`
+            let _INNER_INNER = 42;
+              //^^^^^^^^^^^^ 💡 warn: Variable `_INNER_INNER` should have snake_case name, e.g. `_inner_inner`
         }
 
-        let INNER_LOCAL = 42;
-          //^^^^^^^^^^^ 💡 warn: Variable `INNER_LOCAL` should have snake_case name, e.g. `inner_local`
+        let _INNER_LOCAL = 42;
+          //^^^^^^^^^^^^ 💡 warn: Variable `_INNER_LOCAL` should have snake_case name, e.g. `_inner_local`
     }
 }
 "#,
@@ -640,5 +739,31 @@ enum E {
 }
 "#,
         );
+    }
+
+    #[test]
+    fn module_name_inline() {
+        check_diagnostics(
+            r#"
+mod M {
+  //^ 💡 warn: Module `M` should have snake_case name, e.g. `m`
+    mod IncorrectCase {}
+      //^^^^^^^^^^^^^ 💡 warn: Module `IncorrectCase` should have snake_case name, e.g. `incorrect_case`
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn module_name_decl() {
+        check_diagnostics(
+            r#"
+//- /Foo.rs
+
+//- /main.rs
+mod Foo;
+  //^^^ 💡 warn: Module `Foo` should have snake_case name, e.g. `foo`
+"#,
+        )
     }
 }

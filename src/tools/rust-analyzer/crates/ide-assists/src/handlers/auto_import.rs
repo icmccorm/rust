@@ -5,7 +5,7 @@ use ide_db::{
     helpers::mod_path_to_ast,
     imports::{
         import_assets::{ImportAssets, ImportCandidate, LocatedImport},
-        insert_use::{insert_use, ImportScope},
+        insert_use::{insert_use, insert_use_as_alias, ImportScope},
     },
 };
 use syntax::{ast, AstNode, NodeOrToken, SyntaxElement};
@@ -49,6 +49,8 @@ use crate::{AssistContext, AssistId, AssistKind, Assists, GroupLabel};
 // - `item`: Don't merge imports at all, creating one import per item.
 // - `preserve`: Do not change the granularity of any imports. For auto-import this has the same
 //  effect as `item`.
+// - `one`: Merge all imports into a single use statement as long as they have the same visibility
+//  and attributes.
 //
 // In `VS Code` the configuration for this is `rust-analyzer.imports.granularity.group`.
 //
@@ -89,11 +91,14 @@ use crate::{AssistContext, AssistId, AssistKind, Assists, GroupLabel};
 // ```
 pub(crate) fn auto_import(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let (import_assets, syntax_under_caret) = find_importable_node(ctx)?;
-    let mut proposed_imports = import_assets.search_for_imports(
-        &ctx.sema,
-        ctx.config.insert_use.prefix_kind,
-        ctx.config.prefer_no_std,
-    );
+    let mut proposed_imports: Vec<_> = import_assets
+        .search_for_imports(
+            &ctx.sema,
+            ctx.config.insert_use.prefix_kind,
+            ctx.config.prefer_no_std,
+            ctx.config.prefer_no_std,
+        )
+        .collect();
     if proposed_imports.is_empty() {
         return None;
     }
@@ -112,6 +117,7 @@ pub(crate) fn auto_import(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<
     )?;
 
     // we aren't interested in different namespaces
+    proposed_imports.sort_by(|a, b| a.import_path.cmp(&b.import_path));
     proposed_imports.dedup_by(|a, b| a.import_path == b.import_path);
 
     let current_node = match ctx.covering_element() {
@@ -129,10 +135,12 @@ pub(crate) fn auto_import(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<
     for import in proposed_imports {
         let import_path = import.import_path;
 
+        let (assist_id, import_name) =
+            (AssistId("auto_import", AssistKind::QuickFix), import_path.display(ctx.db()));
         acc.add_group(
             &group_label,
-            AssistId("auto_import", AssistKind::QuickFix),
-            format!("Import `{}`", import_path.display(ctx.db())),
+            assist_id,
+            format!("Import `{}`", import_name),
             range,
             |builder| {
                 let scope = match scope.clone() {
@@ -143,6 +151,38 @@ pub(crate) fn auto_import(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<
                 insert_use(&scope, mod_path_to_ast(&import_path), &ctx.config.insert_use);
             },
         );
+
+        match import_assets.import_candidate() {
+            ImportCandidate::TraitAssocItem(name) | ImportCandidate::TraitMethod(name) => {
+                let is_method =
+                    matches!(import_assets.import_candidate(), ImportCandidate::TraitMethod(_));
+                let type_ = if is_method { "method" } else { "item" };
+                let group_label = GroupLabel(format!(
+                    "Import a trait for {} {} by alias",
+                    type_,
+                    name.assoc_item_name.text()
+                ));
+                acc.add_group(
+                    &group_label,
+                    assist_id,
+                    format!("Import `{} as _`", import_name),
+                    range,
+                    |builder| {
+                        let scope = match scope.clone() {
+                            ImportScope::File(it) => ImportScope::File(builder.make_mut(it)),
+                            ImportScope::Module(it) => ImportScope::Module(builder.make_mut(it)),
+                            ImportScope::Block(it) => ImportScope::Block(builder.make_mut(it)),
+                        };
+                        insert_use_as_alias(
+                            &scope,
+                            mod_path_to_ast(&import_path),
+                            &ctx.config.insert_use,
+                        );
+                    },
+                );
+            }
+            _ => {}
+        }
     }
     Some(())
 }
@@ -158,7 +198,7 @@ pub(super) fn find_importable_node(
     {
         ImportAssets::for_method_call(&method_under_caret, &ctx.sema)
             .zip(Some(method_under_caret.syntax().clone().into()))
-    } else if let Some(_) = ctx.find_node_at_offset_with_descend::<ast::Param>() {
+    } else if ctx.find_node_at_offset_with_descend::<ast::Param>().is_some() {
         None
     } else if let Some(pat) = ctx
         .find_node_at_offset_with_descend::<ast::IdentPat>()
@@ -246,14 +286,12 @@ mod tests {
     use super::*;
 
     use hir::Semantics;
-    use ide_db::{
-        assists::AssistResolveStrategy,
-        base_db::{fixture::WithFixture, FileRange},
-        RootDatabase,
-    };
+    use ide_db::{assists::AssistResolveStrategy, base_db::FileRange, RootDatabase};
+    use test_fixture::WithFixture;
 
     use crate::tests::{
-        check_assist, check_assist_not_applicable, check_assist_target, TEST_CONFIG,
+        check_assist, check_assist_by_label, check_assist_not_applicable, check_assist_target,
+        TEST_CONFIG,
     };
 
     fn check_auto_import_order(before: &str, order: &[&str]) {
@@ -705,7 +743,7 @@ fn main() {
 
     #[test]
     fn associated_trait_function() {
-        check_assist(
+        check_assist_by_label(
             auto_import,
             r"
             mod test_mod {
@@ -739,6 +777,44 @@ fn main() {
                 test_mod::TestStruct::test_function
             }
             ",
+            "Import `test_mod::TestTrait`",
+        );
+
+        check_assist_by_label(
+            auto_import,
+            r"
+            mod test_mod {
+                pub trait TestTrait {
+                    fn test_function();
+                }
+                pub struct TestStruct {}
+                impl TestTrait for TestStruct {
+                    fn test_function() {}
+                }
+            }
+
+            fn main() {
+                test_mod::TestStruct::test_function$0
+            }
+            ",
+            r"
+            use test_mod::TestTrait as _;
+
+            mod test_mod {
+                pub trait TestTrait {
+                    fn test_function();
+                }
+                pub struct TestStruct {}
+                impl TestTrait for TestStruct {
+                    fn test_function() {}
+                }
+            }
+
+            fn main() {
+                test_mod::TestStruct::test_function
+            }
+            ",
+            "Import `test_mod::TestTrait as _`",
         );
     }
 
@@ -776,7 +852,44 @@ fn main() {
 
     #[test]
     fn associated_trait_const() {
-        check_assist(
+        check_assist_by_label(
+            auto_import,
+            r"
+            mod test_mod {
+                pub trait TestTrait {
+                    const TEST_CONST: u8;
+                }
+                pub struct TestStruct {}
+                impl TestTrait for TestStruct {
+                    const TEST_CONST: u8 = 42;
+                }
+            }
+
+            fn main() {
+                test_mod::TestStruct::TEST_CONST$0
+            }
+            ",
+            r"
+            use test_mod::TestTrait as _;
+
+            mod test_mod {
+                pub trait TestTrait {
+                    const TEST_CONST: u8;
+                }
+                pub struct TestStruct {}
+                impl TestTrait for TestStruct {
+                    const TEST_CONST: u8 = 42;
+                }
+            }
+
+            fn main() {
+                test_mod::TestStruct::TEST_CONST
+            }
+            ",
+            "Import `test_mod::TestTrait as _`",
+        );
+
+        check_assist_by_label(
             auto_import,
             r"
             mod test_mod {
@@ -810,6 +923,7 @@ fn main() {
                 test_mod::TestStruct::TEST_CONST
             }
             ",
+            "Import `test_mod::TestTrait`",
         );
     }
 
@@ -847,7 +961,46 @@ fn main() {
 
     #[test]
     fn trait_method() {
-        check_assist(
+        check_assist_by_label(
+            auto_import,
+            r"
+            mod test_mod {
+                pub trait TestTrait {
+                    fn test_method(&self);
+                }
+                pub struct TestStruct {}
+                impl TestTrait for TestStruct {
+                    fn test_method(&self) {}
+                }
+            }
+
+            fn main() {
+                let test_struct = test_mod::TestStruct {};
+                test_struct.test_meth$0od()
+            }
+            ",
+            r"
+            use test_mod::TestTrait as _;
+
+            mod test_mod {
+                pub trait TestTrait {
+                    fn test_method(&self);
+                }
+                pub struct TestStruct {}
+                impl TestTrait for TestStruct {
+                    fn test_method(&self) {}
+                }
+            }
+
+            fn main() {
+                let test_struct = test_mod::TestStruct {};
+                test_struct.test_method()
+            }
+            ",
+            "Import `test_mod::TestTrait as _`",
+        );
+
+        check_assist_by_label(
             auto_import,
             r"
             mod test_mod {
@@ -883,12 +1036,43 @@ fn main() {
                 test_struct.test_method()
             }
             ",
+            "Import `test_mod::TestTrait`",
         );
     }
 
     #[test]
     fn trait_method_cross_crate() {
-        check_assist(
+        check_assist_by_label(
+            auto_import,
+            r"
+            //- /main.rs crate:main deps:dep
+            fn main() {
+                let test_struct = dep::test_mod::TestStruct {};
+                test_struct.test_meth$0od()
+            }
+            //- /dep.rs crate:dep
+            pub mod test_mod {
+                pub trait TestTrait {
+                    fn test_method(&self);
+                }
+                pub struct TestStruct {}
+                impl TestTrait for TestStruct {
+                    fn test_method(&self) {}
+                }
+            }
+            ",
+            r"
+            use dep::test_mod::TestTrait as _;
+
+            fn main() {
+                let test_struct = dep::test_mod::TestStruct {};
+                test_struct.test_method()
+            }
+            ",
+            "Import `dep::test_mod::TestTrait as _`",
+        );
+
+        check_assist_by_label(
             auto_import,
             r"
             //- /main.rs crate:main deps:dep
@@ -915,12 +1099,41 @@ fn main() {
                 test_struct.test_method()
             }
             ",
+            "Import `dep::test_mod::TestTrait`",
         );
     }
 
     #[test]
     fn assoc_fn_cross_crate() {
-        check_assist(
+        check_assist_by_label(
+            auto_import,
+            r"
+            //- /main.rs crate:main deps:dep
+            fn main() {
+                dep::test_mod::TestStruct::test_func$0tion
+            }
+            //- /dep.rs crate:dep
+            pub mod test_mod {
+                pub trait TestTrait {
+                    fn test_function();
+                }
+                pub struct TestStruct {}
+                impl TestTrait for TestStruct {
+                    fn test_function() {}
+                }
+            }
+            ",
+            r"
+            use dep::test_mod::TestTrait as _;
+
+            fn main() {
+                dep::test_mod::TestStruct::test_function
+            }
+            ",
+            "Import `dep::test_mod::TestTrait as _`",
+        );
+
+        check_assist_by_label(
             auto_import,
             r"
             //- /main.rs crate:main deps:dep
@@ -945,12 +1158,41 @@ fn main() {
                 dep::test_mod::TestStruct::test_function
             }
             ",
+            "Import `dep::test_mod::TestTrait`",
         );
     }
 
     #[test]
     fn assoc_const_cross_crate() {
-        check_assist(
+        check_assist_by_label(
+            auto_import,
+            r"
+            //- /main.rs crate:main deps:dep
+            fn main() {
+                dep::test_mod::TestStruct::CONST$0
+            }
+            //- /dep.rs crate:dep
+            pub mod test_mod {
+                pub trait TestTrait {
+                    const CONST: bool;
+                }
+                pub struct TestStruct {}
+                impl TestTrait for TestStruct {
+                    const CONST: bool = true;
+                }
+            }
+            ",
+            r"
+            use dep::test_mod::TestTrait as _;
+
+            fn main() {
+                dep::test_mod::TestStruct::CONST
+            }
+            ",
+            "Import `dep::test_mod::TestTrait as _`",
+        );
+
+        check_assist_by_label(
             auto_import,
             r"
             //- /main.rs crate:main deps:dep
@@ -975,6 +1217,7 @@ fn main() {
                 dep::test_mod::TestStruct::CONST
             }
             ",
+            "Import `dep::test_mod::TestTrait`",
         );
     }
 
@@ -1308,6 +1551,41 @@ mod bar {
 }
 use foo::Foo$0;
 ",
+        );
+    }
+
+    #[test]
+    fn considers_pub_crate() {
+        check_assist(
+            auto_import,
+            r#"
+mod foo {
+    pub struct Foo;
+}
+
+pub(crate) use self::foo::*;
+
+mod bar {
+    fn main() {
+        Foo$0;
+    }
+}
+"#,
+            r#"
+mod foo {
+    pub struct Foo;
+}
+
+pub(crate) use self::foo::*;
+
+mod bar {
+    use crate::Foo;
+
+    fn main() {
+        Foo;
+    }
+}
+"#,
         );
     }
 }

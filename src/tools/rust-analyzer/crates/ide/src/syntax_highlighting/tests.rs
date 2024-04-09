@@ -22,11 +22,11 @@ fn attributes() {
     check_highlighting(
         r#"
 //- proc_macros: identity
-//- minicore: derive, copy
+//- minicore: derive, copy, default
 #[allow(dead_code)]
 #[rustfmt::skip]
 #[proc_macros::identity]
-#[derive(Copy)]
+#[derive(Default)]
 /// This is a doc comment
 // This is a normal comment
 /// This is a doc comment
@@ -36,7 +36,10 @@ fn attributes() {
 // This is another normal comment
 #[derive(Copy, Unresolved)]
 // The reason for these being here is to test AttrIds
-struct Foo;
+enum Foo {
+    #[default]
+    Bar
+}
 "#,
         expect_file!["./test_data/highlight_attributes.html"],
         false,
@@ -47,9 +50,12 @@ struct Foo;
 fn macros() {
     check_highlighting(
         r#"
-//- proc_macros: mirror
+//- proc_macros: mirror, identity, derive_identity
+//- minicore: fmt, include, concat
 //- /lib.rs crate:lib
-proc_macros::mirror! {
+use proc_macros::{mirror, identity, DeriveIdentity};
+
+mirror! {
     {
         ,i32 :x pub
         ,i32 :y pub
@@ -96,17 +102,11 @@ macro without_args {
     }
 }
 
-#[rustc_builtin_macro]
-macro_rules! concat {}
-#[rustc_builtin_macro]
-macro_rules! include {}
-#[rustc_builtin_macro]
-macro_rules! format_args {}
 
 include!(concat!("foo/", "foo.rs"));
 
 fn main() {
-    format_args!("Hello, {}!", 92);
+    format_args!("Hello, {}!", (92,).0);
     dont_color_me_braces!();
     noop!(noop!(1));
 }
@@ -401,51 +401,42 @@ fn test_string_highlighting() {
     // thus, we have to copy the macro definition from `std`
     check_highlighting(
         r#"
-//- minicore: fmt
+//- minicore: fmt, assert, asm, concat, panic
 macro_rules! println {
     ($($arg:tt)*) => ({
         $crate::io::_print(format_args_nl!($($arg)*));
     })
 }
-#[rustc_builtin_macro]
-#[macro_export]
-macro_rules! format_args_nl {}
 
 mod panic {
     pub macro panic_2015 {
         () => (
-            $crate::panicking::panic("explicit panic")
+            panic("explicit panic")
         ),
         ($msg:literal $(,)?) => (
-            $crate::panicking::panic($msg)
+            panic($msg)
         ),
         // Use `panic_str` instead of `panic_display::<&str>` for non_fmt_panic lint.
         ($msg:expr $(,)?) => (
-            $crate::panicking::panic_str($msg)
+            panic_str($msg)
         ),
         // Special-case the single-argument case for const_panic.
         ("{}", $arg:expr $(,)?) => (
-            $crate::panicking::panic_display(&$arg)
+            panic_display(&$arg)
         ),
         ($fmt:expr, $($arg:tt)+) => (
-            $crate::panicking::panic_fmt(const_format_args!($fmt, $($arg)+))
+            panic_fmt(const_format_args!($fmt, $($arg)+))
         ),
     }
 }
 
-#[rustc_builtin_macro(std_panic)]
-#[macro_export]
-macro_rules! panic {}
-#[rustc_builtin_macro]
-macro_rules! assert {}
-#[rustc_builtin_macro]
-macro_rules! asm {}
-#[rustc_builtin_macro]
-macro_rules! concat {}
-
 macro_rules! toho {
     () => ($crate::panic!("not yet implemented"));
     ($($arg:tt)+) => ($crate::panic!("not yet implemented: {}", format_args!($($arg)+)));
+}
+
+macro_rules! reuse_twice {
+    ($literal:literal) => {{stringify!($literal); format_args!($literal)}};
 }
 
 fn main() {
@@ -538,8 +529,11 @@ fn main() {
         in(reg) i,
     );
 
+    const CONSTANT: () = ():
+    let mut m = ();
     format_args!(concat!("{}"), "{}");
-    format_args!("{} {} {} {} {} {}", backslash, format_args!("{}", 0), foo, "bar", toho!(), backslash);
+    format_args!("{} {} {} {} {} {} {backslash} {CONSTANT} {m}", backslash, format_args!("{}", 0), foo, "bar", toho!(), backslash);
+    reuse_twice!("{backslash}");
 }"#,
         expect_file!["./test_data/highlight_strings.html"],
         false,
@@ -634,6 +628,52 @@ fn main() {
 }
 "#,
         expect_file!["./test_data/highlight_unsafe.html"],
+        false,
+    );
+}
+
+#[test]
+fn test_const_highlighting() {
+    check_highlighting(
+        r#"
+macro_rules! id {
+    ($($tt:tt)*) => {
+        $($tt)*
+    };
+}
+const CONST_ITEM: *const () = &raw const ();
+const fn const_fn<const CONST_PARAM: ()>(const {}: const fn()) where (): const ConstTrait {
+    CONST_ITEM;
+    CONST_PARAM;
+    const {
+        const || {}
+    }
+    id!(
+        CONST_ITEM;
+        CONST_PARAM;
+        const {
+            const || {}
+        };
+        &raw const ();
+        const
+    );
+}
+trait ConstTrait {
+    const ASSOC_CONST: () = ();
+    const fn assoc_const_fn() {}
+}
+impl const ConstTrait for () {
+    const ASSOC_CONST: () = ();
+    const fn assoc_const_fn() {}
+}
+
+macro_rules! unsafe_deref {
+    () => {
+        *(&() as *const ())
+    };
+}
+"#,
+        expect_file!["./test_data/highlight_const.html"],
         false,
     );
 }
@@ -1002,10 +1042,6 @@ pub struct Struct;
 }
 
 #[test]
-#[cfg_attr(
-    not(all(unix, target_pointer_width = "64")),
-    ignore = "depends on `DefaultHasher` outputs"
-)]
 fn test_rainbow_highlighting() {
     check_highlighting(
         r#"
@@ -1024,6 +1060,35 @@ fn bar() {
 "#,
         expect_file!["./test_data/highlight_rainbow.html"],
         true,
+    );
+}
+
+#[test]
+fn test_block_mod_items() {
+    check_highlighting(
+        r#"
+macro_rules! foo {
+    ($foo:ident) => {
+        mod y {
+            struct $foo;
+        }
+    };
+}
+fn main() {
+    foo!(Foo);
+    mod module {
+        // FIXME: IDE layer has this unresolved
+        foo!(Bar);
+        fn func() {
+            mod inner {
+                struct Innerest<const C: usize> { field: [(); {C}] }
+            }
+        }
+    }
+}
+"#,
+        expect_file!["./test_data/highlight_block_mod_items.html"],
+        false,
     );
 }
 
@@ -1157,8 +1222,27 @@ fn benchmark_syntax_highlighting_parser() {
             .highlight(HL_CONFIG, file_id)
             .unwrap()
             .iter()
-            .filter(|it| it.highlight.tag == HlTag::Symbol(SymbolKind::Function))
+            .filter(|it| {
+                matches!(it.highlight.tag, HlTag::Symbol(SymbolKind::Function | SymbolKind::Method))
+            })
             .count()
     };
     assert_eq!(hash, 1169);
+}
+
+#[test]
+fn highlight_trait_with_lifetimes_regression_16958() {
+    let (analysis, file_id) = fixture::file(
+        r#"
+pub trait Deserialize<'de> {
+    fn deserialize();
+}
+
+fn f<'de, T: Deserialize<'de>>() {
+    T::deserialize();
+}
+"#
+        .trim(),
+    );
+    let _ = analysis.highlight(HL_CONFIG, file_id).unwrap();
 }

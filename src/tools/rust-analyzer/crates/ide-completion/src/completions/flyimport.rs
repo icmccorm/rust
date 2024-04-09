@@ -13,9 +13,8 @@ use crate::{
         TypeLocation,
     },
     render::{render_resolution_with_import, render_resolution_with_import_pat, RenderContext},
+    Completions,
 };
-
-use super::Completions;
 
 // Feature: Completion With Autoimport
 //
@@ -208,11 +207,10 @@ fn import_on_the_fly(
     position: SyntaxNode,
     potential_import_name: String,
 ) -> Option<()> {
-    let _p = profile::span("import_on_the_fly").detail(|| potential_import_name.clone());
+    let _p =
+        tracing::span!(tracing::Level::INFO, "import_on_the_fly", ?potential_import_name).entered();
 
-    if ImportScope::find_insert_use_container(&position, &ctx.sema).is_none() {
-        return None;
-    }
+    ImportScope::find_insert_use_container(&position, &ctx.sema)?;
 
     let ns_filter = |import: &LocatedImport| {
         match (kind, import.original_item) {
@@ -240,6 +238,8 @@ fn import_on_the_fly(
             (PathKind::Type { location }, ItemInNs::Types(ty)) => {
                 if matches!(location, TypeLocation::TypeBound) {
                     matches!(ty, ModuleDef::Trait(_))
+                } else if matches!(location, TypeLocation::ImplTrait) {
+                    matches!(ty, ModuleDef::Trait(_) | ModuleDef::Module(_))
                 } else {
                     true
                 }
@@ -258,8 +258,12 @@ fn import_on_the_fly(
     let user_input_lowercased = potential_import_name.to_lowercase();
 
     import_assets
-        .search_for_imports(&ctx.sema, ctx.config.insert_use.prefix_kind, ctx.config.prefer_no_std)
-        .into_iter()
+        .search_for_imports(
+            &ctx.sema,
+            ctx.config.insert_use.prefix_kind,
+            ctx.config.prefer_no_std,
+            ctx.config.prefer_prelude,
+        )
         .filter(ns_filter)
         .filter(|import| {
             let original_item = &import.original_item;
@@ -267,8 +271,14 @@ fn import_on_the_fly(
                 && !ctx.is_item_hidden(original_item)
                 && ctx.check_stability(original_item.attrs(ctx.db).as_deref())
         })
-        .sorted_by_key(|located_import| {
-            compute_fuzzy_completion_order_key(&located_import.import_path, &user_input_lowercased)
+        .sorted_by(|a, b| {
+            let key = |import_path| {
+                (
+                    compute_fuzzy_completion_order_key(import_path, &user_input_lowercased),
+                    import_path,
+                )
+            };
+            key(&a.import_path).cmp(&key(&b.import_path))
         })
         .filter_map(|import| {
             render_resolution_with_import(RenderContext::new(ctx), path_ctx, import)
@@ -286,11 +296,10 @@ fn import_on_the_fly_pat_(
     position: SyntaxNode,
     potential_import_name: String,
 ) -> Option<()> {
-    let _p = profile::span("import_on_the_fly_pat").detail(|| potential_import_name.clone());
+    let _p = tracing::span!(tracing::Level::INFO, "import_on_the_fly_pat", ?potential_import_name)
+        .entered();
 
-    if ImportScope::find_insert_use_container(&position, &ctx.sema).is_none() {
-        return None;
-    }
+    ImportScope::find_insert_use_container(&position, &ctx.sema)?;
 
     let ns_filter = |import: &LocatedImport| match import.original_item {
         ItemInNs::Macros(mac) => mac.is_fn_like(ctx.db),
@@ -300,8 +309,12 @@ fn import_on_the_fly_pat_(
     let user_input_lowercased = potential_import_name.to_lowercase();
 
     import_assets
-        .search_for_imports(&ctx.sema, ctx.config.insert_use.prefix_kind, ctx.config.prefer_no_std)
-        .into_iter()
+        .search_for_imports(
+            &ctx.sema,
+            ctx.config.insert_use.prefix_kind,
+            ctx.config.prefer_no_std,
+            ctx.config.prefer_prelude,
+        )
         .filter(ns_filter)
         .filter(|import| {
             let original_item = &import.original_item;
@@ -309,8 +322,14 @@ fn import_on_the_fly_pat_(
                 && !ctx.is_item_hidden(original_item)
                 && ctx.check_stability(original_item.attrs(ctx.db).as_deref())
         })
-        .sorted_by_key(|located_import| {
-            compute_fuzzy_completion_order_key(&located_import.import_path, &user_input_lowercased)
+        .sorted_by(|a, b| {
+            let key = |import_path| {
+                (
+                    compute_fuzzy_completion_order_key(import_path, &user_input_lowercased),
+                    import_path,
+                )
+            };
+            key(&a.import_path).cmp(&key(&b.import_path))
         })
         .filter_map(|import| {
             render_resolution_with_import_pat(RenderContext::new(ctx), pattern_ctx, import)
@@ -328,29 +347,38 @@ fn import_on_the_fly_method(
     position: SyntaxNode,
     potential_import_name: String,
 ) -> Option<()> {
-    let _p = profile::span("import_on_the_fly_method").detail(|| potential_import_name.clone());
+    let _p =
+        tracing::span!(tracing::Level::INFO, "import_on_the_fly_method", ?potential_import_name)
+            .entered();
 
-    if ImportScope::find_insert_use_container(&position, &ctx.sema).is_none() {
-        return None;
-    }
+    ImportScope::find_insert_use_container(&position, &ctx.sema)?;
 
     let user_input_lowercased = potential_import_name.to_lowercase();
 
     import_assets
-        .search_for_imports(&ctx.sema, ctx.config.insert_use.prefix_kind, ctx.config.prefer_no_std)
-        .into_iter()
+        .search_for_imports(
+            &ctx.sema,
+            ctx.config.insert_use.prefix_kind,
+            ctx.config.prefer_no_std,
+            ctx.config.prefer_prelude,
+        )
         .filter(|import| {
             !ctx.is_item_hidden(&import.item_to_import)
                 && !ctx.is_item_hidden(&import.original_item)
         })
-        .sorted_by_key(|located_import| {
-            compute_fuzzy_completion_order_key(&located_import.import_path, &user_input_lowercased)
+        .sorted_by(|a, b| {
+            let key = |import_path| {
+                (
+                    compute_fuzzy_completion_order_key(import_path, &user_input_lowercased),
+                    import_path,
+                )
+            };
+            key(&a.import_path).cmp(&key(&b.import_path))
         })
-        .for_each(|import| match import.original_item {
-            ItemInNs::Values(hir::ModuleDef::Function(f)) => {
+        .for_each(|import| {
+            if let ItemInNs::Values(hir::ModuleDef::Function(f)) = import.original_item {
                 acc.add_method_with_import(ctx, dot_access, f, import);
             }
-            _ => (),
         });
     Some(())
 }
@@ -369,6 +397,14 @@ fn import_assets_for_path(
     potential_import_name: &str,
     qualifier: Option<ast::Path>,
 ) -> Option<ImportAssets> {
+    let _p = tracing::span!(
+        tracing::Level::INFO,
+        "import_assets_for_path",
+        ?potential_import_name,
+        ?qualifier
+    )
+    .entered();
+
     let fuzzy_name_length = potential_import_name.len();
     let mut assets_for_path = ImportAssets::for_fuzzy_path(
         ctx.module,
@@ -377,9 +413,12 @@ fn import_assets_for_path(
         &ctx.sema,
         ctx.token.parent()?,
     )?;
-    if fuzzy_name_length < 3 {
-        cov_mark::hit!(flyimport_exact_on_short_path);
-        assets_for_path.path_fuzzy_name_to_exact(false);
+    if fuzzy_name_length == 0 {
+        // nothing matches the empty string exactly, but we still compute assoc items in this case
+        assets_for_path.path_fuzzy_name_to_exact();
+    } else if fuzzy_name_length < 3 {
+        cov_mark::hit!(flyimport_prefix_on_short_path);
+        assets_for_path.path_fuzzy_name_to_prefix();
     }
     Some(assets_for_path)
 }
@@ -390,7 +429,8 @@ fn compute_fuzzy_completion_order_key(
 ) -> usize {
     cov_mark::hit!(certain_fuzzy_order_test);
     let import_name = match proposed_mod_path.segments().last() {
-        Some(name) => name.to_smol_str().to_lowercase(),
+        // FIXME: nasty alloc, this is a hot path!
+        Some(name) => name.to_smol_str().to_ascii_lowercase(),
         None => return usize::MAX,
     };
     match import_name.match_indices(user_input_lowercased).next() {

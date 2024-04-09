@@ -1,6 +1,6 @@
 use super::{repeat, BorrowedBuf, Cursor, SeekFrom};
 use crate::cmp::{self, min};
-use crate::io::{self, IoSlice, IoSliceMut};
+use crate::io::{self, IoSlice, IoSliceMut, DEFAULT_BUF_SIZE};
 use crate::io::{BufRead, BufReader, Read, Seek, Write};
 use crate::mem::MaybeUninit;
 use crate::ops::Deref;
@@ -23,6 +23,36 @@ fn read_until() {
     v.truncate(0);
     assert_eq!(buf.read_until(b'3', &mut v).unwrap(), 0);
     assert_eq!(v, []);
+}
+
+#[test]
+fn skip_until() {
+    let bytes: &[u8] = b"read\0ignore\0read\0ignore\0read\0ignore\0";
+    let mut reader = BufReader::new(bytes);
+
+    // read from the bytes, alternating between
+    // consuming `read\0`s and skipping `ignore\0`s
+    loop {
+        // consume `read\0`
+        let mut out = Vec::new();
+        let read = reader.read_until(0, &mut out).unwrap();
+        if read == 0 {
+            // eof
+            break;
+        } else {
+            assert_eq!(out, b"read\0");
+            assert_eq!(read, b"read\0".len());
+        }
+
+        // skip past `ignore\0`
+        let skipped = reader.skip_until(0).unwrap();
+        assert_eq!(skipped, b"ignore\0".len());
+    }
+
+    // ensure we are at the end of the byte slice and that we can skip no further
+    // also ensure skip_until matches the behavior of read_until at EOF
+    let skipped = reader.skip_until(0).unwrap();
+    assert_eq!(skipped, 0);
 }
 
 #[test]
@@ -229,6 +259,17 @@ fn chain_bufread() {
         (&testdata[..3]).chain(&testdata[3..6]).chain(&testdata[6..9]).chain(&testdata[9..]);
     let chain2 = (&testdata[..4]).chain(&testdata[4..8]).chain(&testdata[8..]);
     cmp_bufread(chain1, chain2, &testdata[..]);
+}
+
+#[test]
+fn chain_splitted_char() {
+    let chain = b"\xc3".chain(b"\xa9".as_slice());
+    assert_eq!(crate::io::read_to_string(chain).unwrap(), "é");
+
+    let mut chain = b"\xc3".chain(b"\xa9\n".as_slice());
+    let mut buf = String::new();
+    assert_eq!(chain.read_line(&mut buf).unwrap(), 3);
+    assert_eq!(buf, "é\n");
 }
 
 #[test]
@@ -621,4 +662,45 @@ fn bench_take_read_buf(b: &mut test::Bencher) {
 
         [255; 128].take(64).read_buf(buf.unfilled()).unwrap();
     });
+}
+
+// Issue #120603
+#[test]
+#[should_panic]
+fn read_buf_broken_read() {
+    struct MalformedRead;
+
+    impl Read for MalformedRead {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            // broken length calculation
+            Ok(buf.len() + 1)
+        }
+    }
+
+    let _ = BufReader::new(MalformedRead).fill_buf();
+}
+
+#[test]
+fn read_buf_full_read() {
+    struct FullRead;
+
+    impl Read for FullRead {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+    }
+
+    assert_eq!(BufReader::new(FullRead).fill_buf().unwrap().len(), DEFAULT_BUF_SIZE);
+}
+
+#[test]
+// Miri does not support signalling OOM
+#[cfg_attr(miri, ignore)]
+// 64-bit only to be sure the allocator will fail fast on an impossible to satsify size
+#[cfg(target_pointer_width = "64")]
+fn try_oom_error() {
+    let mut v = Vec::<u8>::new();
+    let reserve_err = v.try_reserve(isize::MAX as usize - 1).unwrap_err();
+    let io_err = io::Error::from(reserve_err);
+    assert_eq!(io::ErrorKind::OutOfMemory, io_err.kind());
 }

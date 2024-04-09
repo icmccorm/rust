@@ -8,8 +8,8 @@ pub use crate::def_id::DefPathHash;
 use crate::def_id::{CrateNum, DefIndex, LocalDefId, StableCrateId, CRATE_DEF_INDEX, LOCAL_CRATE};
 use crate::def_path_hash_map::DefPathHashMap;
 
-use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::stable_hasher::{Hash64, StableHasher};
+use rustc_data_structures::unord::UnordMap;
 use rustc_index::IndexVec;
 use rustc_span::symbol::{kw, sym, Symbol};
 
@@ -20,27 +20,42 @@ use std::hash::Hash;
 /// Internally the `DefPathTable` holds a tree of `DefKey`s, where each `DefKey`
 /// stores the `DefIndex` of its parent.
 /// There is one `DefPathTable` for each crate.
-#[derive(Clone, Default, Debug)]
+#[derive(Debug)]
 pub struct DefPathTable {
+    stable_crate_id: StableCrateId,
     index_to_key: IndexVec<DefIndex, DefKey>,
-    def_path_hashes: IndexVec<DefIndex, DefPathHash>,
+    // We do only store the local hash, as all the definitions are from the current crate.
+    def_path_hashes: IndexVec<DefIndex, Hash64>,
     def_path_hash_to_index: DefPathHashMap,
 }
 
 impl DefPathTable {
+    fn new(stable_crate_id: StableCrateId) -> DefPathTable {
+        DefPathTable {
+            stable_crate_id,
+            index_to_key: Default::default(),
+            def_path_hashes: Default::default(),
+            def_path_hash_to_index: Default::default(),
+        }
+    }
+
     fn allocate(&mut self, key: DefKey, def_path_hash: DefPathHash) -> DefIndex {
+        // Assert that all DefPathHashes correctly contain the local crate's StableCrateId.
+        debug_assert_eq!(self.stable_crate_id, def_path_hash.stable_crate_id());
+        let local_hash = def_path_hash.local_hash();
+
         let index = {
             let index = DefIndex::from(self.index_to_key.len());
             debug!("DefPathTable::insert() - {:?} <-> {:?}", key, index);
             self.index_to_key.push(key);
             index
         };
-        self.def_path_hashes.push(def_path_hash);
+        self.def_path_hashes.push(local_hash);
         debug_assert!(self.def_path_hashes.len() == self.index_to_key.len());
 
         // Check for hash collisions of DefPathHashes. These should be
         // exceedingly rare.
-        if let Some(existing) = self.def_path_hash_to_index.insert(&def_path_hash, &index) {
+        if let Some(existing) = self.def_path_hash_to_index.insert(&local_hash, &index) {
             let def_path1 = DefPath::make(LOCAL_CRATE, existing, |idx| self.def_key(idx));
             let def_path2 = DefPath::make(LOCAL_CRATE, index, |idx| self.def_key(idx));
 
@@ -58,13 +73,6 @@ impl DefPathTable {
             );
         }
 
-        // Assert that all DefPathHashes correctly contain the local crate's
-        // StableCrateId
-        #[cfg(debug_assertions)]
-        if let Some(root) = self.def_path_hashes.get(CRATE_DEF_INDEX) {
-            assert!(def_path_hash.stable_crate_id() == root.stable_crate_id());
-        }
-
         index
     }
 
@@ -73,19 +81,19 @@ impl DefPathTable {
         self.index_to_key[index]
     }
 
+    #[instrument(level = "trace", skip(self), ret)]
     #[inline(always)]
     pub fn def_path_hash(&self, index: DefIndex) -> DefPathHash {
         let hash = self.def_path_hashes[index];
-        debug!("def_path_hash({:?}) = {:?}", index, hash);
-        hash
+        DefPathHash::new(self.stable_crate_id, hash)
     }
 
     pub fn enumerated_keys_and_path_hashes(
         &self,
-    ) -> impl Iterator<Item = (DefIndex, &DefKey, &DefPathHash)> + ExactSizeIterator + '_ {
+    ) -> impl Iterator<Item = (DefIndex, &DefKey, DefPathHash)> + ExactSizeIterator + '_ {
         self.index_to_key
             .iter_enumerated()
-            .map(move |(index, key)| (index, key, &self.def_path_hashes[index]))
+            .map(move |(index, key)| (index, key, self.def_path_hash(index)))
     }
 }
 
@@ -95,10 +103,7 @@ impl DefPathTable {
 #[derive(Debug)]
 pub struct Definitions {
     table: DefPathTable,
-    next_disambiguator: FxHashMap<(LocalDefId, DefPathData), u32>,
-
-    /// The [StableCrateId] of the local crate.
-    stable_crate_id: StableCrateId,
+    next_disambiguator: UnordMap<(LocalDefId, DefPathData), u32>,
 }
 
 /// A unique identifier that we can use to lookup a definition
@@ -246,6 +251,7 @@ impl DefPath {
     }
 }
 
+/// New variants should only be added in synchronization with `enum DefKind`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Encodable, Decodable)]
 pub enum DefPathData {
     // Root: these should only be used for the root nodes, because
@@ -271,7 +277,7 @@ pub enum DefPathData {
     /// Something in the lifetime namespace.
     LifetimeNs(Symbol),
     /// A closure expression.
-    ClosureExpr,
+    Closure,
 
     // Subportions of items:
     /// Implicit constructor for a unit or tuple-like struct or enum variant.
@@ -280,9 +286,9 @@ pub enum DefPathData {
     AnonConst,
     /// An existential `impl Trait` type node.
     /// Argument position `impl Trait` have a `TypeNs` with their pretty-printed name.
-    ImplTrait,
-    /// `impl Trait` generated associated type node.
-    ImplTraitAssocTy,
+    OpaqueTy,
+    /// An anonymous struct or union type i.e. `struct { foo: Type }` or `union { bar: Type }`
+    AnonAdt,
 }
 
 impl Definitions {
@@ -330,11 +336,11 @@ impl Definitions {
         let def_path_hash = key.compute_stable_hash(parent_hash);
 
         // Create the root definition.
-        let mut table = DefPathTable::default();
+        let mut table = DefPathTable::new(stable_crate_id);
         let root = LocalDefId { local_def_index: table.allocate(key, def_path_hash) };
         assert_eq!(root.local_def_index, CRATE_DEF_INDEX);
 
-        Definitions { table, next_disambiguator: Default::default(), stable_crate_id }
+        Definitions { table, next_disambiguator: Default::default() }
     }
 
     /// Adds a definition with a parent definition.
@@ -374,14 +380,19 @@ impl Definitions {
     pub fn local_def_path_hash_to_def_id(
         &self,
         hash: DefPathHash,
-        err: &mut dyn FnMut() -> !,
+        err_msg: &dyn std::fmt::Debug,
     ) -> LocalDefId {
-        debug_assert!(hash.stable_crate_id() == self.stable_crate_id);
+        debug_assert!(hash.stable_crate_id() == self.table.stable_crate_id);
+        #[cold]
+        #[inline(never)]
+        fn err(err_msg: &dyn std::fmt::Debug) -> ! {
+            panic!("{err_msg:?}")
+        }
         self.table
             .def_path_hash_to_index
-            .get(&hash)
+            .get(&hash.local_hash())
             .map(|local_def_index| LocalDefId { local_def_index })
-            .unwrap_or_else(|| err())
+            .unwrap_or_else(|| err(err_msg))
     }
 
     pub fn def_path_hash_to_def_index_map(&self) -> &DefPathHashMap {
@@ -403,16 +414,20 @@ impl DefPathData {
     pub fn get_opt_name(&self) -> Option<Symbol> {
         use self::DefPathData::*;
         match *self {
+            TypeNs(name) if name == kw::Empty => None,
             TypeNs(name) | ValueNs(name) | MacroNs(name) | LifetimeNs(name) => Some(name),
 
-            Impl | ForeignMod | CrateRoot | Use | GlobalAsm | ClosureExpr | Ctor | AnonConst
-            | ImplTrait | ImplTraitAssocTy => None,
+            Impl | ForeignMod | CrateRoot | Use | GlobalAsm | Closure | Ctor | AnonConst
+            | OpaqueTy | AnonAdt => None,
         }
     }
 
     pub fn name(&self) -> DefPathDataName {
         use self::DefPathData::*;
         match *self {
+            TypeNs(name) if name == kw::Empty => {
+                DefPathDataName::Anon { namespace: sym::synthetic }
+            }
             TypeNs(name) | ValueNs(name) | MacroNs(name) | LifetimeNs(name) => {
                 DefPathDataName::Named(name)
             }
@@ -422,10 +437,11 @@ impl DefPathData {
             ForeignMod => DefPathDataName::Anon { namespace: kw::Extern },
             Use => DefPathDataName::Anon { namespace: kw::Use },
             GlobalAsm => DefPathDataName::Anon { namespace: sym::global_asm },
-            ClosureExpr => DefPathDataName::Anon { namespace: sym::closure },
+            Closure => DefPathDataName::Anon { namespace: sym::closure },
             Ctor => DefPathDataName::Anon { namespace: sym::constructor },
             AnonConst => DefPathDataName::Anon { namespace: sym::constant },
-            ImplTrait | ImplTraitAssocTy => DefPathDataName::Anon { namespace: sym::opaque },
+            OpaqueTy => DefPathDataName::Anon { namespace: sym::opaque },
+            AnonAdt => DefPathDataName::Anon { namespace: sym::anon_adt },
         }
     }
 }

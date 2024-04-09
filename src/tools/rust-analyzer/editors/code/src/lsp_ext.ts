@@ -68,14 +68,57 @@ export const viewItemTree = new lc.RequestType<ViewItemTreeParams, string, void>
     "rust-analyzer/viewItemTree",
 );
 
+export type DiscoverTestParams = { testId?: string | undefined };
+export type RunTestParams = {
+    include?: string[] | undefined;
+    exclude?: string[] | undefined;
+};
+export type TestItem = {
+    id: string;
+    label: string;
+    kind: "package" | "module" | "test";
+    canResolveChildren: boolean;
+    parent?: string | undefined;
+    textDocument?: lc.TextDocumentIdentifier | undefined;
+    range?: lc.Range | undefined;
+    runnable?: Runnable | undefined;
+};
+export type DiscoverTestResults = {
+    tests: TestItem[];
+    scope: string[] | undefined;
+    scopeFile: lc.TextDocumentIdentifier[] | undefined;
+};
+export type TestState =
+    | { tag: "failed"; message: string }
+    | { tag: "passed" }
+    | { tag: "started" }
+    | { tag: "enqueued" }
+    | { tag: "skipped" };
+export type ChangeTestStateParams = { testId: string; state: TestState };
+export const discoverTest = new lc.RequestType<DiscoverTestParams, DiscoverTestResults, void>(
+    "experimental/discoverTest",
+);
+export const discoveredTests = new lc.NotificationType<DiscoverTestResults>(
+    "experimental/discoveredTests",
+);
+export const runTest = new lc.RequestType<RunTestParams, void, void>("experimental/runTest");
+export const abortRunTest = new lc.NotificationType0("experimental/abortRunTest");
+export const endRunTest = new lc.NotificationType0("experimental/endRunTest");
+export const appendOutputToRunTest = new lc.NotificationType<string>(
+    "experimental/appendOutputToRunTest",
+);
+export const changeTestState = new lc.NotificationType<ChangeTestStateParams>(
+    "experimental/changeTestState",
+);
+
 export type AnalyzerStatusParams = { textDocument?: lc.TextDocumentIdentifier };
 
 export interface FetchDependencyListParams {}
 
 export interface FetchDependencyListResult {
     crates: {
-        name: string | undefined;
-        version: string | undefined;
+        name?: string;
+        version?: string;
         path: string;
     }[];
 }
@@ -135,7 +178,11 @@ export const onEnter = new lc.RequestType<lc.TextDocumentPositionParams, lc.Text
 export const openCargoToml = new lc.RequestType<OpenCargoTomlParams, lc.Location, void>(
     "experimental/openCargoToml",
 );
-export const openDocs = new lc.RequestType<lc.TextDocumentPositionParams, string | void, void>(
+export interface DocsUrls {
+    local?: string;
+    web?: string;
+}
+export const openDocs = new lc.RequestType<lc.TextDocumentPositionParams, DocsUrls, void>(
     "experimental/externalDocs",
 );
 export const parentModule = new lc.RequestType<
@@ -216,3 +263,9 @@ export type RecursiveMemoryLayoutNode = {
 export type RecursiveMemoryLayout = {
     nodes: RecursiveMemoryLayoutNode[];
 };
+
+export const unindexedProject = new lc.NotificationType<UnindexedProjectParams>(
+    "rust-analyzer/unindexedProject",
+);
+
+export type UnindexedProjectParams = { textDocuments: lc.TextDocumentIdentifier[] };

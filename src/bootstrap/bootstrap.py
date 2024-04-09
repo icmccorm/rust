@@ -211,7 +211,7 @@ def require(cmd, exit=True, exception=False):
         if exception:
             raise
         elif exit:
-            eprint("error: unable to run `{}`: {}".format(' '.join(cmd), exc))
+            eprint("ERROR: unable to run `{}`: {}".format(' '.join(cmd), exc))
             eprint("Please make sure it's installed and in the path.")
             sys.exit(1)
         return None
@@ -557,7 +557,9 @@ class RustBuild(object):
                 shutil.rmtree(bin_root)
 
             key = self.stage0_compiler.date
-            cache_dst = os.path.join(self.build_dir, "cache")
+            cache_dst = (self.get_toml('bootstrap-cache-path', 'build') or
+                os.path.join(self.build_dir, "cache"))
+
             rustc_cache = os.path.join(cache_dst, key)
             if not os.path.exists(rustc_cache):
                 os.makedirs(rustc_cache)
@@ -610,27 +612,17 @@ class RustBuild(object):
                 self.fix_bin_or_dylib("{}/libexec/rust-analyzer-proc-macro-srv".format(bin_root))
                 lib_dir = "{}/lib".format(bin_root)
                 for lib in os.listdir(lib_dir):
-                    if lib.endswith(".so"):
-                        self.fix_bin_or_dylib(os.path.join(lib_dir, lib))
+                    # .so is not necessarily the suffix, there can be version numbers afterwards.
+                    if ".so" in lib:
+                        elf_path = os.path.join(lib_dir, lib)
+                        with open(elf_path, "rb") as f:
+                            magic = f.read(4)
+                            # Patchelf will skip non-ELF files, but issue a warning.
+                            if magic == b"\x7fELF":
+                                self.fix_bin_or_dylib(elf_path)
 
             with output(self.rustc_stamp()) as rust_stamp:
                 rust_stamp.write(key)
-
-    def _download_component_helper(
-        self, filename, pattern, tarball_suffix, rustc_cache,
-    ):
-        key = self.stage0_compiler.date
-
-        tarball = os.path.join(rustc_cache, filename)
-        if not os.path.exists(tarball):
-            get(
-                self.download_url,
-                "dist/{}/{}".format(key, filename),
-                tarball,
-                self.checksums_sha256,
-                verbose=self.verbose,
-            )
-        unpack(tarball, tarball_suffix, self.bin_root(), match=pattern, verbose=self.verbose)
 
     def should_fix_bins_and_dylibs(self):
         """Whether or not `fix_bin_or_dylib` needs to be run; can only be True
@@ -681,7 +673,7 @@ class RustBuild(object):
 
         answer = self._should_fix_bins_and_dylibs = get_answer()
         if answer:
-            eprint("info: You seem to be using Nix.")
+            eprint("INFO: You seem to be using Nix.")
         return answer
 
     def fix_bin_or_dylib(self, fname):
@@ -727,7 +719,7 @@ class RustBuild(object):
                     "nix-build", "-E", nix_expr, "-o", nix_deps_dir,
                 ])
             except subprocess.CalledProcessError as reason:
-                eprint("warning: failed to call nix-build:", reason)
+                eprint("WARNING: failed to call nix-build:", reason)
                 return
             self.nix_deps_dir = nix_deps_dir
 
@@ -739,7 +731,7 @@ class RustBuild(object):
             os.path.join(os.path.realpath(nix_deps_dir), "lib")
         ]
         patchelf_args = ["--set-rpath", ":".join(rpath_entries)]
-        if not fname.endswith(".so"):
+        if ".so" not in fname:
             # Finally, set the correct .interp for binaries
             with open("{}/nix-support/dynamic-linker".format(nix_deps_dir)) as dynamic_linker:
                 patchelf_args += ["--set-interpreter", dynamic_linker.read().rstrip()]
@@ -747,7 +739,7 @@ class RustBuild(object):
         try:
             subprocess.check_output([patchelf] + patchelf_args + [fname])
         except subprocess.CalledProcessError as reason:
-            eprint("warning: failed to call patchelf:", reason)
+            eprint("WARNING: failed to call patchelf:", reason)
             return
 
     def rustc_stamp(self):
@@ -933,8 +925,36 @@ class RustBuild(object):
             if toml_val is not None:
                 env["{}_{}".format(var_name, host_triple_sanitized)] = toml_val
 
-        # preserve existing RUSTFLAGS
-        env.setdefault("RUSTFLAGS", "")
+        # In src/etc/rust_analyzer_settings.json, we configure rust-analyzer to
+        # pass RUSTC_BOOTSTRAP=1 to all cargo invocations because the standard
+        # library uses unstable Cargo features. Without RUSTC_BOOTSTRAP,
+        # rust-analyzer would fail to fetch workspace layout when the system's
+        # default toolchain is not nightly.
+        #
+        # But that setting has the collateral effect of rust-analyzer also
+        # passing RUSTC_BOOTSTRAP=1 to all x.py invocations too (the various
+        # overrideCommand).
+        #
+        # Set a consistent RUSTC_BOOTSTRAP=1 here to prevent spurious rebuilds
+        # of bootstrap when rust-analyzer x.py invocations are interleaved with
+        # handwritten ones on the command line.
+        env["RUSTC_BOOTSTRAP"] = "1"
+
+        # If any of RUSTFLAGS or RUSTFLAGS_BOOTSTRAP are present and nonempty,
+        # we allow arbitrary compiler flags in there, including unstable ones
+        # such as `-Zthreads=8`.
+        #
+        # But if there aren't custom flags being passed to bootstrap, then we
+        # cancel the RUSTC_BOOTSTRAP=1 from above by passing `-Zallow-features=`
+        # to ensure unstable language or library features do not accidentally
+        # get introduced into bootstrap over time. Distros rely on being able to
+        # compile bootstrap with a variety of their toolchains, not necessarily
+        # the same as Rust's CI uses.
+        if env.get("RUSTFLAGS", "") or env.get("RUSTFLAGS_BOOTSTRAP", ""):
+            # Preserve existing RUSTFLAGS.
+            env.setdefault("RUSTFLAGS", "")
+        else:
+            env["RUSTFLAGS"] = "-Zallow-features="
 
         target_features = []
         if self.get_toml("crt-static", build_section) == "true":
@@ -946,6 +966,8 @@ class RustBuild(object):
         target_linker = self.get_toml("linker", build_section)
         if target_linker is not None:
             env["RUSTFLAGS"] += " -C linker=" + target_linker
+        # When changing this list, also update the corresponding list in `Builder::cargo`
+        # in `src/bootstrap/src/core/builder.rs`.
         env["RUSTFLAGS"] += " -Wrust_2018_idioms -Wunused_lifetimes"
         if self.warnings == "default":
             deny_warnings = self.get_toml("deny-warnings", "rust") != "false"
@@ -953,6 +975,13 @@ class RustBuild(object):
             deny_warnings = self.warnings == "deny"
         if deny_warnings:
             env["RUSTFLAGS"] += " -Dwarnings"
+
+        # Add RUSTFLAGS_BOOTSTRAP to RUSTFLAGS for bootstrap compilation.
+        # Note that RUSTFLAGS_BOOTSTRAP should always be added to the end of
+        # RUSTFLAGS to be actually effective (e.g., if we have `-Dwarnings` in
+        # RUSTFLAGS, passing `-Awarnings` from RUSTFLAGS_BOOTSTRAP should override it).
+        if "RUSTFLAGS_BOOTSTRAP" in env:
+            env["RUSTFLAGS"] += " " + env["RUSTFLAGS_BOOTSTRAP"]
 
         env["PATH"] = os.path.join(self.bin_root(), "bin") + \
             os.pathsep + env["PATH"]
@@ -998,7 +1027,7 @@ class RustBuild(object):
         if 'SUDO_USER' in os.environ and not self.use_vendored_sources:
             if os.getuid() == 0:
                 self.use_vendored_sources = True
-                eprint('info: looks like you\'re trying to run this command as root')
+                eprint('INFO: looks like you\'re trying to run this command as root')
                 eprint('      and so in order to preserve your $HOME this will now')
                 eprint('      use vendored sources by default.')
 
@@ -1009,15 +1038,25 @@ class RustBuild(object):
                 sync_dirs = "--sync ./src/tools/cargo/Cargo.toml " \
                             "--sync ./src/tools/rust-analyzer/Cargo.toml " \
                             "--sync ./compiler/rustc_codegen_cranelift/Cargo.toml " \
+                            "--sync ./compiler/rustc_codegen_gcc/Cargo.toml " \
                             "--sync ./src/bootstrap/Cargo.toml "
-                eprint('error: vendoring required, but vendor directory does not exist.')
+                eprint('ERROR: vendoring required, but vendor directory does not exist.')
                 eprint('       Run `cargo vendor {}` to initialize the '
                       'vendor directory.'.format(sync_dirs))
-                eprint('Alternatively, use the pre-vendored `rustc-src` dist component.')
+                eprint('       Alternatively, use the pre-vendored `rustc-src` dist component.')
+                eprint('       To get a stable/beta/nightly version, download it from: ')
+                eprint('       '
+                'https://forge.rust-lang.org/infra/other-installation-methods.html#source-code')
+                eprint('       To get a specific commit version, download it using the below URL,')
+                eprint('       replacing <commit> with a specific commit checksum: ')
+                eprint('       '
+                'https://ci-artifacts.rust-lang.org/rustc-builds/<commit>/rustc-nightly-src.tar.xz')
+                eprint('       Once you have the source downloaded, place the vendor directory')
+                eprint('       from the archive in the root of the rust project.')
                 raise Exception("{} not found".format(vendor_dir))
 
             if not os.path.exists(cargo_dir):
-                eprint('error: vendoring required, but .cargo/config does not exist.')
+                eprint('ERROR: vendoring required, but .cargo/config does not exist.')
                 raise Exception("{} not found".format(cargo_dir))
         else:
             if os.path.exists(cargo_dir):
@@ -1041,6 +1080,12 @@ def parse_args(args):
 def bootstrap(args):
     """Configure, fetch, build and run the initial bootstrap"""
     rust_root = os.path.abspath(os.path.join(__file__, '../../..'))
+
+    if not os.path.exists(os.path.join(rust_root, '.git')) and \
+            os.path.exists(os.path.join(rust_root, '.github')):
+        eprint("warn: Looks like you are trying to bootstrap Rust from a source that is neither a "
+               "git clone nor distributed tarball.\nThis build may fail due to missing submodules "
+               "unless you put them in place manually.")
 
     # Read from `--config`, then `RUST_BOOTSTRAP_CONFIG`, then `./config.toml`,
     # then `config.toml` in the root directory.
@@ -1070,6 +1115,11 @@ def bootstrap(args):
         include_file = 'config.{}.toml'.format(profile_aliases.get(profile) or profile)
         include_dir = os.path.join(rust_root, 'src', 'bootstrap', 'defaults')
         include_path = os.path.join(include_dir, include_file)
+
+        if not os.path.exists(include_path):
+            raise Exception("Unrecognized config profile '{}'. Check src/bootstrap/defaults"
+            " for available options.".format(profile))
+
         # HACK: This works because `self.get_toml()` returns the first match it finds for a
         # specific key, so appending our defaults at the end allows the user to override them
         with open(include_path) as included_toml:
@@ -1112,7 +1162,7 @@ def main():
     # process has to happen before anything is printed out.
     if help_triggered:
         eprint(
-            "info: Downloading and building bootstrap before processing --help command.\n"
+            "INFO: Downloading and building bootstrap before processing --help command.\n"
             "      See src/bootstrap/README.md for help with common commands.")
 
     exit_code = 0

@@ -7,12 +7,11 @@ mod prelude2021;
 pub mod probe;
 mod suggest;
 
-pub use self::suggest::{MethodCallComponents, SelfSource};
+pub use self::suggest::SelfSource;
 pub use self::MethodError::*;
 
-use crate::errors::OpMethodGenericParams;
 use crate::FnCtxt;
-use rustc_errors::{Applicability, Diagnostic, SubdiagnosticMessage};
+use rustc_errors::{Applicability, Diag, SubdiagMessage};
 use rustc_hir as hir;
 use rustc_hir::def::{CtorOf, DefKind, Namespace};
 use rustc_hir::def_id::DefId;
@@ -39,7 +38,7 @@ pub struct MethodCallee<'tcx> {
     pub args: GenericArgsRef<'tcx>,
 
     /// Instantiated method signature, i.e., it has been
-    /// substituted, normalized, and has had late-bound
+    /// instantiated, normalized, and has had late-bound
     /// lifetimes replaced with inference variables.
     pub sig: ty::FnSig<'tcx>,
 }
@@ -82,7 +81,7 @@ pub struct NoMatchData<'tcx> {
 
 // A pared down enum describing just the places from which a method
 // candidate can arise. Used for error reporting only.
-#[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum CandidateSource {
     Impl(DefId),
     Trait(DefId /* trait id */),
@@ -127,8 +126,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     #[instrument(level = "debug", skip(self, err, call_expr))]
     pub(crate) fn suggest_method_call(
         &self,
-        err: &mut Diagnostic,
-        msg: impl Into<SubdiagnosticMessage> + std::fmt::Debug,
+        err: &mut Diag<'_>,
+        msg: impl Into<SubdiagMessage> + std::fmt::Debug,
         method_name: Ident,
         self_ty: Ty<'tcx>,
         call_expr: &hir::Expr<'tcx>,
@@ -177,7 +176,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub fn lookup_method(
         &self,
         self_ty: Ty<'tcx>,
-        segment: &hir::PathSegment<'_>,
+        segment: &'tcx hir::PathSegment<'tcx>,
         span: Span,
         call_expr: &'tcx hir::Expr<'tcx>,
         self_expr: &'tcx hir::Expr<'tcx>,
@@ -201,11 +200,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         if let Some(span) = result.illegal_sized_bound {
             let mut needs_mut = false;
             if let ty::Ref(region, t_type, mutability) = self_ty.kind() {
-                let trait_type = Ty::new_ref(
-                    self.tcx,
-                    *region,
-                    ty::TypeAndMut { ty: *t_type, mutbl: mutability.invert() },
-                );
+                let trait_type = Ty::new_ref(self.tcx, *region, *t_type, mutability.invert());
                 // We probe again to see if there might be a borrow mutability discrepancy.
                 match self.lookup_probe(
                     segment.ident,
@@ -255,7 +250,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub fn lookup_method_for_diagnostic(
         &self,
         self_ty: Ty<'tcx>,
-        segment: &hir::PathSegment<'_>,
+        segment: &hir::PathSegment<'tcx>,
         span: Span,
         call_expr: &'tcx hir::Expr<'tcx>,
         self_expr: &'tcx hir::Expr<'tcx>,
@@ -385,32 +380,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // type parameters or early-bound regions.
         let tcx = self.tcx;
         let Some(method_item) = self.associated_value(trait_def_id, m_name) else {
-            tcx.sess.delay_span_bug(
-                obligation.cause.span,
-                "operator trait does not have corresponding operator method",
-            );
-            return None;
+            bug!("expected associated item for operator trait")
         };
 
-        if method_item.kind != ty::AssocKind::Fn {
-            self.tcx.sess.delay_span_bug(tcx.def_span(method_item.def_id), "not a method");
-            return None;
-        }
-
         let def_id = method_item.def_id;
-        let generics = tcx.generics_of(def_id);
-
-        if generics.params.len() != 0 {
-            tcx.sess.emit_fatal(OpMethodGenericParams {
-                span: tcx.def_span(method_item.def_id),
-                method_name: m_name.to_string(),
-            });
+        if method_item.kind != ty::AssocKind::Fn {
+            span_bug!(tcx.def_span(def_id), "expected `{m_name}` to be an associated function");
         }
 
         debug!("lookup_in_trait_adjusted: method_item={:?}", method_item);
         let mut obligations = vec![];
 
-        // Instantiate late-bound regions and substitute the trait
+        // Instantiate late-bound regions and instantiate the trait
         // parameters into the method type to get the actual method type.
         //
         // N.B., instantiate late-bound regions before normalizing the

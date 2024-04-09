@@ -1,7 +1,7 @@
 use crate::arena::Arena;
 use rustc_data_structures::aligned::{align_of, Aligned};
 use rustc_serialize::{Encodable, Encoder};
-use rustc_type_ir::{InferCtxtLike, OptWithInfcx};
+use rustc_type_ir::{InferCtxtLike, WithInfcx};
 use std::alloc::Layout;
 use std::cmp::Ordering;
 use std::fmt;
@@ -61,7 +61,7 @@ impl<T> List<T> {
         // length) that is 64-byte aligned, thus featuring the necessary
         // trailing padding for elements with up to 64-byte alignment.
         static EMPTY_SLICE: InOrder<usize, MaxAlign> = InOrder(0, MaxAlign);
-        unsafe { &*(&EMPTY_SLICE as *const _ as *const List<T>) }
+        unsafe { &*(std::ptr::addr_of!(EMPTY_SLICE) as *const List<T>) }
     }
 
     pub fn len(&self) -> usize {
@@ -121,8 +121,8 @@ impl<T: fmt::Debug> fmt::Debug for List<T> {
     }
 }
 impl<'tcx, T: super::DebugWithInfcx<TyCtxt<'tcx>>> super::DebugWithInfcx<TyCtxt<'tcx>> for List<T> {
-    fn fmt<InfCtx: InferCtxtLike<TyCtxt<'tcx>>>(
-        this: OptWithInfcx<'_, TyCtxt<'tcx>, InfCtx, &Self>,
+    fn fmt<Infcx: InferCtxtLike<Interner = TyCtxt<'tcx>>>(
+        this: WithInfcx<'_, Infcx, &Self>,
         f: &mut core::fmt::Formatter<'_>,
     ) -> core::fmt::Result {
         fmt::Debug::fmt(&this.map(|this| this.as_slice()), f)

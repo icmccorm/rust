@@ -1,6 +1,6 @@
-use super::super::map::RandomState;
 use super::HashSet;
 
+use crate::hash::RandomState;
 use crate::panic::{catch_unwind, AssertUnwindSafe};
 use crate::sync::atomic::{AtomicU32, Ordering};
 use crate::sync::Arc;
@@ -352,7 +352,7 @@ fn test_replace() {
     use crate::hash;
 
     #[derive(Debug)]
-    struct Foo(&'static str, i32);
+    struct Foo(&'static str, #[allow(dead_code)] i32);
 
     impl PartialEq for Foo {
         fn eq(&self, other: &Self) -> bool {

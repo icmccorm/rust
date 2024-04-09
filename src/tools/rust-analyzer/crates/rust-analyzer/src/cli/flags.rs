@@ -30,7 +30,7 @@ xflags::xflags! {
 
         default cmd lsp-server {
             /// Print version.
-            optional --version
+            optional -V, --version
 
             /// Dump a LSP config JSON schema.
             optional --print-config-schema
@@ -71,6 +71,9 @@ xflags::xflags! {
             optional --with-deps
             /// Don't load sysroot crates (`std`, `core` & friends).
             optional --no-sysroot
+            /// Run cargo metadata on the sysroot to analyze its third-party dependencies.
+            /// Requires --no-sysroot to not be set.
+            optional --query-sysroot-metadata
 
             /// Don't run build scripts or load `OUT_DIR` values by running `cargo check` before analysis.
             optional --disable-build-scripts
@@ -90,12 +93,26 @@ xflags::xflags! {
             /// and annotations. This is useful for benchmarking the memory usage on a project that has
             /// been worked on for a bit in a longer running session.
             optional --run-all-ide-things
+            /// Run term search on all the tail expressions (of functions, block, if statements etc.)
+            optional --run-term-search
+            /// Validate term search by running `cargo check` on every response.
+            /// Note that this also temporarily modifies the files on disk, use with caution!
+            optional --validate-term-search
         }
 
         /// Run unit tests of the project using mir interpreter
         cmd run-tests {
             /// Directory with Cargo.toml.
             required path: PathBuf
+        }
+
+        /// Run unit tests of the project using mir interpreter
+        cmd rustc-tests {
+            /// Directory with Cargo.toml.
+            required rustc_repo: PathBuf
+
+            /// Only run tests with filter as substring
+            optional --filter path: String
         }
 
         cmd diagnostics {
@@ -131,6 +148,9 @@ xflags::xflags! {
 
             /// The output path where the SCIP file will be written to. Defaults to `index.scip`.
             optional --output path: PathBuf
+
+            /// A path to an json configuration file that can be used to customize cargo behavior.
+            optional --config-path config_path: PathBuf
         }
     }
 }
@@ -156,6 +176,7 @@ pub enum RustAnalyzerCmd {
     Highlight(Highlight),
     AnalysisStats(AnalysisStats),
     RunTests(RunTests),
+    RustcTests(RustcTests),
     Diagnostics(Diagnostics),
     Ssr(Ssr),
     Search(Search),
@@ -193,6 +214,7 @@ pub struct AnalysisStats {
     pub only: Option<String>,
     pub with_deps: bool,
     pub no_sysroot: bool,
+    pub query_sysroot_metadata: bool,
     pub disable_build_scripts: bool,
     pub disable_proc_macros: bool,
     pub skip_lowering: bool,
@@ -201,11 +223,20 @@ pub struct AnalysisStats {
     pub skip_data_layout: bool,
     pub skip_const_eval: bool,
     pub run_all_ide_things: bool,
+    pub run_term_search: bool,
+    pub validate_term_search: bool,
 }
 
 #[derive(Debug)]
 pub struct RunTests {
     pub path: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct RustcTests {
+    pub rustc_repo: PathBuf,
+
+    pub filter: Option<String>,
 }
 
 #[derive(Debug)]
@@ -239,6 +270,7 @@ pub struct Scip {
     pub path: PathBuf,
 
     pub output: Option<PathBuf>,
+    pub config_path: Option<PathBuf>,
 }
 
 impl RustAnalyzer {

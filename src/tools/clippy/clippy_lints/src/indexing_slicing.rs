@@ -7,7 +7,7 @@ use rustc_ast::ast::RangeLimits;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty;
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_session::impl_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -26,7 +26,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # let x = [1, 2, 3, 4];
     /// // Index within bounds
     ///
@@ -65,7 +65,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # #![allow(unused)]
     ///
     /// # let x = vec![0; 5];
@@ -170,7 +170,24 @@ impl<'tcx> LateLintPass<'tcx> for IndexingSlicing {
                         return;
                     }
                     // Index is a constant uint.
-                    if constant(cx, cx.typeck_results(), index).is_some() {
+                    if let Some(constant) = constant(cx, cx.typeck_results(), index) {
+                        // only `usize` index is legal in rust array index
+                        // leave other type to rustc
+                        if let Constant::Int(off) = constant
+                            && off <= usize::MAX as u128
+                            && let ty::Uint(utype) = cx.typeck_results().expr_ty(index).kind()
+                            && *utype == ty::UintTy::Usize
+                            && let ty::Array(_, s) = ty.kind()
+                            && let Some(size) = s.try_eval_target_usize(cx.tcx, cx.param_env)
+                        {
+                            // get constant offset and check whether it is in bounds
+                            let off = usize::try_from(off).unwrap();
+                            let size = usize::try_from(size).unwrap();
+
+                            if off >= size {
+                                span_lint(cx, OUT_OF_BOUNDS_INDEXING, expr.span, "index is out of bounds");
+                            }
+                        }
                         // Let rustc's `const_err` lint handle constant `usize` indexing on arrays.
                         return;
                     }

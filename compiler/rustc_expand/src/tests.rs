@@ -2,13 +2,13 @@ use rustc_ast as ast;
 use rustc_ast::tokenstream::TokenStream;
 use rustc_parse::{new_parser_from_source_str, parser::Parser, source_file_to_stream};
 use rustc_session::parse::ParseSess;
-use rustc_span::create_default_session_if_not_set_then;
+use rustc_span::create_default_session_globals_then;
 use rustc_span::source_map::{FilePathMapping, SourceMap};
 use rustc_span::{BytePos, Span};
 
 use rustc_data_structures::sync::Lrc;
-use rustc_errors::emitter::EmitterWriter;
-use rustc_errors::{Handler, MultiSpan, PResult};
+use rustc_errors::emitter::HumanEmitter;
+use rustc_errors::{DiagCtxt, MultiSpan, PResult};
 use termcolor::WriteColor;
 
 use std::io;
@@ -18,35 +18,39 @@ use std::path::{Path, PathBuf};
 use std::str;
 use std::sync::{Arc, Mutex};
 
-/// Map string to parser (via tts).
-fn string_to_parser(ps: &ParseSess, source_str: String) -> Parser<'_> {
-    new_parser_from_source_str(ps, PathBuf::from("bogofile").into(), source_str)
+pub(crate) fn psess() -> ParseSess {
+    ParseSess::new(vec![crate::DEFAULT_LOCALE_RESOURCE, rustc_parse::DEFAULT_LOCALE_RESOURCE])
 }
 
-fn create_test_handler() -> (Handler, Lrc<SourceMap>, Arc<Mutex<Vec<u8>>>) {
+/// Map string to parser (via tts).
+fn string_to_parser(psess: &ParseSess, source_str: String) -> Parser<'_> {
+    new_parser_from_source_str(psess, PathBuf::from("bogofile").into(), source_str)
+}
+
+fn create_test_handler() -> (DiagCtxt, Lrc<SourceMap>, Arc<Mutex<Vec<u8>>>) {
     let output = Arc::new(Mutex::new(Vec::new()));
     let source_map = Lrc::new(SourceMap::new(FilePathMapping::empty()));
     let fallback_bundle = rustc_errors::fallback_fluent_bundle(
         vec![crate::DEFAULT_LOCALE_RESOURCE, rustc_parse::DEFAULT_LOCALE_RESOURCE],
         false,
     );
-    let emitter = EmitterWriter::new(Box::new(Shared { data: output.clone() }), fallback_bundle)
+    let emitter = HumanEmitter::new(Box::new(Shared { data: output.clone() }), fallback_bundle)
         .sm(Some(source_map.clone()))
         .diagnostic_width(Some(140));
-    let handler = Handler::with_emitter(Box::new(emitter));
-    (handler, source_map, output)
+    let dcx = DiagCtxt::new(Box::new(emitter));
+    (dcx, source_map, output)
 }
 
 /// Returns the result of parsing the given string via the given callback.
 ///
 /// If there are any errors, this will panic.
-pub(crate) fn with_error_checking_parse<'a, T, F>(s: String, ps: &'a ParseSess, f: F) -> T
+pub(crate) fn with_error_checking_parse<'a, T, F>(s: String, psess: &'a ParseSess, f: F) -> T
 where
     F: FnOnce(&mut Parser<'a>) -> PResult<'a, T>,
 {
-    let mut p = string_to_parser(&ps, s);
+    let mut p = string_to_parser(&psess, s);
     let x = f(&mut p).unwrap();
-    p.sess.span_diagnostic.abort_if_errors();
+    p.psess.dcx.abort_if_errors();
     x
 }
 
@@ -57,8 +61,8 @@ where
     F: for<'a> FnOnce(&mut Parser<'a>) -> PResult<'a, T>,
 {
     let (handler, source_map, output) = create_test_handler();
-    let ps = ParseSess::with_span_handler(handler, source_map);
-    let mut p = string_to_parser(&ps, source_str.to_string());
+    let psess = ParseSess::with_dcx(handler, source_map);
+    let mut p = string_to_parser(&psess, source_str.to_string());
     let result = f(&mut p);
     assert!(result.is_ok());
 
@@ -72,24 +76,18 @@ where
 
 /// Maps a string to tts, using a made-up filename.
 pub(crate) fn string_to_stream(source_str: String) -> TokenStream {
-    let ps = ParseSess::new(
-        vec![crate::DEFAULT_LOCALE_RESOURCE, rustc_parse::DEFAULT_LOCALE_RESOURCE],
-        FilePathMapping::empty(),
-    );
+    let psess = psess();
     source_file_to_stream(
-        &ps,
-        ps.source_map().new_source_file(PathBuf::from("bogofile").into(), source_str),
+        &psess,
+        psess.source_map().new_source_file(PathBuf::from("bogofile").into(), source_str),
         None,
     )
 }
 
 /// Parses a string, returns a crate.
 pub(crate) fn string_to_crate(source_str: String) -> ast::Crate {
-    let ps = ParseSess::new(
-        vec![crate::DEFAULT_LOCALE_RESOURCE, rustc_parse::DEFAULT_LOCALE_RESOURCE],
-        FilePathMapping::empty(),
-    );
-    with_error_checking_parse(source_str, &ps, |p| p.parse_crate_mod())
+    let psess = psess();
+    with_error_checking_parse(source_str, &psess, |p| p.parse_crate_mod())
 }
 
 /// Does the given string match the pattern? whitespace in the first string
@@ -135,7 +133,7 @@ pub(crate) fn matches_codepattern(a: &str, b: &str) -> bool {
 
 /// Advances the given peekable `Iterator` until it reaches a non-whitespace character.
 fn scan_for_non_ws_or_end<I: Iterator<Item = char>>(iter: &mut Peekable<I>) {
-    while iter.peek().copied().map(rustc_lexer::is_whitespace) == Some(true) {
+    while iter.peek().copied().is_some_and(rustc_lexer::is_whitespace) {
         iter.next();
     }
 }
@@ -180,8 +178,9 @@ impl<T: Write> Write for Shared<T> {
     }
 }
 
+#[allow(rustc::untranslatable_diagnostic)] // no translation needed for tests
 fn test_harness(file_text: &str, span_labels: Vec<SpanLabel>, expected_output: &str) {
-    create_default_session_if_not_set_then(|_| {
+    create_default_session_globals_then(|| {
         let (handler, source_map, output) = create_test_handler();
         source_map.new_source_file(Path::new("test.rs").to_owned().into(), file_text.to_owned());
 
@@ -194,7 +193,6 @@ fn test_harness(file_text: &str, span_labels: Vec<SpanLabel>, expected_output: &
             println!("text: {:?}", source_map.span_to_snippet(span));
         }
 
-        #[allow(rustc::untranslatable_diagnostic)]
         handler.span_err(msp, "foo");
 
         assert!(
@@ -278,8 +276,7 @@ error: foo
   |
 2 |   fn foo() {
   |  __________^
-3 | |
-4 | |
+... |
 5 | |   }
   | |___^ test
 

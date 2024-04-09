@@ -1,10 +1,3 @@
-use log::trace;
-
-use rustc_target::abi::{Abi, Align, Size};
-
-use crate::borrow_tracker::{
-    AccessKind, GlobalState, GlobalStateInner, ProtectorKind, RetagFields,
-};
 use rustc_middle::{
     mir::{Mutability, RetagKind},
     ty::{
@@ -14,8 +7,13 @@ use rustc_middle::{
     },
 };
 use rustc_span::def_id::DefId;
+use rustc_target::abi::{Abi, Size};
 
 use crate::*;
+use crate::{
+    borrow_tracker::{GlobalState, GlobalStateInner, ProtectorKind},
+    concurrency::data_race::NaReadType,
+};
 
 pub mod diagnostics;
 mod perms;
@@ -74,6 +72,7 @@ impl<'tcx> Tree {
             tag,
             Some(range),
             global,
+            alloc_id,
             span,
             diagnostics::AccessCause::Explicit(access_kind),
         )
@@ -82,9 +81,9 @@ impl<'tcx> Tree {
     /// Check that this pointer has permission to deallocate this range.
     pub fn before_memory_deallocation(
         &mut self,
-        _alloc_id: AllocId,
+        alloc_id: AllocId,
         prov: ProvenanceExtra,
-        range: AllocRange,
+        size: Size,
         machine: &MiriMachine<'_, 'tcx>,
     ) -> InterpResult<'tcx> {
         // TODO: for now we bail out on wildcard pointers. Eventually we should
@@ -95,7 +94,7 @@ impl<'tcx> Tree {
         };
         let global = machine.borrow_tracker.as_ref().unwrap();
         let span = machine.current_span();
-        self.dealloc(tag, range, global, span)
+        self.dealloc(tag, alloc_range(Size::ZERO, size), global, alloc_id, span)
     }
 
     pub fn expose_tag(&mut self, _tag: BorTag) {
@@ -113,6 +112,7 @@ impl<'tcx> Tree {
         machine: &MiriMachine<'_, 'tcx>,
         global: &GlobalState,
         tag: BorTag,
+        alloc_id: AllocId, // diagnostics
     ) -> InterpResult<'tcx> {
         let span = machine.current_span();
         self.perform_access(
@@ -120,6 +120,7 @@ impl<'tcx> Tree {
             tag,
             None, // no specified range because it occurs on the entire allocation
             global,
+            alloc_id,
             span,
             diagnostics::AccessCause::FnExit,
         )
@@ -206,12 +207,7 @@ trait EvalContextPrivExt<'mir: 'ecx, 'tcx: 'mir, 'ecx>: crate::MiriInterpCxExt<'
         // Make sure the new permission makes sense as the initial permission of a fresh tag.
         assert!(new_perm.initial_state.is_initial());
         // Ensure we bail out if the pointer goes out-of-bounds (see miri#1050).
-        this.check_ptr_access_align(
-            place.ptr(),
-            ptr_size,
-            Align::ONE,
-            CheckInAllocMsg::InboundsTest,
-        )?;
+        this.check_ptr_access(place.ptr(), ptr_size, CheckInAllocMsg::InboundsTest)?;
 
         // It is crucial that this gets called on all code paths, to ensure we track tag creation.
         let log_creation = |this: &MiriInterpCx<'mir, 'tcx>,
@@ -220,7 +216,7 @@ trait EvalContextPrivExt<'mir: 'ecx, 'tcx: 'mir, 'ecx>: crate::MiriInterpCxExt<'
             let global = this.machine.borrow_tracker.as_ref().unwrap().borrow();
             let ty = place.layout.ty;
             if global.tracked_pointer_tags.contains(&new_tag) {
-                let kind_str = format!("{new_perm:?} (pointee type {ty})");
+                let kind_str = format!("initial state {} (pointee type {ty})", new_perm.initial_state);
                 this.emit_diagnostic(NonHaltingDiagnostic::CreatedPointerTag(
                     new_tag.inner(),
                     Some(kind_str),
@@ -308,6 +304,7 @@ trait EvalContextPrivExt<'mir: 'ecx, 'tcx: 'mir, 'ecx>: crate::MiriInterpCxExt<'
             orig_tag,
             Some(range),
             this.machine.borrow_tracker.as_ref().unwrap(),
+            alloc_id,
             this.machine.current_span(),
             diagnostics::AccessCause::Reborrow,
         )?;
@@ -322,7 +319,13 @@ trait EvalContextPrivExt<'mir: 'ecx, 'tcx: 'mir, 'ecx>: crate::MiriInterpCxExt<'
         // Also inform the data race model (but only if any bytes are actually affected).
         if range.size.bytes() > 0 {
             if let Some(data_race) = alloc_extra.data_race.as_ref() {
-                data_race.read(alloc_id, range, &this.machine)?;
+                data_race.read(
+                    alloc_id,
+                    range,
+                    NaReadType::Retag,
+                    Some(place.layout.ty),
+                    &this.machine,
+                )?;
             }
         }
 
@@ -362,7 +365,9 @@ trait EvalContextPrivExt<'mir: 'ecx, 'tcx: 'mir, 'ecx>: crate::MiriInterpCxExt<'
         let new_prov = this.tb_reborrow(place, reborrow_size, new_perm, new_tag)?;
 
         // Adjust place.
-        Ok(place.clone().map_provenance(|_| new_prov))
+        // (If the closure gets called, that means the old provenance was `Some`, and hence the new
+        // one must also be `Some`.)
+        Ok(place.clone().map_provenance(|_| new_prov.unwrap()))
     }
 
     /// Retags an individual pointer, returning the retagged version.
@@ -449,14 +454,22 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             /// Regardless of how `Unique` is handled, Boxes are always reborrowed.
             /// When `Unique` is also reborrowed, then it behaves exactly like `Box`
             /// except for the fact that `Box` has a non-zero-sized reborrow.
-            fn visit_box(&mut self, place: &PlaceTy<'tcx, Provenance>) -> InterpResult<'tcx> {
-                let new_perm = NewPermission::from_unique_ty(
-                    place.layout.ty,
-                    self.kind,
-                    self.ecx,
-                    /* zero_size */ false,
-                );
-                self.retag_ptr_inplace(place, new_perm)
+            fn visit_box(
+                &mut self,
+                box_ty: Ty<'tcx>,
+                place: &PlaceTy<'tcx, Provenance>,
+            ) -> InterpResult<'tcx> {
+                // Only boxes for the global allocator get any special treatment.
+                if box_ty.is_box_global(*self.ecx.tcx) {
+                    let new_perm = NewPermission::from_unique_ty(
+                        place.layout.ty,
+                        self.kind,
+                        self.ecx,
+                        /* zero_size */ false,
+                    );
+                    self.retag_ptr_inplace(place, new_perm)?;
+                }
+                Ok(())
             }
 
             fn visit_value(&mut self, place: &PlaceTy<'tcx, Provenance>) -> InterpResult<'tcx> {
@@ -475,7 +488,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                             NewPermission::from_ref_ty(pointee, mutability, self.kind, self.ecx);
                         self.retag_ptr_inplace(place, new_perm)?;
                     }
-                    ty::RawPtr(_) => {
+                    ty::RawPtr(_, _) => {
                         // We definitely do *not* want to recurse into raw pointers -- wide raw
                         // pointers have fields, and for dyn Trait pointees those can have reference
                         // type!

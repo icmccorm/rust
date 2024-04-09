@@ -1,4 +1,4 @@
-// run-rustfix
+//@ run-rustfix
 
 #![deny(unused_qualifications)]
 
@@ -16,8 +16,10 @@ fn main() {
     use foo::bar;
     foo::bar();
     //~^ ERROR unnecessary qualification
+    bar();
 
     use baz::qux::quux;
     baz::qux::quux();
     //~^ ERROR unnecessary qualification
+    quux();
 }

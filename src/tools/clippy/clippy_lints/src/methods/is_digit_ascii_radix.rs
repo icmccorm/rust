@@ -1,9 +1,9 @@
 //! Lint for `c.is_digit(10)`
 
 use super::IS_DIGIT_ASCII_RADIX;
+use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::consts::{constant_full_int, FullInt};
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::snippet_with_applicability;
 use rustc_errors::Applicability;
 use rustc_hir::Expr;
@@ -36,7 +36,7 @@ pub(super) fn check<'tcx>(
             cx,
             IS_DIGIT_ASCII_RADIX,
             expr.span,
-            &format!("use of `char::is_digit` with literal radix of {num}"),
+            format!("use of `char::is_digit` with literal radix of {num}"),
             "try",
             format!(
                 "{}.{replacement}()",

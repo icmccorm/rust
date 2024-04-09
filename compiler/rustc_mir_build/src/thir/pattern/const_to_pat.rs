@@ -1,5 +1,5 @@
+use rustc_apfloat::Float;
 use rustc_hir as hir;
-use rustc_hir::def_id::DefId;
 use rustc_index::Idx;
 use rustc_infer::infer::{InferCtxt, TyCtxtInferExt};
 use rustc_infer::traits::Obligation;
@@ -7,7 +7,7 @@ use rustc_middle::mir;
 use rustc_middle::thir::{FieldPat, Pat, PatKind};
 use rustc_middle::ty::{self, Ty, TyCtxt, ValTree};
 use rustc_session::lint;
-use rustc_span::Span;
+use rustc_span::{ErrorGuaranteed, Span};
 use rustc_target::abi::{FieldIdx, VariantIdx};
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt;
 use rustc_trait_selection::traits::{self, ObligationCause};
@@ -16,8 +16,8 @@ use std::cell::Cell;
 
 use super::PatCtxt;
 use crate::errors::{
-    FloatPattern, IndirectStructuralMatch, InvalidPattern, NonPartialEqMatch,
-    NontrivialStructuralMatch, PointerPattern, TypeNotStructural, UnionPattern, UnsizedPattern,
+    IndirectStructuralMatch, InvalidPattern, NaNPattern, PointerPattern, TypeNotPartialEq,
+    TypeNotStructural, UnionPattern, UnsizedPattern,
 };
 
 impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
@@ -32,11 +32,10 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
         cv: mir::Const<'tcx>,
         id: hir::HirId,
         span: Span,
-        check_body_for_struct_match_violation: Option<DefId>,
     ) -> Box<Pat<'tcx>> {
         let infcx = self.tcx.infer_ctxt().build();
         let mut convert = ConstToPat::new(self, id, span, infcx);
-        convert.to_pat(cv, check_body_for_struct_match_violation)
+        convert.to_pat(cv)
     }
 }
 
@@ -48,7 +47,7 @@ struct ConstToPat<'tcx> {
     // This tracks if we emitted some hard error for a given const value, so that
     // we will not subsequently issue an irrelevant lint for the same const
     // value.
-    saw_const_match_error: Cell<bool>,
+    saw_const_match_error: Cell<Option<ErrorGuaranteed>>,
 
     // This tracks if we emitted some diagnostic for a given const value, so that
     // we will not subsequently issue an irrelevant lint for the same const
@@ -84,7 +83,7 @@ impl<'tcx> ConstToPat<'tcx> {
             span,
             infcx,
             param_env: pat_ctxt.param_env,
-            saw_const_match_error: Cell::new(false),
+            saw_const_match_error: Cell::new(None),
             saw_const_match_lint: Cell::new(false),
             behind_reference: Cell::new(false),
             treat_byte_string_as_slice: pat_ctxt
@@ -102,11 +101,7 @@ impl<'tcx> ConstToPat<'tcx> {
         ty.is_structural_eq_shallow(self.infcx.tcx)
     }
 
-    fn to_pat(
-        &mut self,
-        cv: mir::Const<'tcx>,
-        check_body_for_struct_match_violation: Option<DefId>,
-    ) -> Box<Pat<'tcx>> {
+    fn to_pat(&mut self, cv: mir::Const<'tcx>) -> Box<Pat<'tcx>> {
         trace!(self.treat_byte_string_as_slice);
         // This method is just a wrapper handling a validity check; the heavy lifting is
         // performed by the recursive `recur` method, which is not meant to be
@@ -115,14 +110,8 @@ impl<'tcx> ConstToPat<'tcx> {
         // once indirect_structural_match is a full fledged error, this
         // level of indirection can be eliminated
 
-        let mir_structural_match_violation = check_body_for_struct_match_violation.map(|def_id| {
-            // `mir_const_qualif` must be called with the `DefId` of the item where the const is
-            // defined, not where it is declared. The difference is significant for associated
-            // constants.
-            self.tcx().mir_const_qualif(def_id).custom_eq
-        });
-        debug!(?check_body_for_struct_match_violation, ?mir_structural_match_violation);
-
+        let have_valtree =
+            matches!(cv, mir::Const::Ty(c) if matches!(c.kind(), ty::ConstKind::Value(_)));
         let inlined_const_as_pat = match cv {
             mir::Const::Ty(c) => match c.kind() {
                 ty::ConstKind::Param(_)
@@ -134,15 +123,15 @@ impl<'tcx> ConstToPat<'tcx> {
                 | ty::ConstKind::Expr(_) => {
                     span_bug!(self.span, "unexpected const in `to_pat`: {:?}", c.kind())
                 }
-                ty::ConstKind::Value(valtree) => self
-                    .recur(valtree, cv.ty(), mir_structural_match_violation.unwrap_or(false))
-                    .unwrap_or_else(|_: FallbackToOpaqueConst| {
+                ty::ConstKind::Value(valtree) => {
+                    self.recur(valtree, cv.ty()).unwrap_or_else(|_: FallbackToOpaqueConst| {
                         Box::new(Pat {
                             span: self.span,
                             ty: cv.ty(),
                             kind: PatKind::Constant { value: cv },
                         })
-                    }),
+                    })
+                }
             },
             mir::Const::Unevaluated(_, _) => {
                 span_bug!(self.span, "unevaluated const in `to_pat`: {cv:?}")
@@ -154,103 +143,77 @@ impl<'tcx> ConstToPat<'tcx> {
             }),
         };
 
-        if !self.saw_const_match_error.get() {
+        if self.saw_const_match_error.get().is_none() {
             // If we were able to successfully convert the const to some pat (possibly with some
             // lints, but no errors), double-check that all types in the const implement
-            // `Structural` and `PartialEq`.
+            // `PartialEq`. Even if we have a valtree, we may have found something
+            // in there with non-structural-equality, meaning we match using `PartialEq`
+            // and we hence have to check that that impl exists.
+            // This is all messy but not worth cleaning up: at some point we'll emit
+            // a hard error when we don't have a valtree or when we find something in
+            // the valtree that is not structural; then this can all be made a lot simpler.
 
-            let structural =
-                traits::search_for_structural_match_violation(self.span, self.tcx(), cv.ty());
+            let structural = traits::search_for_structural_match_violation(self.tcx(), cv.ty());
             debug!(
                 "search_for_structural_match_violation cv.ty: {:?} returned: {:?}",
                 cv.ty(),
                 structural
             );
 
-            // This can occur because const qualification treats all associated constants as
-            // opaque, whereas `search_for_structural_match_violation` tries to monomorphize them
-            // before it runs.
-            //
-            // FIXME(#73448): Find a way to bring const qualification into parity with
-            // `search_for_structural_match_violation`.
-            if structural.is_none() && mir_structural_match_violation.unwrap_or(false) {
-                warn!("MIR const-checker found novel structural match violation. See #73448.");
-                return inlined_const_as_pat;
-            }
-
             if let Some(non_sm_ty) = structural {
                 if !self.type_has_partial_eq_impl(cv.ty()) {
-                    if let ty::Adt(def, ..) = non_sm_ty.kind() {
+                    // This is reachable and important even if we have a valtree: there might be
+                    // non-structural things in a valtree, in which case we fall back to `PartialEq`
+                    // comparison, in which case we better make sure the trait is implemented for
+                    // each inner type (and not just for the surrounding type).
+                    let e = if let ty::Adt(def, ..) = non_sm_ty.kind() {
                         if def.is_union() {
                             let err = UnionPattern { span: self.span };
-                            self.tcx().sess.emit_err(err);
+                            self.tcx().dcx().emit_err(err)
                         } else {
                             // fatal avoids ICE from resolution of nonexistent method (rare case).
                             self.tcx()
-                                .sess
-                                .emit_fatal(TypeNotStructural { span: self.span, non_sm_ty });
+                                .dcx()
+                                .emit_fatal(TypeNotStructural { span: self.span, non_sm_ty })
                         }
                     } else {
                         let err = InvalidPattern { span: self.span, non_sm_ty };
-                        self.tcx().sess.emit_err(err);
-                    }
+                        self.tcx().dcx().emit_err(err)
+                    };
                     // All branches above emitted an error. Don't print any more lints.
-                    // The pattern we return is irrelevant since we errored.
-                    return Box::new(Pat { span: self.span, ty: cv.ty(), kind: PatKind::Wild });
-                } else if !self.saw_const_match_lint.get() {
-                    if let Some(mir_structural_match_violation) = mir_structural_match_violation {
-                        match non_sm_ty.kind() {
-                            ty::RawPtr(pointee)
-                                if pointee.ty.is_sized(self.tcx(), self.param_env) => {}
-                            ty::FnPtr(..) | ty::RawPtr(..) => {
-                                self.tcx().emit_spanned_lint(
-                                    lint::builtin::POINTER_STRUCTURAL_MATCH,
-                                    self.id,
-                                    self.span,
-                                    PointerPattern,
-                                );
-                            }
-                            ty::Adt(..) if mir_structural_match_violation => {
-                                self.tcx().emit_spanned_lint(
-                                    lint::builtin::INDIRECT_STRUCTURAL_MATCH,
-                                    self.id,
-                                    self.span,
-                                    IndirectStructuralMatch { non_sm_ty },
-                                );
-                            }
-                            _ => {
-                                debug!(
-                                    "`search_for_structural_match_violation` found one, but `CustomEq` was \
-                                  not in the qualifs for that `const`"
-                                );
-                            }
-                        }
-                    }
+                    // We errored. Signal that in the pattern, so that follow up errors can be silenced.
+                    let kind = PatKind::Error(e);
+                    return Box::new(Pat { span: self.span, ty: cv.ty(), kind });
+                } else if !have_valtree {
+                    // Not being structural prevented us from constructing a valtree,
+                    // so this is definitely a case we want to reject.
+                    let err = TypeNotStructural { span: self.span, non_sm_ty };
+                    let e = self.tcx().dcx().emit_err(err);
+                    let kind = PatKind::Error(e);
+                    return Box::new(Pat { span: self.span, ty: cv.ty(), kind });
+                } else {
+                    // This could be a violation in an inactive enum variant.
+                    // Since we have a valtree, we trust that we have traversed the full valtree and
+                    // complained about structural match violations there, so we don't
+                    // have to check anything any more.
                 }
-            } else if !self.saw_const_match_lint.get() {
-                match cv.ty().kind() {
-                    ty::RawPtr(pointee) if pointee.ty.is_sized(self.tcx(), self.param_env) => {}
-                    ty::FnPtr(..) | ty::RawPtr(..) => {
-                        self.tcx().emit_spanned_lint(
-                            lint::builtin::POINTER_STRUCTURAL_MATCH,
-                            self.id,
-                            self.span,
-                            PointerPattern,
-                        );
-                    }
-                    _ => {}
-                }
-            }
-
-            // Always check for `PartialEq`, even if we emitted other lints. (But not if there were
-            // any errors.) This ensures it shows up in cargo's future-compat reports as well.
-            if !self.type_has_partial_eq_impl(cv.ty()) {
-                self.tcx().emit_spanned_lint(
-                    lint::builtin::CONST_PATTERNS_WITHOUT_PARTIAL_EQ,
+            } else if !have_valtree && !self.saw_const_match_lint.get() {
+                // The only way valtree construction can fail without the structural match
+                // checker finding a violation is if there is a pointer somewhere.
+                self.tcx().emit_node_span_lint(
+                    lint::builtin::POINTER_STRUCTURAL_MATCH,
                     self.id,
                     self.span,
-                    NonPartialEqMatch { non_peq_ty: cv.ty() },
+                    PointerPattern,
                 );
+            }
+
+            // Always check for `PartialEq` if we had no other errors yet.
+            if !self.type_has_partial_eq_impl(cv.ty()) {
+                let err = TypeNotPartialEq { span: self.span, non_peq_ty: cv.ty() };
+                let e = self.tcx().dcx().emit_err(err);
+                let kind = PatKind::Error(e);
+                return Box::new(Pat { span: self.span, ty: cv.ty(), kind });
             }
         }
 
@@ -259,18 +222,26 @@ impl<'tcx> ConstToPat<'tcx> {
 
     #[instrument(level = "trace", skip(self), ret)]
     fn type_has_partial_eq_impl(&self, ty: Ty<'tcx>) -> bool {
+        let tcx = self.tcx();
         // double-check there even *is* a semantic `PartialEq` to dispatch to.
         //
         // (If there isn't, then we can safely issue a hard
         // error, because that's never worked, due to compiler
         // using `PartialEq::eq` in this scenario in the past.)
-        let partial_eq_trait_id =
-            self.tcx().require_lang_item(hir::LangItem::PartialEq, Some(self.span));
+        let partial_eq_trait_id = tcx.require_lang_item(hir::LangItem::PartialEq, Some(self.span));
         let partial_eq_obligation = Obligation::new(
-            self.tcx(),
+            tcx,
             ObligationCause::dummy(),
             self.param_env,
-            ty::TraitRef::new(self.tcx(), partial_eq_trait_id, [ty, ty]),
+            ty::TraitRef::new(
+                tcx,
+                partial_eq_trait_id,
+                tcx.with_opt_host_effect_param(
+                    tcx.hir().enclosing_body_owner(self.id),
+                    partial_eq_trait_id,
+                    [ty, ty],
+                ),
+            ),
         );
 
         // This *could* accept a type that isn't actually `PartialEq`, because region bounds get
@@ -291,7 +262,7 @@ impl<'tcx> ConstToPat<'tcx> {
                 let field = FieldIdx::new(idx);
                 // Patterns can only use monomorphic types.
                 let ty = self.tcx().normalize_erasing_regions(self.param_env, ty);
-                Ok(FieldPat { field, pattern: self.recur(val, ty, false)? })
+                Ok(FieldPat { field, pattern: self.recur(val, ty)? })
             })
             .collect()
     }
@@ -302,7 +273,6 @@ impl<'tcx> ConstToPat<'tcx> {
         &self,
         cv: ValTree<'tcx>,
         ty: Ty<'tcx>,
-        mir_structural_match_violation: bool,
     ) -> Result<Box<Pat<'tcx>>, FallbackToOpaqueConst> {
         let id = self.id;
         let span = self.span;
@@ -310,16 +280,6 @@ impl<'tcx> ConstToPat<'tcx> {
         let param_env = self.param_env;
 
         let kind = match ty.kind() {
-            ty::Float(_) => {
-                self.saw_const_match_lint.set(true);
-                tcx.emit_spanned_lint(
-                    lint::builtin::ILLEGAL_FLOATING_POINT_LITERAL_PATTERN,
-                    id,
-                    span,
-                    FloatPattern,
-                );
-                return Err(FallbackToOpaqueConst);
-            }
             // If the type is not structurally comparable, just emit the constant directly,
             // causing the pattern match code to treat it opaquely.
             // FIXME: This code doesn't emit errors itself, the caller emits the errors.
@@ -330,9 +290,9 @@ impl<'tcx> ConstToPat<'tcx> {
             // Backwards compatibility hack because we can't cause hard errors on these
             // types, so we compare them via `PartialEq::eq` at runtime.
             ty::Adt(..) if !self.type_marked_structural(ty) && self.behind_reference.get() => {
-                if !self.saw_const_match_error.get() && !self.saw_const_match_lint.get() {
+                if self.saw_const_match_error.get().is_none() && !self.saw_const_match_lint.get() {
                     self.saw_const_match_lint.set(true);
-                    tcx.emit_spanned_lint(
+                    tcx.emit_node_span_lint(
                         lint::builtin::INDIRECT_STRUCTURAL_MATCH,
                         id,
                         span,
@@ -345,18 +305,18 @@ impl<'tcx> ConstToPat<'tcx> {
                 return Err(FallbackToOpaqueConst);
             }
             ty::FnDef(..) => {
-                self.saw_const_match_error.set(true);
-                tcx.sess.emit_err(InvalidPattern { span, non_sm_ty: ty });
-                // We errored, so the pattern we generate is irrelevant.
-                PatKind::Wild
+                let e = tcx.dcx().emit_err(InvalidPattern { span, non_sm_ty: ty });
+                self.saw_const_match_error.set(Some(e));
+                // We errored. Signal that in the pattern, so that follow up errors can be silenced.
+                PatKind::Error(e)
             }
             ty::Adt(adt_def, _) if !self.type_marked_structural(ty) => {
                 debug!("adt_def {:?} has !type_marked_structural for cv.ty: {:?}", adt_def, ty,);
-                self.saw_const_match_error.set(true);
                 let err = TypeNotStructural { span, non_sm_ty: ty };
-                tcx.sess.emit_err(err);
-                // We errored, so the pattern we generate is irrelevant.
-                PatKind::Wild
+                let e = tcx.dcx().emit_err(err);
+                self.saw_const_match_error.set(Some(e));
+                // We errored. Signal that in the pattern, so that follow up errors can be silenced.
+                PatKind::Error(e)
             }
             ty::Adt(adt_def, args) if adt_def.is_enum() => {
                 let (&variant_index, fields) = cv.unwrap_branch().split_first().unwrap();
@@ -380,16 +340,24 @@ impl<'tcx> ConstToPat<'tcx> {
                 subpatterns: self
                     .field_pats(cv.unwrap_branch().iter().copied().zip(fields.iter()))?,
             },
-            ty::Adt(def, args) => PatKind::Leaf {
-                subpatterns: self.field_pats(cv.unwrap_branch().iter().copied().zip(
-                    def.non_enum_variant().fields.iter().map(|field| field.ty(self.tcx(), args)),
-                ))?,
-            },
+            ty::Adt(def, args) => {
+                assert!(!def.is_union()); // Valtree construction would never succeed for unions.
+                PatKind::Leaf {
+                    subpatterns: self.field_pats(
+                        cv.unwrap_branch().iter().copied().zip(
+                            def.non_enum_variant()
+                                .fields
+                                .iter()
+                                .map(|field| field.ty(self.tcx(), args)),
+                        ),
+                    )?,
+                }
+            }
             ty::Slice(elem_ty) => PatKind::Slice {
                 prefix: cv
                     .unwrap_branch()
                     .iter()
-                    .map(|val| self.recur(*val, *elem_ty, false))
+                    .map(|val| self.recur(*val, *elem_ty))
                     .collect::<Result<_, _>>()?,
                 slice: None,
                 suffix: Box::new([]),
@@ -398,7 +366,7 @@ impl<'tcx> ConstToPat<'tcx> {
                 prefix: cv
                     .unwrap_branch()
                     .iter()
-                    .map(|val| self.recur(*val, *elem_ty, false))
+                    .map(|val| self.recur(*val, *elem_ty))
                     .collect::<Result<_, _>>()?,
                 slice: None,
                 suffix: Box::new([]),
@@ -416,9 +384,11 @@ impl<'tcx> ConstToPat<'tcx> {
                 // instead of a hard error.
                 ty::Adt(_, _) if !self.type_marked_structural(*pointee_ty) => {
                     if self.behind_reference.get() {
-                        if !self.saw_const_match_error.get() && !self.saw_const_match_lint.get() {
+                        if self.saw_const_match_error.get().is_none()
+                            && !self.saw_const_match_lint.get()
+                        {
                             self.saw_const_match_lint.set(true);
-                            tcx.emit_spanned_lint(
+                            tcx.emit_node_span_lint(
                                 lint::builtin::INDIRECT_STRUCTURAL_MATCH,
                                 self.id,
                                 span,
@@ -427,14 +397,16 @@ impl<'tcx> ConstToPat<'tcx> {
                         }
                         return Err(FallbackToOpaqueConst);
                     } else {
-                        if !self.saw_const_match_error.get() {
-                            self.saw_const_match_error.set(true);
+                        if let Some(e) = self.saw_const_match_error.get() {
+                            // We already errored. Signal that in the pattern, so that follow up errors can be silenced.
+                            PatKind::Error(e)
+                        } else {
                             let err = TypeNotStructural { span, non_sm_ty: *pointee_ty };
-                            tcx.sess.emit_err(err);
+                            let e = tcx.dcx().emit_err(err);
+                            self.saw_const_match_error.set(Some(e));
+                            // We errored. Signal that in the pattern, so that follow up errors can be silenced.
+                            PatKind::Error(e)
                         }
-                        tcx.sess.delay_span_bug(span, "`saw_const_match_error` set but no error?");
-                        // We errored, so the pattern we generate is irrelevant.
-                        PatKind::Wild
                     }
                 }
                 // All other references are converted into deref patterns and then recursively
@@ -443,11 +415,9 @@ impl<'tcx> ConstToPat<'tcx> {
                 _ => {
                     if !pointee_ty.is_sized(tcx, param_env) && !pointee_ty.is_slice() {
                         let err = UnsizedPattern { span, non_sm_ty: *pointee_ty };
-                        tcx.sess.emit_err(err);
-
-                        // FIXME: introduce PatKind::Error to silence follow up diagnostics due to unreachable patterns.
-                        // We errored, so the pattern we generate is irrelevant.
-                        PatKind::Wild
+                        let e = tcx.dcx().emit_err(err);
+                        // We errored. Signal that in the pattern, so that follow up errors can be silenced.
+                        PatKind::Error(e)
                     } else {
                         let old = self.behind_reference.replace(true);
                         // `b"foo"` produces a `&[u8; 3]`, but you can't use constants of array type when
@@ -463,43 +433,48 @@ impl<'tcx> ConstToPat<'tcx> {
                             _ => *pointee_ty,
                         };
                         // References have the same valtree representation as their pointee.
-                        let subpattern = self.recur(cv, pointee_ty, false)?;
+                        let subpattern = self.recur(cv, pointee_ty)?;
                         self.behind_reference.set(old);
                         PatKind::Deref { subpattern }
                     }
                 }
             },
-            ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) => {
+            ty::Float(flt) => {
+                let v = cv.unwrap_leaf();
+                let is_nan = match flt {
+                    ty::FloatTy::F16 => unimplemented!("f16_f128"),
+                    ty::FloatTy::F32 => v.try_to_f32().unwrap().is_nan(),
+                    ty::FloatTy::F64 => v.try_to_f64().unwrap().is_nan(),
+                    ty::FloatTy::F128 => unimplemented!("f16_f128"),
+                };
+                if is_nan {
+                    // NaNs are not ever equal to anything so they make no sense as patterns.
+                    // Also see <https://github.com/rust-lang/rfcs/pull/3535>.
+                    let e = tcx.dcx().emit_err(NaNPattern { span });
+                    self.saw_const_match_error.set(Some(e));
+                    return Err(FallbackToOpaqueConst);
+                } else {
+                    PatKind::Constant { value: mir::Const::Ty(ty::Const::new_value(tcx, cv, ty)) }
+                }
+            }
+            ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::RawPtr(..) => {
+                // The raw pointers we see here have been "vetted" by valtree construction to be
+                // just integers, so we simply allow them.
                 PatKind::Constant { value: mir::Const::Ty(ty::Const::new_value(tcx, cv, ty)) }
             }
-            ty::FnPtr(..) | ty::RawPtr(..) => unreachable!(),
+            ty::FnPtr(..) => {
+                unreachable!(
+                    "Valtree construction would never succeed for FnPtr, so this is unreachable."
+                )
+            }
             _ => {
-                self.saw_const_match_error.set(true);
                 let err = InvalidPattern { span, non_sm_ty: ty };
-                tcx.sess.emit_err(err);
-                // We errored, so the pattern we generate is irrelevant.
-                PatKind::Wild
+                let e = tcx.dcx().emit_err(err);
+                self.saw_const_match_error.set(Some(e));
+                // We errored. Signal that in the pattern, so that follow up errors can be silenced.
+                PatKind::Error(e)
             }
         };
-
-        if !self.saw_const_match_error.get()
-            && !self.saw_const_match_lint.get()
-            && mir_structural_match_violation
-            // FIXME(#73448): Find a way to bring const qualification into parity with
-            // `search_for_structural_match_violation` and then remove this condition.
-
-            // Obtain the actual type that isn't annotated. If we just looked at `cv.ty` we
-            // could get `Option<NonStructEq>`, even though `Option` is annotated with derive.
-            && let Some(non_sm_ty) = traits::search_for_structural_match_violation(span, tcx, ty)
-        {
-            self.saw_const_match_lint.set(true);
-            tcx.emit_spanned_lint(
-                lint::builtin::NONTRIVIAL_STRUCTURAL_MATCH,
-                id,
-                span,
-                NontrivialStructuralMatch {non_sm_ty}
-            );
-        }
 
         Ok(Box::new(Pat { span, ty, kind }))
     }

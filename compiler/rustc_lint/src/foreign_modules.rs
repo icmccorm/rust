@@ -1,5 +1,5 @@
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::stack::ensure_sufficient_stack;
+use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_middle::query::Providers;
@@ -72,7 +72,7 @@ struct ClashingExternDeclarations {
     /// the symbol should be reported as a clashing declaration.
     // FIXME: Technically, we could just store a &'tcx str here without issue; however, the
     // `impl_lint_pass` macro doesn't currently support lints parametric over a lifetime.
-    seen_decls: FxHashMap<Symbol, hir::OwnerId>,
+    seen_decls: UnordMap<Symbol, hir::OwnerId>,
 }
 
 /// Differentiate between whether the name for an extern decl came from the link_name attribute or
@@ -96,7 +96,7 @@ impl SymbolName {
 
 impl ClashingExternDeclarations {
     pub(crate) fn new() -> Self {
-        ClashingExternDeclarations { seen_decls: FxHashMap::default() }
+        ClashingExternDeclarations { seen_decls: Default::default() }
     }
 
     /// Insert a new foreign item into the seen set. If a symbol with the same name already exists
@@ -161,7 +161,7 @@ impl ClashingExternDeclarations {
                     sub,
                 }
             };
-            tcx.emit_spanned_lint(
+            tcx.emit_node_span_lint(
                 CLASHING_EXTERN_DECLARATIONS,
                 this_fi.hir_id(),
                 mismatch_label,
@@ -209,12 +209,12 @@ fn structurally_same_type<'tcx>(
     b: Ty<'tcx>,
     ckind: types::CItemKind,
 ) -> bool {
-    let mut seen_types = FxHashSet::default();
+    let mut seen_types = UnordSet::default();
     structurally_same_type_impl(&mut seen_types, tcx, param_env, a, b, ckind)
 }
 
 fn structurally_same_type_impl<'tcx>(
-    seen_types: &mut FxHashSet<(Ty<'tcx>, Ty<'tcx>)>,
+    seen_types: &mut UnordSet<(Ty<'tcx>, Ty<'tcx>)>,
     tcx: TyCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     a: Ty<'tcx>,
@@ -262,7 +262,7 @@ fn structurally_same_type_impl<'tcx>(
         true
     } else {
         // Do a full, depth-first comparison between the two.
-        use rustc_type_ir::sty::TyKind::*;
+        use rustc_type_ir::TyKind::*;
         let a_kind = a.kind();
         let b_kind = b.kind();
 
@@ -322,10 +322,10 @@ fn structurally_same_type_impl<'tcx>(
                 (Slice(a_ty), Slice(b_ty)) => {
                     structurally_same_type_impl(seen_types, tcx, param_env, *a_ty, *b_ty, ckind)
                 }
-                (RawPtr(a_tymut), RawPtr(b_tymut)) => {
-                    a_tymut.mutbl == b_tymut.mutbl
+                (RawPtr(a_ty, a_mutbl), RawPtr(b_ty, b_mutbl)) => {
+                    a_mutbl == b_mutbl
                         && structurally_same_type_impl(
-                            seen_types, tcx, param_env, a_tymut.ty, b_tymut.ty, ckind,
+                            seen_types, tcx, param_env, *a_ty, *b_ty, ckind,
                         )
                 }
                 (Ref(_a_region, a_ty, a_mut), Ref(_b_region, b_ty, b_mut)) => {
@@ -341,8 +341,8 @@ fn structurally_same_type_impl<'tcx>(
 
                     // We don't compare regions, but leaving bound regions around ICEs, so
                     // we erase them.
-                    let a_sig = tcx.erase_late_bound_regions(a_poly_sig);
-                    let b_sig = tcx.erase_late_bound_regions(b_poly_sig);
+                    let a_sig = tcx.instantiate_bound_regions_with_erased(a_poly_sig);
+                    let b_sig = tcx.instantiate_bound_regions_with_erased(b_poly_sig);
 
                     (a_sig.abi, a_sig.unsafety, a_sig.c_variadic)
                         == (b_sig.abi, b_sig.unsafety, b_sig.c_variadic)
@@ -369,8 +369,8 @@ fn structurally_same_type_impl<'tcx>(
                 (Dynamic(..), Dynamic(..))
                 | (Error(..), Error(..))
                 | (Closure(..), Closure(..))
-                | (Generator(..), Generator(..))
-                | (GeneratorWitness(..), GeneratorWitness(..))
+                | (Coroutine(..), Coroutine(..))
+                | (CoroutineWitness(..), CoroutineWitness(..))
                 | (Alias(ty::Projection, ..), Alias(ty::Projection, ..))
                 | (Alias(ty::Inherent, ..), Alias(ty::Inherent, ..))
                 | (Alias(ty::Opaque, ..), Alias(ty::Opaque, ..)) => false,

@@ -15,7 +15,7 @@ where
     type QueryResponse = T;
 
     fn try_fast_path(_tcx: TyCtxt<'tcx>, key: &ParamEnvAnd<'tcx, Self>) -> Option<T> {
-        if !key.value.value.has_projections() { Some(key.value.value) } else { None }
+        if !key.value.value.has_aliases() { Some(key.value.value) } else { None }
     }
 
     fn perform_query(
@@ -25,11 +25,11 @@ where
         T::type_op_method(tcx, canonicalized)
     }
 
-    fn perform_locally_in_new_solver(
+    fn perform_locally_with_next_solver(
         ocx: &ObligationCtxt<'_, 'tcx>,
         key: ParamEnvAnd<'tcx, Self>,
     ) -> Result<Self::QueryResponse, NoSolution> {
-        // FIXME(-Ztrait-solver=next): shouldn't be using old normalizer
+        // FIXME(-Znext-solver): shouldn't be using old normalizer
         Ok(ocx.normalize(&ObligationCause::dummy(), key.param_env, key.value.value))
     }
 }

@@ -16,7 +16,7 @@ use rustc_target::spec::abi::Abi as SpecAbi;
 
 use std::iter;
 
-pub fn provide(providers: &mut Providers) {
+pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers { fn_abi_of_fn_ptr, fn_abi_of_instance, ..*providers };
 }
 
@@ -50,7 +50,7 @@ fn fn_sig_for_fn_abi<'tcx>(
             // `tests/ui/polymorphization/normalized_sig_types.rs`), and codegen not keeping
             // track of a polymorphization `ParamEnv` to allow normalizing later.
             //
-            // We normalize the `fn_sig` again after substituting at a later point.
+            // We normalize the `fn_sig` again after instantiating at a later point.
             let mut sig = match *ty.kind() {
                 ty::FnDef(def_id, args) => tcx
                     .fn_sig(def_id)
@@ -82,8 +82,12 @@ fn fn_sig_for_fn_abi<'tcx>(
                 var: ty::BoundVar::from_usize(bound_vars.len() - 1),
                 kind: ty::BoundRegionKind::BrEnv,
             };
-            let env_region = ty::Region::new_late_bound(tcx, ty::INNERMOST, br);
-            let env_ty = tcx.closure_env_ty(def_id, args, env_region).unwrap();
+            let env_region = ty::Region::new_bound(tcx, ty::INNERMOST, br);
+            let env_ty = tcx.closure_env_ty(
+                Ty::new_closure(tcx, def_id, args),
+                args.as_closure().kind(),
+                env_region,
+            );
 
             let sig = sig.skip_binder();
             ty::Binder::bind_with_vars(
@@ -97,9 +101,9 @@ fn fn_sig_for_fn_abi<'tcx>(
                 bound_vars,
             )
         }
-        ty::Generator(did, args, _) => {
-            let sig = args.as_generator().poly_sig();
-
+        ty::CoroutineClosure(def_id, args) => {
+            let coroutine_ty = Ty::new_coroutine_closure(tcx, def_id, args);
+            let sig = args.as_coroutine_closure().coroutine_closure_sig();
             let bound_vars = tcx.mk_bound_variable_kinds_from_iter(
                 sig.bound_vars().iter().chain(iter::once(ty::BoundVariableKind::Region(ty::BrEnv))),
             );
@@ -107,71 +111,219 @@ fn fn_sig_for_fn_abi<'tcx>(
                 var: ty::BoundVar::from_usize(bound_vars.len() - 1),
                 kind: ty::BoundRegionKind::BrEnv,
             };
+            let env_region = ty::Region::new_bound(tcx, ty::INNERMOST, br);
+            // When this `CoroutineClosure` comes from a `ConstructCoroutineInClosureShim`,
+            // make sure we respect the `target_kind` in that shim.
+            // FIXME(async_closures): This shouldn't be needed, and we should be populating
+            // a separate def-id for these bodies.
+            let mut coroutine_kind = args.as_coroutine_closure().kind();
+
             let env_ty =
-                Ty::new_mut_ref(tcx, ty::Region::new_late_bound(tcx, ty::INNERMOST, br), ty);
+                if let InstanceDef::ConstructCoroutineInClosureShim { receiver_by_ref, .. } =
+                    instance.def
+                {
+                    coroutine_kind = ty::ClosureKind::FnOnce;
+
+                    // Implementations of `FnMut` and `Fn` for coroutine-closures
+                    // still take their receiver by (mut) ref.
+                    if receiver_by_ref {
+                        Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, coroutine_ty)
+                    } else {
+                        coroutine_ty
+                    }
+                } else {
+                    tcx.closure_env_ty(coroutine_ty, coroutine_kind, env_region)
+                };
+
+            let sig = sig.skip_binder();
+            ty::Binder::bind_with_vars(
+                tcx.mk_fn_sig(
+                    iter::once(env_ty).chain([sig.tupled_inputs_ty]),
+                    sig.to_coroutine_given_kind_and_upvars(
+                        tcx,
+                        args.as_coroutine_closure().parent_args(),
+                        tcx.coroutine_for_closure(def_id),
+                        coroutine_kind,
+                        env_region,
+                        args.as_coroutine_closure().tupled_upvars_ty(),
+                        args.as_coroutine_closure().coroutine_captures_by_ref_ty(),
+                    ),
+                    sig.c_variadic,
+                    sig.unsafety,
+                    sig.abi,
+                ),
+                bound_vars,
+            )
+        }
+        ty::Coroutine(did, args) => {
+            let coroutine_kind = tcx.coroutine_kind(did).unwrap();
+            let sig = args.as_coroutine().sig();
+
+            let bound_vars = tcx.mk_bound_variable_kinds_from_iter(iter::once(
+                ty::BoundVariableKind::Region(ty::BrEnv),
+            ));
+            let br = ty::BoundRegion {
+                var: ty::BoundVar::from_usize(bound_vars.len() - 1),
+                kind: ty::BoundRegionKind::BrEnv,
+            };
+
+            let mut ty = ty;
+            // When this `Closure` comes from a `CoroutineKindShim`,
+            // make sure we respect the `target_kind` in that shim.
+            // FIXME(async_closures): This shouldn't be needed, and we should be populating
+            // a separate def-id for these bodies.
+            if let InstanceDef::CoroutineKindShim { .. } = instance.def {
+                // Grab the parent coroutine-closure. It has the same args for the purposes
+                // of instantiation, so this will be okay to do.
+                let ty::CoroutineClosure(_, coroutine_closure_args) = *tcx
+                    .instantiate_and_normalize_erasing_regions(
+                        args,
+                        param_env,
+                        tcx.type_of(tcx.parent(did)),
+                    )
+                    .kind()
+                else {
+                    bug!("CoroutineKindShim comes from calling a coroutine-closure");
+                };
+                let coroutine_closure_args = coroutine_closure_args.as_coroutine_closure();
+                ty = tcx.instantiate_bound_regions_with_erased(
+                    coroutine_closure_args.coroutine_closure_sig().map_bound(|sig| {
+                        sig.to_coroutine_given_kind_and_upvars(
+                            tcx,
+                            coroutine_closure_args.parent_args(),
+                            did,
+                            ty::ClosureKind::FnOnce,
+                            tcx.lifetimes.re_erased,
+                            coroutine_closure_args.tupled_upvars_ty(),
+                            coroutine_closure_args.coroutine_captures_by_ref_ty(),
+                        )
+                    }),
+                );
+            }
+            let env_ty = Ty::new_mut_ref(tcx, ty::Region::new_bound(tcx, ty::INNERMOST, br), ty);
 
             let pin_did = tcx.require_lang_item(LangItem::Pin, None);
             let pin_adt_ref = tcx.adt_def(pin_did);
             let pin_args = tcx.mk_args(&[env_ty.into()]);
-            let env_ty = Ty::new_adt(tcx, pin_adt_ref, pin_args);
-
-            let sig = sig.skip_binder();
-            // The `FnSig` and the `ret_ty` here is for a generators main
-            // `Generator::resume(...) -> GeneratorState` function in case we
-            // have an ordinary generator, or the `Future::poll(...) -> Poll`
-            // function in case this is a special generator backing an async construct.
-            let (resume_ty, ret_ty) = if tcx.generator_is_async(did) {
-                // The signature should be `Future::poll(_, &mut Context<'_>) -> Poll<Output>`
-                let poll_did = tcx.require_lang_item(LangItem::Poll, None);
-                let poll_adt_ref = tcx.adt_def(poll_did);
-                let poll_args = tcx.mk_args(&[sig.return_ty.into()]);
-                let ret_ty = Ty::new_adt(tcx, poll_adt_ref, poll_args);
-
-                // We have to replace the `ResumeTy` that is used for type and borrow checking
-                // with `&mut Context<'_>` which is used in codegen.
-                #[cfg(debug_assertions)]
-                {
-                    if let ty::Adt(resume_ty_adt, _) = sig.resume_ty.kind() {
-                        let expected_adt =
-                            tcx.adt_def(tcx.require_lang_item(LangItem::ResumeTy, None));
-                        assert_eq!(*resume_ty_adt, expected_adt);
-                    } else {
-                        panic!("expected `ResumeTy`, found `{:?}`", sig.resume_ty);
-                    };
+            let env_ty = match coroutine_kind {
+                hir::CoroutineKind::Desugared(hir::CoroutineDesugaring::Gen, _) => {
+                    // Iterator::next doesn't accept a pinned argument,
+                    // unlike for all other coroutine kinds.
+                    env_ty
                 }
-                let context_mut_ref = Ty::new_task_context(tcx);
-
-                (context_mut_ref, ret_ty)
-            } else {
-                // The signature should be `Generator::resume(_, Resume) -> GeneratorState<Yield, Return>`
-                let state_did = tcx.require_lang_item(LangItem::GeneratorState, None);
-                let state_adt_ref = tcx.adt_def(state_did);
-                let state_args = tcx.mk_args(&[sig.yield_ty.into(), sig.return_ty.into()]);
-                let ret_ty = Ty::new_adt(tcx, state_adt_ref, state_args);
-
-                (sig.resume_ty, ret_ty)
+                hir::CoroutineKind::Desugared(hir::CoroutineDesugaring::Async, _)
+                | hir::CoroutineKind::Desugared(hir::CoroutineDesugaring::AsyncGen, _)
+                | hir::CoroutineKind::Coroutine(_) => Ty::new_adt(tcx, pin_adt_ref, pin_args),
             };
 
-            ty::Binder::bind_with_vars(
+            // The `FnSig` and the `ret_ty` here is for a coroutines main
+            // `Coroutine::resume(...) -> CoroutineState` function in case we
+            // have an ordinary coroutine, the `Future::poll(...) -> Poll`
+            // function in case this is a special coroutine backing an async construct
+            // or the `Iterator::next(...) -> Option` function in case this is a
+            // special coroutine backing a gen construct.
+            let (resume_ty, ret_ty) = match coroutine_kind {
+                hir::CoroutineKind::Desugared(hir::CoroutineDesugaring::Async, _) => {
+                    // The signature should be `Future::poll(_, &mut Context<'_>) -> Poll<Output>`
+                    assert_eq!(sig.yield_ty, tcx.types.unit);
+
+                    let poll_did = tcx.require_lang_item(LangItem::Poll, None);
+                    let poll_adt_ref = tcx.adt_def(poll_did);
+                    let poll_args = tcx.mk_args(&[sig.return_ty.into()]);
+                    let ret_ty = Ty::new_adt(tcx, poll_adt_ref, poll_args);
+
+                    // We have to replace the `ResumeTy` that is used for type and borrow checking
+                    // with `&mut Context<'_>` which is used in codegen.
+                    #[cfg(debug_assertions)]
+                    {
+                        if let ty::Adt(resume_ty_adt, _) = sig.resume_ty.kind() {
+                            let expected_adt =
+                                tcx.adt_def(tcx.require_lang_item(LangItem::ResumeTy, None));
+                            assert_eq!(*resume_ty_adt, expected_adt);
+                        } else {
+                            panic!("expected `ResumeTy`, found `{:?}`", sig.resume_ty);
+                        };
+                    }
+                    let context_mut_ref = Ty::new_task_context(tcx);
+
+                    (Some(context_mut_ref), ret_ty)
+                }
+                hir::CoroutineKind::Desugared(hir::CoroutineDesugaring::Gen, _) => {
+                    // The signature should be `Iterator::next(_) -> Option<Yield>`
+                    let option_did = tcx.require_lang_item(LangItem::Option, None);
+                    let option_adt_ref = tcx.adt_def(option_did);
+                    let option_args = tcx.mk_args(&[sig.yield_ty.into()]);
+                    let ret_ty = Ty::new_adt(tcx, option_adt_ref, option_args);
+
+                    assert_eq!(sig.return_ty, tcx.types.unit);
+                    assert_eq!(sig.resume_ty, tcx.types.unit);
+
+                    (None, ret_ty)
+                }
+                hir::CoroutineKind::Desugared(hir::CoroutineDesugaring::AsyncGen, _) => {
+                    // The signature should be
+                    // `AsyncIterator::poll_next(_, &mut Context<'_>) -> Poll<Option<Output>>`
+                    assert_eq!(sig.return_ty, tcx.types.unit);
+
+                    // Yield type is already `Poll<Option<yield_ty>>`
+                    let ret_ty = sig.yield_ty;
+
+                    // We have to replace the `ResumeTy` that is used for type and borrow checking
+                    // with `&mut Context<'_>` which is used in codegen.
+                    #[cfg(debug_assertions)]
+                    {
+                        if let ty::Adt(resume_ty_adt, _) = sig.resume_ty.kind() {
+                            let expected_adt =
+                                tcx.adt_def(tcx.require_lang_item(LangItem::ResumeTy, None));
+                            assert_eq!(*resume_ty_adt, expected_adt);
+                        } else {
+                            panic!("expected `ResumeTy`, found `{:?}`", sig.resume_ty);
+                        };
+                    }
+                    let context_mut_ref = Ty::new_task_context(tcx);
+
+                    (Some(context_mut_ref), ret_ty)
+                }
+                hir::CoroutineKind::Coroutine(_) => {
+                    // The signature should be `Coroutine::resume(_, Resume) -> CoroutineState<Yield, Return>`
+                    let state_did = tcx.require_lang_item(LangItem::CoroutineState, None);
+                    let state_adt_ref = tcx.adt_def(state_did);
+                    let state_args = tcx.mk_args(&[sig.yield_ty.into(), sig.return_ty.into()]);
+                    let ret_ty = Ty::new_adt(tcx, state_adt_ref, state_args);
+
+                    (Some(sig.resume_ty), ret_ty)
+                }
+            };
+
+            let fn_sig = if let Some(resume_ty) = resume_ty {
                 tcx.mk_fn_sig(
                     [env_ty, resume_ty],
                     ret_ty,
                     false,
                     hir::Unsafety::Normal,
                     rustc_target::spec::abi::Abi::Rust,
-                ),
-                bound_vars,
-            )
+                )
+            } else {
+                // `Iterator::next` doesn't have a `resume` argument.
+                tcx.mk_fn_sig(
+                    [env_ty],
+                    ret_ty,
+                    false,
+                    hir::Unsafety::Normal,
+                    rustc_target::spec::abi::Abi::Rust,
+                )
+            };
+            ty::Binder::bind_with_vars(fn_sig, bound_vars)
         }
         _ => bug!("unexpected type {:?} in Instance::fn_sig", ty),
     }
 }
 
 #[inline]
-fn conv_from_spec_abi(tcx: TyCtxt<'_>, abi: SpecAbi) -> Conv {
+fn conv_from_spec_abi(tcx: TyCtxt<'_>, abi: SpecAbi, c_variadic: bool) -> Conv {
     use rustc_target::spec::abi::Abi::*;
-    match tcx.sess.target.adjust_abi(abi) {
-        RustIntrinsic | PlatformIntrinsic | Rust | RustCall => Conv::Rust,
+    match tcx.sess.target.adjust_abi(abi, c_variadic) {
+        RustIntrinsic | Rust | RustCall => Conv::Rust,
 
         // This is intentionally not using `Conv::Cold`, as that has to preserve
         // even SIMD registers, which is generally not a good trade-off.
@@ -194,7 +346,6 @@ fn conv_from_spec_abi(tcx: TyCtxt<'_>, abi: SpecAbi) -> Conv {
         PtxKernel => Conv::PtxKernel,
         Msp430Interrupt => Conv::Msp430Intr,
         X86Interrupt => Conv::X86Intr,
-        AmdGpuKernel => Conv::AmdGpuKernel,
         AvrInterrupt => Conv::AvrInterrupt,
         AvrNonBlockingInterrupt => Conv::AvrNonBlockingInterrupt,
         RiscvInterruptM => Conv::RiscvInterrupt { kind: RiscvInterruptKind::Machine },
@@ -312,7 +463,7 @@ fn adjust_for_rust_scalar<'tcx>(
             let no_alias = match kind {
                 PointerKind::SharedRef { frozen } => frozen,
                 PointerKind::MutableRef { unpin } => unpin && noalias_mut_ref,
-                PointerKind::Box { unpin } => unpin && noalias_for_box,
+                PointerKind::Box { unpin, global } => unpin && global && noalias_for_box,
             };
             // We can never add `noalias` in return position; that LLVM attribute has some very surprising semantics
             // (see <https://github.com/rust-lang/unsafe-code-guidelines/issues/385#issuecomment-1368055745>).
@@ -325,6 +476,93 @@ fn adjust_for_rust_scalar<'tcx>(
             }
         }
     }
+}
+
+/// Ensure that the ABI makes basic sense.
+fn fn_abi_sanity_check<'tcx>(
+    cx: &LayoutCx<'tcx, TyCtxt<'tcx>>,
+    fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
+    spec_abi: SpecAbi,
+) {
+    fn fn_arg_sanity_check<'tcx>(
+        cx: &LayoutCx<'tcx, TyCtxt<'tcx>>,
+        fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
+        spec_abi: SpecAbi,
+        arg: &ArgAbi<'tcx, Ty<'tcx>>,
+    ) {
+        match &arg.mode {
+            PassMode::Ignore => {}
+            PassMode::Direct(_) => {
+                // Here the Rust type is used to determine the actual ABI, so we have to be very
+                // careful. Scalar/ScalarPair is fine, since backends will generally use
+                // `layout.abi` and ignore everything else. We should just reject `Aggregate`
+                // entirely here, but some targets need to be fixed first.
+                if matches!(arg.layout.abi, Abi::Aggregate { .. }) {
+                    // For an unsized type we'd only pass the sized prefix, so there is no universe
+                    // in which we ever want to allow this.
+                    assert!(
+                        arg.layout.is_sized(),
+                        "`PassMode::Direct` for unsized type in ABI: {:#?}",
+                        fn_abi
+                    );
+                    // This really shouldn't happen even for sized aggregates, since
+                    // `immediate_llvm_type` will use `layout.fields` to turn this Rust type into an
+                    // LLVM type. This means all sorts of Rust type details leak into the ABI.
+                    // However wasm sadly *does* currently use this mode so we have to allow it --
+                    // but we absolutely shouldn't let any more targets do that.
+                    // (Also see <https://github.com/rust-lang/rust/issues/115666>.)
+                    //
+                    // The unstable abi `PtxKernel` also uses Direct for now.
+                    // It needs to switch to something else before stabilization can happen.
+                    // (See issue: https://github.com/rust-lang/rust/issues/117271)
+                    assert!(
+                        matches!(&*cx.tcx.sess.target.arch, "wasm32" | "wasm64")
+                            || matches!(spec_abi, SpecAbi::PtxKernel | SpecAbi::Unadjusted),
+                        r#"`PassMode::Direct` for aggregates only allowed for "unadjusted" and "ptx-kernel" functions and on wasm\nProblematic type: {:#?}"#,
+                        arg.layout,
+                    );
+                }
+            }
+            PassMode::Pair(_, _) => {
+                // Similar to `Direct`, we need to make sure that backends use `layout.abi` and
+                // ignore the rest of the layout.
+                assert!(
+                    matches!(arg.layout.abi, Abi::ScalarPair(..)),
+                    "PassMode::Pair for type {}",
+                    arg.layout.ty
+                );
+            }
+            PassMode::Cast { .. } => {
+                // `Cast` means "transmute to `CastType`"; that only makes sense for sized types.
+                assert!(arg.layout.is_sized());
+            }
+            PassMode::Indirect { meta_attrs: None, .. } => {
+                // No metadata, must be sized.
+                // Conceptually, unsized arguments must be copied around, which requires dynamically
+                // determining their size, which we cannot do without metadata. Consult
+                // t-opsem before removing this check.
+                assert!(arg.layout.is_sized());
+            }
+            PassMode::Indirect { meta_attrs: Some(_), on_stack, .. } => {
+                // With metadata. Must be unsized and not on the stack.
+                assert!(arg.layout.is_unsized() && !on_stack);
+                // Also, must not be `extern` type.
+                let tail = cx.tcx.struct_tail_with_normalize(arg.layout.ty, |ty| ty, || {});
+                if matches!(tail.kind(), ty::Foreign(..)) {
+                    // These types do not have metadata, so having `meta_attrs` is bogus.
+                    // Conceptually, unsized arguments must be copied around, which requires dynamically
+                    // determining their size. Therefore, we cannot allow `extern` types here. Consult
+                    // t-opsem before removing this check.
+                    panic!("unsized arguments must not be `extern` types");
+                }
+            }
+        }
+    }
+
+    for arg in fn_abi.args.iter() {
+        fn_arg_sanity_check(cx, fn_abi, spec_abi, arg);
+    }
+    fn_arg_sanity_check(cx, fn_abi, spec_abi, &fn_abi.ret);
 }
 
 // FIXME(eddyb) perhaps group the signature/type-containing (or all of them?)
@@ -341,7 +579,7 @@ fn fn_abi_new_uncached<'tcx>(
 ) -> Result<&'tcx FnAbi<'tcx, Ty<'tcx>>, &'tcx FnAbiError<'tcx>> {
     let sig = cx.tcx.normalize_erasing_late_bound_regions(cx.param_env, sig);
 
-    let conv = conv_from_spec_abi(cx.tcx(), sig.abi);
+    let conv = conv_from_spec_abi(cx.tcx(), sig.abi, sig.c_variadic);
 
     let mut inputs = sig.inputs();
     let extra_args = if sig.abi == RustCall {
@@ -378,7 +616,7 @@ fn fn_abi_new_uncached<'tcx>(
     let linux_powerpc_gnu_like =
         target.os == "linux" && target.arch == "powerpc" && target_env_gnu_like;
     use SpecAbi::*;
-    let rust_abi = matches!(sig.abi, RustIntrinsic | PlatformIntrinsic | Rust | RustCall);
+    let rust_abi = matches!(sig.abi, RustIntrinsic | Rust | RustCall);
 
     let is_drop_in_place =
         fn_def_id.is_some() && fn_def_id == cx.tcx.lang_items().drop_in_place_fn();
@@ -389,7 +627,7 @@ fn fn_abi_new_uncached<'tcx>(
         let is_return = arg_idx.is_none();
         let is_drop_target = is_drop_in_place && arg_idx == Some(0);
         let drop_target_pointee = is_drop_target.then(|| match ty.kind() {
-            ty::RawPtr(ty::TypeAndMut { ty, .. }) => *ty,
+            ty::RawPtr(ty, _) => *ty,
             _ => bug!("argument to drop_in_place is not a raw ptr: {:?}", ty),
         });
 
@@ -453,6 +691,7 @@ fn fn_abi_new_uncached<'tcx>(
     };
     fn_abi_adjust_for_abi(cx, &mut fn_abi, sig.abi, fn_def_id)?;
     debug!("fn_abi_new_uncached = {:?}", fn_abi);
+    fn_abi_sanity_check(cx, &fn_abi, sig.abi);
     Ok(cx.tcx.arena.alloc(fn_abi))
 }
 
@@ -464,14 +703,28 @@ fn fn_abi_adjust_for_abi<'tcx>(
     fn_def_id: Option<DefId>,
 ) -> Result<(), &'tcx FnAbiError<'tcx>> {
     if abi == SpecAbi::Unadjusted {
+        // The "unadjusted" ABI passes aggregates in "direct" mode. That's fragile but needed for
+        // some LLVM intrinsics.
+        fn unadjust<'tcx>(arg: &mut ArgAbi<'tcx, Ty<'tcx>>) {
+            // This still uses `PassMode::Pair` for ScalarPair types. That's unlikely to be intended,
+            // but who knows what breaks if we change this now.
+            if matches!(arg.layout.abi, Abi::Aggregate { .. }) {
+                assert!(
+                    arg.layout.abi.is_sized(),
+                    "'unadjusted' ABI does not support unsized arguments"
+                );
+            }
+            arg.make_direct_deprecated();
+        }
+
+        unadjust(&mut fn_abi.ret);
+        for arg in fn_abi.args.iter_mut() {
+            unadjust(arg);
+        }
         return Ok(());
     }
 
-    if abi == SpecAbi::Rust
-        || abi == SpecAbi::RustCall
-        || abi == SpecAbi::RustIntrinsic
-        || abi == SpecAbi::PlatformIntrinsic
-    {
+    if abi == SpecAbi::Rust || abi == SpecAbi::RustCall || abi == SpecAbi::RustIntrinsic {
         // Look up the deduced parameter attributes for this function, if we have its def ID and
         // we're optimizing in non-incremental mode. We'll tag its parameters with those attributes
         // as appropriate.
@@ -507,12 +760,11 @@ fn fn_abi_adjust_for_abi<'tcx>(
                 // target feature sets. Some more information about this
                 // issue can be found in #44367.
                 //
-                // Note that the platform intrinsic ABI is exempt here as
+                // Note that the intrinsic ABI is exempt here as
                 // that's how we connect up to LLVM and it's unstable
                 // anyway, we control all calls to it in libstd.
                 Abi::Vector { .. }
-                    if abi != SpecAbi::PlatformIntrinsic
-                        && cx.tcx.sess.target.simd_types_indirect =>
+                    if abi != SpecAbi::RustIntrinsic && cx.tcx.sess.target.simd_types_indirect =>
                 {
                     arg.make_indirect();
                     return;
@@ -520,15 +772,16 @@ fn fn_abi_adjust_for_abi<'tcx>(
 
                 _ => return,
             }
-            // `Aggregate` ABI must be adjusted to ensure that ABI-compatible Rust types are passed
-            // the same way.
+            // Compute `Aggregate` ABI.
+
+            let is_indirect_not_on_stack =
+                matches!(arg.mode, PassMode::Indirect { on_stack: false, .. });
+            assert!(is_indirect_not_on_stack, "{:?}", arg);
 
             let size = arg.layout.size;
-            if arg.layout.is_unsized() || size > Pointer(AddressSpace::DATA).size(cx) {
-                arg.make_indirect();
-            } else {
+            if !arg.layout.is_unsized() && size <= Pointer(AddressSpace::DATA).size(cx) {
                 // We want to pass small aggregates as immediates, but using
-                // a LLVM aggregate type for this leads to bad optimizations,
+                // an LLVM aggregate type for this leads to bad optimizations,
                 // so we pick an appropriately sized integer type instead.
                 arg.cast_to(Reg { kind: RegKind::Integer, size });
             }

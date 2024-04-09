@@ -1,4 +1,3 @@
-use crate::MirPass;
 use rustc_ast::InlineAsmOptions;
 use rustc_middle::mir::*;
 use rustc_middle::ty::layout;
@@ -40,7 +39,9 @@ impl<'tcx> MirPass<'tcx> for AbortUnwindingCalls {
         let body_abi = match body_ty.kind() {
             ty::FnDef(..) => body_ty.fn_sig(tcx).abi(),
             ty::Closure(..) => Abi::RustCall,
-            ty::Generator(..) => Abi::Rust,
+            ty::CoroutineClosure(..) => Abi::RustCall,
+            ty::Coroutine(..) => Abi::Rust,
+            ty::Error(_) => return,
             _ => span_bug!(body.span, "unexpected body ty: {:?}", body_ty),
         };
         let body_can_unwind = layout::fn_can_unwind(tcx, Some(def_id), body_abi);
@@ -113,6 +114,6 @@ impl<'tcx> MirPass<'tcx> for AbortUnwindingCalls {
         }
 
         // We may have invalidated some `cleanup` blocks so clean those up now.
-        super::simplify::remove_dead_blocks(tcx, body);
+        super::simplify::remove_dead_blocks(body);
     }
 }

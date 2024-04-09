@@ -74,12 +74,11 @@ fn variant_hints(
         },
         Some(InlayTooltip::String(match &d {
             Ok(_) => "enum variant discriminant".into(),
-            Err(e) => format!("{e:?}").into(),
+            Err(e) => format!("{e:?}"),
         })),
         None,
     );
     acc.push(InlayHint {
-        needs_resolve: label.needs_resolve(),
         range: match eq_token {
             Some(t) => range.cover(t.text_range()),
             _ => range,

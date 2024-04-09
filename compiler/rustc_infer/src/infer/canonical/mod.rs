@@ -24,32 +24,33 @@
 use crate::infer::{ConstVariableOrigin, ConstVariableOriginKind};
 use crate::infer::{InferCtxt, RegionVariableOrigin, TypeVariableOrigin, TypeVariableOriginKind};
 use rustc_index::IndexVec;
+use rustc_middle::infer::unify_key::EffectVarValue;
 use rustc_middle::ty::fold::TypeFoldable;
 use rustc_middle::ty::GenericArg;
 use rustc_middle::ty::{self, List, Ty, TyCtxt};
-use rustc_span::source_map::Span;
+use rustc_span::Span;
 
+pub use instantiate::CanonicalExt;
 pub use rustc_middle::infer::canonical::*;
-pub use substitute::CanonicalExt;
 
 mod canonicalizer;
+mod instantiate;
 pub mod query_response;
-mod substitute;
 
 impl<'tcx> InferCtxt<'tcx> {
-    /// Creates a substitution S for the canonical value with fresh
-    /// inference variables and applies it to the canonical value.
-    /// Returns both the instantiated result *and* the substitution S.
+    /// Creates an instantiation S for the canonical value with fresh inference
+    /// variables and placeholders then applies it to the canonical value.
+    /// Returns both the instantiated result *and* the instantiation S.
     ///
     /// This can be invoked as part of constructing an
     /// inference context at the start of a query (see
     /// `InferCtxtBuilder::build_with_canonical`). It basically
     /// brings the canonical value "into scope" within your new infcx.
     ///
-    /// At the end of processing, the substitution S (once
+    /// At the end of processing, the instantiation S (once
     /// canonicalized) then represents the values that you computed
     /// for each of the canonical inputs to your query.
-    pub fn instantiate_canonical_with_fresh_inference_vars<T>(
+    pub fn instantiate_canonical<T>(
         &self,
         span: Span,
         canonical: &Canonical<'tcx, T>,
@@ -72,14 +73,14 @@ impl<'tcx> InferCtxt<'tcx> {
 
         let canonical_inference_vars =
             self.instantiate_canonical_vars(span, canonical.variables, |ui| universes[ui]);
-        let result = canonical.substitute(self.tcx, &canonical_inference_vars);
+        let result = canonical.instantiate(self.tcx, &canonical_inference_vars);
         (result, canonical_inference_vars)
     }
 
     /// Given the "infos" about the canonical variables from some
     /// canonical, creates fresh variables with the same
     /// characteristics (see `instantiate_canonical_var` for
-    /// details). You can then use `substitute` to instantiate the
+    /// details). You can then use `instantiate` to instantiate the
     /// canonical variable with these inference variables.
     fn instantiate_canonical_vars(
         &self,
@@ -101,7 +102,7 @@ impl<'tcx> InferCtxt<'tcx> {
     /// variable, then you'll get a new inference variable; if it is a
     /// universally quantified variable, you get a placeholder.
     ///
-    /// FIXME(-Ztrait-solver=next): This is public because it's used by the
+    /// FIXME(-Znext-solver): This is public because it's used by the
     /// new trait solver which has a different canonicalization routine.
     /// We should somehow deduplicate all of this.
     pub fn instantiate_canonical_var(
@@ -152,7 +153,12 @@ impl<'tcx> InferCtxt<'tcx> {
                 )
                 .into(),
             CanonicalVarKind::Effect => {
-                let vid = self.inner.borrow_mut().effect_unification_table().new_key(None);
+                let vid = self
+                    .inner
+                    .borrow_mut()
+                    .effect_unification_table()
+                    .new_key(EffectVarValue::Unknown)
+                    .vid;
                 ty::Const::new_infer(self.tcx, ty::InferConst::EffectVar(vid), self.tcx.types.bool)
                     .into()
             }

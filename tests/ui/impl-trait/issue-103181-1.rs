@@ -1,6 +1,7 @@
-// revisions: current next
-//[next] compile-flags: -Ztrait-solver=next
-// edition:2021
+//@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
+//@[next] compile-flags: -Znext-solver
+//@ edition:2021
 
 mod hyper {
     use std::{fmt::Debug, future::Future, marker::PhantomData, pin::Pin, task::Poll};

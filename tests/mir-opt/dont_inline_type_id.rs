@@ -1,5 +1,6 @@
-// unit-test: Inline
-// compile-flags: --crate-type=lib -C panic=abort
+// skip-filecheck
+//@ unit-test: Inline
+//@ compile-flags: --crate-type=lib -C panic=abort
 
 use std::any::Any;
 use std::any::TypeId;

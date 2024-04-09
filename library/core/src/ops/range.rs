@@ -115,6 +115,7 @@ impl<Idx: PartialOrd<Idx>> Range<Idx> {
     /// assert!(!(0.0..f32::NAN).contains(&0.5));
     /// assert!(!(f32::NAN..1.0).contains(&0.5));
     /// ```
+    #[inline]
     #[stable(feature = "range_contains", since = "1.35.0")]
     pub fn contains<U>(&self, item: &U) -> bool
     where
@@ -141,6 +142,7 @@ impl<Idx: PartialOrd<Idx>> Range<Idx> {
     /// assert!( (3.0..f32::NAN).is_empty());
     /// assert!( (f32::NAN..5.0).is_empty());
     /// ```
+    #[inline]
     #[stable(feature = "range_is_empty", since = "1.47.0")]
     pub fn is_empty(&self) -> bool {
         !(self.start < self.end)
@@ -213,6 +215,7 @@ impl<Idx: PartialOrd<Idx>> RangeFrom<Idx> {
     /// assert!(!(0.0..).contains(&f32::NAN));
     /// assert!(!(f32::NAN..).contains(&0.5));
     /// ```
+    #[inline]
     #[stable(feature = "range_contains", since = "1.35.0")]
     pub fn contains<U>(&self, item: &U) -> bool
     where
@@ -294,6 +297,7 @@ impl<Idx: PartialOrd<Idx>> RangeTo<Idx> {
     /// assert!(!(..1.0).contains(&f32::NAN));
     /// assert!(!(..f32::NAN).contains(&0.5));
     /// ```
+    #[inline]
     #[stable(feature = "range_contains", since = "1.35.0")]
     pub fn contains<U>(&self, item: &U) -> bool
     where
@@ -500,6 +504,7 @@ impl<Idx: PartialOrd<Idx>> RangeInclusive<Idx> {
     /// // Precise field values are unspecified here
     /// assert!(!r.contains(&3) && !r.contains(&5));
     /// ```
+    #[inline]
     #[stable(feature = "range_contains", since = "1.35.0")]
     pub fn contains<U>(&self, item: &U) -> bool
     where
@@ -613,6 +618,7 @@ impl<Idx: PartialOrd<Idx>> RangeToInclusive<Idx> {
     /// assert!(!(..=1.0).contains(&f32::NAN));
     /// assert!(!(..=f32::NAN).contains(&0.5));
     /// ```
+    #[inline]
     #[stable(feature = "range_contains", since = "1.35.0")]
     pub fn contains<U>(&self, item: &U) -> bool
     where
@@ -704,7 +710,6 @@ impl<T> Bound<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(bound_map)]
     /// use std::ops::Bound::*;
     ///
     /// let bound_string = Included("Hello, World!");
@@ -713,7 +718,6 @@ impl<T> Bound<T> {
     /// ```
     ///
     /// ```
-    /// #![feature(bound_map)]
     /// use std::ops::Bound;
     /// use Bound::*;
     ///
@@ -722,7 +726,7 @@ impl<T> Bound<T> {
     /// assert_eq!(unbounded_string.map(|s| s.len()), Unbounded);
     /// ```
     #[inline]
-    #[unstable(feature = "bound_map", issue = "86026")]
+    #[stable(feature = "bound_map", since = "1.77.0")]
     pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Bound<U> {
         match self {
             Unbounded => Unbounded,
@@ -758,6 +762,7 @@ impl<T: Clone> Bound<&T> {
 /// `RangeBounds` is implemented by Rust's built-in range types, produced
 /// by range syntax like `..`, `a..`, `..b`, `..=c`, `d..e`, or `f..=g`.
 #[stable(feature = "collections_range", since = "1.28.0")]
+#[rustc_diagnostic_item = "RangeBounds"]
 pub trait RangeBounds<T: ?Sized> {
     /// Start index bound.
     ///
@@ -807,6 +812,7 @@ pub trait RangeBounds<T: ?Sized> {
     /// assert!(!(0.0..1.0).contains(&f32::NAN));
     /// assert!(!(0.0..f32::NAN).contains(&0.5));
     /// assert!(!(f32::NAN..1.0).contains(&0.5));
+    #[inline]
     #[stable(feature = "range_contains", since = "1.35.0")]
     fn contains<U>(&self, item: &U) -> bool
     where

@@ -1,15 +1,15 @@
+use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::span_lint_and_help;
 use clippy_utils::eager_or_lazy::switch_to_eager_eval;
-use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::snippet_with_context;
 use clippy_utils::sugg::Sugg;
-use clippy_utils::{contains_return, higher, is_else_clause, is_res_lang_ctor, path_res, peel_blocks};
+use clippy_utils::{contains_return, higher, in_constant, is_else_clause, is_res_lang_ctor, path_res, peel_blocks};
 use rustc_errors::Applicability;
 use rustc_hir::LangItem::{OptionNone, OptionSome};
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::lint::in_external_macro;
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_session::impl_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -21,7 +21,7 @@ declare_clippy_lint! {
     /// in comparison to `bool::then`.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let v = vec![0];
     /// let a = if v.is_empty() {
     ///     println!("true!");
@@ -33,7 +33,7 @@ declare_clippy_lint! {
     ///
     /// Could be written:
     ///
-    /// ```rust
+    /// ```no_run
     /// # let v = vec![0];
     /// let a = v.is_empty().then(|| {
     ///     println!("true!");
@@ -74,9 +74,18 @@ impl<'tcx> LateLintPass<'tcx> for IfThenSomeElseNone {
             return;
         }
 
+        // `bool::then()` and `bool::then_some()` are not const
+        if in_constant(cx, expr.hir_id) {
+            return;
+        }
+
         let ctxt = expr.span.ctxt();
 
-        if let Some(higher::If { cond, then, r#else: Some(els) }) = higher::If::hir(expr)
+        if let Some(higher::If {
+            cond,
+            then,
+            r#else: Some(els),
+        }) = higher::If::hir(expr)
             && let ExprKind::Block(then_block, _) = then.kind
             && let Some(then_expr) = then_block.expr
             && let ExprKind::Call(then_call, [then_arg]) = then_expr.kind
@@ -86,7 +95,9 @@ impl<'tcx> LateLintPass<'tcx> for IfThenSomeElseNone {
             && !contains_return(then_block.stmts)
         {
             let mut app = Applicability::Unspecified;
-            let cond_snip = Sugg::hir_with_context(cx, cond, expr.span.ctxt(), "[condition]", &mut app).maybe_par().to_string();
+            let cond_snip = Sugg::hir_with_context(cx, cond, expr.span.ctxt(), "[condition]", &mut app)
+                .maybe_par()
+                .to_string();
             let arg_snip = snippet_with_context(cx, then_arg.span, ctxt, "[body]", &mut app).0;
             let mut method_body = if then_block.stmts.is_empty() {
                 arg_snip.into_owned()
@@ -100,16 +111,15 @@ impl<'tcx> LateLintPass<'tcx> for IfThenSomeElseNone {
                 "then"
             };
 
-            let help = format!(
-                "consider using `bool::{method_name}` like: `{cond_snip}.{method_name}({method_body})`",
-            );
+            let help =
+                format!("consider using `bool::{method_name}` like: `{cond_snip}.{method_name}({method_body})`",);
             span_lint_and_help(
                 cx,
                 IF_THEN_SOME_ELSE_NONE,
                 expr.span,
-                &format!("this could be simplified with `bool::{method_name}`"),
+                format!("this could be simplified with `bool::{method_name}`"),
                 None,
-                &help,
+                help,
             );
         }
     }

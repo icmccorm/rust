@@ -56,7 +56,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![stable(feature = "alloc_module", since = "1.28.0")]
 
-use core::intrinsics;
+use core::hint;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use core::{mem, ptr};
@@ -172,7 +172,7 @@ impl System {
                 let new_size = new_layout.size();
 
                 // `realloc` probably checks for `new_size >= old_layout.size()` or something similar.
-                intrinsics::assume(new_size >= old_layout.size());
+                hint::assert_unchecked(new_size >= old_layout.size());
 
                 let raw_ptr = GlobalAlloc::realloc(self, ptr.as_ptr(), old_layout, new_size);
                 let ptr = NonNull::new(raw_ptr).ok_or(AllocError)?;
@@ -264,7 +264,7 @@ unsafe impl Allocator for System {
             // SAFETY: `new_size` is non-zero. Other conditions must be upheld by the caller
             new_size if old_layout.align() == new_layout.align() => unsafe {
                 // `realloc` probably checks for `new_size <= old_layout.size()` or something similar.
-                intrinsics::assume(new_size <= old_layout.size());
+                hint::assert_unchecked(new_size <= old_layout.size());
 
                 let raw_ptr = GlobalAlloc::realloc(self, ptr.as_ptr(), old_layout, new_size);
                 let ptr = NonNull::new(raw_ptr).ok_or(AllocError)?;
@@ -329,7 +329,7 @@ static HOOK: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 /// ```
 #[unstable(feature = "alloc_error_hook", issue = "51245")]
 pub fn set_alloc_error_hook(hook: fn(Layout)) {
-    HOOK.store(hook as *mut (), Ordering::SeqCst);
+    HOOK.store(hook as *mut (), Ordering::Release);
 }
 
 /// Unregisters the current allocation error hook, returning it.
@@ -339,7 +339,7 @@ pub fn set_alloc_error_hook(hook: fn(Layout)) {
 /// If no custom hook is registered, the default hook will be returned.
 #[unstable(feature = "alloc_error_hook", issue = "51245")]
 pub fn take_alloc_error_hook() -> fn(Layout) {
-    let hook = HOOK.swap(ptr::null_mut(), Ordering::SeqCst);
+    let hook = HOOK.swap(ptr::null_mut(), Ordering::Acquire);
     if hook.is_null() { default_alloc_error_hook } else { unsafe { mem::transmute(hook) } }
 }
 
@@ -362,7 +362,7 @@ fn default_alloc_error_hook(layout: Layout) {
 #[alloc_error_handler]
 #[unstable(feature = "alloc_internals", issue = "none")]
 pub fn rust_oom(layout: Layout) -> ! {
-    let hook = HOOK.load(Ordering::SeqCst);
+    let hook = HOOK.load(Ordering::Acquire);
     let hook: fn(Layout) =
         if hook.is_null() { default_alloc_error_hook } else { unsafe { mem::transmute(hook) } };
     hook(layout);

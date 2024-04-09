@@ -6,11 +6,11 @@ use clippy_utils::visitors::{for_each_expr, for_each_expr_with_closures, is_loca
 use core::ops::ControlFlow;
 use rustc_errors::{Applicability, MultiSpan};
 use rustc_hir::{
-    BindingAnnotation, Block, Expr, ExprKind, HirId, Local, LocalSource, MatchSource, Node, Pat, PatKind, Stmt,
+    BindingAnnotation, Block, Expr, ExprKind, HirId, LetStmt, LocalSource, MatchSource, Node, Pat, PatKind, Stmt,
     StmtKind,
 };
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 use rustc_span::Span;
 
 declare_clippy_lint! {
@@ -22,7 +22,7 @@ declare_clippy_lint! {
     /// Assigning in the `let` statement is less repetitive.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let a;
     /// a = 1;
     ///
@@ -41,7 +41,7 @@ declare_clippy_lint! {
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// let a = 1;
     ///
     /// let b = match 3 {
@@ -86,7 +86,7 @@ fn contains_let(cond: &Expr<'_>) -> bool {
 }
 
 fn stmt_needs_ordered_drop(cx: &LateContext<'_>, stmt: &Stmt<'_>) -> bool {
-    let StmtKind::Local(local) = stmt.kind else {
+    let StmtKind::Let(local) = stmt.kind else {
         return false;
     };
     !local.pat.walk_short(|pat| {
@@ -128,21 +128,18 @@ impl LocalAssign {
         let assign = match expr.kind {
             ExprKind::Block(Block { expr: Some(expr), .. }, _) => Self::from_expr(expr, expr.span),
             ExprKind::Block(block, _) => {
-                if_chain! {
-                    if let Some((last, other_stmts)) = block.stmts.split_last();
-                    if let StmtKind::Expr(expr) | StmtKind::Semi(expr) = last.kind;
+                if let Some((last, other_stmts)) = block.stmts.split_last()
+                    && let StmtKind::Expr(expr) | StmtKind::Semi(expr) = last.kind
 
-                    let assign = Self::from_expr(expr, last.span)?;
+                    && let assign = Self::from_expr(expr, last.span)?
 
                     // avoid visiting if not needed
-                    if assign.lhs_id == binding_id;
-                    if other_stmts.iter().all(|stmt| !contains_assign_expr(cx, stmt));
-
-                    then {
-                        Some(assign)
-                    } else {
-                        None
-                    }
+                    && assign.lhs_id == binding_id
+                    && other_stmts.iter().all(|stmt| !contains_assign_expr(cx, stmt))
+                {
+                    Some(assign)
+                } else {
+                    None
                 }
             },
             ExprKind::Assign(..) => Self::from_expr(expr, expr.span),
@@ -240,7 +237,7 @@ fn first_usage<'tcx>(
         })
 }
 
-fn local_snippet_without_semicolon(cx: &LateContext<'_>, local: &Local<'_>) -> Option<String> {
+fn local_snippet_without_semicolon(cx: &LateContext<'_>, local: &LetStmt<'_>) -> Option<String> {
     let span = local.span.with_hi(match local.ty {
         // let <pat>: <ty>;
         // ~~~~~~~~~~~~~~~
@@ -255,7 +252,7 @@ fn local_snippet_without_semicolon(cx: &LateContext<'_>, local: &Local<'_>) -> O
 
 fn check<'tcx>(
     cx: &LateContext<'tcx>,
-    local: &'tcx Local<'tcx>,
+    local: &'tcx LetStmt<'tcx>,
     local_stmt: &'tcx Stmt<'tcx>,
     block: &'tcx Block<'tcx>,
     binding_id: HirId,
@@ -366,24 +363,22 @@ fn check<'tcx>(
 }
 
 impl<'tcx> LateLintPass<'tcx> for NeedlessLateInit {
-    fn check_local(&mut self, cx: &LateContext<'tcx>, local: &'tcx Local<'tcx>) {
+    fn check_local(&mut self, cx: &LateContext<'tcx>, local: &'tcx LetStmt<'tcx>) {
         let mut parents = cx.tcx.hir().parent_iter(local.hir_id);
-        if_chain! {
-            if let Local {
-                init: None,
-                pat: &Pat {
+        if let LetStmt {
+            init: None,
+            pat:
+                &Pat {
                     kind: PatKind::Binding(BindingAnnotation::NONE, binding_id, _, None),
                     ..
                 },
-                source: LocalSource::Normal,
-                ..
-            } = local;
-            if let Some((_, Node::Stmt(local_stmt))) = parents.next();
-            if let Some((_, Node::Block(block))) = parents.next();
-
-            then {
-                check(cx, local, local_stmt, block, binding_id);
-            }
+            source: LocalSource::Normal,
+            ..
+        } = local
+            && let Some((_, Node::Stmt(local_stmt))) = parents.next()
+            && let Some((_, Node::Block(block))) = parents.next()
+        {
+            check(cx, local, local_stmt, block, binding_id);
         }
     }
 }

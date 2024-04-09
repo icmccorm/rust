@@ -38,8 +38,7 @@ use crate::abi::call::Conv;
 use crate::abi::{Endian, Integer, Size, TargetDataLayout, TargetDataLayoutErrors};
 use crate::json::{Json, ToJson};
 use crate::spec::abi::{lookup as lookup_abi, Abi};
-use crate::spec::crt_objects::{CrtObjects, LinkSelfContainedDefault};
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use crate::spec::crt_objects::CrtObjects;
 use rustc_fs_util::try_canonicalize;
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use rustc_span::symbol::{kw, sym, Symbol};
@@ -57,47 +56,11 @@ use rustc_macros::HashStable_Generic;
 pub mod abi;
 pub mod crt_objects;
 
-mod aix_base;
-mod android_base;
-mod apple_base;
-pub use apple_base::deployment_target as current_apple_deployment_target;
-pub use apple_base::platform as current_apple_platform;
-pub use apple_base::sdk_version as current_apple_sdk_version;
-mod avr_gnu_base;
-pub use avr_gnu_base::ef_avr_arch;
-mod bpf_base;
-mod dragonfly_base;
-mod freebsd_base;
-mod fuchsia_base;
-mod haiku_base;
-mod hermit_base;
-mod hurd_base;
-mod hurd_gnu_base;
-mod illumos_base;
-mod l4re_base;
-mod linux_base;
-mod linux_gnu_base;
-mod linux_musl_base;
-mod linux_ohos_base;
-mod linux_uclibc_base;
-mod msvc_base;
-mod netbsd_base;
-mod nto_qnx_base;
-mod openbsd_base;
-mod redox_base;
-mod solaris_base;
-mod solid_base;
-mod teeos_base;
-mod thumb_base;
-mod uefi_msvc_base;
-mod unikraft_linux_musl_base;
-mod vxworks_base;
-mod wasm_base;
-mod windows_gnu_base;
-mod windows_gnullvm_base;
-mod windows_msvc_base;
-mod windows_uwp_gnu_base;
-mod windows_uwp_msvc_base;
+mod base;
+pub use base::apple::deployment_target as current_apple_deployment_target;
+pub use base::apple::platform as current_apple_platform;
+pub use base::apple::sdk_version as current_apple_sdk_version;
+pub use base::avr_gnu::ef_avr_arch;
 
 /// Linker is called through a C/C++ compiler.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -160,15 +123,17 @@ pub enum LinkerFlavor {
     Bpf,
     /// Linker tool for Nvidia PTX.
     Ptx,
+    /// LLVM bitcode linker that can be used as a `self-contained` linker
+    Llbc,
 }
 
 /// Linker flavors available externally through command line (`-Clinker-flavor`)
 /// or json target specifications.
-/// FIXME: This set has accumulated historically, bring it more in line with the internal
-/// linker flavors (`LinkerFlavor`).
+/// This set has accumulated historically, and contains both (stable and unstable) legacy values, as
+/// well as modern ones matching the internal linker flavors (`LinkerFlavor`).
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum LinkerFlavorCli {
-    // New (unstable) flavors, with direct counterparts in `LinkerFlavor`.
+    // Modern (unstable) flavors, with direct counterparts in `LinkerFlavor`.
     Gnu(Cc, Lld),
     Darwin(Cc, Lld),
     WasmLld(Cc),
@@ -178,14 +143,13 @@ pub enum LinkerFlavorCli {
     EmCc,
     Bpf,
     Ptx,
+    Llbc,
 
-    // Below: the legacy stable values.
+    // Legacy stable values
     Gcc,
     Ld,
     Lld(LldFlavor),
     Em,
-    BpfLinker,
-    PtxLinker,
 }
 
 impl LinkerFlavorCli {
@@ -199,9 +163,8 @@ impl LinkerFlavorCli {
             | LinkerFlavorCli::Msvc(Lld::Yes)
             | LinkerFlavorCli::EmCc
             | LinkerFlavorCli::Bpf
-            | LinkerFlavorCli::Ptx
-            | LinkerFlavorCli::BpfLinker
-            | LinkerFlavorCli::PtxLinker => true,
+            | LinkerFlavorCli::Llbc
+            | LinkerFlavorCli::Ptx => true,
             LinkerFlavorCli::Gcc
             | LinkerFlavorCli::Ld
             | LinkerFlavorCli::Lld(..)
@@ -248,7 +211,7 @@ impl ToJson for LldFlavor {
 
 impl LinkerFlavor {
     /// At this point the target's reference linker flavor doesn't yet exist and we need to infer
-    /// it. The inference always succeds and gives some result, and we don't report any flavor
+    /// it. The inference always succeeds and gives some result, and we don't report any flavor
     /// incompatibility errors for json target specs. The CLI flavor is used as the main source
     /// of truth, other flags are used in case of ambiguities.
     fn from_cli_json(cli: LinkerFlavorCli, lld_flavor: LldFlavor, is_gnu: bool) -> LinkerFlavor {
@@ -260,6 +223,7 @@ impl LinkerFlavor {
             LinkerFlavorCli::Msvc(lld) => LinkerFlavor::Msvc(lld),
             LinkerFlavorCli::EmCc => LinkerFlavor::EmCc,
             LinkerFlavorCli::Bpf => LinkerFlavor::Bpf,
+            LinkerFlavorCli::Llbc => LinkerFlavor::Llbc,
             LinkerFlavorCli::Ptx => LinkerFlavor::Ptx,
 
             // Below: legacy stable values
@@ -279,11 +243,10 @@ impl LinkerFlavor {
             LinkerFlavorCli::Lld(LldFlavor::Wasm) => LinkerFlavor::WasmLld(Cc::No),
             LinkerFlavorCli::Lld(LldFlavor::Link) => LinkerFlavor::Msvc(Lld::Yes),
             LinkerFlavorCli::Em => LinkerFlavor::EmCc,
-            LinkerFlavorCli::BpfLinker => LinkerFlavor::Bpf,
-            LinkerFlavorCli::PtxLinker => LinkerFlavor::Ptx,
         }
     }
 
+    /// Returns the corresponding backwards-compatible CLI flavor.
     fn to_cli(self) -> LinkerFlavorCli {
         match self {
             LinkerFlavor::Gnu(Cc::Yes, _)
@@ -299,8 +262,24 @@ impl LinkerFlavor {
             LinkerFlavor::Msvc(Lld::Yes) => LinkerFlavorCli::Lld(LldFlavor::Link),
             LinkerFlavor::Msvc(..) => LinkerFlavorCli::Msvc(Lld::No),
             LinkerFlavor::EmCc => LinkerFlavorCli::Em,
-            LinkerFlavor::Bpf => LinkerFlavorCli::BpfLinker,
-            LinkerFlavor::Ptx => LinkerFlavorCli::PtxLinker,
+            LinkerFlavor::Bpf => LinkerFlavorCli::Bpf,
+            LinkerFlavor::Llbc => LinkerFlavorCli::Llbc,
+            LinkerFlavor::Ptx => LinkerFlavorCli::Ptx,
+        }
+    }
+
+    /// Returns the modern CLI flavor that is the counterpart of this flavor.
+    fn to_cli_counterpart(self) -> LinkerFlavorCli {
+        match self {
+            LinkerFlavor::Gnu(cc, lld) => LinkerFlavorCli::Gnu(cc, lld),
+            LinkerFlavor::Darwin(cc, lld) => LinkerFlavorCli::Darwin(cc, lld),
+            LinkerFlavor::WasmLld(cc) => LinkerFlavorCli::WasmLld(cc),
+            LinkerFlavor::Unix(cc) => LinkerFlavorCli::Unix(cc),
+            LinkerFlavor::Msvc(lld) => LinkerFlavorCli::Msvc(lld),
+            LinkerFlavor::EmCc => LinkerFlavorCli::EmCc,
+            LinkerFlavor::Bpf => LinkerFlavorCli::Bpf,
+            LinkerFlavor::Llbc => LinkerFlavorCli::Llbc,
+            LinkerFlavor::Ptx => LinkerFlavorCli::Ptx,
         }
     }
 
@@ -314,13 +293,13 @@ impl LinkerFlavor {
             LinkerFlavorCli::Msvc(lld) => (Some(Cc::No), Some(lld)),
             LinkerFlavorCli::EmCc => (Some(Cc::Yes), Some(Lld::Yes)),
             LinkerFlavorCli::Bpf | LinkerFlavorCli::Ptx => (None, None),
+            LinkerFlavorCli::Llbc => (None, None),
 
             // Below: legacy stable values
             LinkerFlavorCli::Gcc => (Some(Cc::Yes), None),
             LinkerFlavorCli::Ld => (Some(Cc::No), Some(Lld::No)),
             LinkerFlavorCli::Lld(_) => (Some(Cc::No), Some(Lld::Yes)),
             LinkerFlavorCli::Em => (Some(Cc::Yes), Some(Lld::Yes)),
-            LinkerFlavorCli::BpfLinker | LinkerFlavorCli::PtxLinker => (None, None),
         }
     }
 
@@ -369,7 +348,7 @@ impl LinkerFlavor {
             LinkerFlavor::WasmLld(cc) => LinkerFlavor::WasmLld(cc_hint.unwrap_or(cc)),
             LinkerFlavor::Unix(cc) => LinkerFlavor::Unix(cc_hint.unwrap_or(cc)),
             LinkerFlavor::Msvc(lld) => LinkerFlavor::Msvc(lld_hint.unwrap_or(lld)),
-            LinkerFlavor::EmCc | LinkerFlavor::Bpf | LinkerFlavor::Ptx => self,
+            LinkerFlavor::EmCc | LinkerFlavor::Bpf | LinkerFlavor::Llbc | LinkerFlavor::Ptx => self,
         }
     }
 
@@ -384,8 +363,8 @@ impl LinkerFlavor {
     pub fn check_compatibility(self, cli: LinkerFlavorCli) -> Option<String> {
         let compatible = |cli| {
             // The CLI flavor should be compatible with the target if:
-            // 1. they are counterparts: they have the same principal flavor.
             match (self, cli) {
+                // 1. they are counterparts: they have the same principal flavor.
                 (LinkerFlavor::Gnu(..), LinkerFlavorCli::Gnu(..))
                 | (LinkerFlavor::Darwin(..), LinkerFlavorCli::Darwin(..))
                 | (LinkerFlavor::WasmLld(..), LinkerFlavorCli::WasmLld(..))
@@ -393,11 +372,14 @@ impl LinkerFlavor {
                 | (LinkerFlavor::Msvc(..), LinkerFlavorCli::Msvc(..))
                 | (LinkerFlavor::EmCc, LinkerFlavorCli::EmCc)
                 | (LinkerFlavor::Bpf, LinkerFlavorCli::Bpf)
+                | (LinkerFlavor::Llbc, LinkerFlavorCli::Llbc)
                 | (LinkerFlavor::Ptx, LinkerFlavorCli::Ptx) => return true,
+                // 2. The linker flavor is independent of target and compatible
+                (LinkerFlavor::Ptx, LinkerFlavorCli::Llbc) => return true,
                 _ => {}
             }
 
-            // 2. or, the flavor is legacy and survives this roundtrip.
+            // 3. or, the flavor is legacy and survives this roundtrip.
             cli == self.with_cli_hints(cli).to_cli()
         };
         (!compatible(cli)).then(|| {
@@ -416,6 +398,7 @@ impl LinkerFlavor {
             | LinkerFlavor::Unix(..)
             | LinkerFlavor::EmCc
             | LinkerFlavor::Bpf
+            | LinkerFlavor::Llbc
             | LinkerFlavor::Ptx => LldFlavor::Ld,
             LinkerFlavor::Darwin(..) => LldFlavor::Ld64,
             LinkerFlavor::WasmLld(..) => LldFlavor::Wasm,
@@ -441,6 +424,7 @@ impl LinkerFlavor {
             | LinkerFlavor::Msvc(_)
             | LinkerFlavor::Unix(_)
             | LinkerFlavor::Bpf
+            | LinkerFlavor::Llbc
             | LinkerFlavor::Ptx => false,
         }
     }
@@ -460,6 +444,7 @@ impl LinkerFlavor {
             | LinkerFlavor::Msvc(_)
             | LinkerFlavor::Unix(_)
             | LinkerFlavor::Bpf
+            | LinkerFlavor::Llbc
             | LinkerFlavor::Ptx => false,
         }
     }
@@ -509,9 +494,10 @@ linker_flavor_cli_impls! {
     (LinkerFlavorCli::Msvc(Lld::No)) "msvc"
     (LinkerFlavorCli::EmCc) "em-cc"
     (LinkerFlavorCli::Bpf) "bpf"
+    (LinkerFlavorCli::Llbc) "llbc"
     (LinkerFlavorCli::Ptx) "ptx"
 
-    // Below: legacy stable values
+    // Legacy stable flavors
     (LinkerFlavorCli::Gcc) "gcc"
     (LinkerFlavorCli::Ld) "ld"
     (LinkerFlavorCli::Lld(LldFlavor::Ld)) "ld.lld"
@@ -519,13 +505,196 @@ linker_flavor_cli_impls! {
     (LinkerFlavorCli::Lld(LldFlavor::Link)) "lld-link"
     (LinkerFlavorCli::Lld(LldFlavor::Wasm)) "wasm-ld"
     (LinkerFlavorCli::Em) "em"
-    (LinkerFlavorCli::BpfLinker) "bpf-linker"
-    (LinkerFlavorCli::PtxLinker) "ptx-linker"
 }
 
 impl ToJson for LinkerFlavorCli {
     fn to_json(&self) -> Json {
         self.desc().to_json()
+    }
+}
+
+/// The different `-Clink-self-contained` options that can be specified in a target spec:
+/// - enabling or disabling in bulk
+/// - some target-specific pieces of inference to determine whether to use self-contained linking
+///   if `-Clink-self-contained` is not specified explicitly (e.g. on musl/mingw)
+/// - explicitly enabling some of the self-contained linking components, e.g. the linker component
+///   to use `rust-lld`
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum LinkSelfContainedDefault {
+    /// The target spec explicitly enables self-contained linking.
+    True,
+
+    /// The target spec explicitly disables self-contained linking.
+    False,
+
+    /// The target spec requests that the self-contained mode is inferred, in the context of musl.
+    InferredForMusl,
+
+    /// The target spec requests that the self-contained mode is inferred, in the context of mingw.
+    InferredForMingw,
+
+    /// The target spec explicitly enables a list of self-contained linking components: e.g. for
+    /// targets opting into a subset of components like the CLI's `-C link-self-contained=+linker`.
+    WithComponents(LinkSelfContainedComponents),
+}
+
+/// Parses a backwards-compatible `-Clink-self-contained` option string, without components.
+impl FromStr for LinkSelfContainedDefault {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<LinkSelfContainedDefault, ()> {
+        Ok(match s {
+            "false" => LinkSelfContainedDefault::False,
+            "true" | "wasm" => LinkSelfContainedDefault::True,
+            "musl" => LinkSelfContainedDefault::InferredForMusl,
+            "mingw" => LinkSelfContainedDefault::InferredForMingw,
+            _ => return Err(()),
+        })
+    }
+}
+
+impl ToJson for LinkSelfContainedDefault {
+    fn to_json(&self) -> Json {
+        match *self {
+            LinkSelfContainedDefault::WithComponents(components) => {
+                // Serialize the components in a json object's `components` field, to prepare for a
+                // future where `crt-objects-fallback` is removed from the json specs and
+                // incorporated as a field here.
+                let mut map = BTreeMap::new();
+                map.insert("components", components);
+                map.to_json()
+            }
+
+            // Stable backwards-compatible values
+            LinkSelfContainedDefault::True => "true".to_json(),
+            LinkSelfContainedDefault::False => "false".to_json(),
+            LinkSelfContainedDefault::InferredForMusl => "musl".to_json(),
+            LinkSelfContainedDefault::InferredForMingw => "mingw".to_json(),
+        }
+    }
+}
+
+impl LinkSelfContainedDefault {
+    /// Returns whether the target spec has self-contained linking explicitly disabled. Used to emit
+    /// errors if the user then enables it on the CLI.
+    pub fn is_disabled(self) -> bool {
+        self == LinkSelfContainedDefault::False
+    }
+
+    /// Returns whether the target spec explicitly requests self-contained linking, i.e. not via
+    /// inference.
+    pub fn is_linker_enabled(self) -> bool {
+        match self {
+            LinkSelfContainedDefault::True => true,
+            LinkSelfContainedDefault::False => false,
+            LinkSelfContainedDefault::WithComponents(c) => {
+                c.contains(LinkSelfContainedComponents::LINKER)
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns the key to use when serializing the setting to json:
+    /// - individual components in a `link-self-contained` object value
+    /// - the other variants as a backwards-compatible `crt-objects-fallback` string
+    fn json_key(self) -> &'static str {
+        match self {
+            LinkSelfContainedDefault::WithComponents(_) => "link-self-contained",
+            _ => "crt-objects-fallback",
+        }
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, PartialEq, Eq, Default)]
+    /// The `-C link-self-contained` components that can individually be enabled or disabled.
+    pub struct LinkSelfContainedComponents: u8 {
+        /// CRT objects (e.g. on `windows-gnu`, `musl`, `wasi` targets)
+        const CRT_OBJECTS = 1 << 0;
+        /// libc static library (e.g. on `musl`, `wasi` targets)
+        const LIBC        = 1 << 1;
+        /// libgcc/libunwind (e.g. on `windows-gnu`, `fuchsia`, `fortanix`, `gnullvm` targets)
+        const UNWIND      = 1 << 2;
+        /// Linker, dlltool, and their necessary libraries (e.g. on `windows-gnu` and for `rust-lld`)
+        const LINKER      = 1 << 3;
+        /// Sanitizer runtime libraries
+        const SANITIZERS  = 1 << 4;
+        /// Other MinGW libs and Windows import libs
+        const MINGW       = 1 << 5;
+    }
+}
+rustc_data_structures::external_bitflags_debug! { LinkSelfContainedComponents }
+
+impl LinkSelfContainedComponents {
+    /// Parses a single `-Clink-self-contained` well-known component, not a set of flags.
+    pub fn from_str(s: &str) -> Option<LinkSelfContainedComponents> {
+        Some(match s {
+            "crto" => LinkSelfContainedComponents::CRT_OBJECTS,
+            "libc" => LinkSelfContainedComponents::LIBC,
+            "unwind" => LinkSelfContainedComponents::UNWIND,
+            "linker" => LinkSelfContainedComponents::LINKER,
+            "sanitizers" => LinkSelfContainedComponents::SANITIZERS,
+            "mingw" => LinkSelfContainedComponents::MINGW,
+            _ => return None,
+        })
+    }
+
+    /// Return the component's name.
+    ///
+    /// Returns `None` if the bitflags aren't a singular component (but a mix of multiple flags).
+    pub fn as_str(self) -> Option<&'static str> {
+        Some(match self {
+            LinkSelfContainedComponents::CRT_OBJECTS => "crto",
+            LinkSelfContainedComponents::LIBC => "libc",
+            LinkSelfContainedComponents::UNWIND => "unwind",
+            LinkSelfContainedComponents::LINKER => "linker",
+            LinkSelfContainedComponents::SANITIZERS => "sanitizers",
+            LinkSelfContainedComponents::MINGW => "mingw",
+            _ => return None,
+        })
+    }
+
+    /// Returns an array of all the components.
+    fn all_components() -> [LinkSelfContainedComponents; 6] {
+        [
+            LinkSelfContainedComponents::CRT_OBJECTS,
+            LinkSelfContainedComponents::LIBC,
+            LinkSelfContainedComponents::UNWIND,
+            LinkSelfContainedComponents::LINKER,
+            LinkSelfContainedComponents::SANITIZERS,
+            LinkSelfContainedComponents::MINGW,
+        ]
+    }
+
+    /// Returns whether at least a component is enabled.
+    pub fn are_any_components_enabled(self) -> bool {
+        !self.is_empty()
+    }
+
+    /// Returns whether `LinkSelfContainedComponents::LINKER` is enabled.
+    pub fn is_linker_enabled(self) -> bool {
+        self.contains(LinkSelfContainedComponents::LINKER)
+    }
+
+    /// Returns whether `LinkSelfContainedComponents::CRT_OBJECTS` is enabled.
+    pub fn is_crt_objects_enabled(self) -> bool {
+        self.contains(LinkSelfContainedComponents::CRT_OBJECTS)
+    }
+}
+
+impl ToJson for LinkSelfContainedComponents {
+    fn to_json(&self) -> Json {
+        let components: Vec<_> = Self::all_components()
+            .into_iter()
+            .filter(|c| self.contains(*c))
+            .map(|c| {
+                // We can unwrap because we're iterating over all the known singular components,
+                // not an actual set of flags where `as_str` can fail.
+                c.as_str().unwrap().to_owned()
+            })
+            .collect();
+
+        components.to_json()
     }
 }
 
@@ -762,6 +931,7 @@ pub enum TlsModel {
     LocalDynamic,
     InitialExec,
     LocalExec,
+    Emulated,
 }
 
 impl FromStr for TlsModel {
@@ -775,6 +945,7 @@ impl FromStr for TlsModel {
             "local-dynamic" => TlsModel::LocalDynamic,
             "initial-exec" => TlsModel::InitialExec,
             "local-exec" => TlsModel::LocalExec,
+            "emulated" => TlsModel::Emulated,
             _ => return Err(()),
         })
     }
@@ -787,6 +958,7 @@ impl ToJson for TlsModel {
             TlsModel::LocalDynamic => "local-dynamic",
             TlsModel::InitialExec => "initial-exec",
             TlsModel::LocalExec => "local-exec",
+            TlsModel::Emulated => "emulated",
         }
         .to_json()
     }
@@ -988,10 +1160,6 @@ pub enum StackProbeType {
 }
 
 impl StackProbeType {
-    // LLVM X86 targets (ix86 and x86_64) can use inline-asm stack probes starting with LLVM 16.
-    // Notable past issues were rust#83139 (fixed in 14) and rust#84667 (fixed in 16).
-    const X86: Self = Self::InlineOrCall { min_llvm_version_for_inline: (16, 0, 0) };
-
     fn from_json(json: &Json) -> Result<Self, String> {
         let object = json.as_object().ok_or_else(|| "expected a JSON object")?;
         let kind = object
@@ -1053,9 +1221,10 @@ impl ToJson for StackProbeType {
     }
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable, HashStable_Generic)]
+pub struct SanitizerSet(u16);
 bitflags::bitflags! {
-    #[derive(Default, Encodable, Decodable)]
-    pub struct SanitizerSet: u16 {
+    impl SanitizerSet: u16 {
         const ADDRESS = 1 << 0;
         const LEAK    = 1 << 1;
         const MEMORY  = 1 << 2;
@@ -1067,8 +1236,10 @@ bitflags::bitflags! {
         const KCFI    = 1 << 8;
         const KERNELADDRESS = 1 << 9;
         const SAFESTACK = 1 << 10;
+        const DATAFLOW = 1 << 11;
     }
 }
+rustc_data_structures::external_bitflags_debug! { SanitizerSet }
 
 impl SanitizerSet {
     /// Return sanitizer's name
@@ -1078,6 +1249,7 @@ impl SanitizerSet {
         Some(match self {
             SanitizerSet::ADDRESS => "address",
             SanitizerSet::CFI => "cfi",
+            SanitizerSet::DATAFLOW => "dataflow",
             SanitizerSet::KCFI => "kcfi",
             SanitizerSet::KERNELADDRESS => "kernel-address",
             SanitizerSet::LEAK => "leak",
@@ -1105,38 +1277,6 @@ impl fmt::Display for SanitizerSet {
             first = false;
         }
         Ok(())
-    }
-}
-
-impl IntoIterator for SanitizerSet {
-    type Item = SanitizerSet;
-    type IntoIter = std::vec::IntoIter<SanitizerSet>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        [
-            SanitizerSet::ADDRESS,
-            SanitizerSet::CFI,
-            SanitizerSet::KCFI,
-            SanitizerSet::LEAK,
-            SanitizerSet::MEMORY,
-            SanitizerSet::MEMTAG,
-            SanitizerSet::SHADOWCALLSTACK,
-            SanitizerSet::THREAD,
-            SanitizerSet::HWADDRESS,
-            SanitizerSet::KERNELADDRESS,
-            SanitizerSet::SAFESTACK,
-        ]
-        .iter()
-        .copied()
-        .filter(|&s| self.contains(s))
-        .collect::<Vec<_>>()
-        .into_iter()
-    }
-}
-
-impl<CTX> HashStable<CTX> for SanitizerSet {
-    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
-        self.bits().hash_stable(ctx, hasher);
     }
 }
 
@@ -1241,14 +1381,16 @@ impl fmt::Display for StackProtector {
 
 macro_rules! supported_targets {
     ( $(($triple:literal, $module:ident),)+ ) => {
-        $(mod $module;)+
+        mod targets {
+            $(pub(crate) mod $module;)+
+        }
 
         /// List of supported targets
         pub const TARGETS: &[&str] = &[$($triple),+];
 
         fn load_builtin(target: &str) -> Option<Target> {
             let mut t = match target {
-                $( $triple => $module::target(), )+
+                $( $triple => targets::$module::target(), )+
                 _ => return None,
             };
             t.is_builtin = true;
@@ -1264,7 +1406,7 @@ macro_rules! supported_targets {
             $(
                 #[test] // `#[test]`
                 fn $module() {
-                    tests_impl::test_target(super::$module::target());
+                    tests_impl::test_target(crate::spec::targets::$module::target());
                 }
             )+
         }
@@ -1277,8 +1419,10 @@ supported_targets! {
     ("i686-unknown-linux-gnu", i686_unknown_linux_gnu),
     ("i586-unknown-linux-gnu", i586_unknown_linux_gnu),
     ("loongarch64-unknown-linux-gnu", loongarch64_unknown_linux_gnu),
+    ("loongarch64-unknown-linux-musl", loongarch64_unknown_linux_musl),
     ("m68k-unknown-linux-gnu", m68k_unknown_linux_gnu),
     ("csky-unknown-linux-gnuabiv2", csky_unknown_linux_gnuabiv2),
+    ("csky-unknown-linux-gnuabiv2hf", csky_unknown_linux_gnuabiv2hf),
     ("mips-unknown-linux-gnu", mips_unknown_linux_gnu),
     ("mips64-unknown-linux-gnuabi64", mips64_unknown_linux_gnuabi64),
     ("mips64el-unknown-linux-gnuabi64", mips64el_unknown_linux_gnuabi64),
@@ -1324,6 +1468,7 @@ supported_targets! {
     ("mips64-unknown-linux-muslabi64", mips64_unknown_linux_muslabi64),
     ("mips64el-unknown-linux-muslabi64", mips64el_unknown_linux_muslabi64),
     ("hexagon-unknown-linux-musl", hexagon_unknown_linux_musl),
+    ("hexagon-unknown-none-elf", hexagon_unknown_none_elf),
 
     ("mips-unknown-linux-uclibc", mips_unknown_linux_uclibc),
     ("mipsel-unknown-linux-uclibc", mipsel_unknown_linux_uclibc),
@@ -1360,7 +1505,9 @@ supported_targets! {
     ("aarch64_be-unknown-netbsd", aarch64_be_unknown_netbsd),
     ("armv6-unknown-netbsd-eabihf", armv6_unknown_netbsd_eabihf),
     ("armv7-unknown-netbsd-eabihf", armv7_unknown_netbsd_eabihf),
+    ("i586-unknown-netbsd", i586_unknown_netbsd),
     ("i686-unknown-netbsd", i686_unknown_netbsd),
+    ("mipsel-unknown-netbsd", mipsel_unknown_netbsd),
     ("powerpc-unknown-netbsd", powerpc_unknown_netbsd),
     ("riscv64gc-unknown-netbsd", riscv64gc_unknown_netbsd),
     ("sparc64-unknown-netbsd", sparc64_unknown_netbsd),
@@ -1372,6 +1519,7 @@ supported_targets! {
     ("i686-unknown-hurd-gnu", i686_unknown_hurd_gnu),
 
     ("aarch64-apple-darwin", aarch64_apple_darwin),
+    ("arm64e-apple-darwin", arm64e_apple_darwin),
     ("x86_64-apple-darwin", x86_64_apple_darwin),
     ("x86_64h-apple-darwin", x86_64h_apple_darwin),
     ("i686-apple-darwin", i686_apple_darwin),
@@ -1394,28 +1542,35 @@ supported_targets! {
     ("i386-apple-ios", i386_apple_ios),
     ("x86_64-apple-ios", x86_64_apple_ios),
     ("aarch64-apple-ios", aarch64_apple_ios),
+    ("arm64e-apple-ios", arm64e_apple_ios),
     ("armv7s-apple-ios", armv7s_apple_ios),
     ("x86_64-apple-ios-macabi", x86_64_apple_ios_macabi),
     ("aarch64-apple-ios-macabi", aarch64_apple_ios_macabi),
     ("aarch64-apple-ios-sim", aarch64_apple_ios_sim),
     ("aarch64-apple-tvos", aarch64_apple_tvos),
+    ("aarch64-apple-tvos-sim", aarch64_apple_tvos_sim),
     ("x86_64-apple-tvos", x86_64_apple_tvos),
 
     ("armv7k-apple-watchos", armv7k_apple_watchos),
     ("arm64_32-apple-watchos", arm64_32_apple_watchos),
     ("x86_64-apple-watchos-sim", x86_64_apple_watchos_sim),
+    ("aarch64-apple-watchos", aarch64_apple_watchos),
     ("aarch64-apple-watchos-sim", aarch64_apple_watchos_sim),
+
+    ("aarch64-apple-visionos", aarch64_apple_visionos),
+    ("aarch64-apple-visionos-sim", aarch64_apple_visionos_sim),
 
     ("armebv7r-none-eabi", armebv7r_none_eabi),
     ("armebv7r-none-eabihf", armebv7r_none_eabihf),
     ("armv7r-none-eabi", armv7r_none_eabi),
     ("armv7r-none-eabihf", armv7r_none_eabihf),
+    ("armv8r-none-eabihf", armv8r_none_eabihf),
 
     ("x86_64-pc-solaris", x86_64_pc_solaris),
-    ("x86_64-sun-solaris", x86_64_sun_solaris),
     ("sparcv9-sun-solaris", sparcv9_sun_solaris),
 
     ("x86_64-unknown-illumos", x86_64_unknown_illumos),
+    ("aarch64-unknown-illumos", aarch64_unknown_illumos),
 
     ("x86_64-pc-windows-gnu", x86_64_pc_windows_gnu),
     ("i686-pc-windows-gnu", i686_pc_windows_gnu),
@@ -1428,19 +1583,23 @@ supported_targets! {
 
     ("aarch64-pc-windows-msvc", aarch64_pc_windows_msvc),
     ("aarch64-uwp-windows-msvc", aarch64_uwp_windows_msvc),
+    ("arm64ec-pc-windows-msvc", arm64ec_pc_windows_msvc),
     ("x86_64-pc-windows-msvc", x86_64_pc_windows_msvc),
     ("x86_64-uwp-windows-msvc", x86_64_uwp_windows_msvc),
+    ("x86_64-win7-windows-msvc", x86_64_win7_windows_msvc),
     ("i686-pc-windows-msvc", i686_pc_windows_msvc),
     ("i686-uwp-windows-msvc", i686_uwp_windows_msvc),
+    ("i686-win7-windows-msvc", i686_win7_windows_msvc),
     ("i586-pc-windows-msvc", i586_pc_windows_msvc),
     ("thumbv7a-pc-windows-msvc", thumbv7a_pc_windows_msvc),
     ("thumbv7a-uwp-windows-msvc", thumbv7a_uwp_windows_msvc),
 
-    ("asmjs-unknown-emscripten", asmjs_unknown_emscripten),
     ("wasm32-unknown-emscripten", wasm32_unknown_emscripten),
     ("wasm32-unknown-unknown", wasm32_unknown_unknown),
     ("wasm32-wasi", wasm32_wasi),
-    ("wasm32-wasi-preview1-threads", wasm32_wasi_preview1_threads),
+    ("wasm32-wasip1", wasm32_wasip1),
+    ("wasm32-wasip2", wasm32_wasip2),
+    ("wasm32-wasip1-threads", wasm32_wasip1_threads),
     ("wasm64-unknown-unknown", wasm64_unknown_unknown),
 
     ("thumbv6m-none-eabi", thumbv6m_none_eabi),
@@ -1463,11 +1622,16 @@ supported_targets! {
     ("x86_64-unikraft-linux-musl", x86_64_unikraft_linux_musl),
 
     ("riscv32i-unknown-none-elf", riscv32i_unknown_none_elf),
+    ("riscv32im-risc0-zkvm-elf", riscv32im_risc0_zkvm_elf),
     ("riscv32im-unknown-none-elf", riscv32im_unknown_none_elf),
+    ("riscv32ima-unknown-none-elf", riscv32ima_unknown_none_elf),
     ("riscv32imc-unknown-none-elf", riscv32imc_unknown_none_elf),
     ("riscv32imc-esp-espidf", riscv32imc_esp_espidf),
     ("riscv32imac-esp-espidf", riscv32imac_esp_espidf),
+    ("riscv32imafc-esp-espidf", riscv32imafc_esp_espidf),
+
     ("riscv32imac-unknown-none-elf", riscv32imac_unknown_none_elf),
+    ("riscv32imafc-unknown-none-elf", riscv32imafc_unknown_none_elf),
     ("riscv32imac-unknown-xous-elf", riscv32imac_unknown_xous_elf),
     ("riscv32gc-unknown-linux-gnu", riscv32gc_unknown_linux_gnu),
     ("riscv32gc-unknown-linux-musl", riscv32gc_unknown_linux_musl),
@@ -1534,7 +1698,7 @@ supported_targets! {
 
     ("mips64-openwrt-linux-musl", mips64_openwrt_linux_musl),
 
-    ("aarch64-unknown-nto-qnx710", aarch64_unknown_nto_qnx_710),
+    ("aarch64-unknown-nto-qnx710", aarch64_unknown_nto_qnx710),
     ("x86_64-pc-nto-qnx710", x86_64_pc_nto_qnx710),
     ("i586-pc-nto-qnx700", i586_pc_nto_qnx700),
 
@@ -1598,6 +1762,9 @@ impl TargetWarnings {
 pub struct Target {
     /// Target triple to pass to LLVM.
     pub llvm_target: StaticCow<str>,
+    /// Metadata about a target, for example the description or tier.
+    /// Used for generating target documentation.
+    pub metadata: TargetMetadata,
     /// Number of bits in a pointer. Influences the `target_pointer_width` `cfg` variable.
     pub pointer_width: u32,
     /// Architecture to use for ABI considerations. Valid options include: "x86",
@@ -1607,6 +1774,23 @@ pub struct Target {
     pub data_layout: StaticCow<str>,
     /// Optional settings with defaults.
     pub options: TargetOptions,
+}
+
+/// Metadata about a target like the description or tier.
+/// Part of #120745.
+/// All fields are optional for now, but intended to be required in the future.
+#[derive(Default, PartialEq, Clone, Debug)]
+pub struct TargetMetadata {
+    /// A short description of the target including platform requirements,
+    /// for example "64-bit Linux (kernel 3.2+, glibc 2.17+)".
+    pub description: Option<StaticCow<str>>,
+    /// The tier of the target. 1, 2 or 3.
+    pub tier: Option<u64>,
+    /// Whether the Rust project ships host tools for a target.
+    pub host_tools: Option<bool>,
+    /// Whether a target has the `std` library. This is usually true for targets running
+    /// on an operating system.
+    pub std: Option<bool>,
 }
 
 impl Target {
@@ -1704,6 +1888,8 @@ pub struct TargetOptions {
     /// Same as `(pre|post)_link_objects`, but when self-contained linking mode is enabled.
     pub pre_link_objects_self_contained: CrtObjects,
     pub post_link_objects_self_contained: CrtObjects,
+    /// Behavior for the self-contained linking mode: inferred for some targets, or explicitly
+    /// enabled (in bulk, or with individual components).
     pub link_self_contained: LinkSelfContainedDefault,
 
     /// Linker arguments that are passed *before* any user-defined libraries.
@@ -1746,6 +1932,8 @@ pub struct TargetOptions {
     /// passed, and cannot be disabled even via `-C`. Corresponds to `llc
     /// -mattr=$features`.
     pub features: StaticCow<str>,
+    /// Direct or use GOT indirect to reference external data symbols
+    pub direct_access_external_data: Option<bool>,
     /// Whether dynamic linking is available on this target. Defaults to false.
     pub dynamic_linking: bool,
     /// Whether dynamic linking can export TLS globals. Defaults to true.
@@ -1901,6 +2089,17 @@ pub struct TargetOptions {
     /// Default number of codegen units to use in debug mode
     pub default_codegen_units: Option<u64>,
 
+    /// Default codegen backend used for this target. Defaults to `None`.
+    ///
+    /// If `None`, then `CFG_DEFAULT_CODEGEN_BACKEND` environmental variable captured when
+    /// compiling `rustc` will be used instead (or llvm if it is not set).
+    ///
+    /// N.B. when *using* the compiler, backend can always be overridden with `-Zcodegen-backend`.
+    ///
+    /// This was added by WaffleLapkin in #116793. The motivation is a rustc fork that requires a
+    /// custom codegen backend for a particular target.
+    pub default_codegen_backend: Option<StaticCow<str>>,
+
     /// Whether to generate trap instructions in places where optimization would
     /// otherwise produce control flow that falls through into unrelated memory.
     pub trap_unreachable: bool,
@@ -1917,7 +2116,11 @@ pub struct TargetOptions {
     pub no_builtins: bool,
 
     /// The default visibility for symbols in this target should be "hidden"
-    /// rather than "default"
+    /// rather than "default".
+    ///
+    /// This value typically shouldn't be accessed directly, but through
+    /// the `rustc_session::Session::default_hidden_visibility` method, which
+    /// allows `rustc` users to override this setting using cmdline flags.
     pub default_hidden_visibility: bool,
 
     /// Whether a .debug_gdb_scripts section will be added to the output object file
@@ -2019,9 +2222,6 @@ pub struct TargetOptions {
 
     /// Whether the target supports XRay instrumentation.
     pub supports_xray: bool,
-
-    /// Forces the use of emulated TLS (__emutls_get_address)
-    pub force_emulated_tls: bool,
 }
 
 /// Add arguments for the given flavor and also for its "twin" flavors
@@ -2050,6 +2250,7 @@ fn add_link_args_iter(
         | LinkerFlavor::Unix(..)
         | LinkerFlavor::EmCc
         | LinkerFlavor::Bpf
+        | LinkerFlavor::Llbc
         | LinkerFlavor::Ptx => {}
     }
 }
@@ -2067,10 +2268,6 @@ impl TargetOptions {
 
     fn add_pre_link_args(&mut self, flavor: LinkerFlavor, args: &[&'static str]) {
         add_link_args(&mut self.pre_link_args, flavor, args);
-    }
-
-    fn add_post_link_args(&mut self, flavor: LinkerFlavor, args: &[&'static str]) {
-        add_link_args(&mut self.post_link_args, flavor, args);
     }
 
     fn update_from_cli(&mut self) {
@@ -2104,7 +2301,7 @@ impl TargetOptions {
     }
 
     fn update_to_cli(&mut self) {
-        self.linker_flavor_json = self.linker_flavor.to_cli();
+        self.linker_flavor_json = self.linker_flavor.to_cli_counterpart();
         self.lld_flavor_json = self.linker_flavor.lld_flavor();
         self.linker_is_gnu_json = self.linker_flavor.is_gnu();
         for (args, args_json) in [
@@ -2114,8 +2311,10 @@ impl TargetOptions {
             (&self.late_link_args_static, &mut self.late_link_args_static_json),
             (&self.post_link_args, &mut self.post_link_args_json),
         ] {
-            *args_json =
-                args.iter().map(|(flavor, args)| (flavor.to_cli(), args.clone())).collect();
+            *args_json = args
+                .iter()
+                .map(|(flavor, args)| (flavor.to_cli_counterpart(), args.clone()))
+                .collect();
         }
     }
 }
@@ -2141,6 +2340,7 @@ impl Default for TargetOptions {
             asm_args: cvs![],
             cpu: "generic".into(),
             features: "".into(),
+            direct_access_external_data: None,
             dynamic_linking: false,
             dll_tls_export: true,
             only_cdylib: false,
@@ -2207,6 +2407,7 @@ impl Default for TargetOptions {
             stack_probes: StackProbeType::None,
             min_global_align: None,
             default_codegen_units: None,
+            default_codegen_backend: None,
             trap_unreachable: true,
             requires_lto: false,
             singlethread: false,
@@ -2239,7 +2440,6 @@ impl Default for TargetOptions {
             entry_name: "main".into(),
             entry_abi: Conv::C,
             supports_xray: false,
-            force_emulated_tls: false,
         }
     }
 }
@@ -2264,10 +2464,14 @@ impl DerefMut for Target {
 
 impl Target {
     /// Given a function ABI, turn it into the correct ABI for this target.
-    pub fn adjust_abi(&self, abi: Abi) -> Abi {
+    pub fn adjust_abi(&self, abi: Abi, c_variadic: bool) -> Abi {
         match abi {
             Abi::C { .. } => self.default_adjusted_cabi.unwrap_or(abi),
-            Abi::System { unwind } if self.is_like_windows && self.arch == "x86" => {
+
+            // On Windows, `extern "system"` behaves like msvc's `__stdcall`.
+            // `__stdcall` only applies on x86 and on non-variadic functions:
+            // https://learn.microsoft.com/en-us/cpp/cpp/stdcall?view=msvc-170
+            Abi::System { unwind } if self.is_like_windows && self.arch == "x86" && !c_variadic => {
                 Abi::Stdcall { unwind }
             }
             Abi::System { unwind } => Abi::C { unwind },
@@ -2302,7 +2506,6 @@ impl Target {
             | System { .. }
             | RustIntrinsic
             | RustCall
-            | PlatformIntrinsic
             | Unadjusted
             | Cdecl { .. }
             | RustCold => true,
@@ -2315,7 +2518,6 @@ impl Target {
             Win64 { .. } | SysV64 { .. } => self.arch == "x86_64",
             PtxKernel => self.arch == "nvptx64",
             Msp430Interrupt => self.arch == "msp430",
-            AmdGpuKernel => self.arch == "amdgcn",
             RiscvInterruptM | RiscvInterruptS => ["riscv32", "riscv64"].contains(&&self.arch[..]),
             AvrInterrupt | AvrNonBlockingInterrupt => self.arch == "avr",
             Wasm => ["wasm32", "wasm64"].contains(&&self.arch[..]),
@@ -2394,6 +2596,7 @@ impl Target {
 
         let mut base = Target {
             llvm_target: get_req_field("llvm-target")?.into(),
+            metadata: Default::default(),
             pointer_width: get_req_field("target-pointer-width")?
                 .parse::<u32>()
                 .map_err(|_| "target-pointer-width must be an integer".to_string())?,
@@ -2401,6 +2604,22 @@ impl Target {
             arch: get_req_field("arch")?.into(),
             options: Default::default(),
         };
+
+        // FIXME: This doesn't properly validate anything and just ignores the data if it's invalid.
+        // That's okay for now, the only use of this is when generating docs, which we don't do for
+        // custom targets.
+        if let Some(Json::Object(mut metadata)) = obj.remove("metadata") {
+            base.metadata.description = metadata
+                .remove("description")
+                .and_then(|desc| desc.as_str().map(|desc| desc.to_owned().into()));
+            base.metadata.tier = metadata
+                .remove("tier")
+                .and_then(|tier| tier.as_u64())
+                .filter(|tier| (1..=3).contains(tier));
+            base.metadata.host_tools =
+                metadata.remove("host_tools").and_then(|host| host.as_bool());
+            base.metadata.std = metadata.remove("std").and_then(|host| host.as_bool());
+        }
 
         let mut incorrect_type = vec![];
 
@@ -2436,6 +2655,12 @@ impl Target {
                         return Err("Not a valid DWARF version number".into());
                     }
                     base.$key_name = s as u32;
+                }
+            } );
+            ($key_name:ident, Option<bool>) => ( {
+                let name = (stringify!($key_name)).replace("_", "-");
+                if let Some(s) = obj.remove(&name).and_then(|b| b.as_bool()) {
+                    base.$key_name = Some(s);
                 }
             } );
             ($key_name:ident, Option<u64>) => ( {
@@ -2639,6 +2864,7 @@ impl Target {
                             base.$key_name |= match s.as_str() {
                                 Some("address") => SanitizerSet::ADDRESS,
                                 Some("cfi") => SanitizerSet::CFI,
+                                Some("dataflow") => SanitizerSet::DATAFLOW,
                                 Some("kcfi") => SanitizerSet::KCFI,
                                 Some("kernel-address") => SanitizerSet::KERNELADDRESS,
                                 Some("leak") => SanitizerSet::LEAK,
@@ -2658,8 +2884,43 @@ impl Target {
                 }
                 Ok::<(), String>(())
             } );
-
-            ($key_name:ident = $json_name:expr, link_self_contained) => ( {
+            ($key_name:ident, link_self_contained_components) => ( {
+                // Skeleton of what needs to be parsed:
+                //
+                // ```
+                // $name: {
+                //     "components": [
+                //         <array of strings>
+                //     ]
+                // }
+                // ```
+                let name = (stringify!($key_name)).replace("_", "-");
+                if let Some(o) = obj.remove(&name) {
+                    if let Some(o) = o.as_object() {
+                        let component_array = o.get("components")
+                            .ok_or_else(|| format!("{name}: expected a \
+                                JSON object with a `components` field."))?;
+                        let component_array = component_array.as_array()
+                            .ok_or_else(|| format!("{name}.components: expected a JSON array"))?;
+                        let mut components = LinkSelfContainedComponents::empty();
+                        for s in component_array {
+                            components |= match s.as_str() {
+                                Some(s) => {
+                                    LinkSelfContainedComponents::from_str(s)
+                                        .ok_or_else(|| format!("unknown \
+                                        `-Clink-self-contained` component: {s}"))?
+                                },
+                                _ => return Err(format!("not a string: {:?}", s)),
+                            };
+                        }
+                        base.$key_name = LinkSelfContainedDefault::WithComponents(components);
+                    } else {
+                        incorrect_type.push(name)
+                    }
+                }
+                Ok::<(), String>(())
+            } );
+            ($key_name:ident = $json_name:expr, link_self_contained_backwards_compatible) => ( {
                 let name = $json_name;
                 obj.remove(name).and_then(|o| o.as_str().and_then(|s| {
                     match s.parse::<LinkSelfContainedDefault>() {
@@ -2812,7 +3073,13 @@ impl Target {
         key!(post_link_objects = "post-link-objects", link_objects);
         key!(pre_link_objects_self_contained = "pre-link-objects-fallback", link_objects);
         key!(post_link_objects_self_contained = "post-link-objects-fallback", link_objects);
-        key!(link_self_contained = "crt-objects-fallback", link_self_contained)?;
+        // Deserializes the backwards-compatible variants of `-Clink-self-contained`
+        key!(
+            link_self_contained = "crt-objects-fallback",
+            link_self_contained_backwards_compatible
+        )?;
+        // Deserializes the components variant of `-Clink-self-contained`
+        key!(link_self_contained, link_self_contained_components)?;
         key!(pre_link_args_json = "pre-link-args", link_args);
         key!(late_link_args_json = "late-link-args", link_args);
         key!(late_link_args_dynamic_json = "late-link-args-dynamic", link_args);
@@ -2825,6 +3092,7 @@ impl Target {
         key!(cpu);
         key!(features);
         key!(dynamic_linking, bool);
+        key!(direct_access_external_data, Option<bool>);
         key!(dll_tls_export, bool);
         key!(only_cdylib, bool);
         key!(executables, bool);
@@ -2902,7 +3170,6 @@ impl Target {
         key!(entry_name);
         key!(entry_abi, Conv)?;
         key!(supports_xray, bool);
-        key!(force_emulated_tls, bool);
 
         if base.is_builtin {
             // This can cause unfortunate ICEs later down the line.
@@ -3049,6 +3316,7 @@ impl ToJson for Target {
         }
 
         target_val!(llvm_target);
+        target_val!(metadata);
         d.insert("target-pointer-width".to_string(), self.pointer_width.to_string().to_json());
         target_val!(arch);
         target_val!(data_layout);
@@ -3068,7 +3336,6 @@ impl ToJson for Target {
         target_option_val!(post_link_objects);
         target_option_val!(pre_link_objects_self_contained, "pre-link-objects-fallback");
         target_option_val!(post_link_objects_self_contained, "post-link-objects-fallback");
-        target_option_val!(link_self_contained, "crt-objects-fallback");
         target_option_val!(link_args - pre_link_args_json, "pre-link-args");
         target_option_val!(link_args - late_link_args_json, "late-link-args");
         target_option_val!(link_args - late_link_args_dynamic_json, "late-link-args-dynamic");
@@ -3081,6 +3348,7 @@ impl ToJson for Target {
         target_option_val!(cpu);
         target_option_val!(features);
         target_option_val!(dynamic_linking);
+        target_option_val!(direct_access_external_data);
         target_option_val!(dll_tls_export);
         target_option_val!(only_cdylib);
         target_option_val!(executables);
@@ -3159,11 +3427,14 @@ impl ToJson for Target {
         target_option_val!(entry_name);
         target_option_val!(entry_abi);
         target_option_val!(supports_xray);
-        target_option_val!(force_emulated_tls);
 
         if let Some(abi) = self.default_adjusted_cabi {
             d.insert("default-adjusted-cabi".into(), Abi::name(abi).to_json());
         }
+
+        // Serializing `-Clink-self-contained` needs a dynamic key to support the
+        // backwards-compatible variants.
+        d.insert(self.link_self_contained.json_key().into(), self.link_self_contained.to_json());
 
         Json::Object(d)
     }
@@ -3217,19 +3488,22 @@ impl Hash for TargetTriple {
 impl<S: Encoder> Encodable<S> for TargetTriple {
     fn encode(&self, s: &mut S) {
         match self {
-            TargetTriple::TargetTriple(triple) => s.emit_enum_variant(0, |s| s.emit_str(triple)),
-            TargetTriple::TargetJson { path_for_rustdoc: _, triple, contents } => s
-                .emit_enum_variant(1, |s| {
-                    s.emit_str(triple);
-                    s.emit_str(contents)
-                }),
+            TargetTriple::TargetTriple(triple) => {
+                s.emit_u8(0);
+                s.emit_str(triple);
+            }
+            TargetTriple::TargetJson { path_for_rustdoc: _, triple, contents } => {
+                s.emit_u8(1);
+                s.emit_str(triple);
+                s.emit_str(contents);
+            }
         }
     }
 }
 
 impl<D: Decoder> Decodable<D> for TargetTriple {
     fn decode(d: &mut D) -> Self {
-        match d.read_usize() {
+        match d.read_u8() {
             0 => TargetTriple::TargetTriple(d.read_str().to_owned()),
             1 => TargetTriple::TargetJson {
                 path_for_rustdoc: PathBuf::new(),
@@ -3282,7 +3556,7 @@ impl TargetTriple {
     /// If this target is a path, a hash of the path is appended to the triple returned
     /// by `triple()`.
     pub fn debug_triple(&self) -> String {
-        use std::collections::hash_map::DefaultHasher;
+        use std::hash::DefaultHasher;
 
         match self {
             TargetTriple::TargetTriple(triple) => triple.to_owned(),

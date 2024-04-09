@@ -1,8 +1,7 @@
-// edition: 2021
-// known-bug: #110963
+//@ edition: 2021
+//@ known-bug: #110963
 
 #![feature(return_type_notation)]
-#![feature(async_fn_in_trait)]
 
 trait HealthCheck {
     async fn check<'a: 'a>(&'a mut self) -> bool;

@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -5,8 +6,7 @@ use std::process::Command;
 use crate::path::{Dirs, RelPath};
 use crate::rustc_info::get_file_name;
 use crate::utils::{
-    maybe_incremental, remove_dir_if_exists, spawn_and_wait, try_hard_link, CargoProject, Compiler,
-    LogGroup,
+    remove_dir_if_exists, spawn_and_wait, try_hard_link, CargoProject, Compiler, LogGroup,
 };
 use crate::{config, CodegenBackend, SysrootKind};
 
@@ -259,9 +259,16 @@ fn build_clif_sysroot_for_triple(
         // inlining.
         rustflags.push("-Zinline-mir".to_owned());
     }
+    if let Some(prefix) = env::var_os("CG_CLIF_STDLIB_REMAP_PATH_PREFIX") {
+        rustflags.push("--remap-path-prefix".to_owned());
+        rustflags.push(format!(
+            "{}={}",
+            STDLIB_SRC.to_path(dirs).to_str().unwrap(),
+            prefix.to_str().unwrap()
+        ));
+    }
     compiler.rustflags.extend(rustflags);
     let mut build_cmd = STANDARD_LIBRARY.build(&compiler, dirs);
-    maybe_incremental(&mut build_cmd);
     if channel == "release" {
         build_cmd.arg("--release");
     }

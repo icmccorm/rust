@@ -1,4 +1,5 @@
-// compile-flags: -C debug-assertions=yes
+// skip-filecheck
+//@ compile-flags: -C debug-assertions=yes
 
 // EMIT_MIR shifts.shift_signed.built.after.mir
 fn shift_signed(small: i8, big: u128, a: i8, b: i32, c: i128) -> ([i8; 3], [u128; 3]) {

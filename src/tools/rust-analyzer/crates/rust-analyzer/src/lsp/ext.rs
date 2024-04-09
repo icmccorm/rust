@@ -1,6 +1,8 @@
 //! rust-analyzer extensions to the LSP.
 
-use std::{collections::HashMap, path::PathBuf};
+#![allow(clippy::disallowed_types)]
+
+use std::path::PathBuf;
 
 use ide_db::line_index::WideEncoding;
 use lsp_types::request::Request;
@@ -9,6 +11,7 @@ use lsp_types::{
     PartialResultParams, Position, Range, TextDocumentIdentifier, WorkDoneProgressParams,
 };
 use lsp_types::{PositionEncodingKind, Url};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::line_index::PositionEncoding;
@@ -158,6 +161,116 @@ impl Request for ViewItemTree {
     type Params = ViewItemTreeParams;
     type Result = String;
     const METHOD: &'static str = "rust-analyzer/viewItemTree";
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverTestParams {
+    pub test_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub enum TestItemKind {
+    Package,
+    Module,
+    Test,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TestItem {
+    pub id: String,
+    pub label: String,
+    pub kind: TestItemKind,
+    pub can_resolve_children: bool,
+    pub parent: Option<String>,
+    pub text_document: Option<TextDocumentIdentifier>,
+    pub range: Option<Range>,
+    pub runnable: Option<Runnable>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverTestResults {
+    pub tests: Vec<TestItem>,
+    pub scope: Option<Vec<String>>,
+    pub scope_file: Option<Vec<TextDocumentIdentifier>>,
+}
+
+pub enum DiscoverTest {}
+
+impl Request for DiscoverTest {
+    type Params = DiscoverTestParams;
+    type Result = DiscoverTestResults;
+    const METHOD: &'static str = "experimental/discoverTest";
+}
+
+pub enum DiscoveredTests {}
+
+impl Notification for DiscoveredTests {
+    type Params = DiscoverTestResults;
+    const METHOD: &'static str = "experimental/discoveredTests";
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RunTestParams {
+    pub include: Option<Vec<String>>,
+    pub exclude: Option<Vec<String>>,
+}
+
+pub enum RunTest {}
+
+impl Request for RunTest {
+    type Params = RunTestParams;
+    type Result = ();
+    const METHOD: &'static str = "experimental/runTest";
+}
+
+pub enum EndRunTest {}
+
+impl Notification for EndRunTest {
+    type Params = ();
+    const METHOD: &'static str = "experimental/endRunTest";
+}
+
+pub enum AppendOutputToRunTest {}
+
+impl Notification for AppendOutputToRunTest {
+    type Params = String;
+    const METHOD: &'static str = "experimental/appendOutputToRunTest";
+}
+
+pub enum AbortRunTest {}
+
+impl Notification for AbortRunTest {
+    type Params = ();
+    const METHOD: &'static str = "experimental/abortRunTest";
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase", tag = "tag")]
+pub enum TestState {
+    Passed,
+    Failed { message: String },
+    Skipped,
+    Started,
+    Enqueued,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeTestStateParams {
+    pub test_id: String,
+    pub state: TestState,
+}
+
+pub enum ChangeTestState {}
+
+impl Notification for ChangeTestState {
+    type Params = ChangeTestStateParams;
+    const METHOD: &'static str = "experimental/changeTestState";
 }
 
 pub enum ExpandMacro {}
@@ -448,12 +561,16 @@ pub struct CodeActionData {
 #[serde(rename_all = "camelCase")]
 pub struct SnippetWorkspaceEdit {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub changes: Option<HashMap<lsp_types::Url, Vec<lsp_types::TextEdit>>>,
+    pub changes: Option<FxHashMap<lsp_types::Url, Vec<lsp_types::TextEdit>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document_changes: Option<Vec<SnippetDocumentChangeOperation>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub change_annotations:
-        Option<HashMap<lsp_types::ChangeAnnotationIdentifier, lsp_types::ChangeAnnotation>>,
+    pub change_annotations: Option<
+        std::collections::HashMap<
+            lsp_types::ChangeAnnotationIdentifier,
+            lsp_types::ChangeAnnotation,
+        >,
+    >,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]
@@ -627,7 +744,7 @@ pub enum WorkspaceSymbol {}
 
 impl Request for WorkspaceSymbol {
     type Params = WorkspaceSymbolParams;
-    type Result = Option<Vec<lsp_types::SymbolInformation>>;
+    type Result = Option<lsp_types::WorkspaceSymbolResponse>;
     const METHOD: &'static str = "workspace/symbol";
 }
 
@@ -684,6 +801,7 @@ pub struct CompletionResolveData {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InlayHintResolveData {
     pub file_id: u32,
+    pub hash: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -695,4 +813,17 @@ pub struct CompletionImport {
 #[derive(Debug, Deserialize, Default)]
 pub struct ClientCommandOptions {
     pub commands: Vec<String>,
+}
+
+pub enum UnindexedProject {}
+
+impl Notification for UnindexedProject {
+    type Params = UnindexedProjectParams;
+    const METHOD: &'static str = "rust-analyzer/unindexedProject";
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UnindexedProjectParams {
+    pub text_documents: Vec<TextDocumentIdentifier>,
 }

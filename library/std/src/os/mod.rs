@@ -85,6 +85,9 @@ pub mod linux;
 #[cfg(any(target_os = "wasi", doc))]
 pub mod wasi;
 
+#[cfg(any(all(target_os = "wasi", target_env = "p2"), doc))]
+pub mod wasip2;
+
 // windows
 #[cfg(not(all(
     doc,
@@ -97,6 +100,8 @@ pub mod wasi;
 pub mod windows;
 
 // Others.
+#[cfg(target_os = "aix")]
+pub mod aix;
 #[cfg(target_os = "android")]
 pub mod android;
 #[cfg(target_os = "dragonfly")]
@@ -144,6 +149,8 @@ pub mod solid;
 pub(crate) mod tvos;
 #[cfg(target_os = "uefi")]
 pub mod uefi;
+#[cfg(target_os = "visionos")]
+pub(crate) mod visionos;
 #[cfg(target_os = "vita")]
 pub mod vita;
 #[cfg(target_os = "vxworks")]

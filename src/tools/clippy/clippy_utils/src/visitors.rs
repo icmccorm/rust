@@ -5,7 +5,7 @@ use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::intravisit::{self, walk_block, walk_expr, Visitor};
 use rustc_hir::{
-    AnonConst, Arm, Block, BlockCheckMode, Body, BodyId, Expr, ExprKind, HirId, ItemId, ItemKind, Let, Pat, QPath,
+    AnonConst, Arm, Block, BlockCheckMode, Body, BodyId, Expr, ExprKind, HirId, ItemId, ItemKind, LetExpr, Pat, QPath,
     Stmt, UnOp, UnsafeSource, Unsafety,
 };
 use rustc_lint::LateContext;
@@ -58,6 +58,27 @@ where
 {
     fn visit<V: Visitor<'tcx>>(self, visitor: &mut V) {
         for x in self {
+            x.visit(visitor);
+        }
+    }
+}
+impl<'tcx, A, B> Visitable<'tcx> for (A, B)
+where
+    A: Visitable<'tcx>,
+    B: Visitable<'tcx>,
+{
+    fn visit<V: Visitor<'tcx>>(self, visitor: &mut V) {
+        let (a, b) = self;
+        a.visit(visitor);
+        b.visit(visitor);
+    }
+}
+impl<'tcx, T> Visitable<'tcx> for Option<T>
+where
+    T: Visitable<'tcx>,
+{
+    fn visit<V: Visitor<'tcx>>(self, visitor: &mut V) {
+        if let Some(x) = self {
             x.visit(visitor);
         }
     }
@@ -159,9 +180,9 @@ pub fn for_each_expr_with_closures<'tcx, B, C: Continue>(
 }
 
 /// returns `true` if expr contains match expr desugared from try
-fn contains_try(expr: &hir::Expr<'_>) -> bool {
+fn contains_try(expr: &Expr<'_>) -> bool {
     for_each_expr(expr, |e| {
-        if matches!(e.kind, hir::ExprKind::Match(_, _, hir::MatchSource::TryDesugar(_))) {
+        if matches!(e.kind, ExprKind::Match(_, _, hir::MatchSource::TryDesugar(_))) {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
@@ -170,9 +191,9 @@ fn contains_try(expr: &hir::Expr<'_>) -> bool {
     .is_some()
 }
 
-pub fn find_all_ret_expressions<'hir, F>(_cx: &LateContext<'_>, expr: &'hir hir::Expr<'hir>, callback: F) -> bool
+pub fn find_all_ret_expressions<'hir, F>(_cx: &LateContext<'_>, expr: &'hir Expr<'hir>, callback: F) -> bool
 where
-    F: FnMut(&'hir hir::Expr<'hir>) -> bool,
+    F: FnMut(&'hir Expr<'hir>) -> bool,
 {
     struct RetFinder<F> {
         in_stmt: bool,
@@ -215,37 +236,37 @@ where
         }
     }
 
-    impl<'hir, F: FnMut(&'hir hir::Expr<'hir>) -> bool> intravisit::Visitor<'hir> for RetFinder<F> {
-        fn visit_stmt(&mut self, stmt: &'hir hir::Stmt<'_>) {
+    impl<'hir, F: FnMut(&'hir Expr<'hir>) -> bool> Visitor<'hir> for RetFinder<F> {
+        fn visit_stmt(&mut self, stmt: &'hir Stmt<'_>) {
             intravisit::walk_stmt(&mut *self.inside_stmt(true), stmt);
         }
 
-        fn visit_expr(&mut self, expr: &'hir hir::Expr<'_>) {
+        fn visit_expr(&mut self, expr: &'hir Expr<'_>) {
             if self.failed {
                 return;
             }
             if self.in_stmt {
                 match expr.kind {
-                    hir::ExprKind::Ret(Some(expr)) => self.inside_stmt(false).visit_expr(expr),
-                    _ => intravisit::walk_expr(self, expr),
+                    ExprKind::Ret(Some(expr)) => self.inside_stmt(false).visit_expr(expr),
+                    _ => walk_expr(self, expr),
                 }
             } else {
                 match expr.kind {
-                    hir::ExprKind::If(cond, then, else_opt) => {
+                    ExprKind::If(cond, then, else_opt) => {
                         self.inside_stmt(true).visit_expr(cond);
                         self.visit_expr(then);
                         if let Some(el) = else_opt {
                             self.visit_expr(el);
                         }
                     },
-                    hir::ExprKind::Match(cond, arms, _) => {
+                    ExprKind::Match(cond, arms, _) => {
                         self.inside_stmt(true).visit_expr(cond);
                         for arm in arms {
                             self.visit_expr(arm.body);
                         }
                     },
-                    hir::ExprKind::Block(..) => intravisit::walk_expr(self, expr),
-                    hir::ExprKind::Ret(Some(expr)) => self.visit_expr(expr),
+                    ExprKind::Block(..) => walk_expr(self, expr),
+                    ExprKind::Ret(Some(expr)) => self.visit_expr(expr),
                     _ => self.failed |= !(self.cb)(expr),
                 }
             }
@@ -295,10 +316,7 @@ pub fn is_const_evaluatable<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) -> 
         is_const: bool,
     }
     impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
-        type NestedFilter = nested_filter::OnlyBodies;
-        fn nested_visit_map(&mut self) -> Self::Map {
-            self.cx.tcx.hir()
-        }
+        type NestedFilter = intravisit::nested_filter::None;
 
         fn visit_expr(&mut self, e: &'tcx Expr<'_>) {
             if !self.is_const {
@@ -606,7 +624,7 @@ pub fn for_each_unconsumed_temporary<'tcx, B>(
             | ExprKind::Field(e, _)
             | ExprKind::Unary(UnOp::Deref, e)
             | ExprKind::Match(e, ..)
-            | ExprKind::Let(&Let { init: e, .. }) => {
+            | ExprKind::Let(&LetExpr { init: e, .. }) => {
                 helper(typeck, false, e, f)?;
             },
             ExprKind::Block(&Block { expr: Some(e), .. }, _) | ExprKind::Cast(e, _) | ExprKind::Unary(_, e) => {
@@ -747,4 +765,27 @@ pub fn contains_break_or_continue(expr: &Expr<'_>) -> bool {
         }
     })
     .is_some()
+}
+
+/// If the local is only used once in `visitable` returns the path expression referencing the given
+/// local
+pub fn local_used_once<'tcx>(
+    cx: &LateContext<'tcx>,
+    visitable: impl Visitable<'tcx>,
+    id: HirId,
+) -> Option<&'tcx Expr<'tcx>> {
+    let mut expr = None;
+
+    let cf = for_each_expr_with_closures(cx, visitable, |e| {
+        if path_to_local_id(e, id) && expr.replace(e).is_some() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    if cf.is_some() {
+        return None;
+    }
+
+    expr
 }

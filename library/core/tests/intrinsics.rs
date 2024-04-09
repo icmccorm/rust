@@ -4,7 +4,7 @@ use core::intrinsics::assume;
 #[test]
 fn test_typeid_sized_types() {
     struct X;
-    struct Y(u32);
+    struct Y(#[allow(dead_code)] u32);
 
     assert_eq!(TypeId::of::<X>(), TypeId::of::<X>());
     assert_eq!(TypeId::of::<Y>(), TypeId::of::<Y>());
@@ -14,8 +14,8 @@ fn test_typeid_sized_types() {
 #[test]
 fn test_typeid_unsized_types() {
     trait Z {}
-    struct X(str);
-    struct Y(dyn Z + 'static);
+    struct X(#[allow(dead_code)] str);
+    struct Y(#[allow(dead_code)] dyn Z + 'static);
 
     assert_eq!(TypeId::of::<X>(), TypeId::of::<X>());
     assert_eq!(TypeId::of::<Y>(), TypeId::of::<Y>());
@@ -98,4 +98,31 @@ fn test_const_deallocate_at_runtime() {
         const_deallocate(x as *const _ as *mut u8, 4, 4); // nop
         const_deallocate(core::ptr::null_mut(), 1, 1); // nop
     }
+}
+
+#[cfg(not(bootstrap))]
+#[test]
+fn test_three_way_compare_in_const_contexts() {
+    use core::cmp::Ordering::{self, *};
+    use core::intrinsics::three_way_compare;
+
+    const UNSIGNED_LESS: Ordering = three_way_compare(123_u16, 456);
+    const UNSIGNED_EQUAL: Ordering = three_way_compare(456_u16, 456);
+    const UNSIGNED_GREATER: Ordering = three_way_compare(789_u16, 456);
+    const CHAR_LESS: Ordering = three_way_compare('A', 'B');
+    const CHAR_EQUAL: Ordering = three_way_compare('B', 'B');
+    const CHAR_GREATER: Ordering = three_way_compare('C', 'B');
+    const SIGNED_LESS: Ordering = three_way_compare(123_i64, 456);
+    const SIGNED_EQUAL: Ordering = three_way_compare(456_i64, 456);
+    const SIGNED_GREATER: Ordering = three_way_compare(789_i64, 456);
+
+    assert_eq!(UNSIGNED_LESS, Less);
+    assert_eq!(UNSIGNED_EQUAL, Equal);
+    assert_eq!(UNSIGNED_GREATER, Greater);
+    assert_eq!(CHAR_LESS, Less);
+    assert_eq!(CHAR_EQUAL, Equal);
+    assert_eq!(CHAR_GREATER, Greater);
+    assert_eq!(SIGNED_LESS, Less);
+    assert_eq!(SIGNED_EQUAL, Equal);
+    assert_eq!(SIGNED_GREATER, Greater);
 }

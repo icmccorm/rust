@@ -228,16 +228,26 @@ pub enum PanicExpn<'a> {
 
 impl<'a> PanicExpn<'a> {
     pub fn parse(expr: &'a Expr<'a>) -> Option<Self> {
-        let ExprKind::Call(callee, [arg, rest @ ..]) = &expr.kind else {
+        let ExprKind::Call(callee, args) = &expr.kind else {
             return None;
         };
         let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind else {
             return None;
         };
-        let result = match path.segments.last().unwrap().ident.as_str() {
-            "panic" if arg.span.ctxt() == expr.span.ctxt() => Self::Empty,
+        let name = path.segments.last().unwrap().ident.as_str();
+
+        // This has no argument
+        if name == "panic_cold_explicit" {
+            return Some(Self::Empty);
+        };
+
+        let [arg, rest @ ..] = args else {
+            return None;
+        };
+        let result = match name {
+            "panic" if arg.span.eq_ctxt(expr.span) => Self::Empty,
             "panic" | "panic_str" => Self::Str(arg),
-            "panic_display" => {
+            "panic_display" | "panic_cold_display" => {
                 let ExprKind::AddrOf(_, _, e) = &arg.kind else {
                     return None;
                 };
@@ -410,7 +420,7 @@ pub fn find_format_args(cx: &LateContext<'_>, start: &Expr<'_>, expn_id: ExpnId)
         ast_format_args
             .get()?
             .get(&format_args_expr.span.with_parent(None))
-            .map(Rc::clone)
+            .cloned()
     })
 }
 
@@ -419,7 +429,7 @@ pub fn find_format_args(cx: &LateContext<'_>, start: &Expr<'_>, expn_id: ExpnId)
 pub fn find_format_arg_expr<'hir, 'ast>(
     start: &'hir Expr<'hir>,
     target: &'ast FormatArgument,
-) -> Result<&'hir rustc_hir::Expr<'hir>, &'ast rustc_ast::Expr> {
+) -> Result<&'hir Expr<'hir>, &'ast rustc_ast::Expr> {
     let SpanData {
         lo,
         hi,

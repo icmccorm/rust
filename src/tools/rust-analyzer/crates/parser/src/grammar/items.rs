@@ -1,5 +1,5 @@
-mod consts;
 mod adt;
+mod consts;
 mod traits;
 mod use_item;
 
@@ -58,14 +58,20 @@ pub(super) fn item_or_macro(p: &mut Parser<'_>, stop_on_r_curly: bool) {
         Err(m) => m,
     };
 
+    // test macro_rules_as_macro_name
+    // macro_rules! {}
+    // macro_rules! ();
+    // macro_rules! [];
+    // fn main() {
+    //     let foo = macro_rules!();
+    // }
+
+    // test_err macro_rules_as_macro_name
+    // macro_rules! {};
+    // macro_rules! ()
+    // macro_rules! []
     if paths::is_use_path_start(p) {
-        match macro_call(p) {
-            BlockLike::Block => (),
-            BlockLike::NotBlock => {
-                p.expect(T![;]);
-            }
-        }
-        m.complete(p, MACRO_CALL);
+        macro_call(p, m);
         return;
     }
 
@@ -79,6 +85,7 @@ pub(super) fn item_or_macro(p: &mut Parser<'_>, stop_on_r_curly: bool) {
             e.complete(p, ERROR);
         }
         EOF | T!['}'] => p.error("expected an item"),
+        T![let] => error_let_stmt(p, "expected an item"),
         _ => p.err_and_bump("expected an item"),
     }
 }
@@ -148,27 +155,19 @@ pub(super) fn opt_item(p: &mut Parser<'_>, m: Marker) -> Result<(), Marker> {
             // impl T for Foo {
             //     default async fn foo() {}
             // }
-            T![async] => {
-                let mut maybe_fn = p.nth(2);
-                let is_unsafe = if matches!(maybe_fn, T![unsafe]) {
-                    // test default_async_unsafe_fn
-                    // impl T for Foo {
-                    //     default async unsafe fn foo() {}
-                    // }
-                    maybe_fn = p.nth(3);
-                    true
-                } else {
-                    false
-                };
+            T![async]
+                if p.nth_at(2, T![fn]) || (p.nth_at(2, T![unsafe]) && p.nth_at(3, T![fn])) =>
+            {
+                p.bump_remap(T![default]);
+                p.bump(T![async]);
 
-                if matches!(maybe_fn, T![fn]) {
-                    p.bump_remap(T![default]);
-                    p.bump(T![async]);
-                    if is_unsafe {
-                        p.bump(T![unsafe]);
-                    }
-                    has_mods = true;
-                }
+                // test default_async_unsafe_fn
+                // impl T for Foo {
+                //     default async unsafe fn foo() {}
+                // }
+                p.eat(T![unsafe]);
+
+                has_mods = true;
             }
             _ => (),
         }
@@ -227,7 +226,15 @@ fn opt_item_without_modifiers(p: &mut Parser<'_>, m: Marker) -> Result<(), Marke
         IDENT if p.at_contextual_kw(T![union]) && p.nth(1) == IDENT => adt::union(p, m),
 
         T![macro] => macro_def(p, m),
-        IDENT if p.at_contextual_kw(T![macro_rules]) && p.nth(1) == BANG => macro_rules(p, m),
+        // check if current token is "macro_rules" followed by "!" followed by an identifier or "try"
+        // try is keyword since the 2018 edition and the parser is not edition aware (yet!)
+        IDENT
+            if p.at_contextual_kw(T![macro_rules])
+                && p.nth_at(1, BANG)
+                && (p.nth_at(2, IDENT) || p.nth_at(2, T![try])) =>
+        {
+            macro_rules(p, m)
+        }
 
         T![const] if (la == IDENT || la == T![_] || la == T![mut]) => consts::konst(p, m),
         T![static] if (la == IDENT || la == T![_] || la == T![mut]) => consts::static_(p, m),
@@ -403,20 +410,24 @@ fn fn_(p: &mut Parser<'_>, m: Marker) {
     // fn foo<T>() where T: Copy {}
     generic_params::opt_where_clause(p);
 
-    if p.at(T![;]) {
-        // test fn_decl
-        // trait T { fn foo(); }
-        p.bump(T![;]);
-    } else {
+    // test fn_decl
+    // trait T { fn foo(); }
+    if !p.eat(T![;]) {
         expressions::block_expr(p);
     }
     m.complete(p, FN);
 }
 
-fn macro_call(p: &mut Parser<'_>) -> BlockLike {
+fn macro_call(p: &mut Parser<'_>, m: Marker) {
     assert!(paths::is_use_path_start(p));
     paths::use_path(p);
-    macro_call_after_excl(p)
+    match macro_call_after_excl(p) {
+        BlockLike::Block => (),
+        BlockLike::NotBlock => {
+            p.expect(T![;]);
+        }
+    }
+    m.complete(p, MACRO_CALL);
 }
 
 pub(super) fn macro_call_after_excl(p: &mut Parser<'_>) -> BlockLike {

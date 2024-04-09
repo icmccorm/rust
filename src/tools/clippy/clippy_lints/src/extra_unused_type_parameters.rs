@@ -10,7 +10,7 @@ use rustc_hir::{
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::lint::in_external_macro;
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_session::impl_lint_pass;
 use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::Span;
 
@@ -23,13 +23,13 @@ declare_clippy_lint! {
     /// requires using a turbofish, which serves no purpose but to satisfy the compiler.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// fn unused_ty<T>(x: u8) {
     ///     // ..
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// fn no_unused_ty(x: u8) {
     ///     // ..
     /// }
@@ -110,11 +110,11 @@ impl<'cx, 'tcx> TypeWalker<'cx, 'tcx> {
             .map_or(param.span, |bound_span| param.span.with_hi(bound_span.hi()))
     }
 
-    fn emit_help(&self, spans: Vec<Span>, msg: &str, help: &'static str) {
+    fn emit_help(&self, spans: Vec<Span>, msg: String, help: &'static str) {
         span_lint_and_help(self.cx, EXTRA_UNUSED_TYPE_PARAMETERS, spans, msg, None, help);
     }
 
-    fn emit_sugg(&self, spans: Vec<Span>, msg: &str, help: &'static str) {
+    fn emit_sugg(&self, spans: Vec<Span>, msg: String, help: &'static str) {
         let suggestions: Vec<(Span, String)> = spans.iter().copied().zip(std::iter::repeat(String::new())).collect();
         span_lint_and_then(self.cx, EXTRA_UNUSED_TYPE_PARAMETERS, spans, msg, |diag| {
             diag.multipart_suggestion(help, suggestions, Applicability::MachineApplicable);
@@ -167,7 +167,7 @@ impl<'cx, 'tcx> TypeWalker<'cx, 'tcx> {
                 .iter()
                 .map(|(_, param)| self.get_bound_span(param))
                 .collect::<Vec<_>>();
-            self.emit_help(spans, &msg, help);
+            self.emit_help(spans, msg, help);
         } else {
             let spans = if explicit_params.len() == extra_params.len() {
                 vec![self.generics.span] // Remove the entire list of generics
@@ -177,24 +177,26 @@ impl<'cx, 'tcx> TypeWalker<'cx, 'tcx> {
                     .iter()
                     .rev()
                     .map(|(idx, param)| {
-                        if let Some(next) = explicit_params.get(idx + 1) && end != Some(next.def_id) {
-                        // Extend the current span forward, up until the next param in the list.
-                        param.span.until(next.span)
-                    } else {
-                        // Extend the current span back to include the comma following the previous
-                        // param. If the span of the next param in the list has already been
-                        // extended, we continue the chain. This is why we're iterating in reverse.
-                        end = Some(param.def_id);
+                        if let Some(next) = explicit_params.get(idx + 1)
+                            && end != Some(next.def_id)
+                        {
+                            // Extend the current span forward, up until the next param in the list.
+                            param.span.until(next.span)
+                        } else {
+                            // Extend the current span back to include the comma following the previous
+                            // param. If the span of the next param in the list has already been
+                            // extended, we continue the chain. This is why we're iterating in reverse.
+                            end = Some(param.def_id);
 
-                        // idx will never be 0, else we'd be removing the entire list of generics
-                        let prev = explicit_params[idx - 1];
-                        let prev_span = self.get_bound_span(prev);
-                        self.get_bound_span(param).with_lo(prev_span.hi())
-                    }
+                            // idx will never be 0, else we'd be removing the entire list of generics
+                            let prev = explicit_params[idx - 1];
+                            let prev_span = self.get_bound_span(prev);
+                            self.get_bound_span(param).with_lo(prev_span.hi())
+                        }
                     })
                     .collect()
             };
-            self.emit_sugg(spans, &msg, help);
+            self.emit_sugg(spans, msg, help);
         };
     }
 }

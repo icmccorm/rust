@@ -67,11 +67,47 @@ impl Display for Target {
 }
 
 impl Target {
+    pub fn is_associated_item(self) -> bool {
+        match self {
+            Target::AssocConst | Target::AssocTy | Target::Method(_) => true,
+            Target::ExternCrate
+            | Target::Use
+            | Target::Static
+            | Target::Const
+            | Target::Fn
+            | Target::Closure
+            | Target::Mod
+            | Target::ForeignMod
+            | Target::GlobalAsm
+            | Target::TyAlias
+            | Target::OpaqueTy
+            | Target::Enum
+            | Target::Variant
+            | Target::Struct
+            | Target::Field
+            | Target::Union
+            | Target::Trait
+            | Target::TraitAlias
+            | Target::Impl
+            | Target::Expression
+            | Target::Statement
+            | Target::Arm
+            | Target::ForeignFn
+            | Target::ForeignStatic
+            | Target::ForeignTy
+            | Target::GenericParam(_)
+            | Target::MacroDef
+            | Target::Param
+            | Target::PatField
+            | Target::ExprField => false,
+        }
+    }
+
     pub fn from_item(item: &Item<'_>) -> Target {
         match item.kind {
             ItemKind::ExternCrate(..) => Target::ExternCrate,
             ItemKind::Use(..) => Target::Use,
-            ItemKind::Static(..) => Target::Static,
+            ItemKind::Static { .. } => Target::Static,
             ItemKind::Const(..) => Target::Const,
             ItemKind::Fn(..) => Target::Fn,
             ItemKind::Macro(..) => Target::MacroDef,
@@ -94,7 +130,7 @@ impl Target {
         match def_kind {
             DefKind::ExternCrate => Target::ExternCrate,
             DefKind::Use => Target::Use,
-            DefKind::Static(..) => Target::Static,
+            DefKind::Static { .. } => Target::Static,
             DefKind::Const => Target::Const,
             DefKind::Fn => Target::Fn,
             DefKind::Macro(..) => Target::MacroDef,

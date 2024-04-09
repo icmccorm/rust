@@ -5,7 +5,7 @@ use rustc_hir::{BorrowKind, Expr, ExprKind, MatchSource, Mutability};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty;
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 use rustc_span::Span;
 
 declare_clippy_lint! {
@@ -60,7 +60,7 @@ impl<'tcx> LateLintPass<'tcx> for DebugAssertWithMutCall {
                     cx,
                     DEBUG_ASSERT_WITH_MUT_CALL,
                     span,
-                    &format!("do not call a function with mutable arguments inside of `{macro_name}!`"),
+                    format!("do not call a function with mutable arguments inside of `{macro_name}!`"),
                 );
             }
         }

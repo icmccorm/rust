@@ -2,16 +2,16 @@ use rustc_data_structures::fx::FxIndexSet;
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_infer::infer::{outlives::env::OutlivesEnvironment, TyCtxtInferExt};
-use rustc_lint_defs::builtin::REFINING_IMPL_TRAIT;
+use rustc_lint_defs::builtin::{REFINING_IMPL_TRAIT_INTERNAL, REFINING_IMPL_TRAIT_REACHABLE};
 use rustc_middle::traits::{ObligationCause, Reveal};
 use rustc_middle::ty::{
     self, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperVisitable, TypeVisitable, TypeVisitor,
 };
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::Span;
+use rustc_trait_selection::regions::InferCtxtRegionExt;
 use rustc_trait_selection::traits::{
     elaborate, normalize_param_env_or_error, outlives_bounds::InferCtxtExt, ObligationCtxt,
 };
-use std::ops::ControlFlow;
 
 /// Check that an implementation does not refine an RPITIT from a trait method signature.
 pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
@@ -23,22 +23,23 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
     if !tcx.impl_method_has_trait_impl_trait_tys(impl_m.def_id) {
         return;
     }
-    // crate-private traits don't have any library guarantees, there's no need to do this check.
-    if !tcx.visibility(trait_m.container_id(tcx)).is_public() {
-        return;
-    }
 
-    // If a type in the trait ref is private, then there's also no reason to to do this check.
+    // unreachable traits don't have any library guarantees, there's no need to do this check.
+    let is_internal = trait_m
+        .container_id(tcx)
+        .as_local()
+        .is_some_and(|trait_def_id| !tcx.effective_visibilities(()).is_reachable(trait_def_id))
+        // If a type in the trait ref is private, then there's also no reason to do this check.
+        || impl_trait_ref.args.iter().any(|arg| {
+            if let Some(ty) = arg.as_type()
+                && let Some(self_visibility) = type_visibility(tcx, ty)
+            {
+                return !self_visibility.is_public();
+            }
+            false
+        });
+
     let impl_def_id = impl_m.container_id(tcx);
-    for arg in impl_trait_ref.args {
-        if let Some(ty) = arg.as_type()
-            && let Some(self_visibility) = type_visibility(tcx, ty)
-            && !self_visibility.is_public()
-        {
-            return;
-        }
-    }
-
     let impl_m_args = ty::GenericArgs::identity_for_item(tcx, impl_m.def_id);
     let trait_m_to_impl_m_args = impl_m_args.rebase_onto(tcx, impl_def_id, impl_trait_ref.args);
     let bound_trait_m_sig = tcx.fn_sig(trait_m.def_id).instantiate(tcx, trait_m_to_impl_m_args);
@@ -81,13 +82,14 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
                 trait_m.def_id,
                 impl_m.def_id,
                 None,
+                is_internal,
             );
             return;
         };
 
         // This opaque also needs to be from the impl method -- otherwise,
         // it's a refinement to a TAIT.
-        if !tcx.hir().get_if_local(impl_opaque.def_id).map_or(false, |node| {
+        if !tcx.hir().get_if_local(impl_opaque.def_id).is_some_and(|node| {
             matches!(
                 node.expect_item().expect_opaque_ty().origin,
                 hir::OpaqueTyOrigin::AsyncFn(def_id)  | hir::OpaqueTyOrigin::FnReturn(def_id)
@@ -100,6 +102,7 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
                 trait_m.def_id,
                 impl_m.def_id,
                 None,
+                is_internal,
             );
             return;
         }
@@ -131,11 +134,15 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
     // 1. Project the RPITIT projections from the trait to the opaques on the impl,
     //    which means that they don't need to be mapped manually.
     //
-    // 2. Project any other projections that show up in the bound. That makes sure that
-    //    we don't consider `tests/ui/async-await/in-trait/async-associated-types.rs`
-    //    to be refining.
-    let (trait_bounds, impl_bounds) =
-        ocx.normalize(&ObligationCause::dummy(), param_env, (trait_bounds, impl_bounds));
+    // 2. Deeply normalize any other projections that show up in the bound. That makes sure
+    //    that we don't consider `tests/ui/async-await/in-trait/async-associated-types.rs`
+    //    or `tests/ui/impl-trait/in-trait/refine-normalize.rs` to be refining.
+    let Ok((trait_bounds, impl_bounds)) =
+        ocx.deeply_normalize(&ObligationCause::dummy(), param_env, (trait_bounds, impl_bounds))
+    else {
+        tcx.dcx().delayed_bug("encountered errors when checking RPITIT refinement (selection)");
+        return;
+    };
 
     // Since we've normalized things, we need to resolve regions, since we'll
     // possibly have introduced region vars during projection. We don't expect
@@ -149,31 +156,24 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
         trait_m_sig.inputs_and_output,
     ));
     if !ocx.select_all_or_error().is_empty() {
-        tcx.sess.delay_span_bug(
-            DUMMY_SP,
-            "encountered errors when checking RPITIT refinement (selection)",
-        );
+        tcx.dcx().delayed_bug("encountered errors when checking RPITIT refinement (selection)");
         return;
     }
     let outlives_env = OutlivesEnvironment::with_bounds(
         param_env,
-        infcx.implied_bounds_tys(param_env, impl_m.def_id.expect_local(), implied_wf_types),
+        infcx.implied_bounds_tys(param_env, impl_m.def_id.expect_local(), &implied_wf_types),
     );
     let errors = infcx.resolve_regions(&outlives_env);
     if !errors.is_empty() {
-        tcx.sess.delay_span_bug(
-            DUMMY_SP,
-            "encountered errors when checking RPITIT refinement (regions)",
-        );
+        tcx.dcx().delayed_bug("encountered errors when checking RPITIT refinement (regions)");
         return;
     }
     // Resolve any lifetime variables that may have been introduced during normalization.
     let Ok((trait_bounds, impl_bounds)) = infcx.fully_resolve((trait_bounds, impl_bounds)) else {
-        tcx.sess.delay_span_bug(
-            DUMMY_SP,
-            "encountered errors when checking RPITIT refinement (resolution)",
-        );
-        return;
+        // This code path is not reached in any tests, but may be reachable. If
+        // this is triggered, it should be converted to `delayed_bug` and the
+        // triggering case turned into a test.
+        tcx.dcx().bug("encountered errors when checking RPITIT refinement (resolution)");
     };
 
     // For quicker lookup, use an `IndexSet` (we don't use one earlier because
@@ -197,6 +197,7 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
                 trait_m.def_id,
                 impl_m.def_id,
                 Some(span),
+                is_internal,
             );
             return;
         }
@@ -209,9 +210,7 @@ struct ImplTraitInTraitCollector<'tcx> {
 }
 
 impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for ImplTraitInTraitCollector<'tcx> {
-    type BreakTy = !;
-
-    fn visit_ty(&mut self, ty: Ty<'tcx>) -> std::ops::ControlFlow<Self::BreakTy> {
+    fn visit_ty(&mut self, ty: Ty<'tcx>) {
         if let ty::Alias(ty::Projection, proj) = *ty.kind()
             && self.tcx.is_impl_trait_in_trait(proj.def_id)
         {
@@ -221,12 +220,11 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for ImplTraitInTraitCollector<'tcx> {
                     .explicit_item_bounds(proj.def_id)
                     .iter_instantiated_copied(self.tcx, proj.args)
                 {
-                    pred.visit_with(self)?;
+                    pred.visit_with(self);
                 }
             }
-            ControlFlow::Continue(())
         } else {
-            ty.super_visit_with(self)
+            ty.super_visit_with(self);
         }
     }
 }
@@ -237,6 +235,7 @@ fn report_mismatched_rpitit_signature<'tcx>(
     trait_m_def_id: DefId,
     impl_m_def_id: DefId,
     unmatched_bound: Option<Span>,
+    is_internal: bool,
 ) {
     let mapping = std::iter::zip(
         tcx.fn_sig(trait_m_def_id).skip_binder().bound_vars(),
@@ -258,7 +257,10 @@ fn report_mismatched_rpitit_signature<'tcx>(
 
     if tcx.asyncness(impl_m_def_id).is_async() && tcx.asyncness(trait_m_def_id).is_async() {
         let ty::Alias(ty::Projection, future_ty) = return_ty.kind() else {
-            bug!();
+            span_bug!(
+                tcx.def_span(trait_m_def_id),
+                "expected return type of async fn in trait to be a AFIT projection"
+            );
         };
         let Some(future_output_ty) = tcx
             .explicit_item_bounds(future_ty.def_id)
@@ -268,13 +270,13 @@ fn report_mismatched_rpitit_signature<'tcx>(
                 _ => None,
             })
         else {
-            bug!()
+            span_bug!(tcx.def_span(trait_m_def_id), "expected `Future` projection bound in AFIT");
         };
         return_ty = future_output_ty;
     }
 
     let (span, impl_return_span, pre, post) =
-        match tcx.hir().get_by_def_id(impl_m_def_id.expect_local()).fn_decl().unwrap().output {
+        match tcx.hir_node_by_def_id(impl_m_def_id.expect_local()).fn_decl().unwrap().output {
             hir::FnRetTy::DefaultReturn(span) => (tcx.def_span(impl_m_def_id), span, "-> ", " "),
             hir::FnRetTy::Return(ty) => (ty.span, ty.span, "", ""),
         };
@@ -285,8 +287,8 @@ fn report_mismatched_rpitit_signature<'tcx>(
         });
 
     let span = unmatched_bound.unwrap_or(span);
-    tcx.emit_spanned_lint(
-        REFINING_IMPL_TRAIT,
+    tcx.emit_node_span_lint(
+        if is_internal { REFINING_IMPL_TRAIT_INTERNAL } else { REFINING_IMPL_TRAIT_REACHABLE },
         tcx.local_def_id_to_hir_id(impl_m_def_id.expect_local()),
         span,
         crate::errors::ReturnPositionImplTraitInTraitRefined {

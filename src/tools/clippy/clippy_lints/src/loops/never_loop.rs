@@ -8,7 +8,7 @@ use rustc_errors::Applicability;
 use rustc_hir::{Block, Destination, Expr, ExprKind, HirId, InlineAsmOperand, Pat, Stmt, StmtKind};
 use rustc_lint::LateContext;
 use rustc_span::{sym, Span};
-use std::iter::{once, Iterator};
+use std::iter::once;
 
 pub(super) fn check<'tcx>(
     cx: &LateContext<'tcx>,
@@ -137,7 +137,7 @@ fn stmt_to_expr<'tcx>(stmt: &Stmt<'tcx>) -> Option<(&'tcx Expr<'tcx>, Option<&'t
     match stmt.kind {
         StmtKind::Semi(e) | StmtKind::Expr(e) => Some((e, None)),
         // add the let...else expression (if present)
-        StmtKind::Local(local) => local.init.map(|init| (init, local.els)),
+        StmtKind::Let(local) => local.init.map(|init| (init, local.els)),
         StmtKind::Item(..) => None,
     }
 }
@@ -159,12 +159,9 @@ fn never_loop_expr<'tcx>(
         | ExprKind::DropTemps(e) => never_loop_expr(cx, e, local_labels, main_loop_id),
         ExprKind::Let(let_expr) => never_loop_expr(cx, let_expr.init, local_labels, main_loop_id),
         ExprKind::Array(es) | ExprKind::Tup(es) => never_loop_expr_all(cx, es.iter(), local_labels, main_loop_id),
-        ExprKind::MethodCall(_, receiver, es, _) => never_loop_expr_all(
-            cx,
-            std::iter::once(receiver).chain(es.iter()),
-            local_labels,
-            main_loop_id,
-        ),
+        ExprKind::MethodCall(_, receiver, es, _) => {
+            never_loop_expr_all(cx, once(receiver).chain(es.iter()), local_labels, main_loop_id)
+        },
         ExprKind::Struct(_, fields, base) => {
             let fields = never_loop_expr_all(cx, fields.iter().map(|f| f.expr), local_labels, main_loop_id);
             if let Some(base) = base {
@@ -201,12 +198,12 @@ fn never_loop_expr<'tcx>(
                 })
             })
         },
-        ExprKind::Block(b, l) => {
-            if l.is_some() {
+        ExprKind::Block(b, _) => {
+            if b.targeted_by_break {
                 local_labels.push((b.hir_id, false));
             }
             let ret = never_loop_block(cx, b, local_labels, main_loop_id);
-            let jumped_to = l.is_some() && local_labels.pop().unwrap().1;
+            let jumped_to = b.targeted_by_break && local_labels.pop().unwrap().1;
             match ret {
                 NeverLoopResult::Diverging if jumped_to => NeverLoopResult::Normal,
                 _ => ret,
@@ -255,6 +252,7 @@ fn never_loop_expr<'tcx>(
             InlineAsmOperand::Const { .. } | InlineAsmOperand::SymFn { .. } | InlineAsmOperand::SymStatic { .. } => {
                 NeverLoopResult::Normal
             },
+            InlineAsmOperand::Label { block } => never_loop_block(cx, block, local_labels, main_loop_id),
         })),
         ExprKind::OffsetOf(_, _)
         | ExprKind::Yield(_, _)
@@ -271,9 +269,9 @@ fn never_loop_expr<'tcx>(
             NeverLoopResult::Normal
         }
     });
-    if  let NeverLoopResult::Diverging = result &&
-        let Some(macro_call) = root_macro_call_first_node(cx, expr) &&
-        let Some(sym::todo_macro) = cx.tcx.get_diagnostic_name(macro_call.def_id)
+    if let NeverLoopResult::Diverging = result
+        && let Some(macro_call) = root_macro_call_first_node(cx, expr)
+        && let Some(sym::todo_macro) = cx.tcx.get_diagnostic_name(macro_call.def_id)
     {
         // We return MayContinueMainLoop here because we treat `todo!()`
         // as potentially containing any code, including a continue of the main loop.

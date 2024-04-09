@@ -1,4 +1,3 @@
-use crate::MirPass;
 use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
 use rustc_index::bit_set::{BitSet, GrowableBitSet};
 use rustc_index::IndexVec;
@@ -7,7 +6,7 @@ use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_mir_dataflow::value_analysis::{excluded_locals, iter_fields};
-use rustc_target::abi::{FieldIdx, ReprFlags, FIRST_VARIANT};
+use rustc_target::abi::{FieldIdx, FIRST_VARIANT};
 
 pub struct ScalarReplacementOfAggregates;
 
@@ -20,8 +19,8 @@ impl<'tcx> MirPass<'tcx> for ScalarReplacementOfAggregates {
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         debug!(def_id = ?body.source.def_id());
 
-        // Avoid query cycles (generators require optimized MIR for layout).
-        if tcx.type_of(body.source.def_id()).instantiate_identity().is_generator() {
+        // Avoid query cycles (coroutines require optimized MIR for layout).
+        if tcx.type_of(body.source.def_id()).instantiate_identity().is_coroutine() {
             return;
         }
 
@@ -66,7 +65,7 @@ fn escaping_locals<'tcx>(
             return true;
         }
         if let ty::Adt(def, _args) = ty.kind() {
-            if def.repr().flags.contains(ReprFlags::IS_SIMD) {
+            if def.repr().simd() {
                 // Exclude #[repr(simd)] types so that they are not de-optimized into an array
                 return true;
             }
@@ -167,7 +166,7 @@ impl<'tcx> ReplacementMap<'tcx> {
         };
         let fields = self.fragments[place.local].as_ref()?;
         let (_, new_local) = fields[f]?;
-        Some(Place { local: new_local, projection: tcx.mk_place_elems(&rest) })
+        Some(Place { local: new_local, projection: tcx.mk_place_elems(rest) })
     }
 
     fn place_fragments(

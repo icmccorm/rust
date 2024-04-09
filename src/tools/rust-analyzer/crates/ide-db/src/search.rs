@@ -8,13 +8,14 @@ use std::mem;
 
 use base_db::{salsa::Database, FileId, FileRange, SourceDatabase, SourceDatabaseExt};
 use hir::{
-    AsAssocItem, DefWithBody, HasAttrs, HasSource, InFile, ModuleSource, Semantics, Visibility,
+    AsAssocItem, DefWithBody, DescendPreference, HasAttrs, HasSource, HirFileIdExt, InFile,
+    InRealFile, ModuleSource, PathResolution, Semantics, Visibility,
 };
 use memchr::memmem::Finder;
 use nohash_hasher::IntMap;
 use once_cell::unsync::Lazy;
 use parser::SyntaxKind;
-use syntax::{ast, match_ast, AstNode, TextRange, TextSize};
+use syntax::{ast, match_ast, AstNode, AstToken, SyntaxElement, TextRange, TextSize};
 use triomphe::Arc;
 
 use crate::{
@@ -62,8 +63,65 @@ pub struct FileReference {
     /// The range of the reference in the original file
     pub range: TextRange,
     /// The node of the reference in the (macro-)file
-    pub name: ast::NameLike,
+    pub name: FileReferenceNode,
     pub category: Option<ReferenceCategory>,
+}
+
+#[derive(Debug, Clone)]
+pub enum FileReferenceNode {
+    Name(ast::Name),
+    NameRef(ast::NameRef),
+    Lifetime(ast::Lifetime),
+    FormatStringEntry(ast::String, TextRange),
+}
+
+impl FileReferenceNode {
+    pub fn text_range(&self) -> TextRange {
+        match self {
+            FileReferenceNode::Name(it) => it.syntax().text_range(),
+            FileReferenceNode::NameRef(it) => it.syntax().text_range(),
+            FileReferenceNode::Lifetime(it) => it.syntax().text_range(),
+            FileReferenceNode::FormatStringEntry(_, range) => *range,
+        }
+    }
+    pub fn syntax(&self) -> SyntaxElement {
+        match self {
+            FileReferenceNode::Name(it) => it.syntax().clone().into(),
+            FileReferenceNode::NameRef(it) => it.syntax().clone().into(),
+            FileReferenceNode::Lifetime(it) => it.syntax().clone().into(),
+            FileReferenceNode::FormatStringEntry(it, _) => it.syntax().clone().into(),
+        }
+    }
+    pub fn into_name_like(self) -> Option<ast::NameLike> {
+        match self {
+            FileReferenceNode::Name(it) => Some(ast::NameLike::Name(it)),
+            FileReferenceNode::NameRef(it) => Some(ast::NameLike::NameRef(it)),
+            FileReferenceNode::Lifetime(it) => Some(ast::NameLike::Lifetime(it)),
+            FileReferenceNode::FormatStringEntry(_, _) => None,
+        }
+    }
+    pub fn as_name_ref(&self) -> Option<&ast::NameRef> {
+        match self {
+            FileReferenceNode::NameRef(name_ref) => Some(name_ref),
+            _ => None,
+        }
+    }
+    pub fn as_lifetime(&self) -> Option<&ast::Lifetime> {
+        match self {
+            FileReferenceNode::Lifetime(lifetime) => Some(lifetime),
+            _ => None,
+        }
+    }
+    pub fn text(&self) -> syntax::TokenText<'_> {
+        match self {
+            FileReferenceNode::NameRef(name_ref) => name_ref.text(),
+            FileReferenceNode::Name(name) => name.text(),
+            FileReferenceNode::Lifetime(lifetime) => lifetime.text(),
+            FileReferenceNode::FormatStringEntry(it, range) => {
+                syntax::TokenText::borrowed(&it.text()[*range - it.syntax().text_range().start()])
+            }
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -76,6 +134,7 @@ pub enum ReferenceCategory {
     // FIXME: Some day should be able to search in doc comments. Would probably
     // need to switch from enum to bitflags then?
     // DocComment
+    Test,
 }
 
 /// Generally, `search_scope` returns files that might contain references for the element.
@@ -131,21 +190,15 @@ impl SearchScope {
         let mut entries = IntMap::default();
 
         let (file_id, range) = {
-            let InFile { file_id, value } = module.definition_source(db);
-            if let Some((file_id, call_source)) = file_id.original_call_node(db) {
+            let InFile { file_id, value } = module.definition_source_range(db);
+            if let Some(InRealFile { file_id, value: call_source }) = file_id.original_call_node(db)
+            {
                 (file_id, Some(call_source.text_range()))
             } else {
-                (
-                    file_id.original_file(db),
-                    match value {
-                        ModuleSource::SourceFile(_) => None,
-                        ModuleSource::Module(it) => Some(it.syntax().text_range()),
-                        ModuleSource::BlockExpr(it) => Some(it.syntax().text_range()),
-                    },
-                )
+                (file_id.original_file(db), Some(value))
             }
         };
-        entries.insert(file_id, range);
+        entries.entry(file_id).or_insert(range);
 
         let mut to_visit: Vec<_> = module.children(db).collect();
         while let Some(module) = to_visit.pop() {
@@ -214,7 +267,7 @@ impl IntoIterator for SearchScope {
 
 impl Definition {
     fn search_scope(&self, db: &RootDatabase) -> SearchScope {
-        let _p = profile::span("search_scope");
+        let _p = tracing::span!(tracing::Level::INFO, "search_scope").entered();
 
         if let Definition::BuiltinType(_) = self {
             return SearchScope::crate_graph(db);
@@ -244,14 +297,18 @@ impl Definition {
                 DefWithBody::InTypeConst(_) => return SearchScope::empty(),
             };
             return match def {
-                Some(def) => SearchScope::file_range(def.as_ref().original_file_range_full(db)),
+                Some(def) => SearchScope::file_range(
+                    def.as_ref().original_file_range_with_macro_call_body(db),
+                ),
                 None => SearchScope::single_file(file_id),
             };
         }
 
         if let Definition::SelfType(impl_) = self {
             return match impl_.source(db).map(|src| src.syntax().cloned()) {
-                Some(def) => SearchScope::file_range(def.as_ref().original_file_range_full(db)),
+                Some(def) => SearchScope::file_range(
+                    def.as_ref().original_file_range_with_macro_call_body(db),
+                ),
                 None => SearchScope::single_file(file_id),
             };
         }
@@ -268,7 +325,9 @@ impl Definition {
                 hir::GenericDef::Const(it) => it.source(db).map(|src| src.syntax().cloned()),
             };
             return match def {
-                Some(def) => SearchScope::file_range(def.as_ref().original_file_range_full(db)),
+                Some(def) => SearchScope::file_range(
+                    def.as_ref().original_file_range_with_macro_call_body(db),
+                ),
                 None => SearchScope::single_file(file_id),
             };
         }
@@ -297,7 +356,7 @@ impl Definition {
         if let Some(Visibility::Public) = vis {
             return SearchScope::reverse_dependencies(db, module.krate());
         }
-        if let Some(Visibility::Module(module)) = vis {
+        if let Some(Visibility::Module(module, _)) = vis {
             return SearchScope::module_and_children(db, module.into());
         }
 
@@ -376,7 +435,7 @@ impl<'a> FindUsages<'a> {
     }
 
     pub fn search(&self, sink: &mut dyn FnMut(FileId, FileReference) -> bool) {
-        let _p = profile::span("FindUsages:search");
+        let _p = tracing::span!(tracing::Level::INFO, "FindUsages:search").entered();
         let sema = self.sema;
 
         let search_scope = {
@@ -465,7 +524,9 @@ impl<'a> FindUsages<'a> {
                     // every textual hit. That function is notoriously
                     // expensive even for things that do not get down mapped
                     // into macros.
-                    sema.descend_into_macros(token, offset).into_iter().filter_map(|it| it.parent())
+                    sema.descend_into_macros(DescendPreference::None, token)
+                        .into_iter()
+                        .filter_map(|it| it.parent())
                 })
         };
 
@@ -475,6 +536,15 @@ impl<'a> FindUsages<'a> {
 
             // Search for occurrences of the items name
             for offset in match_indices(&text, finder, search_range) {
+                tree.token_at_offset(offset).for_each(|token| {
+                    let Some(str_token) = ast::String::cast(token.clone()) else { return };
+                    if let Some((range, nameres)) =
+                        sema.check_for_format_args_template(token, offset)
+                    {
+                        if self.found_format_args_ref(file_id, range, str_token, nameres, sink) {}
+                    }
+                });
+
                 for name in find_nodes(name, &tree, offset).filter_map(ast::NameLike::cast) {
                     if match name {
                         ast::NameLike::NameRef(name_ref) => self.found_name_ref(&name_ref, sink),
@@ -584,12 +654,12 @@ impl<'a> FindUsages<'a> {
     ) -> bool {
         match NameRefClass::classify(self.sema, name_ref) {
             Some(NameRefClass::Definition(Definition::SelfType(impl_)))
-                if impl_.self_ty(self.sema.db) == *self_ty =>
+                if impl_.self_ty(self.sema.db).as_adt() == self_ty.as_adt() =>
             {
                 let FileRange { file_id, range } = self.sema.original_range(name_ref.syntax());
                 let reference = FileReference {
                     range,
-                    name: ast::NameLike::NameRef(name_ref.clone()),
+                    name: FileReferenceNode::NameRef(name_ref.clone()),
                     category: None,
                 };
                 sink(file_id, reference)
@@ -608,8 +678,29 @@ impl<'a> FindUsages<'a> {
                 let FileRange { file_id, range } = self.sema.original_range(name_ref.syntax());
                 let reference = FileReference {
                     range,
-                    name: ast::NameLike::NameRef(name_ref.clone()),
+                    name: FileReferenceNode::NameRef(name_ref.clone()),
                     category: is_name_ref_in_import(name_ref).then_some(ReferenceCategory::Import),
+                };
+                sink(file_id, reference)
+            }
+            _ => false,
+        }
+    }
+
+    fn found_format_args_ref(
+        &self,
+        file_id: FileId,
+        range: TextRange,
+        token: ast::String,
+        res: Option<PathResolution>,
+        sink: &mut dyn FnMut(FileId, FileReference) -> bool,
+    ) -> bool {
+        match res.map(Definition::from) {
+            Some(def) if def == self.def => {
+                let reference = FileReference {
+                    range,
+                    name: FileReferenceNode::FormatStringEntry(token, range),
+                    category: Some(ReferenceCategory::Read),
                 };
                 sink(file_id, reference)
             }
@@ -627,7 +718,7 @@ impl<'a> FindUsages<'a> {
                 let FileRange { file_id, range } = self.sema.original_range(lifetime.syntax());
                 let reference = FileReference {
                     range,
-                    name: ast::NameLike::Lifetime(lifetime.clone()),
+                    name: FileReferenceNode::Lifetime(lifetime.clone()),
                     category: None,
                 };
                 sink(file_id, reference)
@@ -651,8 +742,8 @@ impl<'a> FindUsages<'a> {
                 let FileRange { file_id, range } = self.sema.original_range(name_ref.syntax());
                 let reference = FileReference {
                     range,
-                    name: ast::NameLike::NameRef(name_ref.clone()),
-                    category: ReferenceCategory::new(&def, name_ref),
+                    name: FileReferenceNode::NameRef(name_ref.clone()),
+                    category: ReferenceCategory::new(self.sema, &def, name_ref),
                 };
                 sink(file_id, reference)
             }
@@ -667,8 +758,8 @@ impl<'a> FindUsages<'a> {
                 let FileRange { file_id, range } = self.sema.original_range(name_ref.syntax());
                 let reference = FileReference {
                     range,
-                    name: ast::NameLike::NameRef(name_ref.clone()),
-                    category: ReferenceCategory::new(&def, name_ref),
+                    name: FileReferenceNode::NameRef(name_ref.clone()),
+                    category: ReferenceCategory::new(self.sema, &def, name_ref),
                 };
                 sink(file_id, reference)
             }
@@ -677,8 +768,8 @@ impl<'a> FindUsages<'a> {
                     let FileRange { file_id, range } = self.sema.original_range(name_ref.syntax());
                     let reference = FileReference {
                         range,
-                        name: ast::NameLike::NameRef(name_ref.clone()),
-                        category: ReferenceCategory::new(&def, name_ref),
+                        name: FileReferenceNode::NameRef(name_ref.clone()),
+                        category: ReferenceCategory::new(self.sema, &def, name_ref),
                     };
                     sink(file_id, reference)
                 } else {
@@ -692,16 +783,16 @@ impl<'a> FindUsages<'a> {
                 let local = Definition::Local(local);
                 let access = match self.def {
                     Definition::Field(_) if field == self.def => {
-                        ReferenceCategory::new(&field, name_ref)
+                        ReferenceCategory::new(self.sema, &field, name_ref)
                     }
                     Definition::Local(_) if local == self.def => {
-                        ReferenceCategory::new(&local, name_ref)
+                        ReferenceCategory::new(self.sema, &local, name_ref)
                     }
                     _ => return false,
                 };
                 let reference = FileReference {
                     range,
-                    name: ast::NameLike::NameRef(name_ref.clone()),
+                    name: FileReferenceNode::NameRef(name_ref.clone()),
                     category: access,
                 };
                 sink(file_id, reference)
@@ -724,7 +815,7 @@ impl<'a> FindUsages<'a> {
                 let FileRange { file_id, range } = self.sema.original_range(name.syntax());
                 let reference = FileReference {
                     range,
-                    name: ast::NameLike::Name(name.clone()),
+                    name: FileReferenceNode::Name(name.clone()),
                     // FIXME: mutable patterns should have `Write` access
                     category: Some(ReferenceCategory::Read),
                 };
@@ -734,7 +825,7 @@ impl<'a> FindUsages<'a> {
                 let FileRange { file_id, range } = self.sema.original_range(name.syntax());
                 let reference = FileReference {
                     range,
-                    name: ast::NameLike::Name(name.clone()),
+                    name: FileReferenceNode::Name(name.clone()),
                     category: None,
                 };
                 sink(file_id, reference)
@@ -759,7 +850,7 @@ impl<'a> FindUsages<'a> {
                 let FileRange { file_id, range } = self.sema.original_range(name.syntax());
                 let reference = FileReference {
                     range,
-                    name: ast::NameLike::Name(name.clone()),
+                    name: FileReferenceNode::Name(name.clone()),
                     category: None,
                 };
                 sink(file_id, reference)
@@ -780,7 +871,15 @@ fn def_to_ty(sema: &Semantics<'_, RootDatabase>, def: &Definition) -> Option<hir
 }
 
 impl ReferenceCategory {
-    fn new(def: &Definition, r: &ast::NameRef) -> Option<ReferenceCategory> {
+    fn new(
+        sema: &Semantics<'_, RootDatabase>,
+        def: &Definition,
+        r: &ast::NameRef,
+    ) -> Option<ReferenceCategory> {
+        if is_name_ref_in_test(sema, r) {
+            return Some(ReferenceCategory::Test);
+        }
+
         // Only Locals and Fields have accesses for now.
         if !matches!(def, Definition::Local(_) | Definition::Field(_)) {
             return is_name_ref_in_import(r).then_some(ReferenceCategory::Import);
@@ -818,4 +917,11 @@ fn is_name_ref_in_import(name_ref: &ast::NameRef) -> bool {
         .and_then(ast::PathSegment::cast)
         .and_then(|it| it.parent_path().top_path().syntax().parent())
         .map_or(false, |it| it.kind() == SyntaxKind::USE_TREE)
+}
+
+fn is_name_ref_in_test(sema: &Semantics<'_, RootDatabase>, name_ref: &ast::NameRef) -> bool {
+    name_ref.syntax().ancestors().any(|node| match ast::Fn::cast(node) {
+        Some(it) => sema.to_def(&it).map_or(false, |func| func.is_test(sema.db)),
+        None => false,
+    })
 }

@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 
 use base_db::{FileId, SourceDatabaseExt};
-use hir::{Crate, ItemInNs, ModuleDef, Name, Semantics};
+use hir::{Crate, DescendPreference, ItemInNs, ModuleDef, Name, Semantics};
 use syntax::{
     ast::{self, make},
     AstToken, SyntaxKind, SyntaxToken, TokenAtOffset,
@@ -35,7 +35,7 @@ pub fn pick_token<T: AstToken>(mut tokens: TokenAtOffset<SyntaxToken>) -> Option
 
 /// Converts the mod path struct into its ast representation.
 pub fn mod_path_to_ast(path: &hir::ModPath) -> ast::Path {
-    let _p = profile::span("mod_path_to_ast");
+    let _p = tracing::span!(tracing::Level::INFO, "mod_path_to_ast").entered();
 
     let mut segments = Vec::new();
     let mut is_abs = false;
@@ -64,14 +64,14 @@ pub fn visit_file_defs(
     cb: &mut dyn FnMut(Definition),
 ) {
     let db = sema.db;
-    let module = match sema.to_module_def(file_id) {
+    let module = match sema.file_to_module_def(file_id) {
         Some(it) => it,
         None => return,
     };
     let mut defs: VecDeque<_> = module.declarations(db).into();
     while let Some(def) = defs.pop_front() {
         if let ModuleDef::Module(submodule) = def {
-            if let hir::ModuleSource::Module(_) = submodule.definition_source(db).value {
+            if submodule.is_inline(db) {
                 defs.extend(submodule.declarations(db));
                 submodule.impl_defs(db).into_iter().for_each(|impl_| cb(impl_.into()));
             }
@@ -117,7 +117,7 @@ pub fn get_definition(
     sema: &Semantics<'_, RootDatabase>,
     token: SyntaxToken,
 ) -> Option<Definition> {
-    for token in sema.descend_into_macros(token, 0.into()) {
+    for token in sema.descend_into_macros(DescendPreference::None, token) {
         let def = IdentClass::classify_token(sema, &token).map(IdentClass::definitions_no_ops);
         if let Some(&[x]) = def.as_deref() {
             return Some(x);

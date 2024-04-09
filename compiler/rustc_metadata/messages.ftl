@@ -38,6 +38,9 @@ metadata_crate_dep_multiple =
     cannot satisfy dependencies so `{$crate_name}` only shows up once
     .help = having upstream crates all available in one format will likely make this go away
 
+metadata_crate_dep_not_static =
+    `{$crate_name}` was unavailable as a static crate, preventing fully static linking
+
 metadata_crate_location_unknown_type =
     extern location for {$crate_name} is of an unknown type: {$path}
 
@@ -45,7 +48,7 @@ metadata_crate_not_panic_runtime =
     the crate `{$crate_name}` is not a panic runtime
 
 metadata_dl_error =
-    {$err}
+    {$path}{$err}
 
 metadata_empty_link_name =
     link name must not be empty
@@ -63,11 +66,8 @@ metadata_extern_location_not_file =
 metadata_fail_create_file_encoder =
     failed to create file encoder: {$err}
 
-metadata_fail_seek_file =
-    failed to seek the file: {$err}
-
 metadata_fail_write_file =
-    failed to write to the file: {$err}
+    failed to write to `{$path}`: {$err}
 
 metadata_failed_copy_to_stdout =
     failed to copy {$filename} to stdout: {$err}
@@ -196,9 +196,6 @@ metadata_newer_crate_version =
 metadata_no_crate_with_triple =
     couldn't find crate `{$crate_name}` with expected target triple {$locator_triple}{$add_info}
 
-metadata_no_dylib_plugin =
-    plugin `{$crate_name}` only found in rlib format, but must be available in dylib format
-
 metadata_no_link_mod_override =
     overriding linking modifiers from command line is not supported
 
@@ -275,7 +272,7 @@ metadata_unknown_import_name_type =
     unknown import name type `{$import_name_type}`, expected one of: decorated, noprefix, undecorated
 
 metadata_unknown_link_kind =
-    unknown link kind `{$kind}`, expected one of: static, dylib, framework, raw-dylib
+    unknown link kind `{$kind}`, expected one of: static, dylib, framework, raw-dylib, link-arg
     .label = unknown link kind
 
 metadata_unknown_link_modifier =
@@ -287,6 +284,8 @@ metadata_unsupported_abi =
 metadata_unsupported_abi_i686 =
     ABI not supported by `#[link(kind = "raw-dylib")]` on i686
 
+metadata_wasm_c_abi =
+    older versions of the `wasm-bindgen` crate will be incompatible with future versions of Rust; please update to `wasm-bindgen` v0.2.88
 metadata_wasm_import_form =
     wasm import module must be of the form `wasm_import_module = "string"`
 

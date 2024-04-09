@@ -1,4 +1,4 @@
-// compile-flags: -Znormalize-docs
+//@ compile-flags: -Znormalize-docs
 use std::ops::Index;
 
 pub fn next<'a, T>(s: &'a mut dyn SVec<Item = T, Output = T>) {
@@ -21,9 +21,13 @@ pub trait SVec: Index<
     //~| missing generics for associated type `SVec::Item`
     //~| missing generics for associated type `SVec::Item`
     //~| missing generics for associated type `SVec::Item`
+    //~| missing generics for associated type `SVec::Item`
+    //~| missing generics for associated type `SVec::Item`
     Output = <Index<<Self as SVec>::Item,
     //~^ expected 1 lifetime argument
     //~| expected 1 generic argument
+    //~| missing generics for associated type `SVec::Item`
+    //~| missing generics for associated type `SVec::Item`
     //~| missing generics for associated type `SVec::Item`
     //~| missing generics for associated type `SVec::Item`
     //~| missing generics for associated type `SVec::Item`
@@ -41,6 +45,10 @@ pub trait SVec: Index<
     //~| missing generics for associated type `SVec::Item`
     //~| missing generics for associated type `SVec::Item`
     //~| expected 1 generic argument
+    //~| missing generics for associated type `SVec::Item`
+    //~| missing generics for associated type `SVec::Item`
+    //~| missing generics for associated type `SVec::Item`
+    //~| missing generics for associated type `SVec::Item`
     //~| missing generics for associated type `SVec::Item`
     //~| missing generics for associated type `SVec::Item`
     //~| missing generics for associated type `SVec::Item`

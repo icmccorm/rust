@@ -4,7 +4,7 @@ use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_infer::{infer::type_variable::TypeVariableOriginKind, traits::ObligationCauseCode};
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor};
-use rustc_span::{self, symbol::kw, Span};
+use rustc_span::{symbol::kw, Span};
 use rustc_trait_selection::traits;
 
 use std::ops::ControlFlow;
@@ -21,7 +21,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return false;
         };
 
-        let Some(unsubstituted_pred) = self
+        let Some(uninstantiated_pred) = self
             .tcx
             .predicates_of(def_id)
             .instantiate_identity(self.tcx)
@@ -34,7 +34,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         let generics = self.tcx.generics_of(def_id);
         let (predicate_args, predicate_self_type_to_point_at) =
-            match unsubstituted_pred.kind().skip_binder() {
+            match uninstantiated_pred.kind().skip_binder() {
                 ty::ClauseKind::Trait(pred) => {
                     (pred.trait_ref.args.to_vec(), Some(pred.self_ty().into()))
                 }
@@ -86,15 +86,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Finally, for ambiguity-related errors, we actually want to look
         // for a parameter that is the source of the inference type left
         // over in this predicate.
-        if let traits::FulfillmentErrorCode::CodeAmbiguity { .. } = error.code {
+        if let traits::FulfillmentErrorCode::Ambiguity { .. } = error.code {
             fallback_param_to_point_at = None;
             self_param_to_point_at = None;
             param_to_point_at =
                 self.find_ambiguous_parameter_in(def_id, error.root_obligation.predicate);
         }
 
-        let hir = self.tcx.hir();
-        let (expr, qpath) = match hir.get(hir_id) {
+        let (expr, qpath) = match self.tcx.hir_node(hir_id) {
             hir::Node::Expr(expr) => {
                 if self.closure_span_overlaps_error(error, expr.span) {
                     return false;
@@ -122,28 +121,26 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 hir_id: call_hir_id,
                 span: call_span,
                 ..
-            }) = hir.get_parent(hir_id)
+            }) = self.tcx.parent_hir_node(hir_id)
                 && callee.hir_id == hir_id
             {
                 if self.closure_span_overlaps_error(error, *call_span) {
                     return false;
                 }
 
-                for param in
-                    [param_to_point_at, fallback_param_to_point_at, self_param_to_point_at]
+                for param in [param_to_point_at, fallback_param_to_point_at, self_param_to_point_at]
                     .into_iter()
                     .flatten()
                 {
                     if self.blame_specific_arg_if_possible(
-                            error,
-                            def_id,
-                            param,
-                            *call_hir_id,
-                            callee.span,
-                            None,
-                            args,
-                        )
-                    {
+                        error,
+                        def_id,
+                        param,
+                        *call_hir_id,
+                        callee.span,
+                        None,
+                        args,
+                    ) {
                         return true;
                     }
                 }
@@ -340,16 +337,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ) -> Option<ty::GenericArg<'tcx>> {
         struct FindAmbiguousParameter<'a, 'tcx>(&'a FnCtxt<'a, 'tcx>, DefId);
         impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for FindAmbiguousParameter<'_, 'tcx> {
-            type BreakTy = ty::GenericArg<'tcx>;
-            fn visit_ty(&mut self, ty: Ty<'tcx>) -> std::ops::ControlFlow<Self::BreakTy> {
+            type Result = ControlFlow<ty::GenericArg<'tcx>>;
+            fn visit_ty(&mut self, ty: Ty<'tcx>) -> Self::Result {
                 if let Some(origin) = self.0.type_var_origin(ty)
                     && let TypeVariableOriginKind::TypeParameterDefinition(_, def_id) = origin.kind
                     && let generics = self.0.tcx.generics_of(self.1)
                     && let Some(index) = generics.param_def_id_to_index(self.0.tcx, def_id)
-                    && let Some(subst) = ty::GenericArgs::identity_for_item(self.0.tcx, self.1)
-                        .get(index as usize)
+                    && let Some(arg) =
+                        ty::GenericArgs::identity_for_item(self.0.tcx, self.1).get(index as usize)
                 {
-                    ControlFlow::Break(*subst)
+                    ControlFlow::Break(*arg)
                 } else {
                     ty.super_visit_with(self)
                 }
@@ -363,12 +360,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         error: &traits::FulfillmentError<'tcx>,
         span: Span,
     ) -> bool {
-        if let traits::FulfillmentErrorCode::CodeSelectionError(
-            traits::SelectionError::OutputTypeParameterMismatch(box traits::SelectionOutputTypeParameterMismatch{
-                expected_trait_ref, ..
+        if let traits::FulfillmentErrorCode::SelectionError(
+            traits::SelectionError::SignatureMismatch(box traits::SignatureMismatchData {
+                expected_trait_ref,
+                ..
             }),
         ) = error.code
-            && let ty::Closure(def_id, _) | ty::Generator(def_id, ..) = expected_trait_ref.skip_binder().self_ty().kind()
+            && let ty::Closure(def_id, _) | ty::Coroutine(def_id, ..) =
+                expected_trait_ref.skip_binder().self_ty().kind()
             && span.overlaps(self.tcx.def_span(*def_id))
         {
             true
@@ -446,12 +445,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             .collect();
         // If there's one field that references the given generic, great!
         if let [(idx, _)] = args_referencing_param.as_slice()
-            && let Some(arg) = receiver
-                .map_or(args.get(*idx), |rcvr| if *idx == 0 { Some(rcvr) } else { args.get(*idx - 1) }) {
+            && let Some(arg) = receiver.map_or(args.get(*idx), |rcvr| {
+                if *idx == 0 { Some(rcvr) } else { args.get(*idx - 1) }
+            })
+        {
+            error.obligation.cause.span = arg
+                .span
+                .find_ancestor_in_same_ctxt(error.obligation.cause.span)
+                .unwrap_or(arg.span);
 
-            error.obligation.cause.span = arg.span.find_ancestor_in_same_ctxt(error.obligation.cause.span).unwrap_or(arg.span);
-
-            if let hir::Node::Expr(arg_expr) = self.tcx.hir().get(arg.hir_id) {
+            if let hir::Node::Expr(arg_expr) = self.tcx.hir_node(arg.hir_id) {
                 // This is more specific than pointing at the entire argument.
                 self.blame_specific_expr_if_possible(error, arg_expr)
             }
@@ -492,7 +495,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Whether it succeeded or failed, it likely made some amount of progress.
         // In the very worst case, it's just the same `expr` we originally passed in.
         let expr = match self.blame_specific_expr_if_possible_for_obligation_cause_code(
-            &error.obligation.cause.code(),
+            error.obligation.cause.code(),
             expr,
         ) {
             Ok(expr) => expr,
@@ -934,16 +937,16 @@ fn find_param_in_ty<'tcx>(
             return true;
         }
         if let ty::GenericArgKind::Type(ty) = arg.unpack()
-                && let ty::Alias(ty::Projection | ty::Inherent, ..) = ty.kind()
-            {
-                // This logic may seem a bit strange, but typically when
-                // we have a projection type in a function signature, the
-                // argument that's being passed into that signature is
-                // not actually constraining that projection's args in
-                // a meaningful way. So we skip it, and see improvements
-                // in some UI tests.
-                walk.skip_current_subtree();
-            }
+            && let ty::Alias(ty::Projection | ty::Inherent, ..) = ty.kind()
+        {
+            // This logic may seem a bit strange, but typically when
+            // we have a projection type in a function signature, the
+            // argument that's being passed into that signature is
+            // not actually constraining that projection's args in
+            // a meaningful way. So we skip it, and see improvements
+            // in some UI tests.
+            walk.skip_current_subtree();
+        }
     }
     false
 }

@@ -1,4 +1,5 @@
-// unit-test: EarlyOtherwiseBranch
+// skip-filecheck
+//@ unit-test: EarlyOtherwiseBranch
 
 // EMIT_MIR early_otherwise_branch_3_element_tuple.opt1.EarlyOtherwiseBranch.diff
 fn opt1(x: Option<u32>, y: Option<u32>, z: Option<u32>) -> u32 {

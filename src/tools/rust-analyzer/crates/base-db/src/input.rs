@@ -6,21 +6,19 @@
 //! actual IO. See `vfs` and `project_model` in the `rust-analyzer` crate for how
 //! actual IO is done and lowered to input.
 
-use std::{fmt, mem, ops, panic::RefUnwindSafe, str::FromStr, sync};
+use std::{fmt, mem, ops};
 
 use cfg::CfgOptions;
-use la_arena::{Arena, Idx};
+use la_arena::{Arena, Idx, RawIdx};
 use rustc_hash::{FxHashMap, FxHashSet};
+use span::Edition;
 use syntax::SmolStr;
 use triomphe::Arc;
-use tt::token_id::Subtree;
 use vfs::{file_set::FileSet, AbsPathBuf, AnchoredPath, FileId, VfsPath};
 
 // Map from crate id to the name of the crate and path of the proc-macro. If the value is `None`,
 // then the crate for the proc-macro hasn't been build yet as the build data is missing.
 pub type ProcMacroPaths = FxHashMap<CrateId, Result<(Option<String>, AbsPathBuf), String>>;
-pub type ProcMacros = FxHashMap<CrateId, ProcMacroLoadResult>;
-
 /// Files are grouped into source roots. A source root is a directory on the
 /// file systems which is watched for changes. Typically it corresponds to a
 /// Rust crate. Source roots *might* be nested: in this case, a file belongs to
@@ -155,6 +153,14 @@ impl CrateOrigin {
     pub fn is_local(&self) -> bool {
         matches!(self, CrateOrigin::Local { .. })
     }
+
+    pub fn is_lib(&self) -> bool {
+        matches!(self, CrateOrigin::Library { .. })
+    }
+
+    pub fn is_lang(&self) -> bool {
+        matches!(self, CrateOrigin::Lang { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -172,7 +178,7 @@ impl From<&str> for LangCrateOrigin {
         match s {
             "alloc" => LangCrateOrigin::Alloc,
             "core" => LangCrateOrigin::Core,
-            "proc-macro" => LangCrateOrigin::ProcMacro,
+            "proc-macro" | "proc_macro" => LangCrateOrigin::ProcMacro,
             "std" => LangCrateOrigin::Std,
             "test" => LangCrateOrigin::Test,
             _ => LangCrateOrigin::Other,
@@ -238,40 +244,7 @@ impl CrateDisplayName {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub struct ProcMacroId(pub u32);
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
-pub enum ProcMacroKind {
-    CustomDerive,
-    FuncLike,
-    Attr,
-}
-
-pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe {
-    fn expand(
-        &self,
-        subtree: &Subtree,
-        attrs: Option<&Subtree>,
-        env: &Env,
-    ) -> Result<Subtree, ProcMacroExpansionError>;
-}
-
-pub enum ProcMacroExpansionError {
-    Panic(String),
-    /// Things like "proc macro server was killed by OOM".
-    System(String),
-}
-
-pub type ProcMacroLoadResult = Result<Vec<ProcMacro>, String>;
 pub type TargetLayoutLoadResult = Result<Arc<str>, Arc<str>>;
-
-#[derive(Debug, Clone)]
-pub struct ProcMacro {
-    pub name: SmolStr,
-    pub kind: ProcMacroKind,
-    pub expander: sync::Arc<dyn ProcMacroExpander>,
-}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ReleaseChannel {
@@ -289,9 +262,10 @@ impl ReleaseChannel {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(str: &str) -> Option<Self> {
         Some(match str {
-            "" => ReleaseChannel::Stable,
+            "" | "stable" => ReleaseChannel::Stable,
             "nightly" => ReleaseChannel::Nightly,
             _ if str.starts_with("beta") => ReleaseChannel::Beta,
             _ => return None,
@@ -318,36 +292,11 @@ pub struct CrateData {
     pub dependencies: Vec<Dependency>,
     pub origin: CrateOrigin,
     pub is_proc_macro: bool,
-    // FIXME: These things should not be per crate! These are more per workspace crate graph level things
-    pub target_layout: TargetLayoutLoadResult,
-    pub channel: Option<ReleaseChannel>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Edition {
-    Edition2015,
-    Edition2018,
-    Edition2021,
-}
-
-impl Edition {
-    pub const CURRENT: Edition = Edition::Edition2021;
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct Env {
     entries: FxHashMap<String, String>,
-}
-
-impl Env {
-    pub fn new_for_test_fixture() -> Self {
-        Env {
-            entries: FxHashMap::from_iter([(
-                String::from("__ra_is_test_fixture"),
-                String::from("__ra_is_test_fixture"),
-            )]),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -384,8 +333,6 @@ impl CrateGraph {
         env: Env,
         is_proc_macro: bool,
         origin: CrateOrigin,
-        target_layout: Result<Arc<str>, Arc<str>>,
-        channel: Option<ReleaseChannel>,
     ) -> CrateId {
         let data = CrateData {
             root_file_id,
@@ -397,9 +344,7 @@ impl CrateGraph {
             env,
             dependencies: Vec::new(),
             origin,
-            target_layout,
             is_proc_macro,
-            channel,
         };
         self.arena.alloc(data)
     }
@@ -440,7 +385,7 @@ impl CrateGraph {
         from: CrateId,
         dep: Dependency,
     ) -> Result<(), CyclicDependenciesError> {
-        let _p = profile::span("add_dep");
+        let _p = tracing::span!(tracing::Level::INFO, "add_dep").entered();
 
         self.check_cycle_after_dependency(from, dep.crate_id)?;
 
@@ -469,11 +414,15 @@ impl CrateGraph {
         self.arena.is_empty()
     }
 
+    pub fn len(&self) -> usize {
+        self.arena.len()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = CrateId> + '_ {
         self.arena.iter().map(|(idx, _)| idx)
     }
 
-    // FIXME: used for `handle_hack_cargo_workspace`, should be removed later
+    // FIXME: used for fixing up the toolchain sysroot, should be removed and done differently
     #[doc(hidden)]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (CrateId, &mut CrateData)> + '_ {
         self.arena.iter_mut()
@@ -551,13 +500,6 @@ impl CrateGraph {
         }
     }
 
-    // FIXME: this only finds one crate with the given root; we could have multiple
-    pub fn crate_id_for_crate_root(&self, file_id: FileId) -> Option<CrateId> {
-        let (crate_id, _) =
-            self.arena.iter().find(|(_crate_id, data)| data.root_file_id == file_id)?;
-        Some(crate_id)
-    }
-
     pub fn sort_deps(&mut self) {
         self.arena
             .iter_mut()
@@ -569,35 +511,39 @@ impl CrateGraph {
     ///
     /// This will deduplicate the crates of the graph where possible.
     /// Note that for deduplication to fully work, `self`'s crate dependencies must be sorted by crate id.
-    /// If the crate dependencies were sorted, the resulting graph from this `extend` call will also have the crate dependencies sorted.
-    pub fn extend(&mut self, mut other: CrateGraph, proc_macros: &mut ProcMacroPaths) {
+    /// If the crate dependencies were sorted, the resulting graph from this `extend` call will also
+    /// have the crate dependencies sorted.
+    ///
+    /// Returns a mapping from `other`'s crate ids to the new crate ids in `self`.
+    pub fn extend(
+        &mut self,
+        mut other: CrateGraph,
+        proc_macros: &mut ProcMacroPaths,
+        merge: impl Fn((CrateId, &mut CrateData), (CrateId, &CrateData)) -> bool,
+    ) -> FxHashMap<CrateId, CrateId> {
+        let m = self.len();
         let topo = other.crates_in_topological_order();
         let mut id_map: FxHashMap<CrateId, CrateId> = FxHashMap::default();
-
         for topo in topo {
             let crate_data = &mut other.arena[topo];
+
             crate_data.dependencies.iter_mut().for_each(|dep| dep.crate_id = id_map[&dep.crate_id]);
             crate_data.dependencies.sort_by_key(|dep| dep.crate_id);
+            let res = self
+                .arena
+                .iter_mut()
+                .take(m)
+                .find_map(|(id, data)| merge((id, data), (topo, crate_data)).then_some(id));
 
-            let res = self.arena.iter().find_map(
-                |(id, data)| {
-                    if data == crate_data {
-                        Some(id)
-                    } else {
-                        None
-                    }
-                },
-            );
-            if let Some(res) = res {
-                id_map.insert(topo, res);
-            } else {
-                let id = self.arena.alloc(crate_data.clone());
-                id_map.insert(topo, id);
-            }
+            let new_id =
+                if let Some(res) = res { res } else { self.arena.alloc(crate_data.clone()) };
+            id_map.insert(topo, new_id);
         }
 
         *proc_macros =
             mem::take(proc_macros).into_iter().map(|(id, macros)| (id_map[&id], macros)).collect();
+
+        id_map
     }
 
     fn find_path(
@@ -647,6 +593,33 @@ impl CrateGraph {
     fn hacky_find_crate<'a>(&'a self, display_name: &'a str) -> impl Iterator<Item = CrateId> + 'a {
         self.iter().filter(move |it| self[*it].display_name.as_deref() == Some(display_name))
     }
+
+    /// Removes all crates from this crate graph except for the ones in `to_keep` and fixes up the dependencies.
+    /// Returns a mapping from old crate ids to new crate ids.
+    pub fn remove_crates_except(&mut self, to_keep: &[CrateId]) -> Vec<Option<CrateId>> {
+        let mut id_map = vec![None; self.arena.len()];
+        self.arena = std::mem::take(&mut self.arena)
+            .into_iter()
+            .filter_map(|(id, data)| if to_keep.contains(&id) { Some((id, data)) } else { None })
+            .enumerate()
+            .map(|(new_id, (id, data))| {
+                id_map[id.into_raw().into_u32() as usize] =
+                    Some(CrateId::from_raw(RawIdx::from_u32(new_id as u32)));
+                data
+            })
+            .collect();
+        for (_, data) in self.arena.iter_mut() {
+            data.dependencies.iter_mut().for_each(|dep| {
+                dep.crate_id =
+                    id_map[dep.crate_id.into_raw().into_u32() as usize].expect("crate was filtered")
+            });
+        }
+        id_map
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.arena.shrink_to_fit();
+    }
 }
 
 impl ops::Index<CrateId> for CrateGraph {
@@ -657,32 +630,10 @@ impl ops::Index<CrateId> for CrateGraph {
 }
 
 impl CrateData {
+    /// Add a dependency to `self` without checking if the dependency
+    // is existent among `self.dependencies`.
     fn add_dep(&mut self, dep: Dependency) {
         self.dependencies.push(dep)
-    }
-}
-
-impl FromStr for Edition {
-    type Err = ParseEditionError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let res = match s {
-            "2015" => Edition::Edition2015,
-            "2018" => Edition::Edition2018,
-            "2021" => Edition::Edition2021,
-            _ => return Err(ParseEditionError { invalid_input: s.to_string() }),
-        };
-        Ok(res)
-    }
-}
-
-impl fmt::Display for Edition {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Edition::Edition2015 => "2015",
-            Edition::Edition2018 => "2018",
-            Edition::Edition2021 => "2021",
-        })
     }
 }
 
@@ -711,19 +662,6 @@ impl Env {
         self.entries.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
 }
-
-#[derive(Debug)]
-pub struct ParseEditionError {
-    invalid_input: String,
-}
-
-impl fmt::Display for ParseEditionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid edition: {:?}", self.invalid_input)
-    }
-}
-
-impl std::error::Error for ParseEditionError {}
 
 #[derive(Debug)]
 pub struct CyclicDependenciesError {
@@ -766,7 +704,7 @@ mod tests {
     fn detect_cyclic_dependency_indirect() {
         let mut graph = CrateGraph::default();
         let crate1 = graph.add_crate_root(
-            FileId(1u32),
+            FileId::from_raw(1u32),
             Edition2018,
             None,
             None,
@@ -775,11 +713,9 @@ mod tests {
             Env::default(),
             false,
             CrateOrigin::Local { repo: None, name: None },
-            Err("".into()),
-            None,
         );
         let crate2 = graph.add_crate_root(
-            FileId(2u32),
+            FileId::from_raw(2u32),
             Edition2018,
             None,
             None,
@@ -788,11 +724,9 @@ mod tests {
             Env::default(),
             false,
             CrateOrigin::Local { repo: None, name: None },
-            Err("".into()),
-            None,
         );
         let crate3 = graph.add_crate_root(
-            FileId(3u32),
+            FileId::from_raw(3u32),
             Edition2018,
             None,
             None,
@@ -801,17 +735,15 @@ mod tests {
             Env::default(),
             false,
             CrateOrigin::Local { repo: None, name: None },
-            Err("".into()),
-            None,
         );
         assert!(graph
-            .add_dep(crate1, Dependency::new(CrateName::new("crate2").unwrap(), crate2))
+            .add_dep(crate1, Dependency::new(CrateName::new("crate2").unwrap(), crate2,))
             .is_ok());
         assert!(graph
-            .add_dep(crate2, Dependency::new(CrateName::new("crate3").unwrap(), crate3))
+            .add_dep(crate2, Dependency::new(CrateName::new("crate3").unwrap(), crate3,))
             .is_ok());
         assert!(graph
-            .add_dep(crate3, Dependency::new(CrateName::new("crate1").unwrap(), crate1))
+            .add_dep(crate3, Dependency::new(CrateName::new("crate1").unwrap(), crate1,))
             .is_err());
     }
 
@@ -819,7 +751,7 @@ mod tests {
     fn detect_cyclic_dependency_direct() {
         let mut graph = CrateGraph::default();
         let crate1 = graph.add_crate_root(
-            FileId(1u32),
+            FileId::from_raw(1u32),
             Edition2018,
             None,
             None,
@@ -828,11 +760,9 @@ mod tests {
             Env::default(),
             false,
             CrateOrigin::Local { repo: None, name: None },
-            Err("".into()),
-            None,
         );
         let crate2 = graph.add_crate_root(
-            FileId(2u32),
+            FileId::from_raw(2u32),
             Edition2018,
             None,
             None,
@@ -841,14 +771,12 @@ mod tests {
             Env::default(),
             false,
             CrateOrigin::Local { repo: None, name: None },
-            Err("".into()),
-            None,
         );
         assert!(graph
-            .add_dep(crate1, Dependency::new(CrateName::new("crate2").unwrap(), crate2))
+            .add_dep(crate1, Dependency::new(CrateName::new("crate2").unwrap(), crate2,))
             .is_ok());
         assert!(graph
-            .add_dep(crate2, Dependency::new(CrateName::new("crate2").unwrap(), crate2))
+            .add_dep(crate2, Dependency::new(CrateName::new("crate2").unwrap(), crate2,))
             .is_err());
     }
 
@@ -856,7 +784,7 @@ mod tests {
     fn it_works() {
         let mut graph = CrateGraph::default();
         let crate1 = graph.add_crate_root(
-            FileId(1u32),
+            FileId::from_raw(1u32),
             Edition2018,
             None,
             None,
@@ -865,11 +793,9 @@ mod tests {
             Env::default(),
             false,
             CrateOrigin::Local { repo: None, name: None },
-            Err("".into()),
-            None,
         );
         let crate2 = graph.add_crate_root(
-            FileId(2u32),
+            FileId::from_raw(2u32),
             Edition2018,
             None,
             None,
@@ -878,11 +804,9 @@ mod tests {
             Env::default(),
             false,
             CrateOrigin::Local { repo: None, name: None },
-            Err("".into()),
-            None,
         );
         let crate3 = graph.add_crate_root(
-            FileId(3u32),
+            FileId::from_raw(3u32),
             Edition2018,
             None,
             None,
@@ -891,14 +815,12 @@ mod tests {
             Env::default(),
             false,
             CrateOrigin::Local { repo: None, name: None },
-            Err("".into()),
-            None,
         );
         assert!(graph
-            .add_dep(crate1, Dependency::new(CrateName::new("crate2").unwrap(), crate2))
+            .add_dep(crate1, Dependency::new(CrateName::new("crate2").unwrap(), crate2,))
             .is_ok());
         assert!(graph
-            .add_dep(crate2, Dependency::new(CrateName::new("crate3").unwrap(), crate3))
+            .add_dep(crate2, Dependency::new(CrateName::new("crate3").unwrap(), crate3,))
             .is_ok());
     }
 
@@ -906,7 +828,7 @@ mod tests {
     fn dashes_are_normalized() {
         let mut graph = CrateGraph::default();
         let crate1 = graph.add_crate_root(
-            FileId(1u32),
+            FileId::from_raw(1u32),
             Edition2018,
             None,
             None,
@@ -915,11 +837,9 @@ mod tests {
             Env::default(),
             false,
             CrateOrigin::Local { repo: None, name: None },
-            Err("".into()),
-            None,
         );
         let crate2 = graph.add_crate_root(
-            FileId(2u32),
+            FileId::from_raw(2u32),
             Edition2018,
             None,
             None,
@@ -928,18 +848,16 @@ mod tests {
             Env::default(),
             false,
             CrateOrigin::Local { repo: None, name: None },
-            Err("".into()),
-            None,
         );
         assert!(graph
             .add_dep(
                 crate1,
-                Dependency::new(CrateName::normalize_dashes("crate-name-with-dashes"), crate2)
+                Dependency::new(CrateName::normalize_dashes("crate-name-with-dashes"), crate2,)
             )
             .is_ok());
         assert_eq!(
             graph[crate1].dependencies,
-            vec![Dependency::new(CrateName::new("crate_name_with_dashes").unwrap(), crate2)]
+            vec![Dependency::new(CrateName::new("crate_name_with_dashes").unwrap(), crate2,)]
         );
     }
 }

@@ -96,7 +96,7 @@ where
         });
     }
 
-    fn address_of_allows_mutation(&self, _mt: mir::Mutability, _place: mir::Place<'tcx>) -> bool {
+    fn address_of_allows_mutation(&self) -> bool {
         // Exact set of permissions granted by AddressOf is undecided. Conservatively assume that
         // it might allow mutation until resolution of #56604.
         true
@@ -105,7 +105,7 @@ where
     fn ref_allows_mutation(&self, kind: mir::BorrowKind, place: mir::Place<'tcx>) -> bool {
         match kind {
             mir::BorrowKind::Mut { .. } => true,
-            mir::BorrowKind::Shared | mir::BorrowKind::Shallow => {
+            mir::BorrowKind::Shared | mir::BorrowKind::Fake => {
                 self.shared_borrow_allows_mutation(place)
             }
         }
@@ -171,10 +171,8 @@ where
         self.super_rvalue(rvalue, location);
 
         match rvalue {
-            mir::Rvalue::AddressOf(mt, borrowed_place) => {
-                if !borrowed_place.is_indirect()
-                    && self.address_of_allows_mutation(*mt, *borrowed_place)
-                {
+            mir::Rvalue::AddressOf(_mt, borrowed_place) => {
+                if !borrowed_place.is_indirect() && self.address_of_allows_mutation() {
                     let place_ty = borrowed_place.ty(self.ccx.body, self.ccx.tcx).ty;
                     if Q::in_any_value_of_ty(self.ccx, place_ty) {
                         self.state.qualif.insert(borrowed_place.local);

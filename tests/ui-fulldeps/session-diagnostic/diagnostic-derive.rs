@@ -1,14 +1,14 @@
-// check-fail
+//@ check-fail
 // Tests error conditions for specifying diagnostics using #[derive(Diagnostic)]
+//@ normalize-stderr-test "the following other types implement trait `IntoDiagArg`:(?:.*\n){0,9}\s+and \d+ others" -> "normalized in stderr"
+//@ normalize-stderr-test "(COMPILER_DIR/.*\.rs):[0-9]+:[0-9]+" -> "$1:LL:CC"
 
-// normalize-stderr-test "the following other types implement trait `IntoDiagnosticArg`:(?:.*\n){0,9}\s+and \d+ others" -> "normalized in stderr"
-// normalize-stderr-test "diagnostic_builder\.rs:[0-9]+:[0-9]+" -> "diagnostic_builder.rs:LL:CC"
 // The proc_macro2 crate handles spans differently when on beta/stable release rather than nightly,
 // changing the output of this test. Since Diagnostic is strictly internal to the compiler
 // the test is just ignored on stable and beta:
-// ignore-stage1
-// ignore-beta
-// ignore-stable
+//@ ignore-stage1
+//@ ignore-beta
+//@ ignore-stable
 
 #![feature(rustc_private)]
 #![crate_type = "lib"]
@@ -19,29 +19,32 @@ use rustc_span::Span;
 
 extern crate rustc_fluent_macro;
 extern crate rustc_macros;
-use rustc_fluent_macro::fluent_messages;
 use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
 
 extern crate rustc_middle;
 use rustc_middle::ty::Ty;
 
 extern crate rustc_errors;
-use rustc_errors::{Applicability, DiagnosticMessage, MultiSpan, SubdiagnosticMessage};
+use rustc_errors::{Applicability, DiagMessage, ErrCode, MultiSpan, SubdiagMessage};
 
 extern crate rustc_session;
 
-fluent_messages! { "./example.ftl" }
+rustc_fluent_macro::fluent_messages! { "./example.ftl" }
+
+// E0123 and E0456 are no longer used, so we define our own constants here just for this test.
+const E0123: ErrCode = ErrCode::from_u32(0123);
+const E0456: ErrCode = ErrCode::from_u32(0456);
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct Hello {}
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct HelloWarn {}
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 //~^ ERROR unsupported type attribute for diagnostic derive enum
 enum DiagnosticOnEnum {
     Foo,
@@ -51,53 +54,53 @@ enum DiagnosticOnEnum {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 #[diag = "E0123"]
 //~^ ERROR failed to resolve: maybe a missing crate `core`
 struct WrongStructAttrStyle {}
 
 #[derive(Diagnostic)]
-#[nonsense(no_crate_example, code = "E0123")]
+#[nonsense(no_crate_example, code = E0123)]
 //~^ ERROR `#[nonsense(...)]` is not a valid attribute
 //~^^ ERROR diagnostic slug not specified
 //~^^^ ERROR cannot find attribute `nonsense` in this scope
 struct InvalidStructAttr {}
 
 #[derive(Diagnostic)]
-#[diag("E0123")]
+#[diag(code = E0123)]
 //~^ ERROR diagnostic slug not specified
 struct InvalidLitNestedAttr {}
 
 #[derive(Diagnostic)]
-#[diag(nonsense, code = "E0123")]
+#[diag(nonsense, code = E0123)]
 //~^ ERROR cannot find value `nonsense` in module `crate::fluent_generated`
 struct InvalidNestedStructAttr {}
 
 #[derive(Diagnostic)]
-#[diag(nonsense("foo"), code = "E0123", slug = "foo")]
+#[diag(nonsense("foo"), code = E0123, slug = "foo")]
 //~^ ERROR diagnostic slug must be the first argument
 //~| ERROR diagnostic slug not specified
 struct InvalidNestedStructAttr1 {}
 
 #[derive(Diagnostic)]
-#[diag(nonsense = "...", code = "E0123", slug = "foo")]
+#[diag(nonsense = "...", code = E0123, slug = "foo")]
 //~^ ERROR unknown argument
 //~| ERROR diagnostic slug not specified
 struct InvalidNestedStructAttr2 {}
 
 #[derive(Diagnostic)]
-#[diag(nonsense = 4, code = "E0123", slug = "foo")]
+#[diag(nonsense = 4, code = E0123, slug = "foo")]
 //~^ ERROR unknown argument
 //~| ERROR diagnostic slug not specified
 struct InvalidNestedStructAttr3 {}
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123", slug = "foo")]
+#[diag(no_crate_example, code = E0123, slug = "foo")]
 //~^ ERROR unknown argument
 struct InvalidNestedStructAttr4 {}
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct WrongPlaceField {
     #[suggestion = "bar"]
     //~^ ERROR `#[suggestion = ...]` is not a valid attribute
@@ -105,19 +108,19 @@ struct WrongPlaceField {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
-#[diag(no_crate_example, code = "E0456")]
+#[diag(no_crate_example, code = E0123)]
+#[diag(no_crate_example, code = E0456)]
 //~^ ERROR specified multiple times
 //~^^ ERROR specified multiple times
 struct DiagSpecifiedTwice {}
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0456", code = "E0457")]
+#[diag(no_crate_example, code = E0123, code = E0456)]
 //~^ ERROR specified multiple times
 struct CodeSpecifiedTwice {}
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, no_crate::example, code = "E0456")]
+#[diag(no_crate_example, no_crate::example, code = E0123)]
 //~^ ERROR diagnostic slug must be the first argument
 struct SlugSpecifiedTwice {}
 
@@ -125,7 +128,7 @@ struct SlugSpecifiedTwice {}
 struct KindNotProvided {} //~ ERROR diagnostic slug not specified
 
 #[derive(Diagnostic)]
-#[diag(code = "E0456")]
+#[diag(code = E0123)]
 //~^ ERROR diagnostic slug not specified
 struct SlugNotProvided {}
 
@@ -134,7 +137,7 @@ struct SlugNotProvided {}
 struct CodeNotProvided {}
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct MessageWrongType {
     #[primary_span]
     //~^ ERROR `#[primary_span]` attribute can only be applied to fields of type `Span` or `MultiSpan`
@@ -142,7 +145,7 @@ struct MessageWrongType {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct InvalidPathFieldAttr {
     #[nonsense]
     //~^ ERROR `#[nonsense]` is not a valid attribute
@@ -151,7 +154,7 @@ struct InvalidPathFieldAttr {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorWithField {
     name: String,
     #[label(no_crate_label)]
@@ -159,7 +162,7 @@ struct ErrorWithField {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorWithMessageAppliedToField {
     #[label(no_crate_label)]
     //~^ ERROR the `#[label(...)]` attribute can only be applied to fields of type `Span` or `MultiSpan`
@@ -167,7 +170,7 @@ struct ErrorWithMessageAppliedToField {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorWithNonexistentField {
     #[suggestion(no_crate_suggestion, code = "{name}")]
     //~^ ERROR `name` doesn't refer to a field on this type
@@ -176,7 +179,7 @@ struct ErrorWithNonexistentField {
 
 #[derive(Diagnostic)]
 //~^ ERROR invalid format string: expected `'}'`
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorMissingClosingBrace {
     #[suggestion(no_crate_suggestion, code = "{name")]
     suggestion: (Span, Applicability),
@@ -186,7 +189,7 @@ struct ErrorMissingClosingBrace {
 
 #[derive(Diagnostic)]
 //~^ ERROR invalid format string: unmatched `}`
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorMissingOpeningBrace {
     #[suggestion(no_crate_suggestion, code = "name}")]
     suggestion: (Span, Applicability),
@@ -195,14 +198,14 @@ struct ErrorMissingOpeningBrace {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct LabelOnSpan {
     #[label(no_crate_label)]
     sp: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct LabelOnNonSpan {
     #[label(no_crate_label)]
     //~^ ERROR the `#[label(...)]` attribute can only be applied to fields of type `Span` or `MultiSpan`
@@ -210,7 +213,7 @@ struct LabelOnNonSpan {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct Suggest {
     #[suggestion(no_crate_suggestion, code = "This is the suggested code")]
     #[suggestion(no_crate_suggestion, code = "This is the suggested code", style = "normal")]
@@ -221,7 +224,7 @@ struct Suggest {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct SuggestWithoutCode {
     #[suggestion(no_crate_suggestion)]
     //~^ ERROR suggestion without `code = "..."`
@@ -229,7 +232,7 @@ struct SuggestWithoutCode {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct SuggestWithBadKey {
     #[suggestion(nonsense = "bar")]
     //~^ ERROR invalid nested attribute
@@ -238,7 +241,7 @@ struct SuggestWithBadKey {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct SuggestWithShorthandMsg {
     #[suggestion(msg = "bar")]
     //~^ ERROR invalid nested attribute
@@ -247,21 +250,21 @@ struct SuggestWithShorthandMsg {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct SuggestWithoutMsg {
     #[suggestion(code = "bar")]
     suggestion: (Span, Applicability),
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct SuggestWithTypesSwapped {
     #[suggestion(no_crate_suggestion, code = "This is suggested code")]
     suggestion: (Applicability, Span),
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct SuggestWithWrongTypeApplicabilityOnly {
     #[suggestion(no_crate_suggestion, code = "This is suggested code")]
     //~^ ERROR wrong field type for suggestion
@@ -269,14 +272,14 @@ struct SuggestWithWrongTypeApplicabilityOnly {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct SuggestWithSpanOnly {
     #[suggestion(no_crate_suggestion, code = "This is suggested code")]
     suggestion: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct SuggestWithDuplicateSpanAndApplicability {
     #[suggestion(no_crate_suggestion, code = "This is suggested code")]
     suggestion: (Span, Span, Applicability),
@@ -284,7 +287,7 @@ struct SuggestWithDuplicateSpanAndApplicability {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct SuggestWithDuplicateApplicabilityAndSpan {
     #[suggestion(no_crate_suggestion, code = "This is suggested code")]
     suggestion: (Applicability, Applicability, Span),
@@ -292,7 +295,7 @@ struct SuggestWithDuplicateApplicabilityAndSpan {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct WrongKindOfAnnotation {
     #[label = "bar"]
     //~^ ERROR `#[label = ...]` is not a valid attribute
@@ -300,7 +303,7 @@ struct WrongKindOfAnnotation {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct OptionsInErrors {
     #[label(no_crate_label)]
     label: Option<Span>,
@@ -309,7 +312,7 @@ struct OptionsInErrors {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0456")]
+#[diag(no_crate_example, code = E0123)]
 struct MoveOutOfBorrowError<'tcx> {
     name: Ident,
     ty: Ty<'tcx>,
@@ -323,7 +326,7 @@ struct MoveOutOfBorrowError<'tcx> {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorWithLifetime<'a> {
     #[label(no_crate_label)]
     span: Span,
@@ -331,7 +334,7 @@ struct ErrorWithLifetime<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorWithDefaultLabelAttr<'a> {
     #[label]
     span: Span,
@@ -339,76 +342,76 @@ struct ErrorWithDefaultLabelAttr<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ArgFieldWithoutSkip {
     #[primary_span]
     span: Span,
     other: Hello,
-    //~^ ERROR the trait bound `Hello: IntoDiagnosticArg` is not satisfied
+    //~^ ERROR the trait bound `Hello: IntoDiagArg` is not satisfied
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ArgFieldWithSkip {
     #[primary_span]
     span: Span,
-    // `Hello` does not implement `IntoDiagnosticArg` so this would result in an error if
+    // `Hello` does not implement `IntoDiagArg` so this would result in an error if
     // not for `#[skip_arg]`.
     #[skip_arg]
     other: Hello,
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorWithSpannedNote {
     #[note]
     span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorWithSpannedNoteCustom {
     #[note(no_crate_note)]
     span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 #[note]
 struct ErrorWithNote {
     val: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 #[note(no_crate_note)]
 struct ErrorWithNoteCustom {
     val: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorWithSpannedHelp {
     #[help]
     span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorWithSpannedHelpCustom {
     #[help(no_crate_help)]
     span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 #[help]
 struct ErrorWithHelp {
     val: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 #[help(no_crate_help)]
 struct ErrorWithHelpCustom {
     val: String,
@@ -416,34 +419,34 @@ struct ErrorWithHelpCustom {
 
 #[derive(Diagnostic)]
 #[help]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorWithHelpWrongOrder {
     val: String,
 }
 
 #[derive(Diagnostic)]
 #[help(no_crate_help)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorWithHelpCustomWrongOrder {
     val: String,
 }
 
 #[derive(Diagnostic)]
 #[note]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorWithNoteWrongOrder {
     val: String,
 }
 
 #[derive(Diagnostic)]
 #[note(no_crate_note)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorWithNoteCustomWrongOrder {
     val: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ApplicabilityInBoth {
     #[suggestion(no_crate_suggestion, code = "...", applicability = "maybe-incorrect")]
     //~^ ERROR specified multiple times
@@ -451,7 +454,7 @@ struct ApplicabilityInBoth {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct InvalidApplicability {
     #[suggestion(no_crate_suggestion, code = "...", applicability = "batman")]
     //~^ ERROR invalid applicability
@@ -459,14 +462,14 @@ struct InvalidApplicability {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ValidApplicability {
     #[suggestion(no_crate_suggestion, code = "...", applicability = "maybe-incorrect")]
     suggestion: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct NoApplicability {
     #[suggestion(no_crate_suggestion, code = "...")]
     suggestion: Span,
@@ -484,7 +487,7 @@ struct Subdiagnostic {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct VecField {
     #[primary_span]
     #[label]
@@ -492,7 +495,7 @@ struct VecField {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct UnitField {
     #[primary_span]
     spans: Span,
@@ -503,7 +506,7 @@ struct UnitField {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct OptUnitField {
     #[primary_span]
     spans: Span,
@@ -527,7 +530,7 @@ struct BoolField {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct LabelWithTrailingPath {
     #[label(no_crate_label, foo)]
     //~^ ERROR a diagnostic slug must be the first argument to the attribute
@@ -535,7 +538,7 @@ struct LabelWithTrailingPath {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct LabelWithTrailingNameValue {
     #[label(no_crate_label, foo = "...")]
     //~^ ERROR only `no_span` is a valid nested attribute
@@ -543,7 +546,7 @@ struct LabelWithTrailingNameValue {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct LabelWithTrailingList {
     #[label(no_crate_label, foo("..."))]
     //~^ ERROR only `no_span` is a valid nested attribute
@@ -563,42 +566,42 @@ struct PrimarySpanOnLint {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct ErrorWithMultiSpan {
     #[primary_span]
     span: MultiSpan,
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 #[warning]
 struct ErrorWithWarn {
     val: String,
 }
 
 #[derive(Diagnostic)]
-#[error(no_crate_example, code = "E0123")]
+#[error(no_crate_example, code = E0123)]
 //~^ ERROR `#[error(...)]` is not a valid attribute
 //~| ERROR diagnostic slug not specified
 //~| ERROR cannot find attribute `error` in this scope
 struct ErrorAttribute {}
 
 #[derive(Diagnostic)]
-#[warn_(no_crate_example, code = "E0123")]
+#[warn_(no_crate_example, code = E0123)]
 //~^ ERROR `#[warn_(...)]` is not a valid attribute
 //~| ERROR diagnostic slug not specified
 //~| ERROR cannot find attribute `warn_` in this scope
 struct WarnAttribute {}
 
 #[derive(Diagnostic)]
-#[lint(no_crate_example, code = "E0123")]
+#[lint(no_crate_example, code = E0123)]
 //~^ ERROR `#[lint(...)]` is not a valid attribute
 //~| ERROR diagnostic slug not specified
 //~| ERROR cannot find attribute `lint` in this scope
 struct LintAttributeOnSessionDiag {}
 
 #[derive(LintDiagnostic)]
-#[lint(no_crate_example, code = "E0123")]
+#[lint(no_crate_example, code = E0123)]
 //~^ ERROR `#[lint(...)]` is not a valid attribute
 //~| ERROR `#[lint(...)]` is not a valid attribute
 //~| ERROR diagnostic slug not specified
@@ -606,7 +609,7 @@ struct LintAttributeOnSessionDiag {}
 struct LintAttributeOnLintDiag {}
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct DuplicatedSuggestionCode {
     #[suggestion(no_crate_suggestion, code = "...", code = ",,,")]
     //~^ ERROR specified multiple times
@@ -614,7 +617,7 @@ struct DuplicatedSuggestionCode {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct InvalidTypeInSuggestionTuple {
     #[suggestion(no_crate_suggestion, code = "...")]
     suggestion: (Span, usize),
@@ -622,7 +625,7 @@ struct InvalidTypeInSuggestionTuple {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct MissingApplicabilityInSuggestionTuple {
     #[suggestion(no_crate_suggestion, code = "...")]
     suggestion: (Span,),
@@ -630,7 +633,7 @@ struct MissingApplicabilityInSuggestionTuple {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct MissingCodeInSuggestion {
     #[suggestion(no_crate_suggestion)]
     //~^ ERROR suggestion without `code = "..."`
@@ -638,7 +641,7 @@ struct MissingCodeInSuggestion {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 #[multipart_suggestion(no_crate_suggestion)]
 //~^ ERROR `#[multipart_suggestion(...)]` is not a valid attribute
 //~| ERROR cannot find attribute `multipart_suggestion` in this scope
@@ -653,7 +656,7 @@ struct MultipartSuggestion {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 #[suggestion(no_crate_suggestion, code = "...")]
 //~^ ERROR `#[suggestion(...)]` is not a valid attribute
 struct SuggestionOnStruct {
@@ -662,7 +665,7 @@ struct SuggestionOnStruct {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 #[label]
 //~^ ERROR `#[label]` is not a valid attribute
 struct LabelOnStruct {
@@ -689,7 +692,7 @@ enum ExampleEnum {
 }
 
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct RawIdentDiagnosticArg {
     pub r#type: String,
 }
@@ -698,7 +701,7 @@ struct RawIdentDiagnosticArg {
 #[diag(no_crate_example)]
 struct SubdiagnosticBad {
     #[subdiagnostic(bad)]
-    //~^ ERROR `eager` is the only supported nested attribute for `subdiagnostic`
+    //~^ ERROR `#[subdiagnostic(...)]` is not a valid attribute
     note: Note,
 }
 
@@ -714,7 +717,7 @@ struct SubdiagnosticBadStr {
 #[diag(no_crate_example)]
 struct SubdiagnosticBadTwice {
     #[subdiagnostic(bad, bad)]
-    //~^ ERROR `eager` is the only supported nested attribute for `subdiagnostic`
+    //~^ ERROR `#[subdiagnostic(...)]` is not a valid attribute
     note: Note,
 }
 
@@ -722,7 +725,7 @@ struct SubdiagnosticBadTwice {
 #[diag(no_crate_example)]
 struct SubdiagnosticBadLitStr {
     #[subdiagnostic("bad")]
-    //~^ ERROR `eager` is the only supported nested attribute for `subdiagnostic`
+    //~^ ERROR `#[subdiagnostic(...)]` is not a valid attribute
     note: Note,
 }
 
@@ -736,13 +739,14 @@ struct SubdiagnosticEagerLint {
 
 #[derive(Diagnostic)]
 #[diag(no_crate_example)]
-struct SubdiagnosticEagerCorrect {
+struct SubdiagnosticEagerFormerlyCorrect {
     #[subdiagnostic(eager)]
+    //~^ ERROR `#[subdiagnostic(...)]` is not a valid attribute
     note: Note,
 }
 
 // Check that formatting of `correct` in suggestion doesn't move the binding for that field, making
-// the `set_arg` call a compile error; and that isn't worked around by moving the `set_arg` call
+// the `arg` call a compile error; and that isn't worked around by moving the `arg` call
 // after the `span_suggestion` call - which breaks eager translation.
 
 #[derive(Subdiagnostic)]
@@ -758,12 +762,13 @@ pub(crate) struct SubdiagnosticWithSuggestion {
 #[diag(no_crate_example)]
 struct SubdiagnosticEagerSuggestion {
     #[subdiagnostic(eager)]
+    //~^ ERROR `#[subdiagnostic(...)]` is not a valid attribute
     sub: SubdiagnosticWithSuggestion,
 }
 
 /// with a doc comment on the type..
 #[derive(Diagnostic)]
-#[diag(no_crate_example, code = "E0123")]
+#[diag(no_crate_example, code = E0123)]
 struct WithDocComment {
     /// ..and the field
     #[primary_span]

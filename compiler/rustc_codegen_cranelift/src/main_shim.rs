@@ -74,7 +74,7 @@ pub(crate) fn maybe_create_entry_wrapper(
         let cmain_func_id = match m.declare_function(entry_name, Linkage::Export, &cmain_sig) {
             Ok(func_id) => func_id,
             Err(err) => {
-                tcx.sess
+                tcx.dcx()
                     .fatal(format!("entry symbol `{entry_name}` declared multiple times: {err}"));
             }
         };
@@ -115,14 +115,12 @@ pub(crate) fn maybe_create_entry_wrapper(
                         termination_trait,
                     )
                     .unwrap();
-                let report = Instance::resolve(
+                let report = Instance::expect_resolve(
                     tcx,
                     ParamEnv::reveal_all(),
                     report.def_id,
                     tcx.mk_args(&[GenericArg::from(main_ret_ty)]),
                 )
-                .unwrap()
-                .unwrap()
                 .polymorphize(tcx);
 
                 let report_name = tcx.symbol_name(report).name;
@@ -142,14 +140,12 @@ pub(crate) fn maybe_create_entry_wrapper(
                 }
             } else if is_main_fn {
                 let start_def_id = tcx.require_lang_item(LangItem::Start, None);
-                let start_instance = Instance::resolve(
+                let start_instance = Instance::expect_resolve(
                     tcx,
                     ParamEnv::reveal_all(),
                     start_def_id,
                     tcx.mk_args(&[main_ret_ty.into()]),
                 )
-                .unwrap()
-                .unwrap()
                 .polymorphize(tcx);
                 let start_func_id = import_function(tcx, m, start_instance);
 
@@ -171,7 +167,7 @@ pub(crate) fn maybe_create_entry_wrapper(
         }
 
         if let Err(err) = m.define_function(cmain_func_id, &mut ctx) {
-            tcx.sess.fatal(format!("entry symbol `{entry_name}` defined multiple times: {err}"));
+            tcx.dcx().fatal(format!("entry symbol `{entry_name}` defined multiple times: {err}"));
         }
 
         unwind_context.add_function(cmain_func_id, &ctx, m.isa());

@@ -1,98 +1,16 @@
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
+use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_index::bit_set::SparseBitMatrix;
 use rustc_index::interval::IntervalSet;
 use rustc_index::interval::SparseIntervalMatrix;
 use rustc_index::Idx;
-use rustc_index::IndexVec;
-use rustc_middle::mir::{BasicBlock, Body, Location};
+use rustc_middle::mir::{BasicBlock, Location};
 use rustc_middle::ty::{self, RegionVid};
+use rustc_mir_dataflow::points::{DenseLocationMap, PointIndex};
 use std::fmt::Debug;
 use std::rc::Rc;
 
-/// Maps between a `Location` and a `PointIndex` (and vice versa).
-pub(crate) struct RegionValueElements {
-    /// For each basic block, how many points are contained within?
-    statements_before_block: IndexVec<BasicBlock, usize>,
-
-    /// Map backward from each point to the basic block that it
-    /// belongs to.
-    basic_blocks: IndexVec<PointIndex, BasicBlock>,
-
-    num_points: usize,
-}
-
-impl RegionValueElements {
-    pub(crate) fn new(body: &Body<'_>) -> Self {
-        let mut num_points = 0;
-        let statements_before_block: IndexVec<BasicBlock, usize> = body
-            .basic_blocks
-            .iter()
-            .map(|block_data| {
-                let v = num_points;
-                num_points += block_data.statements.len() + 1;
-                v
-            })
-            .collect();
-        debug!("RegionValueElements: statements_before_block={:#?}", statements_before_block);
-        debug!("RegionValueElements: num_points={:#?}", num_points);
-
-        let mut basic_blocks = IndexVec::with_capacity(num_points);
-        for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
-            basic_blocks.extend((0..=bb_data.statements.len()).map(|_| bb));
-        }
-
-        Self { statements_before_block, basic_blocks, num_points }
-    }
-
-    /// Total number of point indices
-    pub(crate) fn num_points(&self) -> usize {
-        self.num_points
-    }
-
-    /// Converts a `Location` into a `PointIndex`. O(1).
-    pub(crate) fn point_from_location(&self, location: Location) -> PointIndex {
-        let Location { block, statement_index } = location;
-        let start_index = self.statements_before_block[block];
-        PointIndex::new(start_index + statement_index)
-    }
-
-    /// Converts a `Location` into a `PointIndex`. O(1).
-    pub(crate) fn entry_point(&self, block: BasicBlock) -> PointIndex {
-        let start_index = self.statements_before_block[block];
-        PointIndex::new(start_index)
-    }
-
-    /// Return the PointIndex for the block start of this index.
-    pub(crate) fn to_block_start(&self, index: PointIndex) -> PointIndex {
-        PointIndex::new(self.statements_before_block[self.basic_blocks[index]])
-    }
-
-    /// Converts a `PointIndex` back to a location. O(1).
-    pub(crate) fn to_location(&self, index: PointIndex) -> Location {
-        assert!(index.index() < self.num_points);
-        let block = self.basic_blocks[index];
-        let start_index = self.statements_before_block[block];
-        let statement_index = index.index() - start_index;
-        Location { block, statement_index }
-    }
-
-    /// Sometimes we get point-indices back from bitsets that may be
-    /// out of range (because they round up to the nearest 2^N number
-    /// of bits). Use this function to filter such points out if you
-    /// like.
-    pub(crate) fn point_in_range(&self, index: PointIndex) -> bool {
-        index.index() < self.num_points
-    }
-}
-
-rustc_index::newtype_index! {
-    /// A single integer representing a `Location` in the MIR control-flow
-    /// graph. Constructed efficiently from `RegionValueElements`.
-    #[debug_format = "PointIndex({})"]
-    pub struct PointIndex {}
-}
+use crate::BorrowIndex;
 
 rustc_index::newtype_index! {
     /// A single integer representing a `ty::Placeholder`.
@@ -116,65 +34,182 @@ pub(crate) enum RegionElement {
     PlaceholderRegion(ty::PlaceholderRegion),
 }
 
-/// When we initially compute liveness, we use an interval matrix storing
-/// liveness ranges for each region-vid.
-pub(crate) struct LivenessValues<N: Idx> {
-    elements: Rc<RegionValueElements>,
-    points: SparseIntervalMatrix<N, PointIndex>,
+/// Records the CFG locations where each region is live. When we initially compute liveness, we use
+/// an interval matrix storing liveness ranges for each region-vid.
+pub(crate) struct LivenessValues {
+    /// The map from locations to points.
+    elements: Rc<DenseLocationMap>,
+
+    /// Which regions are live. This is exclusive with the fine-grained tracking in `points`, and
+    /// currently only used for validating promoteds (which don't care about more precise tracking).
+    live_regions: Option<FxHashSet<RegionVid>>,
+
+    /// For each region: the points where it is live.
+    ///
+    /// This is not initialized for promoteds, because we don't care *where* within a promoted a
+    /// region is live, only that it is.
+    points: Option<SparseIntervalMatrix<RegionVid, PointIndex>>,
+
+    /// When using `-Zpolonius=next`, for each point: the loans flowing into the live regions at
+    /// that point.
+    pub(crate) loans: Option<LiveLoans>,
 }
 
-impl<N: Idx> LivenessValues<N> {
-    /// Creates a new set of "region values" that tracks causal information.
-    /// Each of the regions in num_region_variables will be initialized with an
-    /// empty set of points and no causal information.
-    pub(crate) fn new(elements: Rc<RegionValueElements>) -> Self {
-        Self { points: SparseIntervalMatrix::new(elements.num_points), elements }
+/// Data used to compute the loans that are live at a given point in the CFG, when using
+/// `-Zpolonius=next`.
+pub(crate) struct LiveLoans {
+    /// The set of loans that flow into a given region. When individual regions are marked as live
+    /// in the CFG, these inflowing loans are recorded as live.
+    pub(crate) inflowing_loans: SparseBitMatrix<RegionVid, BorrowIndex>,
+
+    /// The set of loans that are live at a given point in the CFG.
+    pub(crate) live_loans: SparseBitMatrix<PointIndex, BorrowIndex>,
+}
+
+impl LiveLoans {
+    pub(crate) fn new(num_loans: usize) -> Self {
+        LiveLoans {
+            live_loans: SparseBitMatrix::new(num_loans),
+            inflowing_loans: SparseBitMatrix::new(num_loans),
+        }
+    }
+}
+
+impl LivenessValues {
+    /// Create an empty map of regions to locations where they're live.
+    pub(crate) fn with_specific_points(elements: Rc<DenseLocationMap>) -> Self {
+        LivenessValues {
+            live_regions: None,
+            points: Some(SparseIntervalMatrix::new(elements.num_points())),
+            elements,
+            loans: None,
+        }
+    }
+
+    /// Create an empty map of regions to locations where they're live.
+    ///
+    /// Unlike `with_specific_points`, does not track exact locations where something is live, only
+    /// which regions are live.
+    pub(crate) fn without_specific_points(elements: Rc<DenseLocationMap>) -> Self {
+        LivenessValues {
+            live_regions: Some(Default::default()),
+            points: None,
+            elements,
+            loans: None,
+        }
     }
 
     /// Iterate through each region that has a value in this set.
-    pub(crate) fn rows(&self) -> impl Iterator<Item = N> {
-        self.points.rows()
+    pub(crate) fn regions(&self) -> impl Iterator<Item = RegionVid> + '_ {
+        self.points.as_ref().expect("use with_specific_points").rows()
     }
 
-    /// Adds the given element to the value for the given region. Returns whether
-    /// the element is newly added (i.e., was not already present).
-    pub(crate) fn add_element(&mut self, row: N, location: Location) -> bool {
-        debug!("LivenessValues::add(r={:?}, location={:?})", row, location);
-        let index = self.elements.point_from_location(location);
-        self.points.insert(row, index)
+    /// Iterate through each region that has a value in this set.
+    // We are passing query instability implications to the caller.
+    #[rustc_lint_query_instability]
+    #[allow(rustc::potential_query_instability)]
+    pub(crate) fn live_regions_unordered(&self) -> impl Iterator<Item = RegionVid> + '_ {
+        self.live_regions.as_ref().unwrap().iter().copied()
     }
 
-    /// Adds all the elements in the given bit array into the given
-    /// region. Returns whether any of them are newly added.
-    pub(crate) fn add_elements(&mut self, row: N, locations: &IntervalSet<PointIndex>) -> bool {
-        debug!("LivenessValues::add_elements(row={:?}, locations={:?})", row, locations);
-        self.points.union_row(row, locations)
+    /// Records `region` as being live at the given `location`.
+    pub(crate) fn add_location(&mut self, region: RegionVid, location: Location) {
+        let point = self.elements.point_from_location(location);
+        debug!("LivenessValues::add_location(region={:?}, location={:?})", region, location);
+        if let Some(points) = &mut self.points {
+            points.insert(region, point);
+        } else {
+            if self.elements.point_in_range(point) {
+                self.live_regions.as_mut().unwrap().insert(region);
+            }
+        }
+
+        // When available, record the loans flowing into this region as live at the given point.
+        if let Some(loans) = self.loans.as_mut() {
+            if let Some(inflowing) = loans.inflowing_loans.row(region) {
+                loans.live_loans.union_row(point, inflowing);
+            }
+        }
     }
 
-    /// Adds all the control-flow points to the values for `r`.
-    pub(crate) fn add_all_points(&mut self, row: N) {
-        self.points.insert_all_into_row(row);
+    /// Records `region` as being live at all the given `points`.
+    pub(crate) fn add_points(&mut self, region: RegionVid, points: &IntervalSet<PointIndex>) {
+        debug!("LivenessValues::add_points(region={:?}, points={:?})", region, points);
+        if let Some(this) = &mut self.points {
+            this.union_row(region, points);
+        } else {
+            if points.iter().any(|point| self.elements.point_in_range(point)) {
+                self.live_regions.as_mut().unwrap().insert(region);
+            }
+        }
+
+        // When available, record the loans flowing into this region as live at the given points.
+        if let Some(loans) = self.loans.as_mut() {
+            if let Some(inflowing) = loans.inflowing_loans.row(region) {
+                if !inflowing.is_empty() {
+                    for point in points.iter() {
+                        loans.live_loans.union_row(point, inflowing);
+                    }
+                }
+            }
+        }
     }
 
-    /// Returns `true` if the region `r` contains the given element.
-    pub(crate) fn contains(&self, row: N, location: Location) -> bool {
-        let index = self.elements.point_from_location(location);
-        self.points.row(row).is_some_and(|r| r.contains(index))
+    /// Records `region` as being live at all the control-flow points.
+    pub(crate) fn add_all_points(&mut self, region: RegionVid) {
+        if let Some(points) = &mut self.points {
+            points.insert_all_into_row(region);
+        } else {
+            self.live_regions.as_mut().unwrap().insert(region);
+        }
     }
 
-    /// Returns an iterator of all the elements contained by the region `r`
-    pub(crate) fn get_elements(&self, row: N) -> impl Iterator<Item = Location> + '_ {
-        self.points
-            .row(row)
+    /// Returns whether `region` is marked live at the given `location`.
+    pub(crate) fn is_live_at(&self, region: RegionVid, location: Location) -> bool {
+        let point = self.elements.point_from_location(location);
+        if let Some(points) = &self.points {
+            points.row(region).is_some_and(|r| r.contains(point))
+        } else {
+            unreachable!(
+                "Should be using LivenessValues::with_specific_points to ask whether live at a location"
+            )
+        }
+    }
+
+    /// Returns an iterator of all the points where `region` is live.
+    fn live_points(&self, region: RegionVid) -> impl Iterator<Item = PointIndex> + '_ {
+        let Some(points) = &self.points else {
+            unreachable!(
+                "Should be using LivenessValues::with_specific_points to ask whether live at a location"
+            )
+        };
+        points
+            .row(region)
             .into_iter()
             .flat_map(|set| set.iter())
-            .take_while(move |&p| self.elements.point_in_range(p))
-            .map(move |p| self.elements.to_location(p))
+            .take_while(|&p| self.elements.point_in_range(p))
     }
 
-    /// Returns a "pretty" string value of the region. Meant for debugging.
-    pub(crate) fn region_value_str(&self, r: N) -> String {
-        region_value_str(self.get_elements(r).map(RegionElement::Location))
+    /// For debugging purposes, returns a pretty-printed string of the points where the `region` is
+    /// live.
+    pub(crate) fn pretty_print_live_points(&self, region: RegionVid) -> String {
+        pretty_print_region_elements(
+            self.live_points(region).map(|p| RegionElement::Location(self.elements.to_location(p))),
+        )
+    }
+
+    #[inline]
+    pub(crate) fn point_from_location(&self, location: Location) -> PointIndex {
+        self.elements.point_from_location(location)
+    }
+
+    /// When using `-Zpolonius=next`, returns whether the `loan_idx` is live at the given `point`.
+    pub(crate) fn is_loan_live_at(&self, loan_idx: BorrowIndex, point: PointIndex) -> bool {
+        self.loans
+            .as_ref()
+            .expect("Accessing live loans requires `-Zpolonius=next`")
+            .live_loans
+            .contains(point, loan_idx)
     }
 }
 
@@ -229,7 +264,7 @@ impl PlaceholderIndices {
 /// it would also contain various points from within the function.
 #[derive(Clone)]
 pub(crate) struct RegionValues<N: Idx> {
-    elements: Rc<RegionValueElements>,
+    elements: Rc<DenseLocationMap>,
     placeholder_indices: Rc<PlaceholderIndices>,
     points: SparseIntervalMatrix<N, PointIndex>,
     free_regions: SparseBitMatrix<N, RegionVid>,
@@ -244,14 +279,14 @@ impl<N: Idx> RegionValues<N> {
     /// Each of the regions in num_region_variables will be initialized with an
     /// empty set of points and no causal information.
     pub(crate) fn new(
-        elements: &Rc<RegionValueElements>,
+        elements: &Rc<DenseLocationMap>,
         num_universal_regions: usize,
         placeholder_indices: &Rc<PlaceholderIndices>,
     ) -> Self {
         let num_placeholders = placeholder_indices.len();
         Self {
             elements: elements.clone(),
-            points: SparseIntervalMatrix::new(elements.num_points),
+            points: SparseIntervalMatrix::new(elements.num_points()),
             placeholder_indices: placeholder_indices.clone(),
             free_regions: SparseBitMatrix::new(num_universal_regions),
             placeholders: SparseBitMatrix::new(num_placeholders),
@@ -302,8 +337,11 @@ impl<N: Idx> RegionValues<N> {
     /// `self[to] |= values[from]`, essentially: that is, take all the
     /// elements for the region `from` from `values` and add them to
     /// the region `to` in `self`.
-    pub(crate) fn merge_liveness<M: Idx>(&mut self, to: N, from: M, values: &LivenessValues<M>) {
-        if let Some(set) = values.points.row(from) {
+    pub(crate) fn merge_liveness(&mut self, to: N, from: RegionVid, values: &LivenessValues) {
+        let Some(value_points) = &values.points else {
+            panic!("LivenessValues must track specific points for use in merge_liveness");
+        };
+        if let Some(set) = value_points.row(from) {
             self.points.union_row(to, set);
         }
     }
@@ -371,7 +409,7 @@ impl<N: Idx> RegionValues<N> {
 
     /// Returns a "pretty" string value of the region. Meant for debugging.
     pub(crate) fn region_value_str(&self, r: N) -> String {
-        region_value_str(self.elements_contained_in(r))
+        pretty_print_region_elements(self.elements_contained_in(r))
     }
 }
 
@@ -415,11 +453,12 @@ impl ToElementIndex for ty::PlaceholderRegion {
     }
 }
 
-pub(crate) fn location_set_str(
-    elements: &RegionValueElements,
+/// For debugging purposes, returns a pretty-printed string of the given points.
+pub(crate) fn pretty_print_points(
+    elements: &DenseLocationMap,
     points: impl IntoIterator<Item = PointIndex>,
 ) -> String {
-    region_value_str(
+    pretty_print_region_elements(
         points
             .into_iter()
             .take_while(|&p| elements.point_in_range(p))
@@ -428,7 +467,8 @@ pub(crate) fn location_set_str(
     )
 }
 
-fn region_value_str(elements: impl IntoIterator<Item = RegionElement>) -> String {
+/// For debugging purposes, returns a pretty-printed string of the given region elements.
+fn pretty_print_region_elements(elements: impl IntoIterator<Item = RegionElement>) -> String {
     let mut result = String::new();
     result.push('{');
 

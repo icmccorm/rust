@@ -1,5 +1,4 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::get_parent_node;
 use clippy_utils::source::snippet_with_context;
 use clippy_utils::ty::is_copy;
 use rustc_errors::Applicability;
@@ -48,8 +47,8 @@ pub(super) fn check(
     }
 
     if is_copy(cx, ty) {
-        let parent_is_suffix_expr = match get_parent_node(cx.tcx, expr.hir_id) {
-            Some(Node::Expr(parent)) => match parent.kind {
+        let parent_is_suffix_expr = match cx.tcx.parent_hir_node(expr.hir_id) {
+            Node::Expr(parent) => match parent.kind {
                 // &*x is a nop, &x.clone() is not
                 ExprKind::AddrOf(..) => return,
                 // (*x).func() is useless, x.clone().func() can work in case func borrows self
@@ -61,7 +60,7 @@ pub(super) fn check(
                 // ? is a Call, makes sure not to rec *x?, but rather (*x)?
                 ExprKind::Call(hir_callee, _) => matches!(
                     hir_callee.kind,
-                    ExprKind::Path(QPath::LangItem(rustc_hir::LangItem::TryTraitBranch, _, _))
+                    ExprKind::Path(QPath::LangItem(rustc_hir::LangItem::TryTraitBranch, ..))
                 ),
                 ExprKind::MethodCall(_, self_arg, ..) if expr.hir_id == self_arg.hir_id => true,
                 ExprKind::Match(_, _, MatchSource::TryDesugar(_) | MatchSource::AwaitDesugar)
@@ -70,7 +69,7 @@ pub(super) fn check(
                 _ => false,
             },
             // local binding capturing a reference
-            Some(Node::Local(l)) if matches!(l.pat.kind, PatKind::Binding(BindingAnnotation(ByRef::Yes, _), ..)) => {
+            Node::LetStmt(l) if matches!(l.pat.kind, PatKind::Binding(BindingAnnotation(ByRef::Yes(_), _), ..)) => {
                 return;
             },
             _ => false,
@@ -95,7 +94,7 @@ pub(super) fn check(
             cx,
             CLONE_ON_COPY,
             expr.span,
-            &with_forced_trimmed_paths!(format!(
+            with_forced_trimmed_paths!(format!(
                 "using `clone` on type `{ty}` which implements the `Copy` trait"
             )),
             help,

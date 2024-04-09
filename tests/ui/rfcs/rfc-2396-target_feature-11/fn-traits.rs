@@ -1,4 +1,4 @@
-// only-x86_64
+//@ only-x86_64
 
 #![feature(target_feature_11)]
 
@@ -12,7 +12,7 @@ fn call(f: impl Fn()) {
     f()
 }
 
-fn call_mut(f: impl FnMut()) {
+fn call_mut(mut f: impl FnMut()) {
     f()
 }
 
@@ -21,14 +21,14 @@ fn call_once(f: impl FnOnce()) {
 }
 
 fn main() {
-    call(foo); //~ ERROR expected a `Fn<()>` closure, found `fn() {foo}`
-    call_mut(foo); //~ ERROR expected a `FnMut<()>` closure, found `fn() {foo}`
-    call_once(foo); //~ ERROR expected a `FnOnce<()>` closure, found `fn() {foo}`
+    call(foo); //~ ERROR expected a `Fn()` closure, found `fn() {foo}`
+    call_mut(foo); //~ ERROR expected a `FnMut()` closure, found `fn() {foo}`
+    call_once(foo); //~ ERROR expected a `FnOnce()` closure, found `fn() {foo}`
 
     call(foo_unsafe);
-    //~^ ERROR expected a `Fn<()>` closure, found `unsafe fn() {foo_unsafe}`
+    //~^ ERROR expected a `Fn()` closure, found `unsafe fn() {foo_unsafe}`
     call_mut(foo_unsafe);
-    //~^ ERROR expected a `FnMut<()>` closure, found `unsafe fn() {foo_unsafe}`
+    //~^ ERROR expected a `FnMut()` closure, found `unsafe fn() {foo_unsafe}`
     call_once(foo_unsafe);
-    //~^ ERROR expected a `FnOnce<()>` closure, found `unsafe fn() {foo_unsafe}`
+    //~^ ERROR expected a `FnOnce()` closure, found `unsafe fn() {foo_unsafe}`
 }

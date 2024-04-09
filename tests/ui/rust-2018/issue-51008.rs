@@ -2,9 +2,7 @@
 // being incorrectly considered part of the "elided lifetimes" from
 // the impl.
 //
-// run-pass
-
-#![feature(rust_2018_preview)]
+//@ check-pass
 
 trait A {
 

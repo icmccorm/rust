@@ -1,7 +1,6 @@
 //! The next-generation trait solver, currently still WIP.
 //!
-//! As a user of rust, you can use `-Ztrait-solver=next` or `next-coherence`
-//! to enable the new trait solver always, or just within coherence, respectively.
+//! As a user of rust, you can use `-Znext-solver` to enable the new trait solver.
 //!
 //! As a developer of rustc, you shouldn't be using the new trait
 //! solver without asking the trait-system-refactor-initiative, but it can
@@ -19,33 +18,39 @@ use rustc_infer::infer::canonical::{Canonical, CanonicalVarValues};
 use rustc_infer::traits::query::NoSolution;
 use rustc_middle::infer::canonical::CanonicalVarInfos;
 use rustc_middle::traits::solve::{
-    CanonicalResponse, Certainty, ExternalConstraintsData, Goal, IsNormalizesToHack, QueryResult,
-    Response,
+    CanonicalResponse, Certainty, ExternalConstraintsData, Goal, GoalSource, QueryResult, Response,
 };
-use rustc_middle::ty::{self, Ty, TyCtxt, UniverseIndex};
+use rustc_middle::ty::{self, AliasRelationDirection, Ty, TyCtxt, UniverseIndex};
 use rustc_middle::ty::{
     CoercePredicate, RegionOutlivesPredicate, SubtypePredicate, TypeOutlivesPredicate,
 };
 
 mod alias_relate;
 mod assembly;
-mod canonicalize;
 mod eval_ctxt;
 mod fulfill;
-mod inherent_projection;
 pub mod inspect;
 mod normalize;
-mod opaques;
+mod normalizes_to;
 mod project_goals;
 mod search_graph;
 mod trait_goals;
-mod weak_types;
 
-pub use eval_ctxt::{
-    EvalCtxt, GenerateProofTree, InferCtxtEvalExt, InferCtxtSelectExt, UseGlobalCache,
-};
+pub use eval_ctxt::{EvalCtxt, GenerateProofTree, InferCtxtEvalExt, InferCtxtSelectExt};
 pub use fulfill::FulfillmentCtxt;
-pub(crate) use normalize::{deeply_normalize, deeply_normalize_with_skipped_universes};
+pub(crate) use normalize::deeply_normalize_for_diagnostics;
+pub use normalize::{deeply_normalize, deeply_normalize_with_skipped_universes};
+
+/// How many fixpoint iterations we should attempt inside of the solver before bailing
+/// with overflow.
+///
+/// We previously used  `tcx.recursion_limit().0.checked_ilog2().unwrap_or(0)` for this.
+/// However, it feels unlikely that uncreasing the recursion limit by a power of two
+/// to get one more itereation is every useful or desirable. We now instead used a constant
+/// here. If there ever ends up some use-cases where a bigger number of fixpoint iterations
+/// is required, we can add a new attribute for that or revert this to be dependant on the
+/// recursion limit again. However, this feels very unlikely.
+const FIXPOINT_STEP_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 enum SolverMode {
@@ -63,24 +68,14 @@ enum SolverMode {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum GoalEvaluationKind {
     Root,
-    Nested { is_normalizes_to_hack: IsNormalizesToHack },
+    Nested,
 }
 
-trait CanonicalResponseExt {
-    fn has_no_inference_or_external_constraints(&self) -> bool;
-
-    fn has_only_region_constraints(&self) -> bool;
-}
-
-impl<'tcx> CanonicalResponseExt for Canonical<'tcx, Response<'tcx>> {
+#[extension(trait CanonicalResponseExt)]
+impl<'tcx> Canonical<'tcx, Response<'tcx>> {
     fn has_no_inference_or_external_constraints(&self) -> bool {
         self.value.external_constraints.region_constraints.is_empty()
             && self.value.var_values.is_identity()
-            && self.value.external_constraints.opaque_types.is_empty()
-    }
-
-    fn has_only_region_constraints(&self) -> bool {
-        self.value.var_values.is_identity_modulo_regions()
             && self.value.external_constraints.opaque_types.is_empty()
     }
 }
@@ -134,25 +129,6 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
         }
     }
 
-    #[instrument(level = "debug", skip(self))]
-    fn compute_closure_kind_goal(
-        &mut self,
-        goal: Goal<'tcx, (DefId, ty::GenericArgsRef<'tcx>, ty::ClosureKind)>,
-    ) -> QueryResult<'tcx> {
-        let (_, args, expected_kind) = goal.predicate;
-        let found_kind = args.as_closure().kind_ty().to_opt_closure_kind();
-
-        let Some(found_kind) = found_kind else {
-            return self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS);
-        };
-        if found_kind.extends(expected_kind) {
-            self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
-        } else {
-            Err(NoSolution)
-        }
-    }
-
-    #[instrument(level = "debug", skip(self))]
     fn compute_object_safe_goal(&mut self, trait_def_id: DefId) -> QueryResult<'tcx> {
         if self.tcx().check_is_object_safe(trait_def_id) {
             self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
@@ -168,7 +144,7 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
     ) -> QueryResult<'tcx> {
         match self.well_formed_goals(goal.param_env, goal.predicate) {
             Some(goals) => {
-                self.add_goals(goals);
+                self.add_goals(GoalSource::Misc, goals);
                 self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
             }
             None => self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS),
@@ -225,24 +201,25 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
 
 impl<'tcx> EvalCtxt<'_, 'tcx> {
     #[instrument(level = "debug", skip(self))]
-    fn set_normalizes_to_hack_goal(&mut self, goal: Goal<'tcx, ty::ProjectionPredicate<'tcx>>) {
-        assert!(
-            self.nested_goals.normalizes_to_hack_goal.is_none(),
-            "attempted to set the projection eq hack goal when one already exists"
-        );
-        self.nested_goals.normalizes_to_hack_goal = Some(goal);
+    fn add_normalizes_to_goal(&mut self, goal: Goal<'tcx, ty::NormalizesTo<'tcx>>) {
+        inspect::ProofTreeBuilder::add_normalizes_to_goal(self, goal);
+        self.nested_goals.normalizes_to_goals.push(goal);
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn add_goal(&mut self, goal: Goal<'tcx, ty::Predicate<'tcx>>) {
-        inspect::ProofTreeBuilder::add_goal(self, goal);
-        self.nested_goals.goals.push(goal);
+    fn add_goal(&mut self, source: GoalSource, goal: Goal<'tcx, ty::Predicate<'tcx>>) {
+        inspect::ProofTreeBuilder::add_goal(self, source, goal);
+        self.nested_goals.goals.push((source, goal));
     }
 
     #[instrument(level = "debug", skip(self, goals))]
-    fn add_goals(&mut self, goals: impl IntoIterator<Item = Goal<'tcx, ty::Predicate<'tcx>>>) {
+    fn add_goals(
+        &mut self,
+        source: GoalSource,
+        goals: impl IntoIterator<Item = Goal<'tcx, ty::Predicate<'tcx>>>,
+    ) {
         for goal in goals {
-            self.add_goal(goal);
+            self.add_goal(source, goal);
         }
     }
 
@@ -258,7 +235,7 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
             return None;
         }
 
-        // FIXME(-Ztrait-solver=next): We should instead try to find a `Certainty::Yes` response with
+        // FIXME(-Znext-solver): We should instead try to find a `Certainty::Yes` response with
         // a subset of the constraints that all the other responses have.
         let one = responses[0];
         if responses[1..].iter().all(|&resp| resp == one) {
@@ -292,35 +269,34 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
         Ok(self.make_ambiguous_response_no_constraints(maybe_cause))
     }
 
-    /// Normalize a type when it is structually matched on.
+    /// Normalize a type for when it is structurally matched on.
     ///
-    /// For self types this is generally already handled through
-    /// `assemble_candidates_after_normalizing_self_ty`, so anything happening
-    /// in [`EvalCtxt::assemble_candidates_via_self_ty`] does not have to normalize
-    /// the self type. It is required when structurally matching on any other
-    /// arguments of a trait goal, e.g. when assembling builtin unsize candidates.
-    fn try_normalize_ty(
+    /// This function is necessary in nearly all cases before matching on a type.
+    /// Not doing so is likely to be incomplete and therefore unsound during
+    /// coherence.
+    #[instrument(level = "debug", skip(self, param_env), ret)]
+    fn structurally_normalize_ty(
         &mut self,
         param_env: ty::ParamEnv<'tcx>,
-        mut ty: Ty<'tcx>,
-    ) -> Result<Option<Ty<'tcx>>, NoSolution> {
-        for _ in 0..self.local_overflow_limit() {
-            let ty::Alias(_, projection_ty) = *ty.kind() else {
-                return Ok(Some(ty));
-            };
-
+        ty: Ty<'tcx>,
+    ) -> Result<Ty<'tcx>, NoSolution> {
+        if let ty::Alias(..) = ty.kind() {
             let normalized_ty = self.next_ty_infer();
-            let normalizes_to_goal = Goal::new(
+            let alias_relate_goal = Goal::new(
                 self.tcx(),
                 param_env,
-                ty::ProjectionPredicate { projection_ty, term: normalized_ty.into() },
+                ty::PredicateKind::AliasRelate(
+                    ty.into(),
+                    normalized_ty.into(),
+                    AliasRelationDirection::Equate,
+                ),
             );
-            self.add_goal(normalizes_to_goal);
+            self.add_goal(GoalSource::Misc, alias_relate_goal);
             self.try_evaluate_added_goals()?;
-            ty = self.resolve_vars_if_possible(normalized_ty);
+            Ok(self.resolve_vars_if_possible(normalized_ty))
+        } else {
+            Ok(ty)
         }
-
-        Ok(None)
     }
 }
 

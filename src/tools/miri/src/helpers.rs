@@ -1,11 +1,19 @@
 use std::cmp;
+use std::collections::BTreeSet;
 use std::iter;
 use std::num::NonZeroUsize;
-
 use crate::helpers::rustc_data_structures::fx::FxHashMap;
 use crate::helpers::ty::List;
 use log::debug;
 use log::trace;
+use std::num::NonZero;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use rand::RngCore;
+
+use rustc_apfloat::ieee::{Double, Single};
+use rustc_apfloat::Float;
 use rustc_hir::def::{DefKind, Namespace};
 use rustc_hir::def_id::{DefId, CRATE_DEF_INDEX};
 use rustc_index::IndexVec;
@@ -13,21 +21,25 @@ use rustc_middle::mir;
 use rustc_middle::ty::Instance;
 use rustc_middle::ty::{
     self,
-    layout::{IntegerExt as _, LayoutOf, TyAndLayout},
-    IntTy, Ty, TyCtxt, UintTy,
+    layout::{LayoutOf, TyAndLayout},
+    FloatTy, IntTy, Ty, TyCtxt, UintTy,
 };
 use rustc_span::{def_id::CrateNum, sym, Span, Symbol};
-use rustc_target::abi::{Align, FieldIdx, FieldsShape, Integer, Size, Variants};
+use rustc_target::abi::{Align, FieldIdx, FieldsShape, Size, Variants};
 use rustc_target::spec::abi::Abi;
 use std::time::Duration;
 
-use rand::RngCore;
-
-use crate::Provenance;
 use crate::*;
 
+/// Indicates which kind of access is being performed.
+#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
+pub enum AccessKind {
+    Read,
+    Write,
+}
+
 // This mapping should match `decode_error_kind` in
-// <https://github.com/rust-lang/rust/blob/master/library/std/src/sys/unix/mod.rs>.
+// <https://github.com/rust-lang/rust/blob/master/library/std/src/sys/pal/unix/mod.rs>.
 const UNIX_IO_ERROR_TABLE: &[(&str, std::io::ErrorKind)] = {
     use std::io::ErrorKind::*;
     &[
@@ -100,23 +112,84 @@ fn try_resolve_did(tcx: TyCtxt<'_>, path: &[&str], namespace: Option<Namespace>)
         (path, None)
     };
 
-    // First find the crate.
-    let krate =
-        tcx.crates(()).iter().find(|&&krate| tcx.crate_name(krate).as_str() == crate_name)?;
-    let mut cur_item = DefId { krate: *krate, index: CRATE_DEF_INDEX };
-    // Then go over the modules.
-    for &segment in modules {
-        cur_item = find_children(tcx, cur_item, segment)
-            .find(|item| tcx.def_kind(item) == DefKind::Mod)?;
+    // There may be more than one crate with this name. We try them all.
+    // (This is particularly relevant when running `std` tests as then there are two `std` crates:
+    // the one in the sysroot and the one locally built by `cargo test`.)
+    // FIXME: can we prefer the one from the sysroot?
+    'crates: for krate in
+        tcx.crates(()).iter().filter(|&&krate| tcx.crate_name(krate).as_str() == crate_name)
+    {
+        let mut cur_item = DefId { krate: *krate, index: CRATE_DEF_INDEX };
+        // Go over the modules.
+        for &segment in modules {
+            let Some(next_item) = find_children(tcx, cur_item, segment)
+                .find(|item| tcx.def_kind(item) == DefKind::Mod)
+            else {
+                continue 'crates;
+            };
+            cur_item = next_item;
+        }
+        // Finally, look up the desired item in this module, if any.
+        match item {
+            Some((item_name, namespace)) => {
+                let Some(item) = find_children(tcx, cur_item, item_name)
+                    .find(|item| tcx.def_kind(item).ns() == Some(namespace))
+                else {
+                    continue 'crates;
+                };
+                return Some(item);
+            }
+            None => {
+                // Just return the module.
+                return Some(cur_item);
+            }
+        }
     }
-    // Finally, look up the desired item in this module, if any.
-    match item {
-        Some((item_name, namespace)) =>
-            Some(
-                find_children(tcx, cur_item, item_name)
-                    .find(|item| tcx.def_kind(item).ns() == Some(namespace))?,
-            ),
-        None => Some(cur_item),
+    // Item not found in any of the crates with the right name.
+    None
+}
+
+/// Convert a softfloat type to its corresponding hostfloat type.
+pub trait ToHost {
+    type HostFloat;
+    fn to_host(self) -> Self::HostFloat;
+}
+
+/// Convert a hostfloat type to its corresponding softfloat type.
+pub trait ToSoft {
+    type SoftFloat;
+    fn to_soft(self) -> Self::SoftFloat;
+}
+
+impl ToHost for rustc_apfloat::ieee::Double {
+    type HostFloat = f64;
+
+    fn to_host(self) -> Self::HostFloat {
+        f64::from_bits(self.to_bits().try_into().unwrap())
+    }
+}
+
+impl ToSoft for f64 {
+    type SoftFloat = rustc_apfloat::ieee::Double;
+
+    fn to_soft(self) -> Self::SoftFloat {
+        Float::from_bits(self.to_bits().into())
+    }
+}
+
+impl ToHost for rustc_apfloat::ieee::Single {
+    type HostFloat = f32;
+
+    fn to_host(self) -> Self::HostFloat {
+        f32::from_bits(self.to_bits().try_into().unwrap())
+    }
+}
+
+impl ToSoft for f32 {
+    type SoftFloat = rustc_apfloat::ieee::Single;
+
+    fn to_soft(self) -> Self::SoftFloat {
+        Float::from_bits(self.to_bits().into())
     }
 }
 
@@ -175,7 +248,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
     /// Helper function to get a `windows` constant as a `Scalar`.
     fn eval_windows(&self, module: &str, name: &str) -> Scalar<Provenance> {
-        self.eval_context_ref().eval_path_scalar(&["std", "sys", "windows", module, name])
+        self.eval_context_ref().eval_path_scalar(&["std", "sys", "pal", "windows", module, name])
     }
 
     /// Helper function to get a `windows` constant as a `u32`.
@@ -207,7 +280,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn windows_ty_layout(&self, name: &str) -> TyAndLayout<'tcx> {
         let this = self.eval_context_ref();
         let ty = this
-            .resolve_path(&["std", "sys", "windows", "c", name], Namespace::TypeNS)
+            .resolve_path(&["std", "sys", "pal", "windows", "c", name], Namespace::TypeNS)
             .ty(*this.tcx, ty::ParamEnv::reveal_all());
         this.layout_of(ty).unwrap()
     }
@@ -226,6 +299,21 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             }
         }
         bug!("No field named {} in type {}", name, base.layout().ty);
+    }
+
+    /// Search if `base` (which must be a struct or union type) contains the `name` field.
+    fn projectable_has_field<P: Projectable<'tcx, Provenance>>(
+        &self,
+        base: &P,
+        name: &str,
+    ) -> bool {
+        let adt = base.layout().ty.ty_adt_def().unwrap();
+        for field in adt.non_enum_variant().fields.iter() {
+            if field.name.as_str() == name {
+                return true;
+            }
+        }
+        false
     }
 
     /// Write an int of the appropriate size to `dest`. The target type may be signed or unsigned,
@@ -319,13 +407,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         f: ty::Instance<'tcx>,
         caller_abi: Abi,
         args: &[Immediate<Provenance>],
-        dest: Option<&PlaceTy<'tcx, Provenance>>,
+        dest: Option<&MPlaceTy<'tcx, Provenance>>,
         stack_pop: StackPopCleanup,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let param_env = ty::ParamEnv::reveal_all(); // in Miri this is always the param_env we use... and this.param_env is private.
         let callee_abi = f.ty(*this.tcx, param_env).fn_sig(*this.tcx).abi();
-        if this.machine.enforce_abi && callee_abi != caller_abi {
+        if callee_abi != caller_abi {
             throw_ub_format!(
                 "calling a function with ABI {} using caller ABI {}",
                 callee_abi.name(),
@@ -337,7 +425,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let mir = this.load_mir(f.def, None)?;
         let dest = match dest {
             Some(dest) => dest.clone(),
-            None => MPlaceTy::fake_alloc_zst(this.layout_of(mir.return_ty())?).into(),
+            None => MPlaceTy::fake_alloc_zst(this.layout_of(mir.return_ty())?),
         };
         this.push_stack_frame(f, mir, &dest, stack_pop)?;
 
@@ -349,7 +437,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 .ok_or_else(|| err_ub_format!("callee has fewer arguments than expected"))?;
             // Make the local live, and insert the initial value.
             this.storage_live(local)?;
-            let callee_arg = this.local_to_place(this.frame_idx(), local)?;
+            let callee_arg = this.local_to_place(local)?;
             this.write_immediate(*arg, &callee_arg)?;
         }
         // Initialize remaining locals.
@@ -494,7 +582,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     // `Variants::Multiple`.
                     match v.layout.variants {
                         Variants::Multiple { .. } => {
-                            // A multi-variant enum, or generator, or so.
+                            // A multi-variant enum, or coroutine, or so.
                             // Treat this like a union: without reading from memory,
                             // we cannot determine the variant we are in. Reading from
                             // memory would be subject to Stacked Borrows rules, leading
@@ -515,7 +603,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             fn visit_union(
                 &mut self,
                 _v: &MPlaceTy<'tcx, Provenance>,
-                _fields: NonZeroUsize,
+                _fields: NonZero<usize>,
             ) -> InterpResult<'tcx> {
                 bug!("we should have already handled unions in `visit_value`")
             }
@@ -539,9 +627,18 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         match reject_with {
             RejectOpWith::Abort => isolation_abort_error(op_name),
             RejectOpWith::WarningWithoutBacktrace => {
-                this.tcx
-                    .sess
-                    .warn(format!("{op_name} was made to return an error due to isolation"));
+                // This exists to reduce verbosity; make sure we emit the warning at most once per
+                // operation.
+                static EMITTED_WARNINGS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+                let mut emitted_warnings = EMITTED_WARNINGS.lock().unwrap();
+                if !emitted_warnings.contains(op_name) {
+                    // First time we are seeing this.
+                    emitted_warnings.insert(op_name.to_owned());
+                    this.tcx
+                        .dcx()
+                        .warn(format!("{op_name} was made to return an error due to isolation"));
+                }
                 Ok(())
             }
             RejectOpWith::Warning => {
@@ -567,10 +664,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     /// is part of the UNIX family. It panics showing a message with the `name` of the foreign function
     /// if this is not the case.
     fn assert_target_os_is_unix(&self, name: &str) {
-        assert!(
-            target_os_is_unix(self.eval_context_ref().tcx.sess.target.os.as_ref()),
-            "`{name}` is only available for supported UNIX family targets",
-        );
+        assert!(self.target_os_is_unix(), "`{name}` is only available for unix targets",);
+    }
+
+    fn target_os_is_unix(&self) -> bool {
+        self.eval_context_ref().tcx.sess.target.families.iter().any(|f| f == "unix")
     }
 
     /// Get last error variable as a place, lazily allocating thread-local storage for it if
@@ -699,27 +797,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     ) -> InterpResult<'tcx, MPlaceTy<'tcx, Provenance>> {
         let this = self.eval_context_ref();
         let ptr = this.read_pointer(op)?;
-
-        let mplace = MPlaceTy::from_aligned_ptr(ptr, layout);
-
-        this.check_mplace(&mplace)?;
-
-        Ok(mplace)
-    }
-
-    /// Deref' a pointer *without* checking that the place is dereferenceable.
-    fn deref_pointer_unchecked(
-        &self,
-        val: &ImmTy<'tcx, Provenance>,
-        layout: TyAndLayout<'tcx>,
-    ) -> InterpResult<'tcx, MPlaceTy<'tcx, Provenance>> {
-        let this = self.eval_context_ref();
-        let mut mplace = this.ref_to_mplace(val)?;
-
-        mplace.layout = layout;
-        mplace.align = layout.align.abi;
-
-        Ok(mplace)
+        Ok(this.ptr_to_mplace(ptr, layout))
     }
 
     /// Calculates the MPlaceTy given the offset and layout of an access on an operand
@@ -843,7 +921,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         loop {
             // FIXME: We are re-getting the allocation each time around the loop.
             // Would be nice if we could somehow "extend" an existing AllocRange.
-            let alloc = this.get_ptr_alloc(ptr.offset(len, this)?, size1, Align::ONE)?.unwrap(); // not a ZST, so we will get a result
+            let alloc = this.get_ptr_alloc(ptr.offset(len, this)?, size1)?.unwrap(); // not a ZST, so we will get a result
             let byte = alloc.read_integer(alloc_range(Size::ZERO, size1))?.to_u8()?;
             if byte == 0 {
                 break;
@@ -883,13 +961,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn read_wide_str(&self, mut ptr: Pointer<Option<Provenance>>) -> InterpResult<'tcx, Vec<u16>> {
         let this = self.eval_context_ref();
         let size2 = Size::from_bytes(2);
-        let align2 = Align::from_bytes(2).unwrap();
+        this.check_ptr_align(ptr, Align::from_bytes(2).unwrap())?;
 
         let mut wchars = Vec::new();
         loop {
             // FIXME: We are re-getting the allocation each time around the loop.
             // Would be nice if we could somehow "extend" an existing AllocRange.
-            let alloc = this.get_ptr_alloc(ptr, size2, align2)?.unwrap(); // not a ZST, so we will get a result
+            let alloc = this.get_ptr_alloc(ptr, size2)?.unwrap(); // not a ZST, so we will get a result
             let wchar = alloc.read_integer(alloc_range(Size::ZERO, size2))?.to_u16()?;
             if wchar == 0 {
                 break;
@@ -925,9 +1003,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         // Store the UTF-16 string.
         let size2 = Size::from_bytes(2);
         let this = self.eval_context_mut();
-        let mut alloc = this
-            .get_ptr_alloc_mut(ptr, size2 * string_length, Align::from_bytes(2).unwrap())?
-            .unwrap(); // not a ZST, so we will get a result
+        this.check_ptr_align(ptr, Align::from_bytes(2).unwrap())?;
+        let mut alloc = this.get_ptr_alloc_mut(ptr, size2 * string_length)?.unwrap(); // not a ZST, so we will get a result
         for (offset, wchar) in wide_str.iter().copied().chain(iter::once(0x0000)).enumerate() {
             let offset = u64::try_from(offset).unwrap();
             alloc.write_scalar(alloc_range(size2 * offset, size2), Scalar::from_u16(wchar))?;
@@ -937,7 +1014,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
     /// Check that the ABI is what we expect.
     fn check_abi<'a>(&self, abi: Abi, exp_abi: Abi) -> InterpResult<'a, ()> {
-        if self.eval_context_ref().machine.enforce_abi && abi != exp_abi {
+        if abi != exp_abi {
             throw_ub_format!(
                 "calling a function with ABI {} using caller ABI {}",
                 exp_abi.name(),
@@ -949,13 +1026,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
     fn frame_in_std(&self) -> bool {
         let this = self.eval_context_ref();
-        let Some(start_fn) = this.tcx.lang_items().start_fn() else {
-            // no_std situations
-            return false;
-        };
-        if this.active_thread_stack().is_empty() {
-            return false;
-        }
         let frame = this.frame();
         // Make an attempt to get at the instance of the function this is inlined from.
         let instance: Option<_> = try {
@@ -966,13 +1036,15 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         };
         // Fall back to the instance of the function itself.
         let instance = instance.unwrap_or(frame.instance);
-        // Now check if this is in the same crate as start_fn.
-        // As a special exception we also allow unit tests from
-        // <https://github.com/rust-lang/miri-test-libstd/tree/master/std_miri_test> to call these
-        // shims.
+        // Now check the crate it is in. We could try to be clever here and e.g. check if this is
+        // the same crate as `start_fn`, but that would not work for running std tests in Miri, so
+        // we'd need some more hacks anyway. So we just check the name of the crate. If someone
+        // calls their crate `std` then we'll just let them keep the pieces.
         let frame_crate = this.tcx.def_path(instance.def_id()).krate;
-        frame_crate == this.tcx.def_path(start_fn).krate
-            || this.tcx.crate_name(frame_crate).as_str() == "std_miri_test"
+        let crate_name = this.tcx.crate_name(frame_crate);
+        let crate_name = crate_name.as_str();
+        // On miri-test-libstd, the name of the crate is different.
+        crate_name == "std" || crate_name == "std_miri_test"
     }
 
     /// Handler that should be called when unsupported functionality is encountered.
@@ -1047,65 +1119,71 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
-    /// Converts `f` to integer type `dest_ty` after rounding with mode `round`.
+    /// Converts `src` from floating point to integer type `dest_ty`
+    /// after rounding with mode `round`.
     /// Returns `None` if `f` is NaN or out of range.
-    fn float_to_int_checked<F>(
+    fn float_to_int_checked(
         &self,
-        f: F,
+        src: &ImmTy<'tcx, Provenance>,
         cast_to: TyAndLayout<'tcx>,
         round: rustc_apfloat::Round,
-    ) -> Option<ImmTy<'tcx, Provenance>>
-    where
-        F: rustc_apfloat::Float + Into<Scalar<Provenance>>,
-    {
+    ) -> InterpResult<'tcx, Option<ImmTy<'tcx, Provenance>>> {
         let this = self.eval_context_ref();
 
-        let val = match cast_to.ty.kind() {
-            // Unsigned
-            ty::Uint(t) => {
-                let size = Integer::from_uint_ty(this, *t).size();
-                let res = f.to_u128_r(size.bits_usize(), round, &mut false);
-                if res.status.intersects(
-                    rustc_apfloat::Status::INVALID_OP
-                        | rustc_apfloat::Status::OVERFLOW
-                        | rustc_apfloat::Status::UNDERFLOW,
-                ) {
-                    // Floating point value is NaN (flagged with INVALID_OP) or outside the range
-                    // of values of the integer type (flagged with OVERFLOW or UNDERFLOW).
-                    return None;
-                } else {
-                    // Floating point value can be represented by the integer type after rounding.
-                    // The INEXACT flag is ignored on purpose to allow rounding.
-                    Scalar::from_uint(res.value, size)
+        fn float_to_int_inner<'tcx, F: rustc_apfloat::Float>(
+            this: &MiriInterpCx<'_, 'tcx>,
+            src: F,
+            cast_to: TyAndLayout<'tcx>,
+            round: rustc_apfloat::Round,
+        ) -> (Scalar<Provenance>, rustc_apfloat::Status) {
+            let int_size = cast_to.layout.size;
+            match cast_to.ty.kind() {
+                // Unsigned
+                ty::Uint(_) => {
+                    let res = src.to_u128_r(int_size.bits_usize(), round, &mut false);
+                    (Scalar::from_uint(res.value, int_size), res.status)
                 }
-            }
-            // Signed
-            ty::Int(t) => {
-                let size = Integer::from_int_ty(this, *t).size();
-                let res = f.to_i128_r(size.bits_usize(), round, &mut false);
-                if res.status.intersects(
-                    rustc_apfloat::Status::INVALID_OP
-                        | rustc_apfloat::Status::OVERFLOW
-                        | rustc_apfloat::Status::UNDERFLOW,
-                ) {
-                    // Floating point value is NaN (flagged with INVALID_OP) or outside the range
-                    // of values of the integer type (flagged with OVERFLOW or UNDERFLOW).
-                    return None;
-                } else {
-                    // Floating point value can be represented by the integer type after rounding.
-                    // The INEXACT flag is ignored on purpose to allow rounding.
-                    Scalar::from_int(res.value, size)
+                // Signed
+                ty::Int(_) => {
+                    let res = src.to_i128_r(int_size.bits_usize(), round, &mut false);
+                    (Scalar::from_int(res.value, int_size), res.status)
                 }
+                // Nothing else
+                _ =>
+                    span_bug!(
+                        this.cur_span(),
+                        "attempted float-to-int conversion with non-int output type {}",
+                        cast_to.ty,
+                    ),
             }
-            // Nothing else
-            _ =>
-                span_bug!(
-                    this.cur_span(),
-                    "attempted float-to-int conversion with non-int output type {}",
-                    cast_to.ty,
-                ),
+        }
+
+        let ty::Float(fty) = src.layout.ty.kind() else {
+            bug!("float_to_int_checked: non-float input type {}", src.layout.ty)
         };
-        Some(ImmTy::from_scalar(val, cast_to))
+
+        let (val, status) = match fty {
+            FloatTy::F16 => unimplemented!("f16_f128"),
+            FloatTy::F32 =>
+                float_to_int_inner::<Single>(this, src.to_scalar().to_f32()?, cast_to, round),
+            FloatTy::F64 =>
+                float_to_int_inner::<Double>(this, src.to_scalar().to_f64()?, cast_to, round),
+            FloatTy::F128 => unimplemented!("f16_f128"),
+        };
+
+        if status.intersects(
+            rustc_apfloat::Status::INVALID_OP
+                | rustc_apfloat::Status::OVERFLOW
+                | rustc_apfloat::Status::UNDERFLOW,
+        ) {
+            // Floating point value is NaN (flagged with INVALID_OP) or outside the range
+            // of values of the integer type (flagged with OVERFLOW or UNDERFLOW).
+            Ok(None)
+        } else {
+            // Floating point value can be represented by the integer type after rounding.
+            // The INEXACT flag is ignored on purpose to allow rounding.
+            Ok(Some(ImmTy::from_scalar(val, cast_to)))
+        }
     }
 
     /// Returns an integer type that is twice wide as `ty`
@@ -1124,6 +1202,24 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             ty::Int(IntTy::I64) => this.tcx.types.i128,
             _ => span_bug!(this.cur_span(), "unexpected type: {ty:?}"),
         }
+    }
+
+    /// Checks that target feature `target_feature` is enabled.
+    ///
+    /// If not enabled, emits an UB error that states that the feature is
+    /// required by `intrinsic`.
+    fn expect_target_feature_for_intrinsic(
+        &self,
+        intrinsic: Symbol,
+        target_feature: &str,
+    ) -> InterpResult<'tcx, ()> {
+        let this = self.eval_context_ref();
+        if !this.tcx.sess.unstable_target_features.contains(&Symbol::intern(target_feature)) {
+            throw_ub_format!(
+                "attempted to call intrinsic `{intrinsic}` that requires missing target feature {target_feature}"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1268,12 +1364,6 @@ pub fn get_local_crates(tcx: TyCtxt<'_>) -> Vec<CrateNum> {
         }
     }
     local_crates
-}
-
-/// Helper function used inside the shims of foreign functions to check that
-/// `target_os` is a supported UNIX OS.
-pub fn target_os_is_unix(target_os: &str) -> bool {
-    matches!(target_os, "linux" | "macos" | "freebsd" | "android")
 }
 
 pub(crate) fn bool_to_simd_element(b: bool, size: Size) -> Scalar<Provenance> {

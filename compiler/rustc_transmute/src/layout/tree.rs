@@ -81,7 +81,8 @@ where
         Self::Seq(vec![Self::uninit(); width_in_bytes])
     }
 
-    /// Remove all `Def` nodes, and all branches of the layout for which `f` produces false.
+    /// Remove all `Def` nodes, and all branches of the layout for which `f`
+    /// produces `true`.
     pub(crate) fn prune<F>(self, f: &F) -> Tree<!, R>
     where
         F: Fn(D) -> bool,
@@ -106,7 +107,7 @@ where
             Self::Byte(b) => Tree::Byte(b),
             Self::Ref(r) => Tree::Ref(r),
             Self::Def(d) => {
-                if !f(d) {
+                if f(d) {
                     Tree::uninhabited()
                 } else {
                     Tree::unit()
@@ -173,10 +174,10 @@ pub(crate) mod rustc {
     use crate::layout::rustc::{Def, Ref};
 
     use rustc_middle::ty::layout::LayoutError;
-    use rustc_middle::ty::util::Discr;
     use rustc_middle::ty::AdtDef;
     use rustc_middle::ty::GenericArgsRef;
     use rustc_middle::ty::ParamEnv;
+    use rustc_middle::ty::ScalarInt;
     use rustc_middle::ty::VariantDef;
     use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
     use rustc_span::ErrorGuaranteed;
@@ -185,8 +186,8 @@ pub(crate) mod rustc {
 
     #[derive(Debug, Copy, Clone)]
     pub(crate) enum Err {
-        /// The layout of the type is unspecified.
-        Unspecified,
+        /// The layout of the type is not yet supported.
+        NotYetSupported,
         /// This error will be surfaced elsewhere by rustc, so don't surface it.
         UnknownLayout,
         /// Overflow size
@@ -199,6 +200,7 @@ pub(crate) mod rustc {
             match err {
                 LayoutError::Unknown(..) | LayoutError::ReferencesError(..) => Self::UnknownLayout,
                 LayoutError::SizeOverflow(..) => Self::SizeOverflow,
+                LayoutError::Cycle(err) => Self::TypeError(*err),
                 err => unimplemented!("{:?}", err),
             }
         }
@@ -286,14 +288,14 @@ pub(crate) mod rustc {
                     if members.len() == 0 {
                         Ok(Tree::unit())
                     } else {
-                        Err(Err::Unspecified)
+                        Err(Err::NotYetSupported)
                     }
                 }
 
                 ty::Array(ty, len) => {
                     let len = len
                         .try_eval_target_usize(tcx, ParamEnv::reveal_all())
-                        .ok_or(Err::Unspecified)?;
+                        .ok_or(Err::NotYetSupported)?;
                     let elt = Tree::from_ty(*ty, tcx)?;
                     Ok(std::iter::repeat(elt)
                         .take(len as usize)
@@ -305,7 +307,7 @@ pub(crate) mod rustc {
 
                     // If the layout is ill-specified, halt.
                     if !(adt_def.repr().c() || adt_def.repr().int.is_some()) {
-                        return Err(Err::Unspecified);
+                        return Err(Err::NotYetSupported);
                     }
 
                     // Compute a summary of the type's layout.
@@ -329,14 +331,15 @@ pub(crate) mod rustc {
                             trace!(?adt_def, "treeifying enum");
                             let mut tree = Tree::uninhabited();
 
-                            for (idx, discr) in adt_def.discriminants(tcx) {
+                            for (idx, variant) in adt_def.variants().iter_enumerated() {
+                                let tag = tcx.tag_for_variant((ty, idx));
                                 tree = tree.or(Self::from_repr_c_variant(
                                     ty,
                                     *adt_def,
                                     args_ref,
                                     &layout_summary,
-                                    Some(discr),
-                                    adt_def.variant(idx),
+                                    tag,
+                                    variant,
                                     tcx,
                                 )?);
                             }
@@ -346,7 +349,7 @@ pub(crate) mod rustc {
                         AdtKind::Union => {
                             // is the layout well-defined?
                             if !adt_def.repr().c() {
-                                return Err(Err::Unspecified);
+                                return Err(Err::NotYetSupported);
                             }
 
                             let ty_layout = layout_of(tcx, ty)?;
@@ -370,16 +373,19 @@ pub(crate) mod rustc {
                 }
 
                 ty::Ref(lifetime, ty, mutability) => {
-                    let align = layout_of(tcx, *ty)?.align();
+                    let layout = layout_of(tcx, *ty)?;
+                    let align = layout.align();
+                    let size = layout.size();
                     Ok(Tree::Ref(Ref {
                         lifetime: *lifetime,
                         ty: *ty,
                         mutability: *mutability,
                         align,
+                        size,
                     }))
                 }
 
-                _ => Err(Err::Unspecified),
+                _ => Err(Err::NotYetSupported),
             }
         }
 
@@ -388,7 +394,7 @@ pub(crate) mod rustc {
             adt_def: AdtDef<'tcx>,
             args_ref: GenericArgsRef<'tcx>,
             layout_summary: &LayoutSummary,
-            discr: Option<Discr<'tcx>>,
+            tag: Option<ScalarInt>,
             variant_def: &'tcx VariantDef,
             tcx: TyCtxt<'tcx>,
         ) -> Result<Self, Err> {
@@ -397,9 +403,6 @@ pub(crate) mod rustc {
             let repr = adt_def.repr();
             let min_align = repr.align.unwrap_or(Align::ONE);
             let max_align = repr.pack.unwrap_or(Align::MAX);
-
-            let clamp =
-                |align: Align| align.clamp(min_align, max_align).bytes().try_into().unwrap();
 
             let variant_span = trace_span!(
                 "treeifying variant",
@@ -414,17 +417,12 @@ pub(crate) mod rustc {
             )
             .unwrap();
 
-            // The layout of the variant is prefixed by the discriminant, if any.
-            if let Some(discr) = discr {
-                trace!(?discr, "treeifying discriminant");
-                let discr_layout = alloc::Layout::from_size_align(
-                    layout_summary.discriminant_size,
-                    clamp(layout_summary.discriminant_align),
-                )
-                .unwrap();
-                trace!(?discr_layout, "computed discriminant layout");
-                variant_layout = variant_layout.extend(discr_layout).unwrap().0;
-                tree = tree.then(Self::from_discr(discr, tcx, layout_summary.discriminant_size));
+            // The layout of the variant is prefixed by the tag, if any.
+            if let Some(tag) = tag {
+                let tag_layout =
+                    alloc::Layout::from_size_align(tag.size().bytes_usize(), 1).unwrap();
+                tree = tree.then(Self::from_tag(tag, tcx));
+                variant_layout = variant_layout.extend(tag_layout).unwrap().0;
             }
 
             // Next come fields.
@@ -464,18 +462,19 @@ pub(crate) mod rustc {
             Ok(tree)
         }
 
-        pub fn from_discr(discr: Discr<'tcx>, tcx: TyCtxt<'tcx>, size: usize) -> Self {
+        pub fn from_tag(tag: ScalarInt, tcx: TyCtxt<'tcx>) -> Self {
             use rustc_target::abi::Endian;
-
+            let size = tag.size();
+            let bits = tag.to_bits(size).unwrap();
             let bytes: [u8; 16];
             let bytes = match tcx.data_layout.endian {
                 Endian::Little => {
-                    bytes = discr.val.to_le_bytes();
-                    &bytes[..size]
+                    bytes = bits.to_le_bytes();
+                    &bytes[..size.bytes_usize()]
                 }
                 Endian::Big => {
-                    bytes = discr.val.to_be_bytes();
-                    &bytes[bytes.len() - size..]
+                    bytes = bits.to_be_bytes();
+                    &bytes[bytes.len() - size.bytes_usize()..]
                 }
             };
             Self::Seq(bytes.iter().map(|&b| Self::from_bits(b)).collect())

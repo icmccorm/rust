@@ -1,17 +1,19 @@
 use crate::deriving::generic::ty::*;
 use crate::deriving::generic::*;
 use crate::errors;
+use core::ops::ControlFlow;
 use rustc_ast as ast;
-use rustc_ast::{attr, walk_list, EnumDef, VariantData};
+use rustc_ast::visit::walk_list;
+use rustc_ast::{attr, EnumDef, VariantData};
 use rustc_expand::base::{Annotatable, DummyResult, ExtCtxt};
 use rustc_span::symbol::Ident;
 use rustc_span::symbol::{kw, sym};
-use rustc_span::Span;
+use rustc_span::{ErrorGuaranteed, Span};
 use smallvec::SmallVec;
 use thin_vec::{thin_vec, ThinVec};
 
 pub fn expand_deriving_default(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     span: Span,
     mitem: &ast::MetaItem,
     item: &Annotatable,
@@ -41,7 +43,7 @@ pub fn expand_deriving_default(
                         default_struct_substructure(cx, trait_span, substr, fields)
                     }
                     StaticEnum(enum_def, _) => default_enum_substructure(cx, trait_span, enum_def),
-                    _ => cx.span_bug(trait_span, "method in `derive(Default)`"),
+                    _ => cx.dcx().span_bug(trait_span, "method in `derive(Default)`"),
                 }
             })),
         }],
@@ -52,7 +54,7 @@ pub fn expand_deriving_default(
 }
 
 fn default_struct_substructure(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     trait_span: Span,
     substr: &Substructure<'_>,
     summary: &StaticFields,
@@ -62,8 +64,8 @@ fn default_struct_substructure(
     let default_call = |span| cx.expr_call_global(span, default_ident.clone(), ThinVec::new());
 
     let expr = match summary {
-        Unnamed(_, false) => cx.expr_ident(trait_span, substr.type_ident),
-        Unnamed(fields, true) => {
+        Unnamed(_, IsTuple::No) => cx.expr_ident(trait_span, substr.type_ident),
+        Unnamed(fields, IsTuple::Yes) => {
             let exprs = fields.iter().map(|sp| default_call(*sp)).collect();
             cx.expr_call_ident(trait_span, substr.type_ident, exprs)
         }
@@ -79,29 +81,32 @@ fn default_struct_substructure(
 }
 
 fn default_enum_substructure(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     trait_span: Span,
     enum_def: &EnumDef,
 ) -> BlockOrExpr {
-    let expr = if let Ok(default_variant) = extract_default_variant(cx, enum_def, trait_span)
-        && let Ok(_) = validate_default_attribute(cx, default_variant)
-    {
-        // We now know there is exactly one unit variant with exactly one `#[default]` attribute.
-        cx.expr_path(cx.path(
-            default_variant.span,
-            vec![Ident::new(kw::SelfUpper, default_variant.span), default_variant.ident],
-        ))
-    } else {
-        DummyResult::raw_expr(trait_span, true)
+    let expr = match try {
+        let default_variant = extract_default_variant(cx, enum_def, trait_span)?;
+        validate_default_attribute(cx, default_variant)?;
+        default_variant
+    } {
+        Ok(default_variant) => {
+            // We now know there is exactly one unit variant with exactly one `#[default]` attribute.
+            cx.expr_path(cx.path(
+                default_variant.span,
+                vec![Ident::new(kw::SelfUpper, default_variant.span), default_variant.ident],
+            ))
+        }
+        Err(guar) => DummyResult::raw_expr(trait_span, Some(guar)),
     };
     BlockOrExpr::new_expr(expr)
 }
 
 fn extract_default_variant<'a>(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     enum_def: &'a EnumDef,
     trait_span: Span,
-) -> Result<&'a rustc_ast::Variant, ()> {
+) -> Result<&'a rustc_ast::Variant, ErrorGuaranteed> {
     let default_variants: SmallVec<[_; 1]> = enum_def
         .variants
         .iter()
@@ -120,71 +125,70 @@ fn extract_default_variant<'a>(
             let suggs = possible_defaults
                 .map(|v| errors::NoDefaultVariantSugg { span: v.span, ident: v.ident })
                 .collect();
-            cx.emit_err(errors::NoDefaultVariant { span: trait_span, suggs });
+            let guar = cx.dcx().emit_err(errors::NoDefaultVariant { span: trait_span, suggs });
 
-            return Err(());
+            return Err(guar);
         }
         [first, rest @ ..] => {
             let suggs = default_variants
                 .iter()
-                .map(|variant| {
-                    let spans = default_variants
+                .filter_map(|variant| {
+                    let keep = attr::find_by_name(&variant.attrs, kw::Default)?.span;
+                    let spans: Vec<Span> = default_variants
                         .iter()
-                        .filter_map(|v| {
-                            if v.span == variant.span {
-                                None
-                            } else {
-                                Some(attr::find_by_name(&v.attrs, kw::Default)?.span)
-                            }
+                        .flat_map(|v| {
+                            attr::filter_by_name(&v.attrs, kw::Default)
+                                .filter_map(|attr| (attr.span != keep).then_some(attr.span))
                         })
                         .collect();
-                    errors::MultipleDefaultsSugg { spans, ident: variant.ident }
+                    (!spans.is_empty())
+                        .then_some(errors::MultipleDefaultsSugg { spans, ident: variant.ident })
                 })
                 .collect();
-            cx.emit_err(errors::MultipleDefaults {
+            let guar = cx.dcx().emit_err(errors::MultipleDefaults {
                 span: trait_span,
                 first: first.span,
                 additional: rest.iter().map(|v| v.span).collect(),
                 suggs,
             });
-            return Err(());
+            return Err(guar);
         }
     };
 
     if !matches!(variant.data, VariantData::Unit(..)) {
-        cx.emit_err(errors::NonUnitDefault { span: variant.ident.span });
-        return Err(());
+        let guar = cx.dcx().emit_err(errors::NonUnitDefault { span: variant.ident.span });
+        return Err(guar);
     }
 
     if let Some(non_exhaustive_attr) = attr::find_by_name(&variant.attrs, sym::non_exhaustive) {
-        cx.emit_err(errors::NonExhaustiveDefault {
+        let guar = cx.dcx().emit_err(errors::NonExhaustiveDefault {
             span: variant.ident.span,
             non_exhaustive: non_exhaustive_attr.span,
         });
 
-        return Err(());
+        return Err(guar);
     }
 
     Ok(variant)
 }
 
 fn validate_default_attribute(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     default_variant: &rustc_ast::Variant,
-) -> Result<(), ()> {
+) -> Result<(), ErrorGuaranteed> {
     let attrs: SmallVec<[_; 1]> =
         attr::filter_by_name(&default_variant.attrs, kw::Default).collect();
 
     let attr = match attrs.as_slice() {
         [attr] => attr,
-        [] => cx.bug(
+        [] => cx.dcx().bug(
             "this method must only be called with a variant that has a `#[default]` attribute",
         ),
         [first, rest @ ..] => {
             let sugg = errors::MultipleDefaultAttrsSugg {
                 spans: rest.iter().map(|attr| attr.span).collect(),
             };
-            cx.emit_err(errors::MultipleDefaultAttrs {
+            let guar = cx.dcx().emit_err(errors::MultipleDefaultAttrs {
                 span: default_variant.ident.span,
                 first: first.span,
                 first_rest: rest[0].span,
@@ -193,13 +197,13 @@ fn validate_default_attribute(
                 sugg,
             });
 
-            return Err(());
+            return Err(guar);
         }
     };
     if !attr.is_word() {
-        cx.emit_err(errors::DefaultHasArg { span: attr.span });
+        let guar = cx.dcx().emit_err(errors::DefaultHasArg { span: attr.span });
 
-        return Err(());
+        return Err(guar);
     }
     Ok(())
 }
@@ -211,7 +215,7 @@ struct DetectNonVariantDefaultAttr<'a, 'b> {
 impl<'a, 'b> rustc_ast::visit::Visitor<'a> for DetectNonVariantDefaultAttr<'a, 'b> {
     fn visit_attribute(&mut self, attr: &'a rustc_ast::Attribute) {
         if attr.has_name(kw::Default) {
-            self.cx.emit_err(errors::NonUnitDefault { span: attr.span });
+            self.cx.dcx().emit_err(errors::NonUnitDefault { span: attr.span });
         }
 
         rustc_ast::visit::walk_attribute(self, attr);
@@ -228,20 +232,19 @@ impl<'a, 'b> rustc_ast::visit::Visitor<'a> for DetectNonVariantDefaultAttr<'a, '
 }
 
 fn has_a_default_variant(item: &Annotatable) -> bool {
-    struct HasDefaultAttrOnVariant {
-        found: bool,
-    }
+    struct HasDefaultAttrOnVariant;
 
     impl<'ast> rustc_ast::visit::Visitor<'ast> for HasDefaultAttrOnVariant {
-        fn visit_variant(&mut self, v: &'ast rustc_ast::Variant) {
+        type Result = ControlFlow<()>;
+        fn visit_variant(&mut self, v: &'ast rustc_ast::Variant) -> ControlFlow<()> {
             if v.attrs.iter().any(|attr| attr.has_name(kw::Default)) {
-                self.found = true;
+                ControlFlow::Break(())
+            } else {
+                // no need to subrecurse.
+                ControlFlow::Continue(())
             }
-            // no need to subrecurse.
         }
     }
 
-    let mut visitor = HasDefaultAttrOnVariant { found: false };
-    item.visit_with(&mut visitor);
-    visitor.found
+    item.visit_with(&mut HasDefaultAttrOnVariant).is_break()
 }

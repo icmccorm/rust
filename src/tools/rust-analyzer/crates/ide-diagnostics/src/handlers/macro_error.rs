@@ -20,7 +20,7 @@ pub(crate) fn macro_error(ctx: &DiagnosticsContext<'_>, d: &hir::MacroError) -> 
 pub(crate) fn macro_def_error(ctx: &DiagnosticsContext<'_>, d: &hir::MacroDefError) -> Diagnostic {
     // Use more accurate position if available.
     let display_range =
-        ctx.resolve_precise_location(&d.node.clone().map(|it| it.syntax_node_ptr()), d.name);
+        ctx.resolve_precise_location(&d.node.map(|it| it.syntax_node_ptr()), d.name);
     Diagnostic::new(
         DiagnosticCode::Ra("macro-def-error", Severity::Error),
         d.message.clone(),
@@ -60,9 +60,6 @@ macro_rules! compile_error { () => {} }
 
     #[test]
     fn eager_macro_concat() {
-        // FIXME: this is incorrectly handling `$crate`, resulting in a wrong diagnostic.
-        // See: https://github.com/rust-lang/rust-analyzer/issues/10300
-
         check_diagnostics(
             r#"
 //- /lib.rs crate:lib deps:core
@@ -80,7 +77,6 @@ macro_rules! m {
 
 fn f() {
     m!();
-  //^^^^ error: unresolved macro $crate::private::concat
 }
 
 //- /core.rs crate:core
@@ -103,7 +99,7 @@ pub macro panic {
 
         // FIXME: This is a false-positive, the file is actually linked in via
         // `include!` macro
-        config.disabled.insert("unlinked-file".to_string());
+        config.disabled.insert("unlinked-file".to_owned());
 
         check_diagnostics_with_config(
             config,
@@ -246,7 +242,7 @@ macro_rules! foo {
 
 fn f() {
     foo!();
-  //^^^ error: invalid macro definition: expected subtree
+  //^^^ error: macro definition has parse errors
 
 }
 "#,
@@ -267,5 +263,25 @@ fn f() {
 }
 "#,
         )
+    }
+
+    #[test]
+    fn include_does_not_break_diagnostics() {
+        let mut config = DiagnosticsConfig::test_sample();
+        config.disabled.insert("inactive-code".to_owned());
+        config.disabled.insert("unlinked-file".to_owned());
+        check_diagnostics_with_config(
+            config,
+            r#"
+//- minicore: include
+//- /lib.rs crate:lib
+include!("include-me.rs");
+//- /include-me.rs
+/// long doc that pushes the diagnostic range beyond the first file's text length
+  #[err]
+//^^^^^^error: unresolved macro `err`
+mod prim_never {}
+"#,
+        );
     }
 }

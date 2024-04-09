@@ -1,4 +1,4 @@
-// compile-flags: -C opt-level=0 -C no-prepopulate-passes
+//@ compile-flags: -C opt-level=0 -C no-prepopulate-passes
 
 // This test checks that arguments/returns in opt-level=0 builds,
 // while lacking attributes used for optimization, still have ABI-affecting attributes.
@@ -42,7 +42,7 @@ pub fn borrow_call(x: &i32, f: fn(&i32) -> &i32) -> &i32 {
   f(x)
 }
 
-// CHECK: void @struct_(ptr sret(%S) align 4{{( %_0)?}}, ptr align 4 %x)
+// CHECK: void @struct_(ptr sret([32 x i8]) align 4{{( %_0)?}}, ptr align 4 %x)
 #[no_mangle]
 pub fn struct_(x: S) -> S {
   x
@@ -51,11 +51,11 @@ pub fn struct_(x: S) -> S {
 // CHECK-LABEL: @struct_call
 #[no_mangle]
 pub fn struct_call(x: S, f: fn(S) -> S) -> S {
-  // CHECK: call void %f(ptr sret(%S) align 4{{( %_0)?}}, ptr align 4 %{{.+}})
+  // CHECK: call void %f(ptr sret([32 x i8]) align 4{{( %_0)?}}, ptr align 4 %{{.+}})
   f(x)
 }
 
-// CHECK: { i8, i8 } @enum_(i1 zeroext %x.0, i8 %x.1)
+// CHECK: { i1, i8 } @enum_(i1 zeroext %x.0, i8 %x.1)
 #[no_mangle]
 pub fn enum_(x: Option<u8>) -> Option<u8> {
   x
@@ -64,6 +64,6 @@ pub fn enum_(x: Option<u8>) -> Option<u8> {
 // CHECK-LABEL: @enum_call
 #[no_mangle]
 pub fn enum_call(x: Option<u8>, f: fn(Option<u8>) -> Option<u8>) -> Option<u8> {
-  // CHECK: call { i8, i8 } %f(i1 zeroext %x.0, i8 %x.1)
+  // CHECK: call { i1, i8 } %f(i1 zeroext %x.0, i8 %x.1)
   f(x)
 }

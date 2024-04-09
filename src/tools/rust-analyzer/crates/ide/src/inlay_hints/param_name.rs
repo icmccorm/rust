@@ -47,7 +47,7 @@ pub(super) fn hints(
             if let Some(name) = param {
                 if let hir::CallableKind::Function(f) = callable.kind() {
                     // assert the file is cached so we can map out of macros
-                    if let Some(_) = sema.source(f) {
+                    if sema.source(f).is_some() {
                         linked_location = sema.original_range_opt(name.syntax());
                     }
                 }
@@ -57,7 +57,6 @@ pub(super) fn hints(
             let label =
                 InlayHintLabel::simple(format!("{param_name}{colon}"), None, linked_location);
             InlayHint {
-                needs_resolve: label.needs_resolve(),
                 range,
                 kind: InlayKind::Parameter,
                 label,

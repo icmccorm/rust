@@ -4,11 +4,10 @@ use clippy_utils::source::snippet_with_applicability;
 use rustc_errors::Applicability;
 use rustc_hir::{BinOpKind, Expr, ExprKind};
 use rustc_lint::LateContext;
-use rustc_span::source_map::Span;
+use rustc_span::Span;
 
 use super::DOUBLE_COMPARISONS;
 
-#[expect(clippy::similar_names)]
 pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, op: BinOpKind, lhs: &'tcx Expr<'_>, rhs: &'tcx Expr<'_>, span: Span) {
     let (lkind, llhs, lrhs, rkind, rlhs, rrhs) = match (&lhs.kind, &rhs.kind) {
         (ExprKind::Binary(lb, llhs, lrhs), ExprKind::Binary(rb, rlhs, rrhs)) => {

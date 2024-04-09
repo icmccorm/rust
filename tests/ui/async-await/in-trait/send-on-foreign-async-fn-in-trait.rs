@@ -1,7 +1,5 @@
-// aux-build:foreign-async-fn.rs
-// edition:2021
-
-#![feature(async_fn_in_trait)]
+//@ aux-build:foreign-async-fn.rs
+//@ edition:2021
 
 extern crate foreign_async_fn;
 use foreign_async_fn::Foo;

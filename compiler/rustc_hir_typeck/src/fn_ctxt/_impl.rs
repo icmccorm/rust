@@ -2,21 +2,22 @@ use crate::callee::{self, DeferredCallResolution};
 use crate::errors::CtorIsPrivate;
 use crate::method::{self, MethodCallee, SelfSource};
 use crate::rvalue_scopes;
-use crate::{BreakableCtxt, Diverges, Expectation, FnCtxt, RawTy};
+use crate::{BreakableCtxt, Diverges, Expectation, FnCtxt, LoweredTy};
 use rustc_data_structures::captures::Captures;
 use rustc_data_structures::fx::FxHashSet;
-use rustc_errors::{Applicability, Diagnostic, ErrorGuaranteed, MultiSpan, StashKey};
+use rustc_errors::{Applicability, Diag, ErrorGuaranteed, MultiSpan, StashKey};
 use rustc_hir as hir;
 use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::lang_items::LangItem;
 use rustc_hir::{ExprKind, GenericArg, Node, QPath};
-use rustc_hir_analysis::astconv::generics::{
-    check_generic_arg_count_for_call, create_args_for_parent_generic_args,
+use rustc_hir_analysis::hir_ty_lowering::errors::GenericsArgsErrExtend;
+use rustc_hir_analysis::hir_ty_lowering::generics::{
+    check_generic_arg_count_for_call, lower_generic_args,
 };
-use rustc_hir_analysis::astconv::{
-    AstConv, CreateSubstsForGenericArgsCtxt, ExplicitLateBound, GenericArgCountMismatch,
-    GenericArgCountResult, IsMethodCall, PathSeg,
+use rustc_hir_analysis::hir_ty_lowering::{
+    ExplicitLateBound, GenericArgCountMismatch, GenericArgCountResult, GenericArgsLowerer,
+    GenericPathSegment, HirTyLowerer, IsMethodCall,
 };
 use rustc_infer::infer::canonical::{Canonical, OriginalQueryValues, QueryResponse};
 use rustc_infer::infer::error_reporting::TypeAnnotationNeeded::E0282;
@@ -26,7 +27,7 @@ use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::fold::TypeFoldable;
 use rustc_middle::ty::visit::{TypeVisitable, TypeVisitableExt};
 use rustc_middle::ty::{
-    self, AdtKind, CanonicalUserType, GenericParamDefKind, Ty, TyCtxt, UserType,
+    self, AdtKind, CanonicalUserType, GenericParamDefKind, IsIdentity, Ty, TyCtxt, UserType,
 };
 use rustc_middle::ty::{GenericArgKind, GenericArgsRef, UserArgs, UserSelfTy};
 use rustc_session::lint;
@@ -62,7 +63,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 debug!("warn_if_unreachable: id={:?} span={:?} kind={}", id, span, kind);
 
                 let msg = format!("unreachable {kind}");
-                self.tcx().struct_span_lint_hir(
+                self.tcx().node_span_lint(
                     lint::builtin::UNREACHABLE_CODE,
                     id,
                     span,
@@ -72,7 +73,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             orig_span,
                             custom_note
                                 .unwrap_or("any code following this expression is unreachable"),
-                        )
+                        );
                     },
                 )
             }
@@ -83,7 +84,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// version (resolve_vars_if_possible), this version will
     /// also select obligations if it seems useful, in an effort
     /// to get more type information.
-    // FIXME(-Ztrait-solver=next): A lot of the calls to this method should
+    // FIXME(-Znext-solver): A lot of the calls to this method should
     // probably be `try_structurally_resolve_type` or `structurally_resolve_type` instead.
     #[instrument(skip(self), level = "debug", ret)]
     pub(in super::super) fn resolve_vars_with_obligations(&self, mut ty: Ty<'tcx>) -> Ty<'tcx> {
@@ -138,15 +139,36 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     #[inline]
     pub fn write_ty(&self, id: hir::HirId, ty: Ty<'tcx>) {
         debug!("write_ty({:?}, {:?}) in fcx {}", id, self.resolve_vars_if_possible(ty), self.tag());
-        self.typeck_results.borrow_mut().node_types_mut().insert(id, ty);
+        let mut typeck = self.typeck_results.borrow_mut();
+        let mut node_ty = typeck.node_types_mut();
+        if let Some(ty) = node_ty.get(id)
+            && let Err(e) = ty.error_reported()
+        {
+            // Do not overwrite nodes that were already marked as `{type error}`. This allows us to
+            // silence unnecessary errors from obligations that were set earlier than a type error
+            // was produced, but that is overwritten by later analysis. This happens in particular
+            // for `Sized` obligations introduced in gather_locals. (#117846)
+            self.set_tainted_by_errors(e);
+            return;
+        }
+
+        node_ty.insert(id, ty);
 
         if let Err(e) = ty.error_reported() {
             self.set_tainted_by_errors(e);
         }
     }
 
-    pub fn write_field_index(&self, hir_id: hir::HirId, index: FieldIdx) {
+    pub fn write_field_index(
+        &self,
+        hir_id: hir::HirId,
+        index: FieldIdx,
+        nested_fields: Vec<(Ty<'tcx>, FieldIdx)>,
+    ) {
         self.typeck_results.borrow_mut().field_indices_mut().insert(hir_id, index);
+        if !nested_fields.is_empty() {
+            self.typeck_results.borrow_mut().nested_fields_mut().insert(hir_id, nested_fields);
+        }
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -159,7 +181,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub fn write_method_call(&self, hir_id: hir::HirId, method: MethodCallee<'tcx>) {
+    pub fn write_method_call_and_enforce_effects(
+        &self,
+        hir_id: hir::HirId,
+        span: Span,
+        method: MethodCallee<'tcx>,
+    ) {
+        self.enforce_context_effects(span, method.def_id, method.args);
         self.write_resolution(hir_id, Ok((DefKind::AssocFn, method.def_id)));
         self.write_args(hir_id, method.args);
     }
@@ -173,8 +201,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     /// Given the args that we just converted from the HIR, try to
-    /// canonicalize them and store them as user-given substitutions
-    /// (i.e., substitutions that must be respected by the NLL check).
+    /// canonicalize them and store them as user-given parameters
+    /// (i.e., parameters that must be respected by the NLL check).
     ///
     /// This should be invoked **before any unifications have
     /// occurred**, so that annotations like `Vec<_>` are preserved
@@ -207,6 +235,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ) {
         debug!("fcx {}", self.tag());
 
+        // FIXME: is_identity being on `UserType` and not `Canonical<UserType>` is awkward
         if !canonical_user_type_annotation.is_identity() {
             self.typeck_results
                 .borrow_mut()
@@ -270,7 +299,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     // FIXME: currently we never try to compose autoderefs
                     // and ReifyFnPointer/UnsafeFnPointer, but we could.
                     _ => {
-                        self.tcx.sess.delay_span_bug(
+                        self.dcx().span_delayed_bug(
                             expr.span,
                             format!(
                                 "while adjusting {:?}, can't compose {:?} and {:?}",
@@ -366,30 +395,27 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
     }
 
-    pub fn handle_raw_ty(&self, span: Span, ty: Ty<'tcx>) -> RawTy<'tcx> {
-        RawTy { raw: ty, normalized: self.normalize(span, ty) }
+    pub fn lower_ty(&self, hir_ty: &hir::Ty<'tcx>) -> LoweredTy<'tcx> {
+        let ty = self.lowerer().lower_ty(hir_ty);
+        self.register_wf_obligation(ty.into(), hir_ty.span, traits::WellFormed(None));
+        LoweredTy::from_raw(self, hir_ty.span, ty)
     }
 
-    pub fn to_ty(&self, ast_t: &hir::Ty<'_>) -> RawTy<'tcx> {
-        let t = self.astconv().ast_ty_to_ty(ast_t);
-        self.register_wf_obligation(t.into(), ast_t.span, traits::WellFormed(None));
-        self.handle_raw_ty(ast_t.span, t)
-    }
-
-    pub fn to_ty_saving_user_provided_ty(&self, ast_ty: &hir::Ty<'_>) -> Ty<'tcx> {
-        let ty = self.to_ty(ast_ty);
-        debug!("to_ty_saving_user_provided_ty: ty={:?}", ty);
+    #[instrument(level = "debug", skip_all)]
+    pub fn lower_ty_saving_user_provided_ty(&self, hir_ty: &hir::Ty<'tcx>) -> Ty<'tcx> {
+        let ty = self.lower_ty(hir_ty);
+        debug!(?ty);
 
         if Self::can_contain_user_lifetime_bounds(ty.raw) {
             let c_ty = self.canonicalize_response(UserType::Ty(ty.raw));
-            debug!("to_ty_saving_user_provided_ty: c_ty={:?}", c_ty);
-            self.typeck_results.borrow_mut().user_provided_types_mut().insert(ast_ty.hir_id, c_ty);
+            debug!(?c_ty);
+            self.typeck_results.borrow_mut().user_provided_types_mut().insert(hir_ty.hir_id, c_ty);
         }
 
         ty.normalized
     }
 
-    pub(super) fn user_args_for_adt(ty: RawTy<'tcx>) -> UserArgs<'tcx> {
+    pub(super) fn user_args_for_adt(ty: LoweredTy<'tcx>) -> UserArgs<'tcx> {
         match (ty.raw.kind(), ty.normalized.kind()) {
             (ty::Adt(_, args), _) => UserArgs { args, user_self_ty: None },
             (_, ty::Adt(adt, args)) => UserArgs {
@@ -400,9 +426,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
     }
 
-    pub fn array_length_to_const(&self, length: &hir::ArrayLen) -> ty::Const<'tcx> {
+    pub fn lower_array_length(&self, length: &hir::ArrayLen) -> ty::Const<'tcx> {
         match length {
-            &hir::ArrayLen::Infer(_, span) => self.ct_infer(self.tcx.types.usize, None, span),
+            hir::ArrayLen::Infer(inf) => self.ct_infer(self.tcx.types.usize, None, inf.span),
             hir::ArrayLen::Body(anon_const) => {
                 let span = self.tcx.def_span(anon_const.def_id);
                 let c = ty::Const::from_anon_const(self.tcx, anon_const.def_id);
@@ -412,20 +438,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
     }
 
-    pub fn const_arg_to_const(
-        &self,
-        ast_c: &hir::AnonConst,
-        param_def_id: DefId,
-    ) -> ty::Const<'tcx> {
-        let did = ast_c.def_id;
+    pub fn lower_const_arg(&self, hir_ct: &hir::AnonConst, param_def_id: DefId) -> ty::Const<'tcx> {
+        let did = hir_ct.def_id;
         self.tcx.feed_anon_const_type(did, self.tcx.type_of(param_def_id));
-        let c = ty::Const::from_anon_const(self.tcx, did);
+        let ct = ty::Const::from_anon_const(self.tcx, did);
         self.register_wf_obligation(
-            c.into(),
-            self.tcx.hir().span(ast_c.hir_id),
+            ct.into(),
+            self.tcx.hir().span(hir_ct.hir_id),
             ObligationCauseCode::WellFormed(None),
         );
-        c
+        ct
     }
 
     // If the type given by the user has free regions, save it for later, since
@@ -439,13 +461,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     where
         T: TypeVisitable<TyCtxt<'tcx>>,
     {
-        t.has_free_regions() || t.has_projections() || t.has_infer_types()
+        t.has_free_regions() || t.has_aliases() || t.has_infer_types()
     }
 
     pub fn node_ty(&self, id: hir::HirId) -> Ty<'tcx> {
         match self.typeck_results.borrow().node_types().get(id) {
             Some(&t) => t,
-            None if let Some(e) = self.tainted_by_errors() => Ty::new_error(self.tcx,e),
+            None if let Some(e) = self.tainted_by_errors() => Ty::new_error(self.tcx, e),
             None => {
                 bug!(
                     "no type for node {} in fcx {}",
@@ -459,7 +481,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub fn node_ty_opt(&self, id: hir::HirId) -> Option<Ty<'tcx>> {
         match self.typeck_results.borrow().node_types().get(id) {
             Some(&t) => Some(t),
-            None if let Some(e) = self.tainted_by_errors() => Some(Ty::new_error(self.tcx,e)),
+            None if let Some(e) = self.tainted_by_errors() => Some(Ty::new_error(self.tcx, e)),
             None => None,
         }
     }
@@ -504,45 +526,45 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     pub(in super::super) fn resolve_rvalue_scopes(&self, def_id: DefId) {
         let scope_tree = self.tcx.region_scope_tree(def_id);
-        let rvalue_scopes = { rvalue_scopes::resolve_rvalue_scopes(self, &scope_tree, def_id) };
-        let mut typeck_results = self.inh.typeck_results.borrow_mut();
+        let rvalue_scopes = { rvalue_scopes::resolve_rvalue_scopes(self, scope_tree, def_id) };
+        let mut typeck_results = self.typeck_results.borrow_mut();
         typeck_results.rvalue_scopes = rvalue_scopes;
     }
 
-    /// Unify the inference variables corresponding to generator witnesses, and save all the
+    /// Unify the inference variables corresponding to coroutine witnesses, and save all the
     /// predicates that were stalled on those inference variables.
     ///
-    /// This process allows to conservatively save all predicates that do depend on the generator
-    /// interior types, for later processing by `check_generator_obligations`.
+    /// This process allows to conservatively save all predicates that do depend on the coroutine
+    /// interior types, for later processing by `check_coroutine_obligations`.
     ///
     /// We must not attempt to select obligations after this method has run, or risk query cycle
     /// ICE.
     #[instrument(level = "debug", skip(self))]
-    pub(in super::super) fn resolve_generator_interiors(&self, def_id: DefId) {
+    pub(in super::super) fn resolve_coroutine_interiors(&self) {
         // Try selecting all obligations that are not blocked on inference variables.
-        // Once we start unifying generator witnesses, trying to select obligations on them will
+        // Once we start unifying coroutine witnesses, trying to select obligations on them will
         // trigger query cycle ICEs, as doing so requires MIR.
         self.select_obligations_where_possible(|_| {});
 
-        let generators = std::mem::take(&mut *self.deferred_generator_interiors.borrow_mut());
-        debug!(?generators);
+        let coroutines = std::mem::take(&mut *self.deferred_coroutine_interiors.borrow_mut());
+        debug!(?coroutines);
 
-        for &(expr_def_id, body_id, interior, _) in generators.iter() {
+        for &(expr_def_id, body_id, interior) in coroutines.iter() {
             debug!(?expr_def_id);
 
-            // Create the `GeneratorWitness` type that we will unify with `interior`.
+            // Create the `CoroutineWitness` type that we will unify with `interior`.
             let args = ty::GenericArgs::identity_for_item(
                 self.tcx,
                 self.tcx.typeck_root_def_id(expr_def_id.to_def_id()),
             );
-            let witness = Ty::new_generator_witness(self.tcx, expr_def_id.to_def_id(), args);
+            let witness = Ty::new_coroutine_witness(self.tcx, expr_def_id.to_def_id(), args);
 
             // Unify `interior` with `witness` and collect all the resulting obligations.
             let span = self.tcx.hir().body(body_id).value.span;
             let ok = self
                 .at(&self.misc(span), self.param_env)
                 .eq(DefineOpaqueTypes::No, interior, witness)
-                .expect("Failed to unify generator interior type");
+                .expect("Failed to unify coroutine interior type");
             let mut obligations = ok.obligations;
 
             // Also collect the obligations that were unstalled by this unification.
@@ -553,7 +575,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             debug!(?obligations);
             self.typeck_results
                 .borrow_mut()
-                .generator_interior_predicates
+                .coroutine_interior_predicates
                 .insert(expr_def_id, obligations);
         }
     }
@@ -564,7 +586,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         if !errors.is_empty() {
             self.adjust_fulfillment_errors_for_expr_obligation(&mut errors);
-            self.err_ctxt().report_fulfillment_errors(&errors);
+            let errors_causecode = errors
+                .iter()
+                .map(|e| (e.obligation.cause.span, e.root_obligation.cause.code().clone()))
+                .collect::<Vec<_>>();
+            self.err_ctxt().report_fulfillment_errors(errors);
+            self.collect_unused_stmts_for_coerce_return_ty(errors_causecode);
         }
     }
 
@@ -577,7 +604,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         if !result.is_empty() {
             mutate_fulfillment_errors(&mut result);
             self.adjust_fulfillment_errors_for_expr_obligation(&mut result);
-            self.err_ctxt().report_fulfillment_errors(&result);
+            self.err_ctxt().report_fulfillment_errors(result);
         }
     }
 
@@ -645,20 +672,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 | ty::PredicateKind::Clause(ty::ClauseKind::TypeOutlives(..))
                 | ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(..))
                 | ty::PredicateKind::ObjectSafe(..)
+                | ty::PredicateKind::NormalizesTo(..)
                 | ty::PredicateKind::AliasRelate(..)
                 | ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(..))
                 | ty::PredicateKind::ConstEquate(..)
-                // N.B., this predicate is created by breaking down a
-                // `ClosureType: FnFoo()` predicate, where
-                // `ClosureType` represents some `Closure`. It can't
-                // possibly be referring to the current closure,
-                // because we haven't produced the `Closure` for
-                // this closure yet; this is exactly why the other
-                // code is looking for a self type of an unresolved
-                // inference variable.
-                | ty::PredicateKind::ClosureKind(..)
-                | ty::PredicateKind::Ambiguous
-                 => None,
+                | ty::PredicateKind::Ambiguous => None,
             },
         )
     }
@@ -713,7 +731,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 if let ty::GenericArgKind::Type(ty) = ty.unpack()
                     && let ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }) = *ty.kind()
                     && let Some(def_id) = def_id.as_local()
-                    && self.opaque_type_origin(def_id).is_some() {
+                    && self.opaque_type_origin(def_id).is_some()
+                {
                     return None;
                 }
             }
@@ -733,7 +752,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     return Err(TypeError::Mismatch);
                 }
 
-                // Record all the argument types, with the substitutions
+                // Record all the argument types, with the args
                 // produced from the above subtyping unification.
                 Ok(Some(formal_args.iter().map(|&ty| self.resolve_vars_if_possible(ty)).collect()))
             })
@@ -747,7 +766,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         lang_item: hir::LangItem,
         span: Span,
         hir_id: hir::HirId,
-        expr_hir_id: Option<hir::HirId>,
     ) -> (Res, Ty<'tcx>) {
         let def_id = self.tcx.require_lang_item(lang_item, Some(span));
         let def_kind = self.tcx.def_kind(def_id);
@@ -760,11 +778,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let args = self.fresh_args_for_item(span, def_id);
         let ty = item_ty.instantiate(self.tcx, args);
 
+        self.write_args(hir_id, args);
         self.write_resolution(hir_id, Ok((def_kind, def_id)));
 
         let code = match lang_item {
             hir::LangItem::IntoFutureIntoFuture => {
-                Some(ObligationCauseCode::AwaitableExpr(expr_hir_id))
+                if let hir::Node::Expr(into_future_call) = self.tcx.parent_hir_node(hir_id)
+                    && let hir::ExprKind::Call(_, [arg0]) = &into_future_call.kind
+                {
+                    Some(ObligationCauseCode::AwaitableExpr(arg0.hir_id))
+                } else {
+                    None
+                }
             }
             hir::LangItem::IteratorNext | hir::LangItem::IntoIterIntoIter => {
                 Some(ObligationCauseCode::ForLoopIterator)
@@ -790,21 +815,22 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         qpath: &'tcx QPath<'tcx>,
         hir_id: hir::HirId,
         span: Span,
-    ) -> (Res, Option<RawTy<'tcx>>, &'tcx [hir::PathSegment<'tcx>]) {
+        args: Option<&'tcx [hir::Expr<'tcx>]>,
+    ) -> (Res, Option<LoweredTy<'tcx>>, &'tcx [hir::PathSegment<'tcx>]) {
         debug!(
             "resolve_ty_and_res_fully_qualified_call: qpath={:?} hir_id={:?} span={:?}",
             qpath, hir_id, span
         );
         let (ty, qself, item_segment) = match *qpath {
-            QPath::Resolved(ref opt_qself, ref path) => {
+            QPath::Resolved(ref opt_qself, path) => {
                 return (
                     path.res,
-                    opt_qself.as_ref().map(|qself| self.to_ty(qself)),
+                    opt_qself.as_ref().map(|qself| self.lower_ty(qself)),
                     path.segments,
                 );
             }
             QPath::TypeRelative(ref qself, ref segment) => {
-                // Don't use `self.to_ty`, since this will register a WF obligation.
+                // Don't use `self.lower_ty`, since this will register a WF obligation.
                 // If we're trying to call a nonexistent method on a trait
                 // (e.g. `MyTrait::missing_method`), then resolution will
                 // give us a `QPath::TypeRelative` with a trait object as
@@ -813,8 +839,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // to be object-safe.
                 // We manually call `register_wf_obligation` in the success path
                 // below.
-                let ty = self.astconv().ast_ty_to_ty_in_path(qself);
-                (self.handle_raw_ty(span, ty), qself, segment)
+                let ty = self.lowerer().lower_ty_in_path(qself);
+                (LoweredTy::from_raw(self, span, ty), qself, segment)
             }
             QPath::LangItem(..) => {
                 bug!("`resolve_ty_and_res_fully_qualified_call` called on `LangItem`")
@@ -831,18 +857,21 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let item_name = item_segment.ident;
         let result = self
             .resolve_fully_qualified_call(span, item_name, ty.normalized, qself.span, hir_id)
-            .and_then(|r| {
+            .map(|r| {
                 // lint bare trait if the method is found in the trait
-                if span.edition().at_least_rust_2021() && let Some(mut diag) = self.tcx.sess.diagnostic().steal_diagnostic(qself.span, StashKey::TraitMissingMethod) {
-                    diag.emit();
+                if span.edition().at_least_rust_2021() {
+                    self.dcx().try_steal_modify_and_emit_err(
+                        qself.span,
+                        StashKey::TraitMissingMethod,
+                        |_err| {},
+                    );
                 }
-                Ok(r)
+                r
             })
             .or_else(|error| {
                 let guar = self
-                    .tcx
-                    .sess
-                    .delay_span_bug(span, "method resolution should've emitted an error");
+                    .dcx()
+                    .span_delayed_bug(span, "method resolution should've emitted an error");
                 let result = match error {
                     method::MethodError::PrivateMatch(kind, def_id, _) => Ok((kind, def_id)),
                     _ => Err(guar),
@@ -862,24 +891,25 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     );
                 }
 
-                // emit or cancel the diagnostic for bare traits
-                if span.edition().at_least_rust_2021() && let Some(mut diag) = self.tcx.sess.diagnostic().steal_diagnostic(qself.span, StashKey::TraitMissingMethod) {
-                    if trait_missing_method {
-                        // cancel the diag for bare traits when meeting `MyTrait::missing_method`
-                        diag.cancel();
-                    } else {
-                        diag.emit();
-                    }
+                // Emit the diagnostic for bare traits. (We used to cancel for slightly better
+                // error messages, but cancelling stashed diagnostics is no longer allowed because
+                // it causes problems when tracking whether errors have actually occurred.)
+                if span.edition().at_least_rust_2021() {
+                    self.dcx().try_steal_modify_and_emit_err(
+                        qself.span,
+                        StashKey::TraitMissingMethod,
+                        |_err| {},
+                    );
                 }
 
                 if item_name.name != kw::Empty {
-                    if let Some(mut e) = self.report_method_error(
+                    if let Some(e) = self.report_method_error(
                         span,
                         ty.normalized,
                         item_name,
                         SelfSource::QPath(qself),
                         error,
-                        None,
+                        args,
                         Expectation::NoExpectation,
                         trait_missing_method && span.edition().at_least_rust_2021(), // emits missing method for trait only after edition 2021
                     ) {
@@ -943,18 +973,42 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 owner_id,
                 ..
             }) => Some((hir::HirId::make_owner(owner_id.def_id), &sig.decl, ident, false)),
-            Node::Expr(&hir::Expr { hir_id, kind: hir::ExprKind::Closure(..), .. })
-                if let Some(Node::Item(&hir::Item {
+            Node::Expr(&hir::Expr {
+                hir_id,
+                kind:
+                    hir::ExprKind::Closure(hir::Closure {
+                        kind: hir::ClosureKind::Coroutine(..), ..
+                    }),
+                ..
+            }) => {
+                let (ident, sig, owner_id) = match self.tcx.parent_hir_node(hir_id) {
+                    Node::Item(&hir::Item {
+                        ident,
+                        kind: hir::ItemKind::Fn(ref sig, ..),
+                        owner_id,
+                        ..
+                    }) => (ident, sig, owner_id),
+                    Node::TraitItem(&hir::TraitItem {
+                        ident,
+                        kind: hir::TraitItemKind::Fn(ref sig, ..),
+                        owner_id,
+                        ..
+                    }) => (ident, sig, owner_id),
+                    Node::ImplItem(&hir::ImplItem {
+                        ident,
+                        kind: hir::ImplItemKind::Fn(ref sig, ..),
+                        owner_id,
+                        ..
+                    }) => (ident, sig, owner_id),
+                    _ => return None,
+                };
+                Some((
+                    hir::HirId::make_owner(owner_id.def_id),
+                    &sig.decl,
                     ident,
-                    kind: hir::ItemKind::Fn(ref sig, ..),
-                    owner_id,
-                    ..
-                })) = self.tcx.hir().find_parent(hir_id) => Some((
-                hir::HirId::make_owner(owner_id.def_id),
-                &sig.decl,
-                ident,
-                ident.name != sym::main,
-            )),
+                    ident.name != sym::main,
+                ))
+            }
             _ => None,
         }
     }
@@ -968,7 +1022,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Get enclosing Fn, if it is a function or a trait method, unless there's a `loop` or
         // `while` before reaching it, as block tail returns are not available in them.
         self.tcx.hir().get_return_block(blk_id).and_then(|blk_id| {
-            let parent = self.tcx.hir().get(blk_id);
+            let parent = self.tcx.hir_node(blk_id);
             self.get_node_fn_decl(parent)
                 .map(|(fn_id, fn_decl, _, is_main)| (fn_id, fn_decl, is_main))
         })
@@ -976,7 +1030,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     pub(in super::super) fn note_internal_mutation_in_method(
         &self,
-        err: &mut Diagnostic,
+        err: &mut Diag<'_>,
         expr: &hir::Expr<'_>,
         expected: Option<Ty<'tcx>>,
         found: Ty<'tcx>,
@@ -1054,17 +1108,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     #[instrument(skip(self, span), level = "debug")]
     pub fn instantiate_value_path(
         &self,
-        segments: &[hir::PathSegment<'_>],
-        self_ty: Option<RawTy<'tcx>>,
+        segments: &'tcx [hir::PathSegment<'tcx>],
+        self_ty: Option<LoweredTy<'tcx>>,
         res: Res,
         span: Span,
+        path_span: Span,
         hir_id: hir::HirId,
     ) -> (Ty<'tcx>, Res) {
         let tcx = self.tcx;
 
-        let path_segs = match res {
+        let generic_segments = match res {
             Res::Local(_) | Res::SelfCtor(_) => vec![],
-            Res::Def(kind, def_id) => self.astconv().def_ids_for_value_path_segments(
+            Res::Def(kind, def_id) => self.lowerer().probe_generic_path_segments(
                 segments,
                 self_ty.map(|ty| ty.raw),
                 kind,
@@ -1077,11 +1132,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let mut user_self_ty = None;
         let mut is_alias_variant_ctor = false;
         match res {
-            Res::Def(DefKind::Ctor(CtorOf::Variant, _), _)
-                if let Some(self_ty) = self_ty =>
-            {
+            Res::Def(DefKind::Ctor(CtorOf::Variant, _), _) if let Some(self_ty) = self_ty => {
                 let adt_def = self_ty.normalized.ty_adt_def().unwrap();
-                user_self_ty = Some(UserSelfTy { impl_def_id: adt_def.did(), self_ty: self_ty.raw });
+                user_self_ty =
+                    Some(UserSelfTy { impl_def_id: adt_def.did(), self_ty: self_ty.raw });
                 is_alias_variant_ctor = true;
             }
             Res::Def(DefKind::AssocFn | DefKind::AssocConst, def_id) => {
@@ -1091,7 +1145,15 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 debug!(?def_id, ?container, ?container_id);
                 match container {
                     ty::TraitContainer => {
-                        callee::check_legal_trait_for_method_call(tcx, span, None, span, container_id)
+                        if let Err(e) = callee::check_legal_trait_for_method_call(
+                            tcx,
+                            path_span,
+                            None,
+                            span,
+                            container_id,
+                        ) {
+                            self.set_tainted_by_errors(e);
+                        }
                     }
                     ty::ImplContainer => {
                         if segments.len() == 1 {
@@ -1114,16 +1176,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // provided (if any) into their appropriate spaces. We'll also report
         // errors if type parameters are provided in an inappropriate place.
 
-        let generic_segs: FxHashSet<_> = path_segs.iter().map(|PathSeg(_, index)| index).collect();
-        let generics_has_err = self.astconv().prohibit_generics(
+        let indices: FxHashSet<_> =
+            generic_segments.iter().map(|GenericPathSegment(_, index)| index).collect();
+        let generics_err = self.lowerer().prohibit_generic_args(
             segments.iter().enumerate().filter_map(|(index, seg)| {
-                if !generic_segs.contains(&index) || is_alias_variant_ctor {
-                    Some(seg)
-                } else {
-                    None
-                }
+                if !indices.contains(&index) || is_alias_variant_ctor { Some(seg) } else { None }
             }),
-            |_| {},
+            GenericsArgsErrExtend::None,
         );
 
         if let Res::Local(hid) = res {
@@ -1133,14 +1192,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return (ty, res);
         }
 
-        if generics_has_err {
+        if let Err(_) = generics_err {
             // Don't try to infer type parameters when prohibited generic arguments were given.
             user_self_ty = None;
         }
 
         // Now we have to compare the types that the user *actually*
         // provided against the types that were *expected*. If the user
-        // did not provide any types, then we want to substitute inference
+        // did not provide any types, then we want to instantiate inference
         // variables. If the user provided some types, we may still need
         // to add defaults. If the user provided *too many* types, that's
         // a problem.
@@ -1148,7 +1207,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let mut infer_args_for_err = FxHashSet::default();
 
         let mut explicit_late_bound = ExplicitLateBound::No;
-        for &PathSeg(def_id, index) in &path_segs {
+        for &GenericPathSegment(def_id, index) in &generic_segments {
             let seg = &segments[index];
             let generics = tcx.generics_of(def_id);
 
@@ -1156,14 +1215,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // parameter internally, but we don't allow users to specify the
             // parameter's value explicitly, so we have to do some error-
             // checking here.
-            let arg_count = check_generic_arg_count_for_call(
-                tcx,
-                span,
-                def_id,
-                &generics,
-                seg,
-                IsMethodCall::No,
-            );
+            let arg_count =
+                check_generic_arg_count_for_call(tcx, def_id, generics, seg, IsMethodCall::No);
 
             if let ExplicitLateBound::Yes = arg_count.explicit_late_bound {
                 explicit_late_bound = ExplicitLateBound::Yes;
@@ -1175,19 +1228,23 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
         }
 
-        let has_self =
-            path_segs.last().is_some_and(|PathSeg(def_id, _)| tcx.generics_of(*def_id).has_self);
+        let has_self = generic_segments
+            .last()
+            .is_some_and(|GenericPathSegment(def_id, _)| tcx.generics_of(*def_id).has_self);
 
         let (res, self_ctor_args) = if let Res::SelfCtor(impl_def_id) = res {
-            let ty =
-                self.handle_raw_ty(span, tcx.at(span).type_of(impl_def_id).instantiate_identity());
+            let ty = LoweredTy::from_raw(
+                self,
+                span,
+                tcx.at(span).type_of(impl_def_id).instantiate_identity(),
+            );
             match ty.normalized.ty_adt_def() {
                 Some(adt_def) if adt_def.has_ctor() => {
                     let (ctor_kind, ctor_def_id) = adt_def.non_enum_variant().ctor.unwrap();
                     // Check the visibility of the ctor.
                     let vis = tcx.visibility(ctor_def_id);
                     if !vis.is_accessible_from(tcx.parent_module(hir_id).to_def_id(), tcx) {
-                        tcx.sess
+                        tcx.dcx()
                             .emit_err(CtorIsPrivate { span, def: tcx.def_path_str(adt_def.did()) });
                     }
                     let new_res = Res::Def(DefKind::Ctor(CtorOf::Struct, ctor_kind), ctor_def_id);
@@ -1196,7 +1253,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     (new_res, Some(user_args.args))
                 }
                 _ => {
-                    let mut err = tcx.sess.struct_span_err(
+                    let mut err = tcx.dcx().struct_span_err(
                         span,
                         "the `Self` constructor can only be used with tuple or unit structs",
                     );
@@ -1233,26 +1290,26 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             },
         };
 
-        struct CreateCtorSubstsContext<'a, 'tcx> {
+        struct CtorGenericArgsCtxt<'a, 'tcx> {
             fcx: &'a FnCtxt<'a, 'tcx>,
             span: Span,
-            path_segs: &'a [PathSeg],
+            generic_segments: &'a [GenericPathSegment],
             infer_args_for_err: &'a FxHashSet<usize>,
-            segments: &'a [hir::PathSegment<'a>],
+            segments: &'tcx [hir::PathSegment<'tcx>],
         }
-        impl<'tcx, 'a> CreateSubstsForGenericArgsCtxt<'a, 'tcx> for CreateCtorSubstsContext<'a, 'tcx> {
+        impl<'tcx, 'a> GenericArgsLowerer<'a, 'tcx> for CtorGenericArgsCtxt<'a, 'tcx> {
             fn args_for_def_id(
                 &mut self,
                 def_id: DefId,
-            ) -> (Option<&'a hir::GenericArgs<'a>>, bool) {
-                if let Some(&PathSeg(_, index)) =
-                    self.path_segs.iter().find(|&PathSeg(did, _)| *did == def_id)
+            ) -> (Option<&'a hir::GenericArgs<'tcx>>, bool) {
+                if let Some(&GenericPathSegment(_, index)) =
+                    self.generic_segments.iter().find(|&GenericPathSegment(did, _)| *did == def_id)
                 {
                     // If we've encountered an `impl Trait`-related error, we're just
                     // going to infer the arguments for better error messages.
                     if !self.infer_args_for_err.contains(&index) {
                         // Check whether the user has provided generic arguments.
-                        if let Some(ref data) = self.segments[index].args {
+                        if let Some(data) = self.segments[index].args {
                             return (Some(data), self.segments[index].infer_args);
                         }
                     }
@@ -1265,17 +1322,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             fn provided_kind(
                 &mut self,
                 param: &ty::GenericParamDef,
-                arg: &GenericArg<'_>,
+                arg: &GenericArg<'tcx>,
             ) -> ty::GenericArg<'tcx> {
                 match (&param.kind, arg) {
                     (GenericParamDefKind::Lifetime, GenericArg::Lifetime(lt)) => {
-                        self.fcx.astconv().ast_region_to_region(lt, Some(param)).into()
+                        self.fcx.lowerer().lower_lifetime(lt, Some(param)).into()
                     }
                     (GenericParamDefKind::Type { .. }, GenericArg::Type(ty)) => {
-                        self.fcx.to_ty(ty).raw.into()
+                        self.fcx.lower_ty(ty).raw.into()
                     }
                     (GenericParamDefKind::Const { .. }, GenericArg::Const(ct)) => {
-                        self.fcx.const_arg_to_const(&ct.value, param.def_id).into()
+                        self.fcx.lower_const_arg(&ct.value, param.def_id).into()
                     }
                     (GenericParamDefKind::Type { .. }, GenericArg::Infer(inf)) => {
                         self.fcx.ty_infer(Some(param), inf.span).into()
@@ -1357,17 +1414,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
 
         let args_raw = self_ctor_args.unwrap_or_else(|| {
-            create_args_for_parent_generic_args(
+            lower_generic_args(
                 tcx,
                 def_id,
                 &[],
                 has_self,
                 self_ty.map(|s| s.raw),
                 &arg_count,
-                &mut CreateCtorSubstsContext {
+                &mut CtorGenericArgsCtxt {
                     fcx: self,
                     span,
-                    path_segs: &path_segs,
+                    generic_segments: &generic_segments,
                     infer_args_for_err: &infer_args_for_err,
                     segments,
                 },
@@ -1380,20 +1437,20 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Normalize only after registering type annotations.
         let args = self.normalize(span, args_raw);
 
-        self.add_required_obligations_for_hir(span, def_id, &args, hir_id);
+        self.add_required_obligations_for_hir(span, def_id, args, hir_id);
 
-        // Substitute the values for the type parameters into the type of
+        // Instantiate the values for the type parameters into the type of
         // the referenced item.
         let ty = tcx.type_of(def_id);
         assert!(!args.has_escaping_bound_vars());
         assert!(!ty.skip_binder().has_escaping_bound_vars());
-        let ty_substituted = self.normalize(span, ty.instantiate(tcx, args));
+        let ty_instantiated = self.normalize(span, ty.instantiate(tcx, args));
 
         if let Some(UserSelfTy { impl_def_id, self_ty }) = user_self_ty {
             // In the case of `Foo<T>::method` and `<Foo<T>>::method`, if `method`
             // is inherent, there is no `Self` parameter; instead, the impl needs
             // type parameters, which we can infer by unifying the provided `Self`
-            // with the substituted impl type.
+            // with the instantiated impl type.
             // This also occurs for an enum variant on a type alias.
             let impl_ty = self.normalize(span, tcx.type_of(impl_def_id).instantiate(tcx, args));
             let self_ty = self.normalize(span, self_ty);
@@ -1404,7 +1461,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             ) {
                 Ok(ok) => self.register_infer_ok_obligations(ok),
                 Err(_) => {
-                    self.tcx.sess.delay_span_bug(
+                    self.dcx().span_delayed_bug(
                         span,
                         format!(
                         "instantiate_value_path: (UFCS) {self_ty:?} was a subtype of {impl_ty:?} but now is not?",
@@ -1414,13 +1471,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
         }
 
-        debug!("instantiate_value_path: type of {:?} is {:?}", hir_id, ty_substituted);
+        debug!("instantiate_value_path: type of {:?} is {:?}", hir_id, ty_instantiated);
         self.write_args(hir_id, args);
 
-        (ty_substituted, res)
+        (ty_instantiated, res)
     }
 
-    /// Add all the obligations that are required, substituting and normalized appropriately.
+    /// Add all the obligations that are required, instantiated and normalized appropriately.
     pub(crate) fn add_required_obligations_for_hir(
         &self,
         span: Span,
@@ -1447,7 +1504,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ) {
         let param_env = self.param_env;
 
-        let bounds = self.instantiate_bounds(span, def_id, &args);
+        let bounds = self.instantiate_bounds(span, def_id, args);
 
         for obligation in traits::predicates_for_generics(
             |idx, predicate_span| {
@@ -1465,25 +1522,29 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// In case there is still ambiguity, the returned type may be an inference
     /// variable. This is different from `structurally_resolve_type` which errors
     /// in this case.
+    #[instrument(level = "debug", skip(self, sp), ret)]
     pub fn try_structurally_resolve_type(&self, sp: Span, ty: Ty<'tcx>) -> Ty<'tcx> {
         let ty = self.resolve_vars_with_obligations(ty);
 
         if self.next_trait_solver()
-            && let ty::Alias(ty::Projection | ty::Inherent | ty::Weak, _) = ty.kind()
+            && let ty::Alias(..) = ty.kind()
         {
-            match self
+            // We need to use a separate variable here as otherwise the temporary for
+            // `self.fulfillment_cx.borrow_mut()` is alive in the `Err` branch, resulting
+            // in a reentrant borrow, causing an ICE.
+            let result = self
                 .at(&self.misc(sp), self.param_env)
-                .structurally_normalize(ty, &mut **self.fulfillment_cx.borrow_mut())
-            {
+                .structurally_normalize(ty, &mut **self.fulfillment_cx.borrow_mut());
+            match result {
                 Ok(normalized_ty) => normalized_ty,
                 Err(errors) => {
-                    let guar = self.err_ctxt().report_fulfillment_errors(&errors);
-                    return Ty::new_error(self.tcx,guar);
+                    let guar = self.err_ctxt().report_fulfillment_errors(errors);
+                    return Ty::new_error(self.tcx, guar);
                 }
             }
         } else {
             ty
-       }
+        }
     }
 
     /// Resolves `ty` by a single level if `ty` is a type variable.
@@ -1528,7 +1589,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let ctxt = {
             let mut enclosing_breakables = self.enclosing_breakables.borrow_mut();
             debug_assert!(enclosing_breakables.stack.len() == index + 1);
-            enclosing_breakables.by_id.remove(&id).expect("missing breakable context");
+            // FIXME(#120456) - is `swap_remove` correct?
+            enclosing_breakables.by_id.swap_remove(&id).expect("missing breakable context");
             enclosing_breakables.stack.pop().expect("missing breakable context")
         };
         (ctxt, result)
@@ -1554,7 +1616,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub(in super::super) fn expr_in_place(&self, mut expr_id: hir::HirId) -> bool {
         let mut contained_in_place = false;
 
-        while let hir::Node::Expr(parent_expr) = self.tcx.hir().get_parent(expr_id) {
+        while let hir::Node::Expr(parent_expr) = self.tcx.parent_hir_node(expr_id) {
             match &parent_expr.kind {
                 hir::ExprKind::Assign(lhs, ..) | hir::ExprKind::AssignOp(_, lhs, ..) => {
                     if lhs.hir_id == expr_id {

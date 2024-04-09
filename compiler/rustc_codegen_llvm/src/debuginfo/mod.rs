@@ -1,6 +1,7 @@
 #![doc = include_str!("doc.md")]
 
 use rustc_codegen_ssa::mir::debuginfo::VariableKind::*;
+use rustc_data_structures::unord::UnordMap;
 
 use self::metadata::{file_metadata, type_di_node};
 use self::metadata::{UNKNOWN_COLUMN_NUMBER, UNKNOWN_LINE_NUMBER};
@@ -20,8 +21,6 @@ use crate::value::Value;
 use rustc_codegen_ssa::debuginfo::type_names;
 use rustc_codegen_ssa::mir::debuginfo::{DebugScope, FunctionDebugContext, VariableKind};
 use rustc_codegen_ssa::traits::*;
-use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::stable_hasher::Hash128;
 use rustc_data_structures::sync::Lrc;
 use rustc_hir::def_id::{DefId, DefIdMap};
 use rustc_index::IndexVec;
@@ -32,7 +31,9 @@ use rustc_middle::ty::{self, Instance, ParamEnv, Ty, TypeVisitableExt};
 use rustc_session::config::{self, DebugInfo};
 use rustc_session::Session;
 use rustc_span::symbol::Symbol;
-use rustc_span::{self, BytePos, Pos, SourceFile, SourceFileAndLine, SourceFileHash, Span};
+use rustc_span::{
+    BytePos, Pos, SourceFile, SourceFileAndLine, SourceFileHash, Span, StableSourceFileId,
+};
 use rustc_target::abi::Size;
 
 use libc::c_uint;
@@ -50,7 +51,6 @@ mod utils;
 
 pub use self::create_scope_map::compute_mir_scopes;
 pub use self::metadata::build_global_var_di_node;
-pub use self::metadata::extend_scope_to_file;
 
 #[allow(non_upper_case_globals)]
 const DW_TAG_auto_variable: c_uint = 0x100;
@@ -62,7 +62,7 @@ pub struct CodegenUnitDebugContext<'ll, 'tcx> {
     llcontext: &'ll llvm::Context,
     llmod: &'ll llvm::Module,
     builder: &'ll mut DIBuilder<'ll>,
-    created_files: RefCell<FxHashMap<Option<(Hash128, SourceFileHash)>, &'ll DIFile>>,
+    created_files: RefCell<UnordMap<Option<(StableSourceFileId, SourceFileHash)>, &'ll DIFile>>,
 
     type_map: metadata::TypeMap<'ll, 'tcx>,
     namespace_map: RefCell<DefIdMap<&'ll DIScope>>,
@@ -113,7 +113,7 @@ impl<'ll, 'tcx> CodegenUnitDebugContext<'ll, 'tcx> {
                 llvm::LLVMRustAddModuleFlag(
                     self.llmod,
                     llvm::LLVMModFlagBehavior::Warning,
-                    "Dwarf Version\0".as_ptr().cast(),
+                    c"Dwarf Version".as_ptr().cast(),
                     dwarf_version,
                 );
             } else {
@@ -121,17 +121,16 @@ impl<'ll, 'tcx> CodegenUnitDebugContext<'ll, 'tcx> {
                 llvm::LLVMRustAddModuleFlag(
                     self.llmod,
                     llvm::LLVMModFlagBehavior::Warning,
-                    "CodeView\0".as_ptr().cast(),
+                    c"CodeView".as_ptr().cast(),
                     1,
                 )
             }
 
             // Prevent bitcode readers from deleting the debug info.
-            let ptr = "Debug Info Version\0".as_ptr();
             llvm::LLVMRustAddModuleFlag(
                 self.llmod,
                 llvm::LLVMModFlagBehavior::Warning,
-                ptr.cast(),
+                c"Debug Info Version".as_ptr().cast(),
                 llvm::LLVMRustDebugMetadataVersion(),
             );
         }
@@ -342,7 +341,7 @@ impl<'ll, 'tcx> DebugInfoMethods<'tcx> for CodegenCx<'ll, 'tcx> {
 
         // We look up the generics of the enclosing function and truncate the args
         // to their length in order to cut off extra stuff that might be in there for
-        // closures or generators.
+        // closures or coroutines.
         let generics = tcx.generics_of(enclosing_fn_def_id);
         let args = instance.args.truncate_to(tcx, generics);
 
@@ -537,7 +536,9 @@ impl<'ll, 'tcx> DebugInfoMethods<'tcx> for CodegenCx<'ll, 'tcx> {
 
                     // Only "class" methods are generally understood by LLVM,
                     // so avoid methods on other types (e.g., `<*mut T>::null`).
-                    if let ty::Adt(def, ..) = impl_self_ty.kind() && !def.is_box() {
+                    if let ty::Adt(def, ..) = impl_self_ty.kind()
+                        && !def.is_box()
+                    {
                         // Again, only create type information if full debuginfo is enabled
                         if cx.sess().opts.debuginfo == DebugInfo::Full && !impl_self_ty.has_param()
                         {

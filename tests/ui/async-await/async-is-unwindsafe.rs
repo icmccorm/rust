@@ -1,4 +1,4 @@
-// edition:2018
+//@ edition:2018
 
 fn is_unwindsafe(_: impl std::panic::UnwindSafe) {}
 
@@ -11,6 +11,7 @@ fn main() {
 
     is_unwindsafe(async {
         //~^ ERROR the type `&mut Context<'_>` may not be safely transferred across an unwind boundary
+        //~| ERROR the type `&mut (dyn Any + 'static)` may not be safely transferred across an unwind boundary
         use std::ptr::null;
         use std::task::{Context, RawWaker, RawWakerVTable, Waker};
         let waker = unsafe {

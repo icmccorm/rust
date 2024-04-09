@@ -1,4 +1,3 @@
-use crate::MirPass;
 use rustc_index::bit_set::BitSet;
 use rustc_middle::mir::patch::MirPatch;
 use rustc_middle::mir::*;
@@ -16,7 +15,8 @@ impl<'tcx> MirPass<'tcx> for RemoveNoopLandingPads {
     }
 
     fn run_pass(&self, _tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        debug!("remove_noop_landing_pads({:?})", body);
+        let def_id = body.source.def_id();
+        debug!(?def_id);
         self.remove_nop_landing_pads(body)
     }
 }
@@ -69,7 +69,7 @@ impl RemoveNoopLandingPads {
             | TerminatorKind::FalseUnwind { .. } => {
                 terminator.successors().all(|succ| nop_landing_pads.contains(succ))
             }
-            TerminatorKind::GeneratorDrop
+            TerminatorKind::CoroutineDrop
             | TerminatorKind::Yield { .. }
             | TerminatorKind::Return
             | TerminatorKind::UnwindTerminate(_)
@@ -82,8 +82,6 @@ impl RemoveNoopLandingPads {
     }
 
     fn remove_nop_landing_pads(&self, body: &mut Body<'_>) {
-        debug!("body: {:#?}", body);
-
         // Skip the pass if there are no blocks with a resume terminator.
         let has_resume = body
             .basic_blocks

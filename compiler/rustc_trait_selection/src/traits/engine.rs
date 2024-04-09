@@ -3,6 +3,7 @@ use std::fmt::Debug;
 
 use super::FulfillmentContext;
 use super::TraitEngine;
+use crate::regions::InferCtxtRegionExt;
 use crate::solve::FulfillmentCtxt as NextFulfillmentCtxt;
 use crate::traits::error_reporting::TypeErrCtxtExt;
 use crate::traits::NormalizeExt;
@@ -23,27 +24,22 @@ use rustc_middle::traits::query::NoSolution;
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::ToPredicate;
 use rustc_middle::ty::TypeFoldable;
+use rustc_middle::ty::Variance;
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_session::config::TraitSolver;
 
-pub trait TraitEngineExt<'tcx> {
-    fn new(infcx: &InferCtxt<'tcx>) -> Box<Self>;
-}
-
-impl<'tcx> TraitEngineExt<'tcx> for dyn TraitEngine<'tcx> {
+#[extension(pub trait TraitEngineExt<'tcx>)]
+impl<'tcx> dyn TraitEngine<'tcx> {
     fn new(infcx: &InferCtxt<'tcx>) -> Box<Self> {
-        match (infcx.tcx.sess.opts.unstable_opts.trait_solver, infcx.next_trait_solver()) {
-            (TraitSolver::Classic, false) | (TraitSolver::NextCoherence, false) => {
-                Box::new(FulfillmentContext::new(infcx))
-            }
-            (TraitSolver::Next | TraitSolver::NextCoherence, true) => {
-                Box::new(NextFulfillmentCtxt::new(infcx))
-            }
-            _ => bug!(
-                "incompatible combination of -Ztrait-solver flag ({:?}) and InferCtxt::next_trait_solver ({:?})",
-                infcx.tcx.sess.opts.unstable_opts.trait_solver,
-                infcx.next_trait_solver()
-            ),
+        if infcx.next_trait_solver() {
+            Box::new(NextFulfillmentCtxt::new(infcx))
+        } else {
+            let new_solver_globally =
+                infcx.tcx.sess.opts.unstable_opts.next_solver.map_or(false, |c| c.globally);
+            assert!(
+                !new_solver_globally,
+                "using old solver even though new solver is enabled globally"
+            );
+            Box::new(FulfillmentContext::new(infcx))
         }
     }
 }
@@ -107,26 +103,17 @@ impl<'a, 'tcx> ObligationCtxt<'a, 'tcx> {
         param_env: ty::ParamEnv<'tcx>,
         value: T,
     ) -> T {
-        let infer_ok = self.infcx.at(&cause, param_env).normalize(value);
+        let infer_ok = self.infcx.at(cause, param_env).normalize(value);
         self.register_infer_ok_obligations(infer_ok)
     }
 
-    /// Makes `expected <: actual`.
-    pub fn eq_exp<T>(
+    pub fn deeply_normalize<T: TypeFoldable<TyCtxt<'tcx>>>(
         &self,
         cause: &ObligationCause<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
-        a_is_expected: bool,
-        a: T,
-        b: T,
-    ) -> Result<(), TypeError<'tcx>>
-    where
-        T: ToTrace<'tcx>,
-    {
-        self.infcx
-            .at(cause, param_env)
-            .eq_exp(DefineOpaqueTypes::Yes, a_is_expected, a, b)
-            .map(|infer_ok| self.register_infer_ok_obligations(infer_ok))
+        value: T,
+    ) -> Result<T, Vec<FulfillmentError<'tcx>>> {
+        self.infcx.at(cause, param_env).deeply_normalize(value, &mut **self.engine.borrow_mut())
     }
 
     pub fn eq<T: ToTrace<'tcx>>(
@@ -153,6 +140,20 @@ impl<'a, 'tcx> ObligationCtxt<'a, 'tcx> {
         self.infcx
             .at(cause, param_env)
             .sub(DefineOpaqueTypes::Yes, expected, actual)
+            .map(|infer_ok| self.register_infer_ok_obligations(infer_ok))
+    }
+
+    pub fn relate<T: ToTrace<'tcx>>(
+        &self,
+        cause: &ObligationCause<'tcx>,
+        param_env: ty::ParamEnv<'tcx>,
+        variance: Variance,
+        expected: T,
+        actual: T,
+    ) -> Result<(), TypeError<'tcx>> {
+        self.infcx
+            .at(cause, param_env)
+            .relate(DefineOpaqueTypes::Yes, expected, variance, actual)
             .map(|infer_ok| self.register_infer_ok_obligations(infer_ok))
     }
 
@@ -189,7 +190,7 @@ impl<'a, 'tcx> ObligationCtxt<'a, 'tcx> {
         generic_param_scope: LocalDefId,
         outlives_env: &OutlivesEnvironment<'tcx>,
     ) -> Result<(), ErrorGuaranteed> {
-        let errors = self.infcx.resolve_regions(&outlives_env);
+        let errors = self.infcx.resolve_regions(outlives_env);
         if errors.is_empty() {
             Ok(())
         } else {
@@ -203,7 +204,7 @@ impl<'a, 'tcx> ObligationCtxt<'a, 'tcx> {
         def_id: LocalDefId,
     ) -> Result<FxIndexSet<Ty<'tcx>>, ErrorGuaranteed> {
         self.assumed_wf_types(param_env, def_id)
-            .map_err(|errors| self.infcx.err_ctxt().report_fulfillment_errors(&errors))
+            .map_err(|errors| self.infcx.err_ctxt().report_fulfillment_errors(errors))
     }
 
     pub fn assumed_wf_types(

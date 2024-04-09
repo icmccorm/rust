@@ -3,8 +3,8 @@ use crate::{
     infer::canonical::Canonical,
     traits::ObligationCause,
     ty::{
-        self, tls, BindingMode, BoundVar, CanonicalPolyFnSig, ClosureSizeProfileData,
-        GenericArgKind, GenericArgs, GenericArgsRef, Ty, UserArgs,
+        self, tls, BoundVar, CanonicalPolyFnSig, ClosureSizeProfileData, GenericArgKind,
+        GenericArgs, GenericArgsRef, Ty, UserArgs,
     },
 };
 use rustc_data_structures::{
@@ -12,19 +12,19 @@ use rustc_data_structures::{
     unord::{ExtendUnord, UnordItems, UnordSet},
 };
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir as hir;
 use rustc_hir::{
+    self as hir,
     def::{DefKind, Res},
     def_id::{DefId, LocalDefId, LocalDefIdMap},
     hir_id::OwnerId,
-    HirId, ItemLocalId, ItemLocalMap, ItemLocalSet,
+    BindingAnnotation, ByRef, HirId, ItemLocalId, ItemLocalMap, ItemLocalSet, Mutability,
 };
-use rustc_index::{Idx, IndexVec};
+use rustc_index::IndexVec;
 use rustc_macros::HashStable;
 use rustc_middle::mir::FakeReadCause;
 use rustc_session::Session;
 use rustc_span::Span;
-use rustc_target::abi::FieldIdx;
+use rustc_target::abi::{FieldIdx, VariantIdx};
 use std::{collections::hash_map::Entry, hash::Hash, iter};
 
 use super::RvalueScopes;
@@ -44,24 +44,30 @@ pub struct TypeckResults<'tcx> {
     /// belongs, but it may not exist if it's a tuple field (`tuple.0`).
     field_indices: ItemLocalMap<FieldIdx>,
 
+    /// Resolved types and indices for the nested fields' accesses of `obj.field` (expanded
+    /// to `obj._(1)._(2).field` in THIR). This map only stores the intermediate type
+    /// of `obj._(1)` and index of `_(1)._(2)`, and the type of `_(1)._(2)`, and the index of
+    /// `_(2).field`.
+    nested_fields: ItemLocalMap<Vec<(Ty<'tcx>, FieldIdx)>>,
+
     /// Stores the types for various nodes in the AST. Note that this table
     /// is not guaranteed to be populated outside inference. See
     /// typeck::check::fn_ctxt for details.
     node_types: ItemLocalMap<Ty<'tcx>>,
 
-    /// Stores the type parameters which were substituted to obtain the type
+    /// Stores the type parameters which were instantiated to obtain the type
     /// of this node. This only applies to nodes that refer to entities
     /// parameterized by type parameters, such as generic fns, types, or
     /// other items.
     node_args: ItemLocalMap<GenericArgsRef<'tcx>>,
 
     /// This will either store the canonicalized types provided by the user
-    /// or the substitutions that the user explicitly gave (if any) attached
+    /// or the generic parameters that the user explicitly gave (if any) attached
     /// to `id`. These will not include any inferred values. The canonical form
     /// is used to capture things like `_` or other unspecified values.
     ///
     /// For example, if the user wrote `foo.collect::<Vec<_>>()`, then the
-    /// canonical substitutions would include only `for<X> { Vec<X> }`.
+    /// canonical generic parameters would include only `for<X> { Vec<X> }`.
     ///
     /// See also `AscribeUserType` statement in MIR.
     user_provided_types: ItemLocalMap<CanonicalUserType<'tcx>>,
@@ -72,8 +78,8 @@ pub struct TypeckResults<'tcx> {
 
     adjustments: ItemLocalMap<Vec<ty::adjustment::Adjustment<'tcx>>>,
 
-    /// Stores the actual binding mode for all instances of hir::BindingAnnotation.
-    pat_binding_modes: ItemLocalMap<BindingMode>,
+    /// Stores the actual binding mode for all instances of [`BindingAnnotation`].
+    pat_binding_modes: ItemLocalMap<BindingAnnotation>,
 
     /// Stores the types which were implicitly dereferenced in pattern binding modes
     /// for later usage in THIR lowering. For example,
@@ -89,6 +95,10 @@ pub struct TypeckResults<'tcx> {
     /// See:
     /// <https://github.com/rust-lang/rfcs/blob/master/text/2005-match-ergonomics.md#definitions>
     pat_adjustments: ItemLocalMap<Vec<Ty<'tcx>>>,
+
+    /// Set of reference patterns that match against a match-ergonomics inserted reference
+    /// (as opposed to against a reference in the scrutinee type).
+    skipped_ref_pats: ItemLocalSet,
 
     /// Records the reasons that we picked the kind of each closure;
     /// not all closures are present in the map.
@@ -126,7 +136,7 @@ pub struct TypeckResults<'tcx> {
     /// fn(&'a u32) -> u32
     /// ```
     ///
-    /// Note that `'a` is not bound (it would be an `ReFree`) and
+    /// Note that `'a` is not bound (it would be an `ReLateParam`) and
     /// that the `Foo` opaque type is replaced by its hidden type.
     liberated_fn_sigs: ItemLocalMap<ty::FnSig<'tcx>>,
 
@@ -189,9 +199,9 @@ pub struct TypeckResults<'tcx> {
     /// Details may be find in `rustc_hir_analysis::check::rvalue_scopes`.
     pub rvalue_scopes: RvalueScopes,
 
-    /// Stores the predicates that apply on generator witness types.
-    /// formatting modified file tests/ui/generator/retain-resume-ref.rs
-    pub generator_interior_predicates:
+    /// Stores the predicates that apply on coroutine witness types.
+    /// formatting modified file tests/ui/coroutine/retain-resume-ref.rs
+    pub coroutine_interior_predicates:
         LocalDefIdMap<Vec<(ty::Predicate<'tcx>, ObligationCause<'tcx>)>>,
 
     /// We sometimes treat byte string literals (which are of type `&[u8; N]`)
@@ -205,7 +215,7 @@ pub struct TypeckResults<'tcx> {
     pub closure_size_eval: LocalDefIdMap<ClosureSizeProfileData<'tcx>>,
 
     /// Container types and field indices of `offset_of!` expressions
-    offset_of_data: ItemLocalMap<(Ty<'tcx>, Vec<FieldIdx>)>,
+    offset_of_data: ItemLocalMap<(Ty<'tcx>, Vec<(VariantIdx, FieldIdx)>)>,
 }
 
 impl<'tcx> TypeckResults<'tcx> {
@@ -214,6 +224,7 @@ impl<'tcx> TypeckResults<'tcx> {
             hir_owner,
             type_dependent_defs: Default::default(),
             field_indices: Default::default(),
+            nested_fields: Default::default(),
             user_provided_types: Default::default(),
             user_provided_sigs: Default::default(),
             node_types: Default::default(),
@@ -221,6 +232,7 @@ impl<'tcx> TypeckResults<'tcx> {
             adjustments: Default::default(),
             pat_binding_modes: Default::default(),
             pat_adjustments: Default::default(),
+            skipped_ref_pats: Default::default(),
             closure_kind_origins: Default::default(),
             liberated_fn_sigs: Default::default(),
             fru_field_types: Default::default(),
@@ -231,7 +243,7 @@ impl<'tcx> TypeckResults<'tcx> {
             closure_min_captures: Default::default(),
             closure_fake_reads: Default::default(),
             rvalue_scopes: Default::default(),
-            generator_interior_predicates: Default::default(),
+            coroutine_interior_predicates: Default::default(),
             treat_byte_string_as_slice: Default::default(),
             closure_size_eval: Default::default(),
             offset_of_data: Default::default(),
@@ -241,7 +253,7 @@ impl<'tcx> TypeckResults<'tcx> {
     /// Returns the final resolution of a `QPath` in an `Expr` or `Pat` node.
     pub fn qpath_res(&self, qpath: &hir::QPath<'_>, id: hir::HirId) -> Res {
         match *qpath {
-            hir::QPath::Resolved(_, ref path) => path.res,
+            hir::QPath::Resolved(_, path) => path.res,
             hir::QPath::TypeRelative(..) | hir::QPath::LangItem(..) => self
                 .type_dependent_def(id)
                 .map_or(Res::Err, |(kind, def_id)| Res::Def(kind, def_id)),
@@ -283,6 +295,18 @@ impl<'tcx> TypeckResults<'tcx> {
 
     pub fn opt_field_index(&self, id: hir::HirId) -> Option<FieldIdx> {
         self.field_indices().get(id).cloned()
+    }
+
+    pub fn nested_fields(&self) -> LocalTableInContext<'_, Vec<(Ty<'tcx>, FieldIdx)>> {
+        LocalTableInContext { hir_owner: self.hir_owner, data: &self.nested_fields }
+    }
+
+    pub fn nested_fields_mut(&mut self) -> LocalTableInContextMut<'_, Vec<(Ty<'tcx>, FieldIdx)>> {
+        LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.nested_fields }
+    }
+
+    pub fn nested_field_tys_and_indices(&self, id: hir::HirId) -> &[(Ty<'tcx>, FieldIdx)] {
+        self.nested_fields().get(id).map_or(&[], Vec::as_slice)
     }
 
     pub fn user_provided_types(&self) -> LocalTableInContext<'_, CanonicalUserType<'tcx>> {
@@ -329,7 +353,7 @@ impl<'tcx> TypeckResults<'tcx> {
     }
 
     /// Returns the type of a pattern as a monotype. Like [`expr_ty`], this function
-    /// doesn't provide type parameter substitutions.
+    /// doesn't provide type parameter args.
     ///
     /// [`expr_ty`]: TypeckResults::expr_ty
     pub fn pat_ty(&self, pat: &hir::Pat<'_>) -> Ty<'tcx> {
@@ -341,9 +365,9 @@ impl<'tcx> TypeckResults<'tcx> {
     /// NB (1): This is the PRE-ADJUSTMENT TYPE for the expression. That is, in
     /// some cases, we insert `Adjustment` annotations such as auto-deref or
     /// auto-ref. The type returned by this function does not consider such
-    /// adjustments. See `expr_ty_adjusted()` instead.
+    /// adjustments. See [`Self::expr_ty_adjusted`] instead.
     ///
-    /// NB (2): This type doesn't provide type parameter substitutions; e.g., if you
+    /// NB (2): This type doesn't provide type parameter args; e.g., if you
     /// ask for the type of `id` in `id(3)`, it will return `fn(&isize) -> isize`
     /// instead of `fn(ty) -> T with T = isize`.
     pub fn expr_ty(&self, expr: &hir::Expr<'_>) -> Ty<'tcx> {
@@ -389,18 +413,22 @@ impl<'tcx> TypeckResults<'tcx> {
         matches!(self.type_dependent_defs().get(expr.hir_id), Some(Ok((DefKind::AssocFn, _))))
     }
 
-    pub fn extract_binding_mode(&self, s: &Session, id: HirId, sp: Span) -> Option<BindingMode> {
+    pub fn extract_binding_mode(
+        &self,
+        s: &Session,
+        id: HirId,
+        sp: Span,
+    ) -> Option<BindingAnnotation> {
         self.pat_binding_modes().get(id).copied().or_else(|| {
-            s.delay_span_bug(sp, "missing binding mode");
-            None
+            s.dcx().span_bug(sp, "missing binding mode");
         })
     }
 
-    pub fn pat_binding_modes(&self) -> LocalTableInContext<'_, BindingMode> {
+    pub fn pat_binding_modes(&self) -> LocalTableInContext<'_, BindingAnnotation> {
         LocalTableInContext { hir_owner: self.hir_owner, data: &self.pat_binding_modes }
     }
 
-    pub fn pat_binding_modes_mut(&mut self) -> LocalTableInContextMut<'_, BindingMode> {
+    pub fn pat_binding_modes_mut(&mut self) -> LocalTableInContextMut<'_, BindingAnnotation> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.pat_binding_modes }
     }
 
@@ -410,6 +438,39 @@ impl<'tcx> TypeckResults<'tcx> {
 
     pub fn pat_adjustments_mut(&mut self) -> LocalTableInContextMut<'_, Vec<Ty<'tcx>>> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.pat_adjustments }
+    }
+
+    pub fn skipped_ref_pats(&self) -> LocalSetInContext<'_> {
+        LocalSetInContext { hir_owner: self.hir_owner, data: &self.skipped_ref_pats }
+    }
+
+    pub fn skipped_ref_pats_mut(&mut self) -> LocalSetInContextMut<'_> {
+        LocalSetInContextMut { hir_owner: self.hir_owner, data: &mut self.skipped_ref_pats }
+    }
+
+    /// Does the pattern recursively contain a `ref mut` binding in it?
+    ///
+    /// This is used to determined whether a `deref` pattern should emit a `Deref`
+    /// or `DerefMut` call for its pattern scrutinee.
+    ///
+    /// This is computed from the typeck results since we want to make
+    /// sure to apply any match-ergonomics adjustments, which we cannot
+    /// determine from the HIR alone.
+    pub fn pat_has_ref_mut_binding(&self, pat: &'tcx hir::Pat<'tcx>) -> bool {
+        let mut has_ref_mut = false;
+        pat.walk(|pat| {
+            if let hir::PatKind::Binding(_, id, _, _) = pat.kind
+                && let Some(BindingAnnotation(ByRef::Yes(Mutability::Mut), _)) =
+                    self.pat_binding_modes().get(id)
+            {
+                has_ref_mut = true;
+                // No need to continue recursing
+                false
+            } else {
+                true
+            }
+        });
+        has_ref_mut
     }
 
     /// For a given closure, returns the iterator of `ty::CapturedPlace`s that are captured
@@ -464,11 +525,15 @@ impl<'tcx> TypeckResults<'tcx> {
         &self.coercion_casts
     }
 
-    pub fn offset_of_data(&self) -> LocalTableInContext<'_, (Ty<'tcx>, Vec<FieldIdx>)> {
+    pub fn offset_of_data(
+        &self,
+    ) -> LocalTableInContext<'_, (Ty<'tcx>, Vec<(VariantIdx, FieldIdx)>)> {
         LocalTableInContext { hir_owner: self.hir_owner, data: &self.offset_of_data }
     }
 
-    pub fn offset_of_data_mut(&mut self) -> LocalTableInContextMut<'_, (Ty<'tcx>, Vec<FieldIdx>)> {
+    pub fn offset_of_data_mut(
+        &mut self,
+    ) -> LocalTableInContextMut<'_, (Ty<'tcx>, Vec<(VariantIdx, FieldIdx)>)> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.offset_of_data }
     }
 }
@@ -523,7 +588,7 @@ impl<'a, V> LocalTableInContext<'a, V> {
     }
 
     pub fn items_in_stable_order(&self) -> Vec<(ItemLocalId, &'a V)> {
-        self.data.to_sorted_stable_ord()
+        self.data.items().map(|(&k, v)| (k, v)).into_sorted_stable_ord_by_key(|(k, _)| k)
     }
 }
 
@@ -544,6 +609,11 @@ impl<'a, V> LocalTableInContextMut<'a, V> {
     pub fn get_mut(&mut self, id: hir::HirId) -> Option<&mut V> {
         validate_hir_id_for_typeck_results(self.hir_owner, id);
         self.data.get_mut(&id.local_id)
+    }
+
+    pub fn get(&mut self, id: hir::HirId) -> Option<&V> {
+        validate_hir_id_for_typeck_results(self.hir_owner, id);
+        self.data.get(&id.local_id)
     }
 
     pub fn entry(&mut self, id: hir::HirId) -> Entry<'_, hir::ItemLocalId, V> {
@@ -572,8 +642,52 @@ impl<'a, V> LocalTableInContextMut<'a, V> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct LocalSetInContext<'a> {
+    hir_owner: OwnerId,
+    data: &'a ItemLocalSet,
+}
+
+impl<'a> LocalSetInContext<'a> {
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub fn contains(&self, id: hir::HirId) -> bool {
+        validate_hir_id_for_typeck_results(self.hir_owner, id);
+        self.data.contains(&id.local_id)
+    }
+}
+
+#[derive(Debug)]
+pub struct LocalSetInContextMut<'a> {
+    hir_owner: OwnerId,
+    data: &'a mut ItemLocalSet,
+}
+
+impl<'a> LocalSetInContextMut<'a> {
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub fn contains(&self, id: hir::HirId) -> bool {
+        validate_hir_id_for_typeck_results(self.hir_owner, id);
+        self.data.contains(&id.local_id)
+    }
+    pub fn insert(&mut self, id: hir::HirId) -> bool {
+        validate_hir_id_for_typeck_results(self.hir_owner, id);
+        self.data.insert(id.local_id)
+    }
+
+    pub fn remove(&mut self, id: hir::HirId) -> bool {
+        validate_hir_id_for_typeck_results(self.hir_owner, id);
+        self.data.remove(&id.local_id)
+    }
+}
+
 rustc_index::newtype_index! {
     #[derive(HashStable)]
+    #[encodable]
     #[debug_format = "UserType({})"]
     pub struct UserTypeAnnotationIndex {
         const START_INDEX = 0;
@@ -594,10 +708,27 @@ pub struct CanonicalUserTypeAnnotation<'tcx> {
 /// Canonical user type annotation.
 pub type CanonicalUserType<'tcx> = Canonical<'tcx, UserType<'tcx>>;
 
-impl<'tcx> CanonicalUserType<'tcx> {
-    /// Returns `true` if this represents a substitution of the form `[?0, ?1, ?2]`,
+/// A user-given type annotation attached to a constant. These arise
+/// from constants that are named via paths, like `Foo::<A>::new` and
+/// so forth.
+#[derive(Copy, Clone, Debug, PartialEq, TyEncodable, TyDecodable)]
+#[derive(Eq, Hash, HashStable, TypeFoldable, TypeVisitable)]
+pub enum UserType<'tcx> {
+    Ty(Ty<'tcx>),
+
+    /// The canonical type is the result of `type_of(def_id)` with the
+    /// given generic parameters applied.
+    TypeOf(DefId, UserArgs<'tcx>),
+}
+
+pub trait IsIdentity {
+    fn is_identity(&self) -> bool;
+}
+
+impl<'tcx> IsIdentity for CanonicalUserType<'tcx> {
+    /// Returns `true` if this represents the generic parameters of the form `[?0, ?1, ?2]`,
     /// i.e., each thing is mapped to a canonical variable with the same index.
-    pub fn is_identity(&self) -> bool {
+    fn is_identity(&self) -> bool {
         match self.value {
             UserType::Ty(_) => false,
             UserType::TypeOf(_, user_args) => {
@@ -605,11 +736,11 @@ impl<'tcx> CanonicalUserType<'tcx> {
                     return false;
                 }
 
-                iter::zip(user_args.args, BoundVar::new(0)..).all(|(kind, cvar)| {
+                iter::zip(user_args.args, BoundVar::ZERO..).all(|(kind, cvar)| {
                     match kind.unpack() {
                         GenericArgKind::Type(ty) => match ty.kind() {
                             ty::Bound(debruijn, b) => {
-                                // We only allow a `ty::INNERMOST` index in substitutions.
+                                // We only allow a `ty::INNERMOST` index in generic parameters.
                                 assert_eq!(*debruijn, ty::INNERMOST);
                                 cvar == b.var
                             }
@@ -617,8 +748,8 @@ impl<'tcx> CanonicalUserType<'tcx> {
                         },
 
                         GenericArgKind::Lifetime(r) => match *r {
-                            ty::ReLateBound(debruijn, br) => {
-                                // We only allow a `ty::INNERMOST` index in substitutions.
+                            ty::ReBound(debruijn, br) => {
+                                // We only allow a `ty::INNERMOST` index in generic parameters.
                                 assert_eq!(debruijn, ty::INNERMOST);
                                 cvar == br.var
                             }
@@ -627,7 +758,7 @@ impl<'tcx> CanonicalUserType<'tcx> {
 
                         GenericArgKind::Const(ct) => match ct.kind() {
                             ty::ConstKind::Bound(debruijn, b) => {
-                                // We only allow a `ty::INNERMOST` index in substitutions.
+                                // We only allow a `ty::INNERMOST` index in generic parameters.
                                 assert_eq!(debruijn, ty::INNERMOST);
                                 cvar == b
                             }
@@ -638,19 +769,6 @@ impl<'tcx> CanonicalUserType<'tcx> {
             }
         }
     }
-}
-
-/// A user-given type annotation attached to a constant. These arise
-/// from constants that are named via paths, like `Foo::<A>::new` and
-/// so forth.
-#[derive(Copy, Clone, Debug, PartialEq, TyEncodable, TyDecodable)]
-#[derive(Eq, Hash, HashStable, TypeFoldable, TypeVisitable)]
-pub enum UserType<'tcx> {
-    Ty(Ty<'tcx>),
-
-    /// The canonical type is the result of `type_of(def_id)` with the
-    /// given substitutions applied.
-    TypeOf(DefId, UserArgs<'tcx>),
 }
 
 impl<'tcx> std::fmt::Display for UserType<'tcx> {

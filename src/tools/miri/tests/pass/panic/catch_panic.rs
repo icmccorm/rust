@@ -1,10 +1,9 @@
-// We test the `align_offset` panic below, make sure we test the interpreter impl and not the "real" one.
-//@compile-flags: -Zmiri-symbolic-alignment-check
 #![feature(never_type)]
 #![allow(unconditional_panic, non_fmt_panics)]
 
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::process;
 
 thread_local! {
     static MY_COUNTER: Cell<usize> = Cell::new(0);
@@ -62,26 +61,27 @@ fn main() {
     // Built-in panics; also make sure the message is right.
     test(Some("index out of bounds: the len is 3 but the index is 4"), |_old_val| {
         let _val = [0, 1, 2][4];
-        loop {}
+        process::abort()
     });
     test(Some("attempt to divide by zero"), |_old_val| {
         let _val = 1 / 0;
-        loop {}
+        process::abort()
     });
 
+    // Panic somewhere in the standard library.
     test(Some("align_offset: align is not a power-of-two"), |_old_val| {
         let _ = std::ptr::null::<u8>().align_offset(3);
-        loop {}
+        process::abort()
     });
 
     // Assertion and debug assertion
     test(None, |_old_val| {
         assert!(false);
-        loop {}
+        process::abort()
     });
     test(None, |_old_val| {
         debug_assert!(false);
-        loop {}
+        process::abort()
     });
 
     eprintln!("Success!"); // Make sure we get this in stderr

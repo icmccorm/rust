@@ -6,11 +6,16 @@ import { type CommandFactory, Ctx, fetchWorkspace } from "./ctx";
 import * as diagnostics from "./diagnostics";
 import { activateTaskProvider } from "./tasks";
 import { setContextValue } from "./util";
+import type { JsonProject } from "./rust_project";
 
 const RUST_PROJECT_CONTEXT_NAME = "inRustProject";
 
+// This API is not stable and may break in between minor releases.
 export interface RustAnalyzerExtensionApi {
     readonly client?: lc.LanguageClient;
+
+    setWorkspaces(workspaces: JsonProject[]): void;
+    notifyRustAnalyzer(): Promise<void>;
 }
 
 export async function deactivate() {
@@ -20,16 +25,7 @@ export async function deactivate() {
 export async function activate(
     context: vscode.ExtensionContext,
 ): Promise<RustAnalyzerExtensionApi> {
-    if (vscode.extensions.getExtension("rust-lang.rust")) {
-        vscode.window
-            .showWarningMessage(
-                `You have both the rust-analyzer (rust-lang.rust-analyzer) and Rust (rust-lang.rust) ` +
-                    "plugins enabled. These are known to conflict and cause various functions of " +
-                    "both plugins to not work correctly. You should disable one of them.",
-                "Got it",
-            )
-            .then(() => {}, console.error);
-    }
+    checkConflictingExtensions();
 
     const ctx = new Ctx(context, createCommands(), fetchWorkspace());
     // VS Code doesn't show a notification when an extension fails to activate
@@ -152,7 +148,6 @@ function createCommands(): Record<string, CommandFactory> {
         shuffleCrateGraph: { enabled: commands.shuffleCrateGraph },
         reloadWorkspace: { enabled: commands.reloadWorkspace },
         rebuildProcMacros: { enabled: commands.rebuildProcMacros },
-        addProject: { enabled: commands.addProject },
         matchingBrace: { enabled: commands.matchingBrace },
         joinLines: { enabled: commands.joinLines },
         parentModule: { enabled: commands.parentModule },
@@ -170,6 +165,7 @@ function createCommands(): Record<string, CommandFactory> {
         debug: { enabled: commands.debug },
         newDebugConfig: { enabled: commands.newDebugConfig },
         openDocs: { enabled: commands.openDocs },
+        openExternalDocs: { enabled: commands.openExternalDocs },
         openCargoToml: { enabled: commands.openCargoToml },
         peekTests: { enabled: commands.peekTests },
         moveItemUp: { enabled: commands.moveItemUp },
@@ -194,4 +190,27 @@ function createCommands(): Record<string, CommandFactory> {
         openLogs: { enabled: commands.openLogs },
         revealDependency: { enabled: commands.revealDependency },
     };
+}
+
+function checkConflictingExtensions() {
+    if (vscode.extensions.getExtension("rust-lang.rust")) {
+        vscode.window
+            .showWarningMessage(
+                `You have both the rust-analyzer (rust-lang.rust-analyzer) and Rust (rust-lang.rust) ` +
+                    "plugins enabled. These are known to conflict and cause various functions of " +
+                    "both plugins to not work correctly. You should disable one of them.",
+                "Got it",
+            )
+            .then(() => {}, console.error);
+    }
+
+    if (vscode.extensions.getExtension("panicbit.cargo")) {
+        vscode.window
+            .showWarningMessage(
+                `You have both the rust-analyzer (rust-lang.rust-analyzer) and Cargo (panicbit.cargo) plugins enabled, ` +
+                    'you can disable it or set {"cargo.automaticCheck": false} in settings.json to avoid invoking cargo twice',
+                "Got it",
+            )
+            .then(() => {}, console.error);
+    }
 }

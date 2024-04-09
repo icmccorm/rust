@@ -55,12 +55,13 @@ fn llvm_machine_type(cpu: &str) -> LLVMMachineType {
         "x86_64" => LLVMMachineType::AMD64,
         "x86" => LLVMMachineType::I386,
         "aarch64" => LLVMMachineType::ARM64,
+        "arm64ec" => LLVMMachineType::ARM64EC,
         "arm" => LLVMMachineType::ARM,
         _ => panic!("unsupported cpu type {cpu}"),
     }
 }
 
-impl<'a> ArchiveBuilder<'a> for LlvmArchiveBuilder<'a> {
+impl<'a> ArchiveBuilder for LlvmArchiveBuilder<'a> {
     fn add_archive(
         &mut self,
         archive: &Path,
@@ -68,7 +69,7 @@ impl<'a> ArchiveBuilder<'a> for LlvmArchiveBuilder<'a> {
     ) -> io::Result<()> {
         let mut archive = archive.to_path_buf();
         if self.sess.target.llvm_target.contains("-apple-macosx") {
-            if let Some(new_archive) = try_extract_macho_fat_archive(&self.sess, &archive)? {
+            if let Some(new_archive) = try_extract_macho_fat_archive(self.sess, &archive)? {
                 archive = new_archive
             }
         }
@@ -99,7 +100,7 @@ impl<'a> ArchiveBuilder<'a> for LlvmArchiveBuilder<'a> {
     fn build(mut self: Box<Self>, output: &Path) -> bool {
         match self.build_with_llvm(output) {
             Ok(any_members) => any_members,
-            Err(e) => self.sess.emit_fatal(ArchiveBuildFailure { error: e }),
+            Err(e) => self.sess.dcx().emit_fatal(ArchiveBuildFailure { error: e }),
         }
     }
 }
@@ -107,7 +108,7 @@ impl<'a> ArchiveBuilder<'a> for LlvmArchiveBuilder<'a> {
 pub struct LlvmArchiveBuilderBuilder;
 
 impl ArchiveBuilderBuilder for LlvmArchiveBuilderBuilder {
-    fn new_archive_builder<'a>(&self, sess: &'a Session) -> Box<dyn ArchiveBuilder<'a> + 'a> {
+    fn new_archive_builder<'a>(&self, sess: &'a Session) -> Box<dyn ArchiveBuilder + 'a> {
         // FIXME use ArArchiveBuilder on most targets again once reading thin archives is
         // implemented
         if true {
@@ -175,7 +176,7 @@ impl ArchiveBuilderBuilder for LlvmArchiveBuilderBuilder {
             match std::fs::write(&def_file_path, def_file_content) {
                 Ok(_) => {}
                 Err(e) => {
-                    sess.emit_fatal(ErrorWritingDEFFile { error: e });
+                    sess.dcx().emit_fatal(ErrorWritingDEFFile { error: e });
                 }
             };
 
@@ -217,14 +218,14 @@ impl ArchiveBuilderBuilder for LlvmArchiveBuilderBuilder {
 
             match dlltool_cmd.output() {
                 Err(e) => {
-                    sess.emit_fatal(ErrorCallingDllTool {
+                    sess.dcx().emit_fatal(ErrorCallingDllTool {
                         dlltool_path: dlltool.to_string_lossy(),
                         error: e,
                     });
                 }
                 // dlltool returns '0' on failure, so check for error output instead.
                 Ok(output) if !output.stderr.is_empty() => {
-                    sess.emit_fatal(DlltoolFailImportLibrary {
+                    sess.dcx().emit_fatal(DlltoolFailImportLibrary {
                         dlltool_path: dlltool.to_string_lossy(),
                         dlltool_args: dlltool_cmd
                             .get_args()
@@ -282,7 +283,7 @@ impl ArchiveBuilderBuilder for LlvmArchiveBuilderBuilder {
             };
 
             if result == crate::llvm::LLVMRustResult::Failure {
-                sess.emit_fatal(ErrorCreatingImportLibrary {
+                sess.dcx().emit_fatal(ErrorCreatingImportLibrary {
                     lib_name,
                     error: llvm::last_error().unwrap_or("unknown LLVM error".to_string()),
                 });
@@ -313,7 +314,7 @@ fn get_llvm_object_symbols(
             llvm::LLVMRustGetSymbols(
                 buf.as_ptr(),
                 buf.len(),
-                &mut *state as *mut &mut _ as *mut c_void,
+                std::ptr::addr_of_mut!(*state) as *mut c_void,
                 callback,
                 error_callback,
             )
@@ -354,7 +355,7 @@ impl<'a> LlvmArchiveBuilder<'a> {
         let kind = kind
             .parse::<ArchiveKind>()
             .map_err(|_| kind)
-            .unwrap_or_else(|kind| self.sess.emit_fatal(UnknownArchiveKind { kind }));
+            .unwrap_or_else(|kind| self.sess.dcx().emit_fatal(UnknownArchiveKind { kind }));
 
         let mut additions = mem::take(&mut self.additions);
         let mut strings = Vec::new();

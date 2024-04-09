@@ -13,7 +13,7 @@ ignore = [
 
     # tests for now are not formatted, as they are sometimes pretty-printing constrained
     # (and generally rustfmt can move around comments in UI-testing incompatible ways)
-    "tests",
+    "/tests/",
 
     # do not format submodules
     # FIXME: sync submodule list with tidy/bootstrap/etc
@@ -37,6 +37,6 @@ ignore = [
     "src/tools/rustfmt",
 
     # these are ignored by a standard cargo fmt run
-    "compiler/rustc_codegen_cranelift/y.rs", # running rustfmt breaks this file
     "compiler/rustc_codegen_cranelift/scripts",
+    "compiler/rustc_codegen_cranelift/example/gen_block_iterate.rs", # uses edition 2024
 ]

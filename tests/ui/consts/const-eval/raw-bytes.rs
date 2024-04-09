@@ -1,16 +1,17 @@
-// stderr-per-bitwidth
-// ignore-endian-big
+//@ stderr-per-bitwidth
+//@ ignore-endian-big
 // ignore-tidy-linelength
-// normalize-stderr-test "╾─*a(lloc)?[0-9]+(\+[a-z0-9]+)?─*╼" -> "╾ALLOC_ID$2╼"
-// normalize-stderr-test "alloc\d+" -> "allocN"
-#![feature(never_type, rustc_attrs, ptr_metadata, slice_from_ptr_range, const_slice_from_ptr_range)]
+//@ normalize-stderr-test "╾─*ALLOC[0-9]+(\+[a-z0-9]+)?(<imm>)?─*╼" -> "╾ALLOC_ID$1╼"
 #![allow(invalid_value)]
+#![feature(generic_nonzero, never_type, rustc_attrs, ptr_metadata, slice_from_ptr_range, const_slice_from_ptr_range)]
 
 use std::mem;
 use std::alloc::Layout;
 use std::ptr::NonNull;
-use std::num::{NonZeroU8, NonZeroUsize};
+use std::num::NonZero;
 use std::slice::{from_ptr_range, from_raw_parts};
+
+// # Bad enums and chars
 
 #[repr(usize)]
 #[derive(Copy, Clone)]
@@ -50,13 +51,14 @@ const BAD_UNINHABITED_VARIANT2: UninhDiscriminant = unsafe { mem::transmute(3u8)
 const BAD_OPTION_CHAR: Option<(char, char)> = Some(('x', unsafe { mem::transmute(!0u32) }));
 //~^ ERROR is undefined behavior
 
+// # Bad pointers and references
 
 const NULL_PTR: NonNull<u8> = unsafe { mem::transmute(0usize) };
 //~^ ERROR it is undefined behavior to use this value
 
-const NULL_U8: NonZeroU8 = unsafe { mem::transmute(0u8) };
+const NULL_U8: NonZero<u8> = unsafe { mem::transmute(0u8) };
 //~^ ERROR it is undefined behavior to use this value
-const NULL_USIZE: NonZeroUsize = unsafe { mem::transmute(0usize) };
+const NULL_USIZE: NonZero<usize> = unsafe { mem::transmute(0usize) };
 //~^ ERROR it is undefined behavior to use this value
 
 #[rustc_layout_scalar_valid_range_start(10)]
@@ -196,16 +198,7 @@ const RAW_TRAIT_OBJ_VTABLE_NULL: *const dyn Trait = unsafe { mem::transmute((&92
 const RAW_TRAIT_OBJ_VTABLE_INVALID: *const dyn Trait = unsafe { mem::transmute((&92u8, &3u64)) };
 //~^ ERROR it is undefined behavior to use this value
 
-
-// not ok, since alignment needs to be non-zero.
-const LAYOUT_INVALID_ZERO: Layout = unsafe { Layout::from_size_align_unchecked(0x1000, 0x00) };
-//~^ ERROR it is undefined behavior to use this value
-
-// not ok, since alignment needs to be a power of two.
-const LAYOUT_INVALID_THREE: Layout = unsafe { Layout::from_size_align_unchecked(9, 3) };
-//~^ ERROR it is undefined behavior to use this value
-
-
+// Uninhabited types
 const _: &[!; 1] = unsafe { &*(1_usize as *const [!; 1]) }; //~ ERROR undefined behavior
 const _: &[!] = unsafe { &*(1_usize as *const [!; 1]) }; //~ ERROR undefined behavior
 const _: &[!] = unsafe { &*(1_usize as *const [!; 42]) }; //~ ERROR undefined behavior

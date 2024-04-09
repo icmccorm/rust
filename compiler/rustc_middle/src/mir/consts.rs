@@ -1,16 +1,16 @@
 use std::fmt::{self, Debug, Display, Formatter};
 
-use rustc_hir;
-use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::{self as hir};
-use rustc_span::Span;
+use rustc_hir::def_id::DefId;
+use rustc_session::{config::RemapPathScopeComponents, RemapFileNameExt};
+use rustc_span::{Span, DUMMY_SP};
 use rustc_target::abi::{HasDataLayout, Size};
 
 use crate::mir::interpret::{alloc_range, AllocId, ConstAllocation, ErrorHandled, Scalar};
 use crate::mir::{pretty_print_const_value, Promoted};
+use crate::ty::print::with_no_trimmed_paths;
+use crate::ty::GenericArgsRef;
 use crate::ty::ScalarInt;
-use crate::ty::{self, print::pretty_print_const, List, Ty, TyCtxt};
-use crate::ty::{GenericArgs, GenericArgsRef};
+use crate::ty::{self, print::pretty_print_const, Ty, TyCtxt};
 
 ///////////////////////////////////////////////////////////////////////////
 /// Evaluated Constants
@@ -70,12 +70,12 @@ pub enum ConstValue<'tcx> {
     },
 }
 
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_pointer_width = "64"))]
 static_assert_size!(ConstValue<'_>, 24);
 
 impl<'tcx> ConstValue<'tcx> {
     #[inline]
-    pub fn try_to_scalar(&self) -> Option<Scalar<AllocId>> {
+    pub fn try_to_scalar(&self) -> Option<Scalar> {
         match *self {
             ConstValue::Indirect { .. } | ConstValue::Slice { .. } | ConstValue::ZeroSized => None,
             ConstValue::Scalar(val) => Some(val),
@@ -161,8 +161,8 @@ impl<'tcx> ConstValue<'tcx> {
                     return Some(&[]);
                 }
                 // Non-empty slice, must have memory. We know this is a relative pointer.
-                let (inner_alloc_id, offset) = ptr.into_parts();
-                let data = tcx.global_alloc(inner_alloc_id?).unwrap_memory();
+                let (inner_prov, offset) = ptr.into_parts();
+                let data = tcx.global_alloc(inner_prov?.alloc_id()).unwrap_memory();
                 (data, offset.bytes(), offset.bytes() + len)
             }
         };
@@ -172,13 +172,31 @@ impl<'tcx> ConstValue<'tcx> {
         let end = end.try_into().unwrap();
         Some(data.inner().inspect_with_uninit_and_ptr_outside_interpreter(start..end))
     }
+
+    /// Check if a constant may contain provenance information. This is used by MIR opts.
+    /// Can return `true` even if there is no provenance.
+    pub fn may_have_provenance(&self, tcx: TyCtxt<'tcx>, size: Size) -> bool {
+        match *self {
+            ConstValue::ZeroSized | ConstValue::Scalar(Scalar::Int(_)) => return false,
+            ConstValue::Scalar(Scalar::Ptr(..)) => return true,
+            // It's hard to find out the part of the allocation we point to;
+            // just conservatively check everything.
+            ConstValue::Slice { data, meta: _ } => !data.inner().provenance().ptrs().is_empty(),
+            ConstValue::Indirect { alloc_id, offset } => !tcx
+                .global_alloc(alloc_id)
+                .unwrap_memory()
+                .inner()
+                .provenance()
+                .range_empty(super::AllocRange::from(offset..offset + size), &tcx),
+        }
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////
 /// Constants
 
 #[derive(Clone, Copy, PartialEq, Eq, TyEncodable, TyDecodable, Hash, HashStable, Debug)]
-#[derive(TypeFoldable, TypeVisitable)]
+#[derive(TypeFoldable, TypeVisitable, Lift)]
 pub enum Const<'tcx> {
     /// This constant came from the type system.
     ///
@@ -201,6 +219,17 @@ pub enum Const<'tcx> {
 }
 
 impl<'tcx> Const<'tcx> {
+    pub fn identity_unevaluated(tcx: TyCtxt<'tcx>, def_id: DefId) -> ty::EarlyBinder<Const<'tcx>> {
+        ty::EarlyBinder::bind(Const::Unevaluated(
+            UnevaluatedConst {
+                def: def_id,
+                args: ty::GenericArgs::identity_for_item(tcx, def_id),
+                promoted: None,
+            },
+            tcx.type_of(def_id).skip_binder(),
+        ))
+    }
+
     #[inline(always)]
     pub fn ty(&self) -> Ty<'tcx> {
         match self {
@@ -213,10 +242,10 @@ impl<'tcx> Const<'tcx> {
     pub fn try_to_scalar(self) -> Option<Scalar> {
         match self {
             Const::Ty(c) => match c.kind() {
-                ty::ConstKind::Value(valtree) => match valtree {
-                    ty::ValTree::Leaf(scalar_int) => Some(Scalar::Int(scalar_int)),
-                    ty::ValTree::Branch(_) => None,
-                },
+                ty::ConstKind::Value(valtree) if c.ty().is_primitive() => {
+                    // A valtree of a type where leaves directly represent the scalar const value.
+                    Some(valtree.unwrap_leaf().into())
+                }
                 _ => None,
             },
             Const::Val(val, _) => val.try_to_scalar(),
@@ -244,7 +273,7 @@ impl<'tcx> Const<'tcx> {
         self,
         tcx: TyCtxt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
-        span: Option<Span>,
+        span: Span,
     ) -> Result<ConstValue<'tcx>, ErrorHandled> {
         match self {
             Const::Ty(c) => {
@@ -264,7 +293,7 @@ impl<'tcx> Const<'tcx> {
     /// Normalizes the constant to a value or an error if possible.
     #[inline]
     pub fn normalize(self, tcx: TyCtxt<'tcx>, param_env: ty::ParamEnv<'tcx>) -> Self {
-        match self.eval(tcx, param_env, None) {
+        match self.eval(tcx, param_env, DUMMY_SP) {
             Ok(val) => Self::Val(val, self.ty()),
             Err(ErrorHandled::Reported(guar, _span)) => {
                 Self::Ty(ty::Const::new_error(tcx, guar.into(), self.ty()))
@@ -279,7 +308,16 @@ impl<'tcx> Const<'tcx> {
         tcx: TyCtxt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
     ) -> Option<Scalar> {
-        self.eval(tcx, param_env, None).ok()?.try_to_scalar()
+        match self {
+            Const::Ty(c) if c.ty().is_primitive() => {
+                // Avoid the `valtree_to_const_val` query. Can only be done on primitive types that
+                // are valtree leaves, and *not* on references. (References should return the
+                // pointer here, which valtrees don't represent.)
+                let val = c.eval(tcx, param_env, DUMMY_SP).ok()?;
+                Some(val.unwrap_leaf().into())
+            }
+            _ => self.eval(tcx, param_env, DUMMY_SP).ok()?.try_to_scalar(),
+        }
     }
 
     #[inline]
@@ -371,101 +409,6 @@ impl<'tcx> Const<'tcx> {
         Self::Val(val, ty)
     }
 
-    /// Literals are converted to `Const::Val`, const generic parameters are eagerly
-    /// converted to a constant, everything else becomes `Unevaluated`.
-    #[instrument(skip(tcx), level = "debug", ret)]
-    pub fn from_anon_const(
-        tcx: TyCtxt<'tcx>,
-        def: LocalDefId,
-        param_env: ty::ParamEnv<'tcx>,
-    ) -> Self {
-        let body_id = match tcx.hir().get_by_def_id(def) {
-            hir::Node::AnonConst(ac) => ac.body,
-            _ => {
-                span_bug!(tcx.def_span(def), "from_anon_const can only process anonymous constants")
-            }
-        };
-
-        let expr = &tcx.hir().body(body_id).value;
-        debug!(?expr);
-
-        // Unwrap a block, so that e.g. `{ P }` is recognised as a parameter. Const arguments
-        // currently have to be wrapped in curly brackets, so it's necessary to special-case.
-        let expr = match &expr.kind {
-            hir::ExprKind::Block(block, _) if block.stmts.is_empty() && block.expr.is_some() => {
-                block.expr.as_ref().unwrap()
-            }
-            _ => expr,
-        };
-        debug!("expr.kind: {:?}", expr.kind);
-
-        let ty = tcx.type_of(def).instantiate_identity();
-        debug!(?ty);
-
-        // FIXME(const_generics): We currently have to special case parameters because `min_const_generics`
-        // does not provide the parents generics to anonymous constants. We still allow generic const
-        // parameters by themselves however, e.g. `N`. These constants would cause an ICE if we were to
-        // ever try to substitute the generic parameters in their bodies.
-        //
-        // While this doesn't happen as these constants are always used as `ty::ConstKind::Param`, it does
-        // cause issues if we were to remove that special-case and try to evaluate the constant instead.
-        use hir::{def::DefKind::ConstParam, def::Res, ExprKind, Path, QPath};
-        match expr.kind {
-            ExprKind::Path(QPath::Resolved(_, &Path { res: Res::Def(ConstParam, def_id), .. })) => {
-                // Find the name and index of the const parameter by indexing the generics of
-                // the parent item and construct a `ParamConst`.
-                let item_def_id = tcx.parent(def_id);
-                let generics = tcx.generics_of(item_def_id);
-                let index = generics.param_def_id_to_index[&def_id];
-                let name = tcx.item_name(def_id);
-                let ty_const = ty::Const::new_param(tcx, ty::ParamConst::new(index, name), ty);
-                debug!(?ty_const);
-
-                return Self::Ty(ty_const);
-            }
-            _ => {}
-        }
-
-        let hir_id = tcx.hir().local_def_id_to_hir_id(def);
-        let parent_args = if let Some(parent_hir_id) = tcx.hir().opt_parent_id(hir_id)
-            && let Some(parent_did) = parent_hir_id.as_owner()
-        {
-            GenericArgs::identity_for_item(tcx, parent_did)
-        } else {
-            List::empty()
-        };
-        debug!(?parent_args);
-
-        let did = def.to_def_id();
-        let child_args = GenericArgs::identity_for_item(tcx, did);
-        let args = tcx.mk_args_from_iter(parent_args.into_iter().chain(child_args.into_iter()));
-        debug!(?args);
-
-        let span = tcx.def_span(def);
-        let uneval = UnevaluatedConst::new(did, args);
-        debug!(?span, ?param_env);
-
-        match tcx.const_eval_resolve(param_env, uneval, Some(span)) {
-            Ok(val) => {
-                debug!("evaluated const value");
-                Self::Val(val, ty)
-            }
-            Err(_) => {
-                debug!("error encountered during evaluation");
-                // Error was handled in `const_eval_resolve`. Here we just create a
-                // new unevaluated const and error hard later in codegen
-                Self::Unevaluated(
-                    UnevaluatedConst {
-                        def: did,
-                        args: GenericArgs::identity_for_item(tcx, did),
-                        promoted: None,
-                    },
-                    ty,
-                )
-            }
-        }
-    }
-
     pub fn from_ty_const(c: ty::Const<'tcx>, tcx: TyCtxt<'tcx>) -> Self {
         match c.kind() {
             ty::ConstKind::Value(valtree) => {
@@ -476,11 +419,45 @@ impl<'tcx> Const<'tcx> {
             _ => Self::Ty(c),
         }
     }
+
+    /// Return true if any evaluation of this constant always returns the same value,
+    /// taking into account even pointer identity tests.
+    pub fn is_deterministic(&self) -> bool {
+        // Some constants may generate fresh allocations for pointers they contain,
+        // so using the same constant twice can yield two different results:
+        // - valtrees purposefully generate new allocations
+        // - ConstValue::Slice also generate new allocations
+        match self {
+            Const::Ty(c) => match c.kind() {
+                ty::ConstKind::Param(..) => true,
+                // A valtree may be a reference. Valtree references correspond to a
+                // different allocation each time they are evaluated. Valtrees for primitive
+                // types are fine though.
+                ty::ConstKind::Value(_) => c.ty().is_primitive(),
+                ty::ConstKind::Unevaluated(..) | ty::ConstKind::Expr(..) => false,
+                // This can happen if evaluation of a constant failed. The result does not matter
+                // much since compilation is doomed.
+                ty::ConstKind::Error(..) => false,
+                // Should not appear in runtime MIR.
+                ty::ConstKind::Infer(..)
+                | ty::ConstKind::Bound(..)
+                | ty::ConstKind::Placeholder(..) => bug!(),
+            },
+            Const::Unevaluated(..) => false,
+            // If the same slice appears twice in the MIR, we cannot guarantee that we will
+            // give the same `AllocId` to the data.
+            Const::Val(ConstValue::Slice { .. }, _) => false,
+            Const::Val(
+                ConstValue::ZeroSized | ConstValue::Scalar(_) | ConstValue::Indirect { .. },
+                _,
+            ) => true,
+        }
+    }
 }
 
 /// An unevaluated (potentially generic) constant used in MIR.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, TyEncodable, TyDecodable)]
-#[derive(Hash, HashStable, TypeFoldable, TypeVisitable)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, TyEncodable, TyDecodable)]
+#[derive(Hash, HashStable, TypeFoldable, TypeVisitable, Lift)]
 pub struct UnevaluatedConst<'tcx> {
     pub def: DefId,
     pub args: GenericArgsRef<'tcx>,
@@ -513,10 +490,40 @@ impl<'tcx> Display for Const<'tcx> {
             Const::Ty(c) => pretty_print_const(c, fmt, true),
             Const::Val(val, ty) => pretty_print_const_value(val, ty, fmt),
             // FIXME(valtrees): Correctly print mir constants.
-            Const::Unevaluated(..) => {
-                fmt.write_str("_")?;
-                Ok(())
+            Const::Unevaluated(c, _ty) => {
+                ty::tls::with(move |tcx| {
+                    let c = tcx.lift(c).unwrap();
+                    // Matches `GlobalId` printing.
+                    let instance =
+                        with_no_trimmed_paths!(tcx.def_path_str_with_args(c.def, c.args));
+                    write!(fmt, "{instance}")?;
+                    if let Some(promoted) = c.promoted {
+                        write!(fmt, "::{promoted:?}")?;
+                    }
+                    Ok(())
+                })
             }
         }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////
+/// Const-related utilities
+
+impl<'tcx> TyCtxt<'tcx> {
+    pub fn span_as_caller_location(self, span: Span) -> ConstValue<'tcx> {
+        let topmost = span.ctxt().outer_expn().expansion_cause().unwrap_or(span);
+        let caller = self.sess.source_map().lookup_char_pos(topmost.lo());
+        self.const_caller_location(
+            rustc_span::symbol::Symbol::intern(
+                &caller
+                    .file
+                    .name
+                    .for_scope(self.sess, RemapPathScopeComponents::MACRO)
+                    .to_string_lossy(),
+            ),
+            caller.line as u32,
+            caller.col_display as u32 + 1,
+        )
     }
 }

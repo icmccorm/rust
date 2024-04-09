@@ -1,6 +1,8 @@
 #![feature(exclusive_range_pattern)]
+#![allow(overlapping_range_endpoints)]
+#![allow(non_contiguous_range_endpoints)]
 
-// run-pass
+//@ run-pass
 
 fn main() {
     let incl_range = |x, b| {

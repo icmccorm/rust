@@ -4,20 +4,18 @@
 use std::mem;
 
 use base_db::CrateId;
-use either::Either;
 use hir_expand::{
-    ast_id_map::AstIdMap,
     name::{name, AsName, Name},
-    AstId, ExpandError, InFile,
+    ExpandError, InFile,
 };
 use intern::Interned;
-use profile::Count;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
+use span::AstIdMap;
 use syntax::{
     ast::{
         self, ArrayExprKind, AstChildren, BlockExpr, HasArgList, HasAttrs, HasLoopBody, HasName,
-        SlicePatComponents,
+        RangeItem, SlicePatComponents,
     },
     AstNode, AstPtr, SyntaxNodePtr,
 };
@@ -30,7 +28,6 @@ use crate::{
     db::DefDatabase,
     expander::Expander,
     hir::{
-        dummy_expr_id,
         format_args::{
             self, FormatAlignment, FormatArgs, FormatArgsPiece, FormatArgument, FormatArgumentKind,
             FormatArgumentsCollector, FormatCount, FormatDebugHex, FormatOptions,
@@ -66,22 +63,12 @@ pub(super) fn lower(
         krate,
         def_map: expander.module.def_map(db),
         source_map: BodySourceMap::default(),
-        ast_id_map: db.ast_id_map(expander.current_file_id),
-        body: Body {
-            exprs: Default::default(),
-            pats: Default::default(),
-            bindings: Default::default(),
-            binding_owners: Default::default(),
-            labels: Default::default(),
-            params: Vec::new(),
-            body_expr: dummy_expr_id(),
-            block_scopes: Vec::new(),
-            _c: Count::new(),
-        },
+        ast_id_map: db.ast_id_map(expander.current_file_id()),
+        body: Body::default(),
         expander,
         current_try_block_label: None,
         is_lowering_assignee_expr: false,
-        is_lowering_generator: false,
+        is_lowering_coroutine: false,
         label_ribs: Vec::new(),
         current_binding_owner: None,
     }
@@ -99,7 +86,7 @@ struct ExprCollector<'a> {
     source_map: BodySourceMap,
 
     is_lowering_assignee_expr: bool,
-    is_lowering_generator: bool,
+    is_lowering_coroutine: bool,
 
     current_try_block_label: Option<LabelId>,
     // points to the expression that a try expression will target (replaces current_try_block_label)
@@ -193,39 +180,35 @@ impl ExprCollector<'_> {
         is_async_fn: bool,
     ) -> (Body, BodySourceMap) {
         if let Some((param_list, mut attr_enabled)) = param_list {
+            let mut params = vec![];
             if let Some(self_param) =
                 param_list.self_param().filter(|_| attr_enabled.next().unwrap_or(false))
             {
-                let ptr = AstPtr::new(&self_param);
-                let binding_id: la_arena::Idx<Binding> = self.alloc_binding(
-                    name![self],
-                    BindingAnnotation::new(
-                        self_param.mut_token().is_some() && self_param.amp_token().is_none(),
-                        false,
-                    ),
-                );
-                let param_pat =
-                    self.alloc_pat(Pat::Bind { id: binding_id, subpat: None }, Either::Right(ptr));
-                self.add_definition_to_binding(binding_id, param_pat);
-                self.body.params.push(param_pat);
+                let is_mutable =
+                    self_param.mut_token().is_some() && self_param.amp_token().is_none();
+                let binding_id: la_arena::Idx<Binding> =
+                    self.alloc_binding(name![self], BindingAnnotation::new(is_mutable, false));
+                self.body.self_param = Some(binding_id);
+                self.source_map.self_param = Some(self.expander.in_file(AstPtr::new(&self_param)));
             }
 
             for (param, _) in param_list.params().zip(attr_enabled).filter(|(_, enabled)| *enabled)
             {
                 let param_pat = self.collect_pat_top(param.pat());
-                self.body.params.push(param_pat);
+                params.push(param_pat);
             }
+            self.body.params = params.into_boxed_slice();
         };
         self.body.body_expr = self.with_label_rib(RibKind::Closure, |this| {
             if is_async_fn {
                 match body {
                     Some(e) => {
+                        let syntax_ptr = AstPtr::new(&e);
                         let expr = this.collect_expr(e);
-                        this.alloc_expr_desugared(Expr::Async {
-                            id: None,
-                            statements: Box::new([]),
-                            tail: Some(expr),
-                        })
+                        this.alloc_expr_desugared_with_ptr(
+                            Expr::Async { id: None, statements: Box::new([]), tail: Some(expr) },
+                            syntax_ptr,
+                        )
                     }
                     None => this.missing_expr(),
                 }
@@ -411,8 +394,8 @@ impl ExprCollector<'_> {
             }
             ast::Expr::ParenExpr(e) => {
                 let inner = self.collect_expr_opt(e.expr());
-                // make the paren expr point to the inner expression as well
-                let src = self.expander.to_source(syntax_ptr);
+                // make the paren expr point to the inner expression as well for IDE resolution
+                let src = self.expander.in_file(syntax_ptr);
                 self.source_map.expr_map.insert(src, inner);
                 inner
             }
@@ -420,8 +403,13 @@ impl ExprCollector<'_> {
                 let expr = e.expr().map(|e| self.collect_expr(e));
                 self.alloc_expr(Expr::Return { expr }, syntax_ptr)
             }
+            ast::Expr::BecomeExpr(e) => {
+                let expr =
+                    e.expr().map(|e| self.collect_expr(e)).unwrap_or_else(|| self.missing_expr());
+                self.alloc_expr(Expr::Become { expr }, syntax_ptr)
+            }
             ast::Expr::YieldExpr(e) => {
-                self.is_lowering_generator = true;
+                self.is_lowering_coroutine = true;
                 let expr = e.expr().map(|e| self.collect_expr(e));
                 self.alloc_expr(Expr::Yield { expr }, syntax_ptr)
             }
@@ -445,7 +433,7 @@ impl ExprCollector<'_> {
                                 Some(e) => self.collect_expr(e),
                                 None => self.missing_expr(),
                             };
-                            let src = self.expander.to_source(AstPtr::new(&field));
+                            let src = self.expander.in_file(AstPtr::new(&field));
                             self.source_map.field_map_back.insert(expr, src);
                             Some(RecordLitField { name, expr })
                         })
@@ -529,18 +517,18 @@ impl ExprCollector<'_> {
                     .and_then(|r| r.ty())
                     .map(|it| Interned::new(TypeRef::from_ast(&this.ctx(), it)));
 
-                let prev_is_lowering_generator = mem::take(&mut this.is_lowering_generator);
+                let prev_is_lowering_coroutine = mem::take(&mut this.is_lowering_coroutine);
                 let prev_try_block_label = this.current_try_block_label.take();
 
                 let body = this.collect_expr_opt(e.body());
 
-                let closure_kind = if this.is_lowering_generator {
+                let closure_kind = if this.is_lowering_coroutine {
                     let movability = if e.static_token().is_some() {
                         Movability::Static
                     } else {
                         Movability::Movable
                     };
-                    ClosureKind::Generator(movability)
+                    ClosureKind::Coroutine(movability)
                 } else if e.async_token().is_some() {
                     ClosureKind::Async
                 } else {
@@ -548,7 +536,7 @@ impl ExprCollector<'_> {
                 };
                 let capture_by =
                     if e.move_token().is_some() { CaptureBy::Value } else { CaptureBy::Ref };
-                this.is_lowering_generator = prev_is_lowering_generator;
+                this.is_lowering_coroutine = prev_is_lowering_coroutine;
                 this.current_binding_owner = prev_binding_owner;
                 this.current_try_block_label = prev_try_block_label;
                 this.body.exprs[result_expr_id] = Expr::Closure {
@@ -626,7 +614,8 @@ impl ExprCollector<'_> {
             ast::Expr::IndexExpr(e) => {
                 let base = self.collect_expr_opt(e.base());
                 let index = self.collect_expr_opt(e.index());
-                self.alloc_expr(Expr::Index { base, index }, syntax_ptr)
+                let is_assignee_expr = self.is_lowering_assignee_expr;
+                self.alloc_expr(Expr::Index { base, index, is_assignee_expr }, syntax_ptr)
             }
             ast::Expr::RangeExpr(e) => {
                 let lhs = e.start().map(|lhs| self.collect_expr(lhs));
@@ -648,7 +637,7 @@ impl ExprCollector<'_> {
                     Some(id) => {
                         // Make the macro-call point to its expanded expression so we can query
                         // semantics on syntax pointers to the macro
-                        let src = self.expander.to_source(syntax_ptr);
+                        let src = self.expander.in_file(syntax_ptr);
                         self.source_map.expr_map.insert(src, id);
                         id
                     }
@@ -703,9 +692,11 @@ impl ExprCollector<'_> {
         let Some(try_from_output) = LangItem::TryTraitFromOutput.path(self.db, self.krate) else {
             return self.collect_block(e);
         };
-        let label = self.alloc_label_desugared(Label { name: Name::generate_new_name() });
+        let label = self
+            .alloc_label_desugared(Label { name: Name::generate_new_name(self.body.labels.len()) });
         let old_label = self.current_try_block_label.replace(label);
 
+        let ptr = AstPtr::new(&e).upcast();
         let (btail, expr_id) = self.with_labeled_rib(label, |this| {
             let mut btail = None;
             let block = this.collect_block_(e, |id, statements, tail| {
@@ -715,23 +706,21 @@ impl ExprCollector<'_> {
             (btail, block)
         });
 
-        let callee = self.alloc_expr_desugared(Expr::Path(try_from_output));
+        let callee = self.alloc_expr_desugared_with_ptr(Expr::Path(try_from_output), ptr);
         let next_tail = match btail {
-            Some(tail) => self.alloc_expr_desugared(Expr::Call {
-                callee,
-                args: Box::new([tail]),
-                is_assignee_expr: false,
-            }),
+            Some(tail) => self.alloc_expr_desugared_with_ptr(
+                Expr::Call { callee, args: Box::new([tail]), is_assignee_expr: false },
+                ptr,
+            ),
             None => {
-                let unit = self.alloc_expr_desugared(Expr::Tuple {
-                    exprs: Box::new([]),
-                    is_assignee_expr: false,
-                });
-                self.alloc_expr_desugared(Expr::Call {
-                    callee,
-                    args: Box::new([unit]),
-                    is_assignee_expr: false,
-                })
+                let unit = self.alloc_expr_desugared_with_ptr(
+                    Expr::Tuple { exprs: Box::new([]), is_assignee_expr: false },
+                    ptr,
+                );
+                self.alloc_expr_desugared_with_ptr(
+                    Expr::Call { callee, args: Box::new([unit]), is_assignee_expr: false },
+                    ptr,
+                )
             }
         };
         let Expr::Block { tail, .. } = &mut self.body.exprs[expr_id] else {
@@ -779,11 +768,10 @@ impl ExprCollector<'_> {
             None => self.collect_expr_opt(e.condition()),
         };
 
-        let break_expr =
-            self.alloc_expr(Expr::Break { expr: None, label: None }, syntax_ptr.clone());
+        let break_expr = self.alloc_expr(Expr::Break { expr: None, label: None }, syntax_ptr);
         let if_expr = self.alloc_expr(
             Expr::If { condition, then_branch: body, else_branch: Some(break_expr) },
-            syntax_ptr.clone(),
+            syntax_ptr,
         );
         self.alloc_expr(Expr::Loop { body: if_expr, label }, syntax_ptr)
     }
@@ -814,19 +802,19 @@ impl ExprCollector<'_> {
             return self.alloc_expr(Expr::Missing, syntax_ptr);
         };
         let head = self.collect_expr_opt(e.iterable());
-        let into_iter_fn_expr = self.alloc_expr(Expr::Path(into_iter_fn), syntax_ptr.clone());
+        let into_iter_fn_expr = self.alloc_expr(Expr::Path(into_iter_fn), syntax_ptr);
         let iterator = self.alloc_expr(
             Expr::Call {
                 callee: into_iter_fn_expr,
                 args: Box::new([head]),
                 is_assignee_expr: false,
             },
-            syntax_ptr.clone(),
+            syntax_ptr,
         );
         let none_arm = MatchArm {
             pat: self.alloc_pat_desugared(Pat::Path(Box::new(option_none))),
             guard: None,
-            expr: self.alloc_expr(Expr::Break { expr: None, label: None }, syntax_ptr.clone()),
+            expr: self.alloc_expr(Expr::Break { expr: None, label: None }, syntax_ptr),
         };
         let some_pat = Pat::TupleStruct {
             path: Some(Box::new(option_some)),
@@ -841,28 +829,26 @@ impl ExprCollector<'_> {
                 this.collect_expr_opt(e.loop_body().map(|it| it.into()))
             }),
         };
-        let iter_name = Name::generate_new_name();
-        let iter_expr =
-            self.alloc_expr(Expr::Path(Path::from(iter_name.clone())), syntax_ptr.clone());
+        let iter_name = Name::generate_new_name(self.body.exprs.len());
+        let iter_expr = self.alloc_expr(Expr::Path(Path::from(iter_name.clone())), syntax_ptr);
         let iter_expr_mut = self.alloc_expr(
             Expr::Ref { expr: iter_expr, rawness: Rawness::Ref, mutability: Mutability::Mut },
-            syntax_ptr.clone(),
+            syntax_ptr,
         );
-        let iter_next_fn_expr = self.alloc_expr(Expr::Path(iter_next_fn), syntax_ptr.clone());
+        let iter_next_fn_expr = self.alloc_expr(Expr::Path(iter_next_fn), syntax_ptr);
         let iter_next_expr = self.alloc_expr(
             Expr::Call {
                 callee: iter_next_fn_expr,
                 args: Box::new([iter_expr_mut]),
                 is_assignee_expr: false,
             },
-            syntax_ptr.clone(),
+            syntax_ptr,
         );
         let loop_inner = self.alloc_expr(
             Expr::Match { expr: iter_next_expr, arms: Box::new([none_arm, some_arm]) },
-            syntax_ptr.clone(),
+            syntax_ptr,
         );
-        let loop_outer =
-            self.alloc_expr(Expr::Loop { body: loop_inner, label }, syntax_ptr.clone());
+        let loop_outer = self.alloc_expr(Expr::Loop { body: loop_inner, label }, syntax_ptr);
         let iter_binding = self.alloc_binding(iter_name, BindingAnnotation::Mutable);
         let iter_pat = self.alloc_pat_desugared(Pat::Bind { id: iter_binding, subpat: None });
         self.add_definition_to_binding(iter_binding, iter_pat);
@@ -871,7 +857,7 @@ impl ExprCollector<'_> {
                 expr: iterator,
                 arms: Box::new([MatchArm { pat: iter_pat, guard: None, expr: loop_outer }]),
             },
-            syntax_ptr.clone(),
+            syntax_ptr,
         )
     }
 
@@ -899,12 +885,12 @@ impl ExprCollector<'_> {
             return self.alloc_expr(Expr::Missing, syntax_ptr);
         };
         let operand = self.collect_expr_opt(e.expr());
-        let try_branch = self.alloc_expr(Expr::Path(try_branch), syntax_ptr.clone());
+        let try_branch = self.alloc_expr(Expr::Path(try_branch), syntax_ptr);
         let expr = self.alloc_expr(
             Expr::Call { callee: try_branch, args: Box::new([operand]), is_assignee_expr: false },
-            syntax_ptr.clone(),
+            syntax_ptr,
         );
-        let continue_name = Name::generate_new_name();
+        let continue_name = Name::generate_new_name(self.body.bindings.len());
         let continue_binding =
             self.alloc_binding(continue_name.clone(), BindingAnnotation::Unannotated);
         let continue_bpat =
@@ -917,9 +903,9 @@ impl ExprCollector<'_> {
                 ellipsis: None,
             }),
             guard: None,
-            expr: self.alloc_expr(Expr::Path(Path::from(continue_name)), syntax_ptr.clone()),
+            expr: self.alloc_expr(Expr::Path(Path::from(continue_name)), syntax_ptr),
         };
-        let break_name = Name::generate_new_name();
+        let break_name = Name::generate_new_name(self.body.bindings.len());
         let break_binding = self.alloc_binding(break_name.clone(), BindingAnnotation::Unannotated);
         let break_bpat = self.alloc_pat_desugared(Pat::Bind { id: break_binding, subpat: None });
         self.add_definition_to_binding(break_binding, break_bpat);
@@ -931,18 +917,18 @@ impl ExprCollector<'_> {
             }),
             guard: None,
             expr: {
-                let it = self.alloc_expr(Expr::Path(Path::from(break_name)), syntax_ptr.clone());
-                let callee = self.alloc_expr(Expr::Path(try_from_residual), syntax_ptr.clone());
+                let it = self.alloc_expr(Expr::Path(Path::from(break_name)), syntax_ptr);
+                let callee = self.alloc_expr(Expr::Path(try_from_residual), syntax_ptr);
                 let result = self.alloc_expr(
                     Expr::Call { callee, args: Box::new([it]), is_assignee_expr: false },
-                    syntax_ptr.clone(),
+                    syntax_ptr,
                 );
                 self.alloc_expr(
                     match self.current_try_block_label {
                         Some(label) => Expr::Break { expr: Some(result), label: Some(label) },
                         None => Expr::Return { expr: Some(result) },
                     },
-                    syntax_ptr.clone(),
+                    syntax_ptr,
                 )
             },
         };
@@ -961,22 +947,30 @@ impl ExprCollector<'_> {
         T: ast::AstNode,
     {
         // File containing the macro call. Expansion errors will be attached here.
-        let outer_file = self.expander.current_file_id;
+        let outer_file = self.expander.current_file_id();
 
-        let macro_call_ptr = self.expander.to_source(AstPtr::new(&mcall));
+        let macro_call_ptr = self.expander.in_file(syntax_ptr);
         let module = self.expander.module.local_id;
-        let res = self.expander.enter_expand(self.db, mcall, |path| {
-            self.def_map
-                .resolve_path(
-                    self.db,
-                    module,
-                    &path,
-                    crate::item_scope::BuiltinShadowMode::Other,
-                    Some(MacroSubNs::Bang),
-                )
-                .0
-                .take_macros()
-        });
+
+        let res = match self.def_map.modules[module]
+            .scope
+            .macro_invoc(InFile::new(outer_file, self.ast_id_map.ast_id_for_ptr(syntax_ptr)))
+        {
+            // fast path, macro call is in a block module
+            Some(call) => Ok(self.expander.enter_expand_id(self.db, call)),
+            None => self.expander.enter_expand(self.db, mcall, |path| {
+                self.def_map
+                    .resolve_path(
+                        self.db,
+                        module,
+                        &path,
+                        crate::item_scope::BuiltinShadowMode::Other,
+                        Some(MacroSubNs::Bang),
+                    )
+                    .0
+                    .take_macros()
+            }),
+        };
 
         let res = match res {
             Ok(res) => res,
@@ -990,7 +984,6 @@ impl ExprCollector<'_> {
                 return collector(self, None);
             }
         };
-
         if record_diagnostics {
             match &res.err {
                 Some(ExpandError::UnresolvedProcMacro(krate)) => {
@@ -998,10 +991,6 @@ impl ExprCollector<'_> {
                         node: InFile::new(outer_file, syntax_ptr),
                         krate: *krate,
                     });
-                }
-                Some(ExpandError::RecursionOverflowPoisoned) => {
-                    // Recursion limit has been reached in the macro expansion tree, but not in
-                    // this very macro call. Don't add diagnostics to avoid duplication.
                 }
                 Some(err) => {
                     self.source_map.diagnostics.push(BodyDiagnostic::MacroError {
@@ -1017,10 +1006,10 @@ impl ExprCollector<'_> {
             Some((mark, expansion)) => {
                 // Keep collecting even with expansion errors so we can provide completions and
                 // other services in incomplete macro expressions.
-                self.source_map.expansions.insert(macro_call_ptr, self.expander.current_file_id);
+                self.source_map.expansions.insert(macro_call_ptr, self.expander.current_file_id());
                 let prev_ast_id_map = mem::replace(
                     &mut self.ast_id_map,
-                    self.db.ast_id_map(self.expander.current_file_id),
+                    self.db.ast_id_map(self.expander.current_file_id()),
                 );
 
                 if record_diagnostics {
@@ -1029,7 +1018,7 @@ impl ExprCollector<'_> {
 
                 let id = collector(self, Some(expansion.tree()));
                 self.ast_id_map = prev_ast_id_map;
-                self.expander.exit(self.db, mark);
+                self.expander.exit(mark);
                 id
             }
             None => collector(self, None),
@@ -1066,16 +1055,12 @@ impl ExprCollector<'_> {
                 None => None,
             },
         );
-        match expansion {
-            Some(tail) => {
-                // Make the macro-call point to its expanded expression so we can query
-                // semantics on syntax pointers to the macro
-                let src = self.expander.to_source(syntax_ptr);
-                self.source_map.expr_map.insert(src, tail);
-                Some(tail)
-            }
-            None => None,
-        }
+        expansion.inspect(|&tail| {
+            // Make the macro-call point to its expanded expression so we can query
+            // semantics on syntax pointers to the macro
+            let src = self.expander.in_file(syntax_ptr);
+            self.source_map.expr_map.insert(src, tail);
+        })
     }
 
     fn collect_stmt(&mut self, statements: &mut Vec<Statement>, s: ast::Stmt) {
@@ -1111,7 +1096,7 @@ impl ExprCollector<'_> {
                     statements.push(Statement::Expr { expr, has_semi });
                 }
             }
-            ast::Stmt::Item(_item) => (),
+            ast::Stmt::Item(_item) => statements.push(Statement::Item),
         }
     }
 
@@ -1144,7 +1129,7 @@ impl ExprCollector<'_> {
 
         let block_id = if block_has_items {
             let file_local_id = self.ast_id_map.ast_id(&block);
-            let ast_id = AstId::new(self.expander.current_file_id, file_local_id);
+            let ast_id = self.expander.in_file(file_local_id);
             Some(self.db.intern_block(BlockLoc { ast_id, module: self.expander.module }))
         } else {
             None
@@ -1261,7 +1246,7 @@ impl ExprCollector<'_> {
                 };
 
                 let ptr = AstPtr::new(&pat);
-                let pat = self.alloc_pat(pattern, Either::Left(ptr));
+                let pat = self.alloc_pat(pattern, ptr);
                 if let Some(binding_id) = binding {
                     self.add_definition_to_binding(binding_id, pat);
                 }
@@ -1334,10 +1319,11 @@ impl ExprCollector<'_> {
                 let args = record_pat_field_list
                     .fields()
                     .filter_map(|f| {
+                        self.check_cfg(&f)?;
                         let ast_pat = f.pat()?;
                         let pat = self.collect_pat(ast_pat, binding_list);
                         let name = f.field_name()?.as_name();
-                        let src = self.expander.to_source(AstPtr::new(&f));
+                        let src = self.expander.in_file(AstPtr::new(&f));
                         self.source_map.pat_field_map_back.insert(pat, src);
                         Some(RecordFieldPat { name, pat })
                     })
@@ -1357,9 +1343,10 @@ impl ExprCollector<'_> {
                     suffix: suffix.into_iter().map(|p| self.collect_pat(p, binding_list)).collect(),
                 }
             }
-            #[rustfmt::skip] // https://github.com/rust-lang/rustfmt/issues/5676
             ast::Pat::LiteralPat(lit) => 'b: {
-                let Some((hir_lit, ast_lit)) = pat_literal_to_hir(lit) else { break 'b Pat::Missing };
+                let Some((hir_lit, ast_lit)) = pat_literal_to_hir(lit) else {
+                    break 'b Pat::Missing;
+                };
                 let expr = Expr::Literal(hir_lit);
                 let expr_ptr = AstPtr::new(&ast::Expr::Literal(ast_lit));
                 let expr_id = self.alloc_expr(expr, expr_ptr);
@@ -1395,7 +1382,7 @@ impl ExprCollector<'_> {
             ast::Pat::MacroPat(mac) => match mac.macro_call() {
                 Some(call) => {
                     let macro_ptr = AstPtr::new(&call);
-                    let src = self.expander.to_source(Either::Left(AstPtr::new(&pat)));
+                    let src = self.expander.in_file(AstPtr::new(&pat));
                     let pat =
                         self.collect_macro_call(call, macro_ptr, true, |this, expanded_pat| {
                             this.collect_pat_opt(expanded_pat, binding_list)
@@ -1412,16 +1399,10 @@ impl ExprCollector<'_> {
                         ast::Pat::LiteralPat(it) => {
                             Some(Box::new(LiteralOrConst::Literal(pat_literal_to_hir(it)?.0)))
                         }
-                        ast::Pat::IdentPat(p) => {
-                            let name =
-                                p.name().map(|nr| nr.as_name()).unwrap_or_else(Name::missing);
-                            Some(Box::new(LiteralOrConst::Const(name.into())))
+                        pat @ (ast::Pat::IdentPat(_) | ast::Pat::PathPat(_)) => {
+                            let subpat = self.collect_pat(pat.clone(), binding_list);
+                            Some(Box::new(LiteralOrConst::Const(subpat)))
                         }
-                        ast::Pat::PathPat(p) => p
-                            .path()
-                            .and_then(|path| self.expander.parse_path(self.db, path))
-                            .map(LiteralOrConst::Const)
-                            .map(Box::new),
                         _ => None,
                     })
                 };
@@ -1431,7 +1412,7 @@ impl ExprCollector<'_> {
             }
         };
         let ptr = AstPtr::new(&pat);
-        self.alloc_pat(pattern, Either::Left(ptr))
+        self.alloc_pat(pattern, ptr)
     }
 
     fn collect_pat_opt(&mut self, pat: Option<ast::Pat>, binding_list: &mut BindingList) -> PatId {
@@ -1476,10 +1457,7 @@ impl ExprCollector<'_> {
                 }
 
                 self.source_map.diagnostics.push(BodyDiagnostic::InactiveCode {
-                    node: InFile::new(
-                        self.expander.current_file_id,
-                        SyntaxNodePtr::new(owner.syntax()),
-                    ),
+                    node: self.expander.in_file(SyntaxNodePtr::new(owner.syntax())),
                     cfg,
                     opts: self.expander.cfg_options().clone(),
                 });
@@ -1518,10 +1496,7 @@ impl ExprCollector<'_> {
                     } else {
                         Err(BodyDiagnostic::UnreachableLabel {
                             name,
-                            node: InFile::new(
-                                self.expander.current_file_id,
-                                AstPtr::new(&lifetime),
-                            ),
+                            node: self.expander.in_file(AstPtr::new(&lifetime)),
                         })
                     };
                 }
@@ -1530,7 +1505,7 @@ impl ExprCollector<'_> {
 
         Err(BodyDiagnostic::UndeclaredLabel {
             name,
-            node: InFile::new(self.expander.current_file_id, AstPtr::new(&lifetime)),
+            node: self.expander.in_file(AstPtr::new(&lifetime)),
         })
     }
 
@@ -1601,13 +1576,25 @@ impl ExprCollector<'_> {
         });
         let template = f.template();
         let fmt_snippet = template.as_ref().map(ToString::to_string);
+        let mut mappings = vec![];
         let fmt = match template.and_then(|it| self.expand_macros_to_string(it)) {
-            Some((s, is_direct_literal)) => {
-                format_args::parse(&s, fmt_snippet, args, is_direct_literal, |name| {
-                    self.alloc_expr_desugared(Expr::Path(Path::from(name)))
-                })
-            }
-            None => FormatArgs { template: Default::default(), arguments: args.finish() },
+            Some((s, is_direct_literal)) => format_args::parse(
+                &s,
+                fmt_snippet,
+                args,
+                is_direct_literal,
+                |name| self.alloc_expr_desugared(Expr::Path(Path::from(name))),
+                |name, span| {
+                    if let Some(span) = span {
+                        mappings.push((span, name))
+                    }
+                },
+            ),
+            None => FormatArgs {
+                template: Default::default(),
+                arguments: args.finish(),
+                orphans: Default::default(),
+            },
         };
 
         // Create a list of all _unique_ (argument, format trait) combinations.
@@ -1746,18 +1733,26 @@ impl ExprCollector<'_> {
         });
         let unsafe_arg_new = self.alloc_expr_desugared(Expr::Unsafe {
             id: None,
-            statements: Box::default(),
+            // We collect the unused expressions here so that we still infer them instead of
+            // dropping them out of the expression tree
+            statements: fmt
+                .orphans
+                .into_iter()
+                .map(|expr| Statement::Expr { expr, has_semi: true })
+                .collect(),
             tail: Some(unsafe_arg_new),
         });
 
-        self.alloc_expr(
+        let idx = self.alloc_expr(
             Expr::Call {
                 callee: new_v1_formatted,
                 args: Box::new([lit_pieces, args, format_options, unsafe_arg_new]),
                 is_assignee_expr: false,
             },
             syntax_ptr,
-        )
+        );
+        self.source_map.format_args_template_map.insert(idx, mappings);
+        idx
     }
 
     /// Generate a hir expression for a format_args placeholder specification.
@@ -1829,8 +1824,8 @@ impl ExprCollector<'_> {
             flags as u128,
             Some(BuiltinUint::U32),
         )));
-        let precision = self.make_count(&precision, argmap);
-        let width = self.make_count(&width, argmap);
+        let precision = self.make_count(precision, argmap);
+        let width = self.make_count(width, argmap);
 
         let format_placeholder_new = {
             let format_placeholder_new =
@@ -1964,25 +1959,31 @@ fn pat_literal_to_hir(lit: &ast::LiteralPat) -> Option<(Literal, ast::Literal)> 
     let ast_lit = lit.literal()?;
     let mut hir_lit: Literal = ast_lit.kind().into();
     if lit.minus_token().is_some() {
-        let Some(h) = hir_lit.negate() else {
-            return None;
-        };
-        hir_lit = h;
+        hir_lit = hir_lit.negate()?;
     }
     Some((hir_lit, ast_lit))
 }
 
 impl ExprCollector<'_> {
     fn alloc_expr(&mut self, expr: Expr, ptr: ExprPtr) -> ExprId {
-        let src = self.expander.to_source(ptr);
+        let src = self.expander.in_file(ptr);
         let id = self.body.exprs.alloc(expr);
-        self.source_map.expr_map_back.insert(id, src.clone());
+        self.source_map.expr_map_back.insert(id, src);
         self.source_map.expr_map.insert(src, id);
         id
     }
-    // FIXME: desugared exprs don't have ptr, that's wrong and should be fixed somehow.
+    // FIXME: desugared exprs don't have ptr, that's wrong and should be fixed.
+    // Migrate to alloc_expr_desugared_with_ptr and then rename back
     fn alloc_expr_desugared(&mut self, expr: Expr) -> ExprId {
         self.body.exprs.alloc(expr)
+    }
+    fn alloc_expr_desugared_with_ptr(&mut self, expr: Expr, ptr: ExprPtr) -> ExprId {
+        let src = self.expander.in_file(ptr);
+        let id = self.body.exprs.alloc(expr);
+        self.source_map.expr_map_back.insert(id, src);
+        // We intentionally don't fill this as it could overwrite a non-desugared entry
+        // self.source_map.expr_map.insert(src, id);
+        id
     }
     fn missing_expr(&mut self) -> ExprId {
         self.alloc_expr_desugared(Expr::Missing)
@@ -2002,9 +2003,9 @@ impl ExprCollector<'_> {
     }
 
     fn alloc_pat(&mut self, pat: Pat, ptr: PatPtr) -> PatId {
-        let src = self.expander.to_source(ptr);
+        let src = self.expander.in_file(ptr);
         let id = self.body.pats.alloc(pat);
-        self.source_map.pat_map_back.insert(id, src.clone());
+        self.source_map.pat_map_back.insert(id, src);
         self.source_map.pat_map.insert(src, id);
         id
     }
@@ -2017,9 +2018,9 @@ impl ExprCollector<'_> {
     }
 
     fn alloc_label(&mut self, label: Label, ptr: LabelPtr) -> LabelId {
-        let src = self.expander.to_source(ptr);
+        let src = self.expander.in_file(ptr);
         let id = self.body.labels.alloc(label);
-        self.source_map.label_map_back.insert(id, src.clone());
+        self.source_map.label_map_back.insert(id, src);
         self.source_map.label_map.insert(src, id);
         id
     }

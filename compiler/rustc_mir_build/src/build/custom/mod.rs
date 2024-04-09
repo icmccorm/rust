@@ -6,7 +6,7 @@
 //! present, and if so we branch off into this module, which implements the attribute by
 //! implementing a custom lowering from THIR to MIR.
 //!
-//! The result of this lowering is returned "normally" from the `mir_built` query, with the only
+//! The result of this lowering is returned "normally" from the `build_mir` hook, with the only
 //! notable difference being that the `injected` field in the body is set. Various components of the
 //! MIR pipeline, like borrowck and the pass manager will then consult this field (via
 //! `body.should_skip()`) to skip the parts of the MIR pipeline that precede the MIR phase the user
@@ -48,7 +48,7 @@ pub(super) fn build_custom_mir<'tcx>(
         source: MirSource::item(did),
         phase: MirPhase::Built,
         source_scopes: IndexVec::new(),
-        generator: None,
+        coroutine: None,
         local_decls: IndexVec::new(),
         user_type_annotations: IndexVec::new(),
         arg_count: params.len(),
@@ -56,10 +56,13 @@ pub(super) fn build_custom_mir<'tcx>(
         var_debug_info: Vec::new(),
         span,
         required_consts: Vec::new(),
+        mentioned_items: Vec::new(),
         is_polymorphic: false,
         tainted_by_errors: None,
         injection_phase: None,
         pass_count: 0,
+        coverage_branch_info: None,
+        function_coverage_info: None,
     };
 
     body.local_decls.push(LocalDecl::new(return_ty, return_ty_span));
@@ -69,10 +72,7 @@ pub(super) fn build_custom_mir<'tcx>(
         parent_scope: None,
         inlined: None,
         inlined_parent_scope: None,
-        local_data: ClearCrossCrate::Set(SourceScopeLocalData {
-            lint_root: hir_id,
-            safety: Safety::Safe,
-        }),
+        local_data: ClearCrossCrate::Set(SourceScopeLocalData { lint_root: hir_id }),
     });
     body.injection_phase = Some(parse_attribute(attr));
 
@@ -87,11 +87,11 @@ pub(super) fn build_custom_mir<'tcx>(
     };
 
     let res: PResult<_> = try {
-        pctxt.parse_args(&params)?;
+        pctxt.parse_args(params)?;
         pctxt.parse_body(expr)?;
     };
     if let Err(err) = res {
-        tcx.sess.diagnostic().span_fatal(
+        tcx.dcx().span_fatal(
             err.span,
             format!("Could not parse {}, found: {:?}", err.expected, err.item_description),
         )
@@ -158,6 +158,19 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
         ParseError {
             span: expr.span,
             item_description: format!("{:?}", expr.kind),
+            expected: expected.to_string(),
+        }
+    }
+
+    fn stmt_error(&self, stmt: StmtId, expected: &'static str) -> ParseError {
+        let stmt = &self.thir[stmt];
+        let span = match stmt.kind {
+            StmtKind::Expr { expr, .. } => self.thir[expr].span,
+            StmtKind::Let { span, .. } => span,
+        };
+        ParseError {
+            span,
+            item_description: format!("{:?}", stmt.kind),
             expected: expected.to_string(),
         }
     }

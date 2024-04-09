@@ -1,20 +1,21 @@
+use crate::definitions::DefPathData;
 use crate::hir;
 
 use rustc_ast as ast;
 use rustc_ast::NodeId;
-use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::stable_hasher::ToStableHashKey;
+use rustc_data_structures::unord::UnordMap;
 use rustc_macros::HashStable_Generic;
 use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::hygiene::MacroKind;
+use rustc_span::symbol::kw;
 use rustc_span::Symbol;
 
 use std::array::IntoIter;
 use std::fmt::Debug;
 
 /// Encodes if a `DefKind::Ctor` is the constructor of an enum variant or a struct.
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug)]
-#[derive(HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
 pub enum CtorOf {
     /// This `DefKind::Ctor` is a synthesized constructor of a tuple or unit struct.
     Struct,
@@ -23,8 +24,7 @@ pub enum CtorOf {
 }
 
 /// What kind of constructor something is.
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug)]
-#[derive(HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
 pub enum CtorKind {
     /// Constructor function automatically created by a tuple struct/variant.
     Fn,
@@ -33,8 +33,7 @@ pub enum CtorKind {
 }
 
 /// An attribute that is not a macro; e.g., `#[inline]` or `#[rustfmt::skip]`.
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug)]
-#[derive(HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
 pub enum NonMacroAttrKind {
     /// Single-segment attribute defined by the language (`#[inline]`)
     Builtin(Symbol),
@@ -48,8 +47,8 @@ pub enum NonMacroAttrKind {
 }
 
 /// What kind of definition something is; e.g., `mod` vs `struct`.
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug)]
-#[derive(HashStable_Generic)]
+/// `enum DefPathData` may need to be updated if a new variant is added here.
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
 pub enum DefKind {
     // Type namespace
     Mod,
@@ -76,7 +75,12 @@ pub enum DefKind {
     Const,
     /// Constant generic parameter: `struct Foo<const N: usize> { ... }`
     ConstParam,
-    Static(ast::Mutability),
+    Static {
+        /// Whether it's a `static mut` or just a `static`.
+        mutability: ast::Mutability,
+        /// Whether it's an anonymous static generated for nested allocations.
+        nested: bool,
+    },
     /// Refers to the struct or enum variant's constructor.
     ///
     /// The reason `Ctor` exists in addition to [`DefKind::Struct`] and
@@ -109,6 +113,9 @@ pub enum DefKind {
     InlineConst,
     /// Opaque type, aka `impl Trait`.
     OpaqueTy,
+    /// A field in a struct, enum or union. e.g.
+    /// - `bar` in `struct Foo { bar: u8 }`
+    /// - `Foo::Bar::0` in `enum Foo { Bar(u8) }`
     Field,
     /// Lifetime parameter: the `'a` in `struct Foo<'a> { ... }`
     LifetimeParam,
@@ -117,8 +124,13 @@ pub enum DefKind {
     Impl {
         of_trait: bool,
     },
+    /// A closure, coroutine, or coroutine-closure.
+    ///
+    /// These are all represented with the same `ExprKind::Closure` in the AST and HIR,
+    /// which makes it difficult to distinguish these during def collection. Therefore,
+    /// we treat them all the same, and code which needs to distinguish them can match
+    /// or `hir::ClosureKind` or `type_of`.
     Closure,
-    Generator,
 }
 
 impl DefKind {
@@ -126,13 +138,13 @@ impl DefKind {
     ///
     /// If you have access to `TyCtxt`, use `TyCtxt::def_descr` or
     /// `TyCtxt::def_kind_descr` instead, because they give better
-    /// information for generators and associated functions.
+    /// information for coroutines and associated functions.
     pub fn descr(self, def_id: DefId) -> &'static str {
         match self {
             DefKind::Fn => "function",
             DefKind::Mod if def_id.is_crate_root() && !def_id.is_local() => "crate",
             DefKind::Mod => "module",
-            DefKind::Static(..) => "static",
+            DefKind::Static { .. } => "static",
             DefKind::Enum => "enum",
             DefKind::Variant => "variant",
             DefKind::Ctor(CtorOf::Variant, CtorKind::Fn) => "tuple variant",
@@ -161,7 +173,6 @@ impl DefKind {
             DefKind::Field => "field",
             DefKind::Impl { .. } => "implementation",
             DefKind::Closure => "closure",
-            DefKind::Generator => "generator",
             DefKind::ExternCrate => "extern crate",
             DefKind::GlobalAsm => "global assembly block",
         }
@@ -171,7 +182,7 @@ impl DefKind {
     ///
     /// If you have access to `TyCtxt`, use `TyCtxt::def_descr_article` or
     /// `TyCtxt::def_kind_descr_article` instead, because they give better
-    /// information for generators and associated functions.
+    /// information for coroutines and associated functions.
     pub fn article(&self) -> &'static str {
         match *self {
             DefKind::AssocTy
@@ -206,7 +217,7 @@ impl DefKind {
             DefKind::Fn
             | DefKind::Const
             | DefKind::ConstParam
-            | DefKind::Static(..)
+            | DefKind::Static { .. }
             | DefKind::Ctor(..)
             | DefKind::AssocFn
             | DefKind::AssocConst => Some(Namespace::ValueNS),
@@ -220,7 +231,6 @@ impl DefKind {
             | DefKind::LifetimeParam
             | DefKind::ExternCrate
             | DefKind::Closure
-            | DefKind::Generator
             | DefKind::Use
             | DefKind::ForeignMod
             | DefKind::GlobalAsm
@@ -228,9 +238,48 @@ impl DefKind {
         }
     }
 
+    pub fn def_path_data(self, name: Symbol) -> DefPathData {
+        match self {
+            DefKind::Struct | DefKind::Union if name == kw::Empty => DefPathData::AnonAdt,
+            DefKind::Mod
+            | DefKind::Struct
+            | DefKind::Union
+            | DefKind::Enum
+            | DefKind::Variant
+            | DefKind::Trait
+            | DefKind::TyAlias
+            | DefKind::ForeignTy
+            | DefKind::TraitAlias
+            | DefKind::AssocTy
+            | DefKind::TyParam
+            | DefKind::ExternCrate => DefPathData::TypeNs(name),
+            // It's not exactly an anon const, but wrt DefPathData, there
+            // is no difference.
+            DefKind::Static { nested: true, .. } => DefPathData::AnonConst,
+            DefKind::Fn
+            | DefKind::Const
+            | DefKind::ConstParam
+            | DefKind::Static { .. }
+            | DefKind::AssocFn
+            | DefKind::AssocConst
+            | DefKind::Field => DefPathData::ValueNs(name),
+            DefKind::Macro(..) => DefPathData::MacroNs(name),
+            DefKind::LifetimeParam => DefPathData::LifetimeNs(name),
+            DefKind::Ctor(..) => DefPathData::Ctor,
+            DefKind::Use => DefPathData::Use,
+            DefKind::ForeignMod => DefPathData::ForeignMod,
+            DefKind::AnonConst => DefPathData::AnonConst,
+            DefKind::InlineConst => DefPathData::AnonConst,
+            DefKind::OpaqueTy => DefPathData::OpaqueTy,
+            DefKind::GlobalAsm => DefPathData::GlobalAsm,
+            DefKind::Impl { .. } => DefPathData::Impl,
+            DefKind::Closure => DefPathData::Closure,
+        }
+    }
+
     #[inline]
     pub fn is_fn_like(self) -> bool {
-        matches!(self, DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::Generator)
+        matches!(self, DefKind::Fn | DefKind::AssocFn | DefKind::Closure)
     }
 
     /// Whether `query get_codegen_attrs` should be used with this definition.
@@ -240,8 +289,7 @@ impl DefKind {
             | DefKind::AssocFn
             | DefKind::Ctor(..)
             | DefKind::Closure
-            | DefKind::Generator
-            | DefKind::Static(_) => true,
+            | DefKind::Static { .. } => true,
             DefKind::Mod
             | DefKind::Struct
             | DefKind::Union
@@ -299,8 +347,7 @@ impl DefKind {
 /// - the call to `str_to_string` will resolve to [`Res::Def`], with the [`DefId`]
 ///   pointing to the definition of `str_to_string` in the current crate.
 //
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug)]
-#[derive(HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
 pub enum Res<Id = hir::HirId> {
     /// Definition having a unique ID (`DefId`), corresponds to something defined in user code.
     ///
@@ -575,7 +622,7 @@ impl CtorKind {
         match *vdata {
             ast::VariantData::Tuple(_, node_id) => Some((CtorKind::Fn, node_id)),
             ast::VariantData::Unit(node_id) => Some((CtorKind::Const, node_id)),
-            ast::VariantData::Struct(..) => None,
+            ast::VariantData::Struct { .. } => None,
         }
     }
 }
@@ -591,6 +638,8 @@ impl NonMacroAttrKind {
         }
     }
 
+    // Currently trivial, but exists in case a new kind is added in the future whose name starts
+    // with a vowel.
     pub fn article(self) -> &'static str {
         "a"
     }
@@ -764,6 +813,8 @@ pub enum LifetimeRes {
         param: NodeId,
         /// Id of the introducing place. See `Param`.
         binder: NodeId,
+        /// Kind of elided lifetime
+        kind: hir::MissingLifetimeKind,
     },
     /// This variant is used for anonymous lifetimes that we did not resolve during
     /// late resolution. Those lifetimes will be inferred by typechecking.
@@ -776,4 +827,4 @@ pub enum LifetimeRes {
     ElidedAnchor { start: NodeId, end: NodeId },
 }
 
-pub type DocLinkResMap = FxHashMap<(Symbol, Namespace), Option<Res<NodeId>>>;
+pub type DocLinkResMap = UnordMap<(Symbol, Namespace), Option<Res<NodeId>>>;

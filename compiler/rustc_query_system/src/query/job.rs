@@ -4,26 +4,22 @@ use crate::query::plumbing::CycleError;
 use crate::query::DepKind;
 use crate::query::{QueryContext, QueryStackFrame};
 use rustc_data_structures::fx::FxHashMap;
-use rustc_errors::{
-    Diagnostic, DiagnosticBuilder, ErrorGuaranteed, Handler, IntoDiagnostic, Level,
-};
+use rustc_errors::{Diag, DiagCtxt};
 use rustc_hir::def::DefKind;
 use rustc_session::Session;
 use rustc_span::Span;
 
 use std::hash::Hash;
 use std::io::Write;
-use std::num::NonZeroU64;
+use std::num::NonZero;
 
 #[cfg(parallel_compiler)]
 use {
     parking_lot::{Condvar, Mutex},
-    rayon_core,
     rustc_data_structures::fx::FxHashSet,
-    rustc_data_structures::{defer, jobserver},
+    rustc_data_structures::jobserver,
     rustc_span::DUMMY_SP,
     std::iter,
-    std::process,
     std::sync::Arc,
 };
 
@@ -38,8 +34,8 @@ pub struct QueryInfo {
 pub type QueryMap = FxHashMap<QueryJobId, QueryJobInfo>;
 
 /// A value uniquely identifying an active query job.
-#[derive(Copy, Clone, Eq, PartialEq, Hash)]
-pub struct QueryJobId(pub NonZeroU64);
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct QueryJobId(pub NonZero<u64>);
 
 impl QueryJobId {
     fn query(self, map: &QueryMap) -> QueryStackFrame {
@@ -62,14 +58,14 @@ impl QueryJobId {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct QueryJobInfo {
     pub query: QueryStackFrame,
     pub job: QueryJob,
 }
 
 /// Represents an active query job.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct QueryJob {
     pub id: QueryJobId,
 
@@ -182,6 +178,7 @@ impl QueryJobId {
 }
 
 #[cfg(parallel_compiler)]
+#[derive(Debug)]
 struct QueryWaiter {
     query: Option<QueryJobId>,
     condvar: Condvar,
@@ -198,13 +195,14 @@ impl QueryWaiter {
 }
 
 #[cfg(parallel_compiler)]
+#[derive(Debug)]
 struct QueryLatchInfo {
     complete: bool,
     waiters: Vec<Arc<QueryWaiter>>,
 }
 
 #[cfg(parallel_compiler)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) struct QueryLatch {
     info: Arc<Mutex<QueryLatchInfo>>,
 }
@@ -515,12 +513,7 @@ fn remove_cycle(
 /// There may be multiple cycles involved in a deadlock, so this searches
 /// all active queries for cycles before finally resuming all the waiters at once.
 #[cfg(parallel_compiler)]
-pub fn deadlock(query_map: QueryMap, registry: &rayon_core::Registry) {
-    let on_panic = defer(|| {
-        eprintln!("deadlock handler panicked, aborting process");
-        process::abort();
-    });
-
+pub fn break_query_cycles(query_map: QueryMap, registry: &rayon_core::Registry) {
     let mut wakelist = Vec::new();
     let mut jobs: Vec<QueryJobId> = query_map.keys().cloned().collect();
 
@@ -540,23 +533,25 @@ pub fn deadlock(query_map: QueryMap, registry: &rayon_core::Registry) {
     // X to Y due to Rayon waiting and a true dependency from Y to X. The algorithm here
     // only considers the true dependency and won't detect a cycle.
     if !found_cycle {
-        panic!("deadlock detected");
+        panic!(
+            "deadlock detected as we're unable to find a query cycle to break\n\
+            current query map:\n{:#?}",
+            query_map
+        );
     }
 
     // FIXME: Ensure this won't cause a deadlock before we return
     for waiter in wakelist.into_iter() {
         waiter.notify(registry);
     }
-
-    on_panic.disable();
 }
 
 #[inline(never)]
 #[cold]
-pub(crate) fn report_cycle<'a>(
+pub fn report_cycle<'a>(
     sess: &'a Session,
     CycleError { usage, cycle: stack }: &CycleError,
-) -> DiagnosticBuilder<'a, ErrorGuaranteed> {
+) -> Diag<'a> {
     assert!(!stack.is_empty());
 
     let span = stack[0].query.default_span(stack[1 % stack.len()].span);
@@ -599,41 +594,41 @@ pub(crate) fn report_cycle<'a>(
         note_span: (),
     };
 
-    cycle_diag.into_diagnostic(&sess.parse_sess.span_diagnostic)
+    sess.dcx().create_err(cycle_diag)
 }
 
 pub fn print_query_stack<Qcx: QueryContext>(
     qcx: Qcx,
     mut current_query: Option<QueryJobId>,
-    handler: &Handler,
+    dcx: &DiagCtxt,
     num_frames: Option<usize>,
     mut file: Option<std::fs::File>,
 ) -> usize {
     // Be careful relying on global state here: this code is called from
-    // a panic hook, which means that the global `Handler` may be in a weird
+    // a panic hook, which means that the global `DiagCtxt` may be in a weird
     // state if it was responsible for triggering the panic.
     let mut count_printed = 0;
     let mut count_total = 0;
-    let query_map = qcx.try_collect_active_jobs();
+    let query_map = qcx.collect_active_jobs();
 
     if let Some(ref mut file) = file {
         let _ = writeln!(file, "\n\nquery stack during panic:");
     }
     while let Some(query) = current_query {
-        let Some(query_info) = query_map.as_ref().and_then(|map| map.get(&query)) else {
+        let Some(query_info) = query_map.get(&query) else {
             break;
         };
         if Some(count_printed) < num_frames || num_frames.is_none() {
             // Only print to stderr as many stack frames as `num_frames` when present.
-            let mut diag = Diagnostic::new(
-                Level::FailureNote,
-                format!(
-                    "#{} [{:?}] {}",
-                    count_printed, query_info.query.dep_kind, query_info.query.description
-                ),
-            );
-            diag.span = query_info.job.span.into();
-            handler.force_print_diagnostic(diag);
+            // FIXME: needs translation
+            #[allow(rustc::diagnostic_outside_of_impl)]
+            #[allow(rustc::untranslatable_diagnostic)]
+            dcx.struct_failure_note(format!(
+                "#{} [{:?}] {}",
+                count_printed, query_info.query.dep_kind, query_info.query.description
+            ))
+            .with_span(query_info.job.span)
+            .emit();
             count_printed += 1;
         }
 

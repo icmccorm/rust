@@ -1,6 +1,5 @@
-use std::collections::HashSet;
-
-use hir::{self, HasCrate, HasSource, HasVisibility};
+use hir::{HasCrate, HasVisibility};
+use ide_db::{path_transform::PathTransform, FxHashSet};
 use syntax::{
     ast::{
         self, edit_in_place::Indent, make, AstNode, HasGenericParams, HasName, HasVisibility as _,
@@ -70,7 +69,7 @@ pub(crate) fn generate_delegate_methods(acc: &mut Assists, ctx: &AssistContext<'
 
     let sema_field_ty = ctx.sema.resolve_type(&field_ty)?;
     let mut methods = vec![];
-    let mut seen_names = HashSet::new();
+    let mut seen_names = FxHashSet::default();
 
     for ty in sema_field_ty.autoderef(ctx.db()) {
         let krate = ty.krate(ctx.db());
@@ -105,32 +104,49 @@ pub(crate) fn generate_delegate_methods(acc: &mut Assists, ctx: &AssistContext<'
             target,
             |edit| {
                 // Create the function
-                let method_source = match method.source(ctx.db()) {
-                    Some(source) => source.value,
+                let method_source = match ctx.sema.source(method) {
+                    Some(source) => {
+                        let v = source.value.clone_for_update();
+                        let source_scope = ctx.sema.scope(v.syntax());
+                        let target_scope = ctx.sema.scope(strukt.syntax());
+                        if let (Some(s), Some(t)) = (source_scope, target_scope) {
+                            PathTransform::generic_transformation(&t, &s).apply(v.syntax());
+                        }
+                        v
+                    }
                     None => return,
                 };
+
                 let vis = method_source.visibility();
-                let fn_name = make::name(&name);
-                let params =
-                    method_source.param_list().unwrap_or_else(|| make::param_list(None, []));
-                let type_params = method_source.generic_param_list();
-                let arg_list = match method_source.param_list() {
-                    Some(list) => convert_param_list_to_arg_list(list),
-                    None => make::arg_list([]),
-                };
-                let tail_expr = make::expr_method_call(field, make::name_ref(&name), arg_list);
-                let ret_type = method_source.ret_type();
                 let is_async = method_source.async_token().is_some();
                 let is_const = method_source.const_token().is_some();
                 let is_unsafe = method_source.unsafe_token().is_some();
+
+                let fn_name = make::name(&name);
+
+                let type_params = method_source.generic_param_list();
+                let where_clause = method_source.where_clause();
+                let params =
+                    method_source.param_list().unwrap_or_else(|| make::param_list(None, []));
+
+                // compute the `body`
+                let arg_list = method_source
+                    .param_list()
+                    .map(convert_param_list_to_arg_list)
+                    .unwrap_or_else(|| make::arg_list([]));
+
+                let tail_expr = make::expr_method_call(field, make::name_ref(&name), arg_list);
                 let tail_expr_finished =
                     if is_async { make::expr_await(tail_expr) } else { tail_expr };
                 let body = make::block_expr([], Some(tail_expr_finished));
+
+                let ret_type = method_source.ret_type();
+
                 let f = make::fn_(
                     vis,
                     fn_name,
                     type_params,
-                    None,
+                    where_clause,
                     params,
                     body,
                     ret_type,
@@ -145,13 +161,13 @@ pub(crate) fn generate_delegate_methods(acc: &mut Assists, ctx: &AssistContext<'
                     Some(impl_def) => edit.make_mut(impl_def),
                     None => {
                         let name = &strukt_name.to_string();
-                        let params = strukt.generic_param_list();
-                        let ty_params = params.clone();
+                        let ty_params = strukt.generic_param_list();
+                        let ty_args = ty_params.as_ref().map(|it| it.to_generic_args());
                         let where_clause = strukt.where_clause();
 
                         let impl_def = make::impl_(
                             ty_params,
-                            None,
+                            ty_args,
                             make::ty_path(make::ext::ident_path(name)),
                             where_clause,
                             None,
@@ -451,6 +467,209 @@ impl Person {
         self.age.age()
     }
 }"#,
+        );
+    }
+
+    #[test]
+    fn test_preserve_where_clause() {
+        check_assist(
+            generate_delegate_methods,
+            r#"
+struct Inner<T>(T);
+impl<T> Inner<T> {
+    fn get(&self) -> T
+    where
+        T: Copy,
+        T: PartialEq,
+    {
+        self.0
+    }
+}
+
+struct Struct<T> {
+    $0field: Inner<T>,
+}
+"#,
+            r#"
+struct Inner<T>(T);
+impl<T> Inner<T> {
+    fn get(&self) -> T
+    where
+        T: Copy,
+        T: PartialEq,
+    {
+        self.0
+    }
+}
+
+struct Struct<T> {
+    field: Inner<T>,
+}
+
+impl<T> Struct<T> {
+    $0fn get(&self) -> T where
+            T: Copy,
+            T: PartialEq, {
+        self.field.get()
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_fixes_basic_self_references() {
+        check_assist(
+            generate_delegate_methods,
+            r#"
+struct Foo {
+    field: $0Bar,
+}
+
+struct Bar;
+
+impl Bar {
+    fn bar(&self, other: Self) -> Self {
+        other
+    }
+}
+"#,
+            r#"
+struct Foo {
+    field: Bar,
+}
+
+impl Foo {
+    $0fn bar(&self, other: Bar) -> Bar {
+        self.field.bar(other)
+    }
+}
+
+struct Bar;
+
+impl Bar {
+    fn bar(&self, other: Self) -> Self {
+        other
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_fixes_nested_self_references() {
+        check_assist(
+            generate_delegate_methods,
+            r#"
+struct Foo {
+    field: $0Bar,
+}
+
+struct Bar;
+
+impl Bar {
+    fn bar(&mut self, a: (Self, [Self; 4]), b: Vec<Self>) {}
+}
+"#,
+            r#"
+struct Foo {
+    field: Bar,
+}
+
+impl Foo {
+    $0fn bar(&mut self, a: (Bar, [Bar; 4]), b: Vec<Bar>) {
+        self.field.bar(a, b)
+    }
+}
+
+struct Bar;
+
+impl Bar {
+    fn bar(&mut self, a: (Self, [Self; 4]), b: Vec<Self>) {}
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_fixes_self_references_with_lifetimes_and_generics() {
+        check_assist(
+            generate_delegate_methods,
+            r#"
+struct Foo<'a, T> {
+    $0field: Bar<'a, T>,
+}
+
+struct Bar<'a, T>(&'a T);
+
+impl<'a, T> Bar<'a, T> {
+    fn bar(self, mut b: Vec<&'a Self>) -> &'a Self {
+        b.pop().unwrap()
+    }
+}
+"#,
+            r#"
+struct Foo<'a, T> {
+    field: Bar<'a, T>,
+}
+
+impl<'a, T> Foo<'a, T> {
+    $0fn bar(self, mut b: Vec<&'a Bar<'a, T>>) -> &'a Bar<'a, T> {
+        self.field.bar(b)
+    }
+}
+
+struct Bar<'a, T>(&'a T);
+
+impl<'a, T> Bar<'a, T> {
+    fn bar(self, mut b: Vec<&'a Self>) -> &'a Self {
+        b.pop().unwrap()
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_fixes_self_references_across_macros() {
+        check_assist(
+            generate_delegate_methods,
+            r#"
+//- /bar.rs
+macro_rules! test_method {
+    () => {
+        pub fn test(self, b: Bar) -> Self {
+            self
+        }
+    };
+}
+
+pub struct Bar;
+
+impl Bar {
+    test_method!();
+}
+
+//- /main.rs
+mod bar;
+
+struct Foo {
+    $0bar: bar::Bar,
+}
+"#,
+            r#"
+mod bar;
+
+struct Foo {
+    bar: bar::Bar,
+}
+
+impl Foo {
+    $0pub fn test(self,b:bar::Bar) ->bar::Bar {
+        self.bar.test(b)
+    }
+}
+"#,
         );
     }
 

@@ -1,13 +1,13 @@
-// assembly-output: emit-asm
-// only-x86_64
-// ignore-sgx
-// revisions: opt-speed opt-size
-// [opt-speed] compile-flags: -Copt-level=1
-// [opt-size] compile-flags: -Copt-level=s
+//@ assembly-output: emit-asm
+//@ only-x86_64
+//@ ignore-sgx
+//@ revisions: opt-speed opt-size
+//@ [opt-speed] compile-flags: -Copt-level=2 -Cdebug-assertions=no
+//@ [opt-size] compile-flags: -Copt-level=s -Cdebug-assertions=no
 #![crate_type="rlib"]
 
 #![feature(core_intrinsics)]
-#![feature(pointer_is_aligned)]
+#![feature(pointer_is_aligned_to)]
 
 // CHECK-LABEL: is_aligned_to_unchecked
 // CHECK: decq

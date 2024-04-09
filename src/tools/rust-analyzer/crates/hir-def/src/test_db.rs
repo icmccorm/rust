@@ -8,7 +8,6 @@ use base_db::{
     Upcast,
 };
 use hir_expand::{db::ExpandDatabase, InFile};
-use rustc_hash::FxHashSet;
 use syntax::{algo, ast, AstNode};
 use triomphe::Arc;
 
@@ -34,6 +33,7 @@ pub(crate) struct TestDB {
 impl Default for TestDB {
     fn default() -> Self {
         let mut this = Self { storage: Default::default(), events: Default::default() };
+        this.setup_syntax_context_root();
         this.set_expand_proc_attr_macros_with_durability(true, Durability::HIGH);
         this
     }
@@ -41,13 +41,13 @@ impl Default for TestDB {
 
 impl Upcast<dyn ExpandDatabase> for TestDB {
     fn upcast(&self) -> &(dyn ExpandDatabase + 'static) {
-        &*self
+        self
     }
 }
 
 impl Upcast<dyn DefDatabase> for TestDB {
     fn upcast(&self) -> &(dyn DefDatabase + 'static) {
-        &*self
+        self
     }
 }
 
@@ -75,7 +75,7 @@ impl FileLoader for TestDB {
     fn resolve_path(&self, path: AnchoredPath<'_>) -> Option<FileId> {
         FileLoaderDelegate(self).resolve_path(path)
     }
-    fn relevant_crates(&self, file_id: FileId) -> Arc<FxHashSet<CrateId>> {
+    fn relevant_crates(&self, file_id: FileId) -> Arc<[CrateId]> {
         FileLoaderDelegate(self).relevant_crates(file_id)
     }
 }

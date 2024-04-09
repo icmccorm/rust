@@ -1,10 +1,17 @@
 use rustc_apfloat::{Float, Round};
 use rustc_middle::ty::layout::{HasParamEnv, LayoutOf};
 use rustc_middle::{mir, ty, ty::FloatTy};
+use rustc_span::{sym, Symbol};
 use rustc_target::abi::{Endian, HasDataLayout};
 
+use crate::helpers::{bool_to_simd_element, check_arg_count, simd_element_to_bool, ToHost, ToSoft};
 use crate::*;
-use helpers::{bool_to_simd_element, check_arg_count, simd_element_to_bool};
+
+#[derive(Copy, Clone)]
+pub(crate) enum MinMax {
+    Min,
+    Max,
+}
 
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
 pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
@@ -14,7 +21,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         intrinsic_name: &str,
         generic_args: ty::GenericArgsRef<'tcx>,
         args: &[OpTy<'tcx, Provenance>],
-        dest: &PlaceTy<'tcx, Provenance>,
+        dest: &MPlaceTy<'tcx, Provenance>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         match intrinsic_name {
@@ -25,52 +32,67 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             | "floor"
             | "round"
             | "trunc"
-            | "fsqrt" => {
+            | "fsqrt"
+            | "fsin"
+            | "fcos"
+            | "fexp"
+            | "fexp2"
+            | "flog"
+            | "flog2"
+            | "flog10"
+            | "ctlz"
+            | "cttz"
+            | "bswap"
+            | "bitreverse"
+            => {
                 let [op] = check_arg_count(args)?;
                 let (op, op_len) = this.operand_to_simd(op)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, op_len);
 
                 #[derive(Copy, Clone)]
-                enum HostFloatOp {
-                    Ceil,
-                    Floor,
-                    Round,
-                    Trunc,
-                    Sqrt,
-                }
-                #[derive(Copy, Clone)]
-                enum Op {
+                enum Op<'a> {
                     MirOp(mir::UnOp),
                     Abs,
-                    HostOp(HostFloatOp),
+                    Round(rustc_apfloat::Round),
+                    Numeric(Symbol),
+                    HostOp(&'a str),
                 }
                 let which = match intrinsic_name {
                     "neg" => Op::MirOp(mir::UnOp::Neg),
                     "fabs" => Op::Abs,
-                    "ceil" => Op::HostOp(HostFloatOp::Ceil),
-                    "floor" => Op::HostOp(HostFloatOp::Floor),
-                    "round" => Op::HostOp(HostFloatOp::Round),
-                    "trunc" => Op::HostOp(HostFloatOp::Trunc),
-                    "fsqrt" => Op::HostOp(HostFloatOp::Sqrt),
-                    _ => unreachable!(),
+                    "ceil" => Op::Round(rustc_apfloat::Round::TowardPositive),
+                    "floor" => Op::Round(rustc_apfloat::Round::TowardNegative),
+                    "round" => Op::Round(rustc_apfloat::Round::NearestTiesToAway),
+                    "trunc" => Op::Round(rustc_apfloat::Round::TowardZero),
+                    "ctlz" => Op::Numeric(sym::ctlz),
+                    "cttz" => Op::Numeric(sym::cttz),
+                    "bswap" => Op::Numeric(sym::bswap),
+                    "bitreverse" => Op::Numeric(sym::bitreverse),
+                    _ => Op::HostOp(intrinsic_name),
                 };
 
                 for i in 0..dest_len {
                     let op = this.read_immediate(&this.project_index(&op, i)?)?;
                     let dest = this.project_index(&dest, i)?;
                     let val = match which {
-                        Op::MirOp(mir_op) => this.wrapping_unary_op(mir_op, &op)?.to_scalar(),
+                        Op::MirOp(mir_op) => {
+                            // This already does NaN adjustments
+                            this.wrapping_unary_op(mir_op, &op)?.to_scalar()
+                        }
                         Op::Abs => {
                             // Works for f32 and f64.
                             let ty::Float(float_ty) = op.layout.ty.kind() else {
                                 span_bug!(this.cur_span(), "{} operand is not a float", intrinsic_name)
                             };
                             let op = op.to_scalar();
+                            // "Bitwise" operation, no NaN adjustments
                             match float_ty {
+                                FloatTy::F16 => unimplemented!("f16_f128"),
                                 FloatTy::F32 => Scalar::from_f32(op.to_f32()?.abs()),
                                 FloatTy::F64 => Scalar::from_f64(op.to_f64()?.abs()),
+                                FloatTy::F128 => unimplemented!("f16_f128"),
                             }
                         }
                         Op::HostOp(host_op) => {
@@ -79,30 +101,69 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                             };
                             // FIXME using host floats
                             match float_ty {
+                                FloatTy::F16 => unimplemented!("f16_f128"),
                                 FloatTy::F32 => {
-                                    let f = f32::from_bits(op.to_scalar().to_u32()?);
+                                    let f = op.to_scalar().to_f32()?;
+                                    let f_host = f.to_host();
                                     let res = match host_op {
-                                        HostFloatOp::Ceil => f.ceil(),
-                                        HostFloatOp::Floor => f.floor(),
-                                        HostFloatOp::Round => f.round(),
-                                        HostFloatOp::Trunc => f.trunc(),
-                                        HostFloatOp::Sqrt => f.sqrt(),
+                                        "fsqrt" => f_host.sqrt(),
+                                        "fsin" => f_host.sin(),
+                                        "fcos" => f_host.cos(),
+                                        "fexp" => f_host.exp(),
+                                        "fexp2" => f_host.exp2(),
+                                        "flog" => f_host.ln(),
+                                        "flog2" => f_host.log2(),
+                                        "flog10" => f_host.log10(),
+                                        _ => bug!(),
                                     };
-                                    Scalar::from_u32(res.to_bits())
+                                    let res = res.to_soft();
+                                    let res = this.adjust_nan(res, &[f]);
+                                    Scalar::from(res)
                                 }
                                 FloatTy::F64 => {
-                                    let f = f64::from_bits(op.to_scalar().to_u64()?);
+                                    let f = op.to_scalar().to_f64()?;
+                                    let f_host = f.to_host();
                                     let res = match host_op {
-                                        HostFloatOp::Ceil => f.ceil(),
-                                        HostFloatOp::Floor => f.floor(),
-                                        HostFloatOp::Round => f.round(),
-                                        HostFloatOp::Trunc => f.trunc(),
-                                        HostFloatOp::Sqrt => f.sqrt(),
+                                        "fsqrt" => f_host.sqrt(),
+                                        "fsin" => f_host.sin(),
+                                        "fcos" => f_host.cos(),
+                                        "fexp" => f_host.exp(),
+                                        "fexp2" => f_host.exp2(),
+                                        "flog" => f_host.ln(),
+                                        "flog2" => f_host.log2(),
+                                        "flog10" => f_host.log10(),
+                                        _ => bug!(),
                                     };
-                                    Scalar::from_u64(res.to_bits())
+                                    let res = res.to_soft();
+                                    let res = this.adjust_nan(res, &[f]);
+                                    Scalar::from(res)
                                 }
+                                FloatTy::F128 => unimplemented!("f16_f128"),
                             }
-
+                        }
+                        Op::Round(rounding) => {
+                            let ty::Float(float_ty) = op.layout.ty.kind() else {
+                                span_bug!(this.cur_span(), "{} operand is not a float", intrinsic_name)
+                            };
+                            match float_ty {
+                                FloatTy::F16 => unimplemented!("f16_f128"),
+                                FloatTy::F32 => {
+                                    let f = op.to_scalar().to_f32()?;
+                                    let res = f.round_to_integral(rounding).value;
+                                    let res = this.adjust_nan(res, &[f]);
+                                    Scalar::from_f32(res)
+                                }
+                                FloatTy::F64 => {
+                                    let f = op.to_scalar().to_f64()?;
+                                    let res = f.round_to_integral(rounding).value;
+                                    let res = this.adjust_nan(res, &[f]);
+                                    Scalar::from_f64(res)
+                                }
+                                FloatTy::F128 => unimplemented!("f16_f128"),
+                            }
+                        }
+                        Op::Numeric(name) => {
+                            this.numeric_intrinsic(name, op.to_scalar(), op.layout)?
                         }
                     };
                     this.write_scalar(val, &dest)?;
@@ -129,13 +190,14 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             | "fmin"
             | "saturating_add"
             | "saturating_sub"
-            | "arith_offset" => {
+            | "arith_offset"
+            => {
                 use mir::BinOp;
 
                 let [left, right] = check_arg_count(args)?;
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, left_len);
                 assert_eq!(dest_len, right_len);
@@ -143,8 +205,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 enum Op {
                     MirOp(BinOp),
                     SaturatingOp(BinOp),
-                    FMax,
-                    FMin,
+                    FMinMax(MinMax),
                     WrappingOffset,
                 }
                 let which = match intrinsic_name {
@@ -164,8 +225,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     "le" => Op::MirOp(BinOp::Le),
                     "gt" => Op::MirOp(BinOp::Gt),
                     "ge" => Op::MirOp(BinOp::Ge),
-                    "fmax" => Op::FMax,
-                    "fmin" => Op::FMin,
+                    "fmax" => Op::FMinMax(MinMax::Max),
+                    "fmin" => Op::FMinMax(MinMax::Min),
                     "saturating_add" => Op::SaturatingOp(BinOp::Add),
                     "saturating_sub" => Op::SaturatingOp(BinOp::Sub),
                     "arith_offset" => Op::WrappingOffset,
@@ -178,6 +239,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     let dest = this.project_index(&dest, i)?;
                     let val = match which {
                         Op::MirOp(mir_op) => {
+                            // This does NaN adjustments.
                             let (val, overflowed) = this.overflowing_binary_op(mir_op, &left, &right)?;
                             if matches!(mir_op, BinOp::Shl | BinOp::Shr) {
                                 // Shifts have extra UB as SIMD operations that the MIR binop does not have.
@@ -211,11 +273,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                             let offset_ptr = ptr.wrapping_signed_offset(offset_bytes, this);
                             Scalar::from_maybe_pointer(offset_ptr, this)
                         }
-                        Op::FMax => {
-                            fmax_op(&left, &right)?
-                        }
-                        Op::FMin => {
-                            fmin_op(&left, &right)?
+                        Op::FMinMax(op) => {
+                            this.fminmax_op(op, &left, &right)?
                         }
                     };
                     this.write_scalar(val, &dest)?;
@@ -226,7 +285,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let (a, a_len) = this.operand_to_simd(a)?;
                 let (b, b_len) = this.operand_to_simd(b)?;
                 let (c, c_len) = this.operand_to_simd(c)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, a_len);
                 assert_eq!(dest_len, b_len);
@@ -244,20 +303,24 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                         span_bug!(this.cur_span(), "{} operand is not a float", intrinsic_name)
                     };
                     let val = match float_ty {
+                        FloatTy::F16 => unimplemented!("f16_f128"),
                         FloatTy::F32 => {
-                            let a = f32::from_bits(a.to_u32()?);
-                            let b = f32::from_bits(b.to_u32()?);
-                            let c = f32::from_bits(c.to_u32()?);
-                            let res = a.mul_add(b, c);
-                            Scalar::from_u32(res.to_bits())
+                            let a = a.to_f32()?;
+                            let b = b.to_f32()?;
+                            let c = c.to_f32()?;
+                            let res = a.to_host().mul_add(b.to_host(), c.to_host()).to_soft();
+                            let res = this.adjust_nan(res, &[a, b, c]);
+                            Scalar::from(res)
                         }
                         FloatTy::F64 => {
-                            let a = f64::from_bits(a.to_u64()?);
-                            let b = f64::from_bits(b.to_u64()?);
-                            let c = f64::from_bits(c.to_u64()?);
-                            let res = a.mul_add(b, c);
-                            Scalar::from_u64(res.to_bits())
+                            let a = a.to_f64()?;
+                            let b = b.to_f64()?;
+                            let c = c.to_f64()?;
+                            let res = a.to_host().mul_add(b.to_host(), c.to_host()).to_soft();
+                            let res = this.adjust_nan(res, &[a, b, c]);
+                            Scalar::from(res)
                         }
+                        FloatTy::F128 => unimplemented!("f16_f128"),
                     };
                     this.write_scalar(val, &dest)?;
                 }
@@ -281,8 +344,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 enum Op {
                     MirOp(BinOp),
                     MirOpBool(BinOp),
-                    Max,
-                    Min,
+                    MinMax(MinMax),
                 }
                 let which = match intrinsic_name {
                     "reduce_and" => Op::MirOp(BinOp::BitAnd),
@@ -290,8 +352,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     "reduce_xor" => Op::MirOp(BinOp::BitXor),
                     "reduce_any" => Op::MirOpBool(BinOp::BitOr),
                     "reduce_all" => Op::MirOpBool(BinOp::BitAnd),
-                    "reduce_max" => Op::Max,
-                    "reduce_min" => Op::Min,
+                    "reduce_max" => Op::MinMax(MinMax::Max),
+                    "reduce_min" => Op::MinMax(MinMax::Min),
                     _ => unreachable!(),
                 };
 
@@ -311,24 +373,16 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                             let op = imm_from_bool(simd_element_to_bool(op)?);
                             this.wrapping_binary_op(mir_op, &res, &op)?
                         }
-                        Op::Max => {
+                        Op::MinMax(mmop) => {
                             if matches!(res.layout.ty.kind(), ty::Float(_)) {
-                                ImmTy::from_scalar(fmax_op(&res, &op)?, res.layout)
+                                ImmTy::from_scalar(this.fminmax_op(mmop, &res, &op)?, res.layout)
                             } else {
                                 // Just boring integers, so NaNs to worry about
-                                if this.wrapping_binary_op(BinOp::Ge, &res, &op)?.to_scalar().to_bool()? {
-                                    res
-                                } else {
-                                    op
-                                }
-                            }
-                        }
-                        Op::Min => {
-                            if matches!(res.layout.ty.kind(), ty::Float(_)) {
-                                ImmTy::from_scalar(fmin_op(&res, &op)?, res.layout)
-                            } else {
-                                // Just boring integers, so NaNs to worry about
-                                if this.wrapping_binary_op(BinOp::Le, &res, &op)?.to_scalar().to_bool()? {
+                                let mirop = match mmop {
+                                    MinMax::Min => BinOp::Le,
+                                    MinMax::Max => BinOp::Ge,
+                                };
+                                if this.wrapping_binary_op(mirop, &res, &op)?.to_scalar().to_bool()? {
                                     res
                                 } else {
                                     op
@@ -366,7 +420,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let (mask, mask_len) = this.operand_to_simd(mask)?;
                 let (yes, yes_len) = this.operand_to_simd(yes)?;
                 let (no, no_len) = this.operand_to_simd(no)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, mask_len);
                 assert_eq!(dest_len, yes_len);
@@ -382,14 +436,19 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     this.write_immediate(*val, &dest)?;
                 }
             }
+            // Variant of `select` that takes a bitmask rather than a "vector of bool".
             "select_bitmask" => {
                 let [mask, yes, no] = check_arg_count(args)?;
                 let (yes, yes_len) = this.operand_to_simd(yes)?;
                 let (no, no_len) = this.operand_to_simd(no)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
-                let bitmask_len = dest_len.max(8);
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
+                let bitmask_len = dest_len.next_multiple_of(8);
 
-                assert!(mask.layout.ty.is_integral());
+                // The mask must be an integer or an array.
+                assert!(
+                    mask.layout.ty.is_integral()
+                        || matches!(mask.layout.ty.kind(), ty::Array(elemty, _) if elemty == &this.tcx.types.u8)
+                );
                 assert!(bitmask_len <= 64);
                 assert_eq!(bitmask_len, mask.layout.size.bits());
                 assert_eq!(dest_len, yes_len);
@@ -397,13 +456,15 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let dest_len = u32::try_from(dest_len).unwrap();
                 let bitmask_len = u32::try_from(bitmask_len).unwrap();
 
-                let mask: u64 =
-                    this.read_scalar(mask)?.to_bits(mask.layout.size)?.try_into().unwrap();
+                // To read the mask, we transmute it to an integer.
+                // That does the right thing wrt endianness.
+                let mask_ty = this.machine.layouts.uint(mask.layout.size).unwrap();
+                let mask = mask.transmute(mask_ty, this)?;
+                let mask: u64 = this.read_scalar(&mask)?.to_bits(mask_ty.size)?.try_into().unwrap();
+
                 for i in 0..dest_len {
-                    let mask = mask
-                        & 1u64
-                            .checked_shl(simd_bitmask_index(i, dest_len, this.data_layout().endian))
-                            .unwrap();
+                    let bit_i = simd_bitmask_index(i, dest_len, this.data_layout().endian);
+                    let mask = mask & 1u64.checked_shl(bit_i).unwrap();
                     let yes = this.read_immediate(&this.project_index(&yes, i.into())?)?;
                     let no = this.read_immediate(&this.project_index(&no, i.into())?)?;
                     let dest = this.project_index(&dest, i.into())?;
@@ -413,6 +474,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 }
                 for i in dest_len..bitmask_len {
                     // If the mask is "padded", ensure that padding is all-zero.
+                    // This deliberately does not use `simd_bitmask_index`; these bits are outside
+                    // the bitmask. It does not matter in which order we check them.
                     let mask = mask & 1u64.checked_shl(i).unwrap();
                     if mask != 0 {
                         throw_ub_format!(
@@ -421,18 +484,48 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     }
                 }
             }
-            "cast" | "as" | "cast_ptr" | "expose_addr" | "from_exposed_addr" => {
+            // Converts a "vector of bool" into a bitmask.
+            "bitmask" => {
                 let [op] = check_arg_count(args)?;
                 let (op, op_len) = this.operand_to_simd(op)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let bitmask_len = op_len.next_multiple_of(8);
+
+                // Returns either an unsigned integer or array of `u8`.
+                assert!(
+                    dest.layout.ty.is_integral()
+                        || matches!(dest.layout.ty.kind(), ty::Array(elemty, _) if elemty == &this.tcx.types.u8)
+                );
+                assert!(bitmask_len <= 64);
+                assert_eq!(bitmask_len, dest.layout.size.bits());
+                let op_len = u32::try_from(op_len).unwrap();
+
+                let mut res = 0u64;
+                for i in 0..op_len {
+                    let op = this.read_immediate(&this.project_index(&op, i.into())?)?;
+                    if simd_element_to_bool(op)? {
+                        res |= 1u64
+                            .checked_shl(simd_bitmask_index(i, op_len, this.data_layout().endian))
+                            .unwrap();
+                    }
+                }
+                // We have to change the type of the place to be able to write `res` into it. This
+                // transmutes the integer to an array, which does the right thing wrt endianness.
+                let dest =
+                    dest.transmute(this.machine.layouts.uint(dest.layout.size).unwrap(), this)?;
+                this.write_int(res, &dest)?;
+            }
+            "cast" | "as" | "cast_ptr" | "expose_provenance" | "with_exposed_provenance" => {
+                let [op] = check_arg_count(args)?;
+                let (op, op_len) = this.operand_to_simd(op)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, op_len);
 
                 let unsafe_cast = intrinsic_name == "cast";
                 let safe_cast = intrinsic_name == "as";
                 let ptr_cast = intrinsic_name == "cast_ptr";
-                let expose_cast = intrinsic_name == "expose_addr";
-                let from_exposed_cast = intrinsic_name == "from_exposed_addr";
+                let expose_cast = intrinsic_name == "expose_provenance";
+                let from_exposed_cast = intrinsic_name == "with_exposed_provenance";
 
                 for i in 0..dest_len {
                     let op = this.read_immediate(&this.project_index(&op, i)?)?;
@@ -450,22 +543,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                         (ty::Float(_), ty::Int(_) | ty::Uint(_)) if safe_cast =>
                             this.float_to_float_or_int(&op, dest.layout)?,
                         // Float-to-int in unchecked mode
-                        (ty::Float(FloatTy::F32), ty::Int(_) | ty::Uint(_)) if unsafe_cast => {
-                            let f = op.to_scalar().to_f32()?;
-                            this.float_to_int_checked(f, dest.layout, Round::TowardZero)
+                        (ty::Float(_), ty::Int(_) | ty::Uint(_)) if unsafe_cast => {
+                            this.float_to_int_checked(&op, dest.layout, Round::TowardZero)?
                                 .ok_or_else(|| {
                                     err_ub_format!(
-                                        "`simd_cast` intrinsic called on {f} which cannot be represented in target type `{:?}`",
-                                        dest.layout.ty
-                                    )
-                                })?
-                        }
-                        (ty::Float(FloatTy::F64), ty::Int(_) | ty::Uint(_)) if unsafe_cast => {
-                            let f = op.to_scalar().to_f64()?;
-                            this.float_to_int_checked(f, dest.layout, Round::TowardZero)
-                                .ok_or_else(|| {
-                                    err_ub_format!(
-                                        "`simd_cast` intrinsic called on {f} which cannot be represented in target type `{:?}`",
+                                        "`simd_cast` intrinsic called on {op} which cannot be represented in target type `{:?}`",
                                         dest.layout.ty
                                     )
                                 })?
@@ -475,9 +557,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                             this.ptr_to_ptr(&op, dest.layout)?,
                         // Ptr/Int casts
                         (ty::RawPtr(..), ty::Int(_) | ty::Uint(_)) if expose_cast =>
-                            this.pointer_expose_address_cast(&op, dest.layout)?,
+                            this.pointer_expose_provenance_cast(&op, dest.layout)?,
                         (ty::Int(_) | ty::Uint(_), ty::RawPtr(..)) if from_exposed_cast =>
-                            this.pointer_from_exposed_address_cast(&op, dest.layout)?,
+                            this.pointer_with_exposed_provenance_cast(&op, dest.layout)?,
                         // Error otherwise
                         _ =>
                             throw_unsup_format!(
@@ -493,11 +575,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let [left, right] = check_arg_count(args)?;
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 let index = generic_args[2]
                     .expect_const()
-                    .eval(*this.tcx, this.param_env(), Some(this.tcx.span))
+                    .eval(*this.tcx, this.param_env(), this.tcx.span)
                     .unwrap()
                     .unwrap_branch();
                 let index_len = index.len();
@@ -519,9 +601,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                         let right_idx = src_index.checked_sub(left_len).unwrap();
                         this.read_immediate(&this.project_index(&right, right_idx)?)?
                     } else {
-                        span_bug!(
-                            this.cur_span(),
-                            "simd_shuffle index {src_index} is out of bounds for 2 vectors of size {left_len}",
+                        throw_ub_format!(
+                            "`simd_shuffle_generic` index {src_index} is out-of-bounds for 2 vectors with length {dest_len}"
                         );
                     };
                     this.write_immediate(*val, &dest)?;
@@ -531,7 +612,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let [left, right, index] = check_arg_count(args)?;
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 // `index` is an array, not a SIMD type
                 let ty::Array(_, index_len) = index.layout.ty.kind() else {
@@ -560,9 +641,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                         let right_idx = src_index.checked_sub(left_len).unwrap();
                         this.read_immediate(&this.project_index(&right, right_idx)?)?
                     } else {
-                        span_bug!(
-                            this.cur_span(),
-                            "simd_shuffle index {src_index} is out of bounds for 2 vectors of size {left_len}",
+                        throw_ub_format!(
+                            "`simd_shuffle` index {src_index} is out-of-bounds for 2 vectors with length {dest_len}"
                         );
                     };
                     this.write_immediate(*val, &dest)?;
@@ -573,7 +653,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let (passthru, passthru_len) = this.operand_to_simd(passthru)?;
                 let (ptrs, ptrs_len) = this.operand_to_simd(ptrs)?;
                 let (mask, mask_len) = this.operand_to_simd(mask)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, passthru_len);
                 assert_eq!(dest_len, ptrs_len);
@@ -614,38 +694,97 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     }
                 }
             }
-            "bitmask" => {
-                let [op] = check_arg_count(args)?;
-                let (op, op_len) = this.operand_to_simd(op)?;
-                let bitmask_len = op_len.max(8);
+            "masked_load" => {
+                let [mask, ptr, default] = check_arg_count(args)?;
+                let (mask, mask_len) = this.operand_to_simd(mask)?;
+                let ptr = this.read_pointer(ptr)?;
+                let (default, default_len) = this.operand_to_simd(default)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
-                // Returns either an unsigned integer or array of `u8`.
-                assert!(
-                    dest.layout.ty.is_integral()
-                        || matches!(dest.layout.ty.kind(), ty::Array(elemty, _) if elemty == &this.tcx.types.u8)
-                );
-                assert!(bitmask_len <= 64);
-                assert_eq!(bitmask_len, dest.layout.size.bits());
-                let op_len = u32::try_from(op_len).unwrap();
+                assert_eq!(dest_len, mask_len);
+                assert_eq!(dest_len, default_len);
 
-                let mut res = 0u64;
-                for i in 0..op_len {
-                    let op = this.read_immediate(&this.project_index(&op, i.into())?)?;
-                    if simd_element_to_bool(op)? {
-                        res |= 1u64
-                            .checked_shl(simd_bitmask_index(i, op_len, this.data_layout().endian))
-                            .unwrap();
-                    }
+                for i in 0..dest_len {
+                    let mask = this.read_immediate(&this.project_index(&mask, i)?)?;
+                    let default = this.read_immediate(&this.project_index(&default, i)?)?;
+                    let dest = this.project_index(&dest, i)?;
+
+                    let val = if simd_element_to_bool(mask)? {
+                        // Size * u64 is implemented as always checked
+                        #[allow(clippy::arithmetic_side_effects)]
+                        let ptr = ptr.wrapping_offset(dest.layout.size * i, this);
+                        let place = this.ptr_to_mplace(ptr, dest.layout);
+                        this.read_immediate(&place)?
+                    } else {
+                        default
+                    };
+                    this.write_immediate(*val, &dest)?;
                 }
-                // We have to force the place type to be an int so that we can write `res` into it.
-                let mut dest = this.force_allocation(dest)?;
-                dest.layout = this.machine.layouts.uint(dest.layout.size).unwrap();
-                this.write_int(res, &dest)?;
+            }
+            "masked_store" => {
+                let [mask, ptr, vals] = check_arg_count(args)?;
+                let (mask, mask_len) = this.operand_to_simd(mask)?;
+                let ptr = this.read_pointer(ptr)?;
+                let (vals, vals_len) = this.operand_to_simd(vals)?;
+
+                assert_eq!(mask_len, vals_len);
+
+                for i in 0..vals_len {
+                    let mask = this.read_immediate(&this.project_index(&mask, i)?)?;
+                    let val = this.read_immediate(&this.project_index(&vals, i)?)?;
+
+                    if simd_element_to_bool(mask)? {
+                        // Size * u64 is implemented as always checked
+                        #[allow(clippy::arithmetic_side_effects)]
+                        let ptr = ptr.wrapping_offset(val.layout.size * i, this);
+                        let place = this.ptr_to_mplace(ptr, val.layout);
+                        this.write_immediate(*val, &place)?
+                    };
+                }
             }
 
             name => throw_unsup_format!("unimplemented intrinsic: `simd_{name}`"),
         }
         Ok(())
+    }
+
+    fn fminmax_op(
+        &self,
+        op: MinMax,
+        left: &ImmTy<'tcx, Provenance>,
+        right: &ImmTy<'tcx, Provenance>,
+    ) -> InterpResult<'tcx, Scalar<Provenance>> {
+        let this = self.eval_context_ref();
+        assert_eq!(left.layout.ty, right.layout.ty);
+        let ty::Float(float_ty) = left.layout.ty.kind() else {
+            bug!("fmax operand is not a float")
+        };
+        let left = left.to_scalar();
+        let right = right.to_scalar();
+        Ok(match float_ty {
+            FloatTy::F16 => unimplemented!("f16_f128"),
+            FloatTy::F32 => {
+                let left = left.to_f32()?;
+                let right = right.to_f32()?;
+                let res = match op {
+                    MinMax::Min => left.min(right),
+                    MinMax::Max => left.max(right),
+                };
+                let res = this.adjust_nan(res, &[left, right]);
+                Scalar::from_f32(res)
+            }
+            FloatTy::F64 => {
+                let left = left.to_f64()?;
+                let right = right.to_f64()?;
+                let res = match op {
+                    MinMax::Min => left.min(right),
+                    MinMax::Max => left.max(right),
+                };
+                let res = this.adjust_nan(res, &[left, right]);
+                Scalar::from_f64(res)
+            }
+            FloatTy::F128 => unimplemented!("f16_f128"),
+        })
     }
 }
 
@@ -656,32 +795,4 @@ fn simd_bitmask_index(idx: u32, vec_len: u32, endianness: Endian) -> u32 {
         #[allow(clippy::arithmetic_side_effects)] // idx < vec_len
         Endian::Big => vec_len - 1 - idx, // reverse order of bits
     }
-}
-
-fn fmax_op<'tcx>(
-    left: &ImmTy<'tcx, Provenance>,
-    right: &ImmTy<'tcx, Provenance>,
-) -> InterpResult<'tcx, Scalar<Provenance>> {
-    assert_eq!(left.layout.ty, right.layout.ty);
-    let ty::Float(float_ty) = left.layout.ty.kind() else { bug!("fmax operand is not a float") };
-    let left = left.to_scalar();
-    let right = right.to_scalar();
-    Ok(match float_ty {
-        FloatTy::F32 => Scalar::from_f32(left.to_f32()?.max(right.to_f32()?)),
-        FloatTy::F64 => Scalar::from_f64(left.to_f64()?.max(right.to_f64()?)),
-    })
-}
-
-fn fmin_op<'tcx>(
-    left: &ImmTy<'tcx, Provenance>,
-    right: &ImmTy<'tcx, Provenance>,
-) -> InterpResult<'tcx, Scalar<Provenance>> {
-    assert_eq!(left.layout.ty, right.layout.ty);
-    let ty::Float(float_ty) = left.layout.ty.kind() else { bug!("fmin operand is not a float") };
-    let left = left.to_scalar();
-    let right = right.to_scalar();
-    Ok(match float_ty {
-        FloatTy::F32 => Scalar::from_f32(left.to_f32()?.min(right.to_f32()?)),
-        FloatTy::F64 => Scalar::from_f64(left.to_f64()?.min(right.to_f64()?)),
-    })
 }

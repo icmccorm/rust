@@ -17,7 +17,7 @@ use rustc_middle::ty::TyCtxt;
 use rustc_session::parse::feature_err;
 use rustc_span::{sym, Span, Symbol};
 
-use crate::errors::{ExprNotAllowedInContext, SkippingConstChecks};
+use crate::errors::SkippingConstChecks;
 
 /// An expression that is not *always* legal in a const context.
 #[derive(Clone, Copy)]
@@ -48,7 +48,7 @@ impl NonConstExpr {
             Self::Match(TryDesugar(_)) => &[sym::const_try],
 
             // All other expressions are allowed.
-            Self::Loop(Loop | While) | Self::Match(Normal | FormatArgs) => &[],
+            Self::Loop(Loop | While) | Self::Match(Normal | Postfix | FormatArgs) => &[],
         };
 
         Some(gates)
@@ -77,6 +77,7 @@ impl<'tcx> CheckConstVisitor<'tcx> {
     }
 
     /// Emits an error when an unsupported expression is found in a const context.
+    #[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
     fn const_check_violated(&self, expr: NonConstExpr, span: Span) {
         let Self { tcx, def_id, const_kind } = *self;
 
@@ -86,7 +87,7 @@ impl<'tcx> CheckConstVisitor<'tcx> {
         let is_feature_allowed = |feature_gate| {
             // All features require that the corresponding gate be enabled,
             // even if the function has `#[rustc_allow_const_fn_unstable(the_gate)]`.
-            if !tcx.features().enabled(feature_gate) {
+            if !tcx.features().active(feature_gate) {
                 return false;
             }
 
@@ -110,8 +111,8 @@ impl<'tcx> CheckConstVisitor<'tcx> {
 
             // However, we cannot allow stable `const fn`s to use unstable features without an explicit
             // opt-in via `rustc_allow_const_fn_unstable`.
-            let attrs = tcx.hir().attrs(tcx.hir().local_def_id_to_hir_id(def_id));
-            attr::rustc_allow_const_fn_unstable(&tcx.sess, attrs).any(|name| name == feature_gate)
+            let attrs = tcx.hir().attrs(tcx.local_def_id_to_hir_id(def_id));
+            attr::rustc_allow_const_fn_unstable(tcx.sess, attrs).any(|name| name == feature_gate)
         };
 
         match required_gates {
@@ -122,7 +123,7 @@ impl<'tcx> CheckConstVisitor<'tcx> {
             // corresponding feature gate. This encourages nightly users to use feature gates when
             // possible.
             None if tcx.sess.opts.unstable_opts.unleash_the_miri_inside_of_you => {
-                tcx.sess.emit_warning(SkippingConstChecks { span });
+                tcx.dcx().emit_warn(SkippingConstChecks { span });
                 return;
             }
 
@@ -134,34 +135,31 @@ impl<'tcx> CheckConstVisitor<'tcx> {
 
         let required_gates = required_gates.unwrap_or(&[]);
         let missing_gates: Vec<_> =
-            required_gates.iter().copied().filter(|&g| !features.enabled(g)).collect();
+            required_gates.iter().copied().filter(|&g| !features.active(g)).collect();
 
         match missing_gates.as_slice() {
             [] => {
-                tcx.sess.emit_err(ExprNotAllowedInContext {
+                span_bug!(
                     span,
-                    expr: expr.name(),
-                    context: const_kind.keyword_name(),
-                });
+                    "we should not have reached this point, since `.await` is denied earlier"
+                );
             }
 
             [missing_primary, ref missing_secondary @ ..] => {
                 let msg =
                     format!("{} is not allowed in a `{}`", expr.name(), const_kind.keyword_name());
-                let mut err = feature_err(&tcx.sess.parse_sess, *missing_primary, span, msg);
+                let mut err = feature_err(&tcx.sess, *missing_primary, span, msg);
 
                 // If multiple feature gates would be required to enable this expression, include
                 // them as help messages. Don't emit a separate error for each missing feature gate.
                 //
                 // FIXME(ecstaticmorse): Maybe this could be incorporated into `feature_err`? This
                 // is a pretty narrow case, however.
-                if tcx.sess.is_nightly_build() {
-                    for gate in missing_secondary {
-                        let note =
-                            format!("add `#![feature({gate})]` to the crate attributes to enable",);
-                        err.help(note);
-                    }
-                }
+                tcx.disabled_nightly_features(
+                    &mut err,
+                    def_id.map(|id| tcx.local_def_id_to_hir_id(id)),
+                    missing_secondary.into_iter().map(|gate| (String::new(), *gate)),
+                );
 
                 err.emit();
             }

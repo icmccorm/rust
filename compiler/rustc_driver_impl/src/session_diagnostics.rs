@@ -43,6 +43,21 @@ pub(crate) struct IceBugReport<'a> {
 }
 
 #[derive(Diagnostic)]
+#[diag(driver_impl_ice_bug_report_internal_feature)]
+pub(crate) struct IceBugReportInternalFeature;
+
+#[derive(Diagnostic)]
+#[diag(driver_impl_ice_bug_report_outdated)]
+pub(crate) struct IceBugReportOutdated<'a> {
+    pub version: &'a str,
+    pub bug_report_url: &'a str,
+    #[note(driver_impl_update)]
+    pub note_update: (),
+    #[note(driver_impl_url)]
+    pub note_url: (),
+}
+
+#[derive(Diagnostic)]
 #[diag(driver_impl_ice_version)]
 pub(crate) struct IceVersion<'a> {
     pub version: &'a str,
@@ -52,13 +67,13 @@ pub(crate) struct IceVersion<'a> {
 #[derive(Diagnostic)]
 #[diag(driver_impl_ice_path)]
 pub(crate) struct IcePath {
-    pub path: String,
+    pub path: std::path::PathBuf,
 }
 
 #[derive(Diagnostic)]
 #[diag(driver_impl_ice_path_error)]
 pub(crate) struct IcePathError {
-    pub path: String,
+    pub path: std::path::PathBuf,
     pub error: String,
     #[subdiagnostic]
     pub env_var: Option<IcePathErrorEnv>,
@@ -67,7 +82,7 @@ pub(crate) struct IcePathError {
 #[derive(Subdiagnostic)]
 #[note(driver_impl_ice_path_error_env)]
 pub(crate) struct IcePathErrorEnv {
-    pub env_var: String,
+    pub env_var: std::path::PathBuf,
 }
 
 #[derive(Diagnostic)]

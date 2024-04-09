@@ -49,7 +49,8 @@ pub type EvaluationCache<'tcx> = Cache<
 /// parameters don't unify with regular types, but they *can* unify
 /// with variables from blanket impls, and (unless we know its bounds
 /// will always be satisfied) picking the blanket impl will be wrong
-/// for at least *some* substitutions. To make this concrete, if we have
+/// for at least *some* generic parameters. To make this concrete, if
+/// we have
 ///
 /// ```rust, ignore
 /// trait AsDebug { type Out: fmt::Debug; fn debug(self) -> Self::Out; }
@@ -125,10 +126,8 @@ pub enum SelectionCandidate<'tcx> {
 
     /// This is a trait matching with a projected type as `Self`, and we found
     /// an applicable bound in the trait definition. The `usize` is an index
-    /// into the list returned by `tcx.item_bounds`. The constness is the
-    /// constness of the bound in the trait.
-    // FIXME(effects) do we need this constness
-    ProjectionCandidate(usize, ty::BoundConstness),
+    /// into the list returned by `tcx.item_bounds`.
+    ProjectionCandidate(usize),
 
     /// Implementation of a `Fn`-family trait by one of the anonymous types
     /// generated for an `||` expression.
@@ -136,18 +135,35 @@ pub enum SelectionCandidate<'tcx> {
         is_const: bool,
     },
 
-    /// Implementation of a `Generator` trait by one of the anonymous types
-    /// generated for a generator.
-    GeneratorCandidate,
+    /// Implementation of an `AsyncFn`-family trait by one of the anonymous types
+    /// generated for an `async ||` expression.
+    AsyncClosureCandidate,
 
-    /// Implementation of a `Future` trait by one of the generator types
+    /// Implementation of the `AsyncFnKindHelper` helper trait, which
+    /// is used internally to delay computation for async closures until after
+    /// upvar analysis is performed in HIR typeck.
+    AsyncFnKindHelperCandidate,
+
+    /// Implementation of a `Coroutine` trait by one of the anonymous types
+    /// generated for a coroutine.
+    CoroutineCandidate,
+
+    /// Implementation of a `Future` trait by one of the coroutine types
     /// generated for an async construct.
     FutureCandidate,
+
+    /// Implementation of an `Iterator` trait by one of the coroutine types
+    /// generated for a `gen` construct.
+    IteratorCandidate,
+
+    /// Implementation of an `AsyncIterator` trait by one of the coroutine types
+    /// generated for a `async gen` construct.
+    AsyncIteratorCandidate,
 
     /// Implementation of a `Fn`-family trait by one of the anonymous
     /// types generated for a fn pointer type (e.g., `fn(int) -> int`)
     FnPointerCandidate {
-        is_const: bool,
+        fn_host_effect: ty::Const<'tcx>,
     },
 
     TraitAliasCandidate,
@@ -176,8 +192,7 @@ pub enum SelectionCandidate<'tcx> {
 ///
 /// The evaluation results are ordered:
 ///     - `EvaluatedToOk` implies `EvaluatedToOkModuloRegions`
-///       implies `EvaluatedToAmbig` implies `EvaluatedToUnknown`
-///     - `EvaluatedToErr` implies `EvaluatedToRecur`
+///       implies `EvaluatedToAmbig` implies `EvaluatedToAmbigStackDependent`
 ///     - the "union" of evaluation results is equal to their maximum -
 ///     all the "potential success" candidates can potentially succeed,
 ///     so they are noops when unioned with a definite error, and within
@@ -195,7 +210,7 @@ pub enum EvaluationResult {
     /// Evaluation is known to be ambiguous -- it *might* hold for some
     /// assignment of inference variables, but it might not.
     ///
-    /// While this has the same meaning as `EvaluatedToUnknown` -- we can't
+    /// While this has the same meaning as `EvaluatedToAmbigStackDependent` -- we can't
     /// know whether this obligation holds or not -- it is the result we
     /// would get with an empty stack, and therefore is cacheable.
     EvaluatedToAmbig,
@@ -203,52 +218,9 @@ pub enum EvaluationResult {
     /// variables. We are somewhat imprecise there, so we don't actually
     /// know the real result.
     ///
-    /// This can't be trivially cached for the same reason as `EvaluatedToRecur`.
-    EvaluatedToUnknown,
-    /// Evaluation failed because we encountered an obligation we are already
-    /// trying to prove on this branch.
-    ///
-    /// We know this branch can't be a part of a minimal proof-tree for
-    /// the "root" of our cycle, because then we could cut out the recursion
-    /// and maintain a valid proof tree. However, this does not mean
-    /// that all the obligations on this branch do not hold -- it's possible
-    /// that we entered this branch "speculatively", and that there
-    /// might be some other way to prove this obligation that does not
-    /// go through this cycle -- so we can't cache this as a failure.
-    ///
-    /// For example, suppose we have this:
-    ///
-    /// ```rust,ignore (pseudo-Rust)
-    /// pub trait Trait { fn xyz(); }
-    /// // This impl is "useless", but we can still have
-    /// // an `impl Trait for SomeUnsizedType` somewhere.
-    /// impl<T: Trait + Sized> Trait for T { fn xyz() {} }
-    ///
-    /// pub fn foo<T: Trait + ?Sized>() {
-    ///     <T as Trait>::xyz();
-    /// }
-    /// ```
-    ///
-    /// When checking `foo`, we have to prove `T: Trait`. This basically
-    /// translates into this:
-    ///
-    /// ```plain,ignore
-    /// (T: Trait + Sized →_\impl T: Trait), T: Trait ⊢ T: Trait
-    /// ```
-    ///
-    /// When we try to prove it, we first go the first option, which
-    /// recurses. This shows us that the impl is "useless" -- it won't
-    /// tell us that `T: Trait` unless it already implemented `Trait`
-    /// by some other means. However, that does not prevent `T: Trait`
-    /// does not hold, because of the bound (which can indeed be satisfied
-    /// by `SomeUnsizedType` from another crate).
-    //
-    // FIXME: when an `EvaluatedToRecur` goes past its parent root, we
-    // ought to convert it to an `EvaluatedToErr`, because we know
-    // there definitely isn't a proof tree for that obligation. Not
-    // doing so is still sound -- there isn't any proof tree, so the
-    // branch still can't be a part of a minimal one -- but does not re-enable caching.
-    EvaluatedToRecur,
+    /// This can't be trivially cached because the result depends on the
+    /// stack results.
+    EvaluatedToAmbigStackDependent,
     /// Evaluation failed.
     EvaluatedToErr,
 }
@@ -272,15 +244,15 @@ impl EvaluationResult {
             | EvaluatedToOk
             | EvaluatedToOkModuloRegions
             | EvaluatedToAmbig
-            | EvaluatedToUnknown => true,
+            | EvaluatedToAmbigStackDependent => true,
 
-            EvaluatedToErr | EvaluatedToRecur => false,
+            EvaluatedToErr => false,
         }
     }
 
     pub fn is_stack_dependent(self) -> bool {
         match self {
-            EvaluatedToUnknown | EvaluatedToRecur => true,
+            EvaluatedToAmbigStackDependent => true,
 
             EvaluatedToOkModuloOpaqueTypes
             | EvaluatedToOk
@@ -296,7 +268,6 @@ impl EvaluationResult {
 pub enum OverflowError {
     Error(ErrorGuaranteed),
     Canonical,
-    ErrorReporting,
 }
 
 impl From<ErrorGuaranteed> for OverflowError {
@@ -312,7 +283,6 @@ impl<'tcx> From<OverflowError> for SelectionError<'tcx> {
         match overflow_error {
             OverflowError::Error(e) => SelectionError::Overflow(OverflowError::Error(e)),
             OverflowError::Canonical => SelectionError::Overflow(OverflowError::Canonical),
-            OverflowError::ErrorReporting => SelectionError::ErrorReporting,
         }
     }
 }

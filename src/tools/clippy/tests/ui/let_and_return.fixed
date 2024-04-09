@@ -168,7 +168,26 @@ mod issue_5729 {
     impl<T: Foo + 'static> FooStorage for FooStorageImpl<T> {
         fn foo_cloned(&self) -> Arc<dyn Foo> {
             
-            Arc::clone(&self.foo) as _
+            (Arc::clone(&self.foo)) as _
+            //~^ ERROR: returning the result of a `let` binding from a block
+        }
+    }
+}
+
+mod issue_11335 {
+    pub enum E<T> {
+        A(T),
+        B(T),
+    }
+
+    impl<T> E<T> {
+        pub fn inner(&self) -> &T {
+            
+
+            (match self {
+                E::A(x) => x,
+                E::B(x) => x,
+            }) as _
             //~^ ERROR: returning the result of a `let` binding from a block
         }
     }
@@ -183,5 +202,12 @@ macro_rules! fn_in_macro {
 fn_in_macro!({
     return 1;
 });
+
+fn issue9150() -> usize {
+    let x = 1;
+    #[cfg(any())]
+    panic!("can't see me");
+    x
+}
 
 fn main() {}

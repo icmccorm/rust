@@ -55,11 +55,14 @@ const ANNOTATIONS_TO_IGNORE: &[&str] = &[
     "// CHECK",
     "// EMIT_MIR",
     "// compile-flags",
+    "//@ compile-flags",
     "// error-pattern",
+    "//@ error-pattern",
     "// gdb",
     "// lldb",
     "// cdb",
     "// normalize-stderr-test",
+    "//@ normalize-stderr-test",
 ];
 
 // Intentionally written in decimal rather than hex
@@ -127,8 +130,20 @@ fn should_ignore(line: &str) -> bool {
     // Matches test annotations like `//~ ERROR text`.
     // This mirrors the regex in src/tools/compiletest/src/runtest.rs, please
     // update both if either are changed.
-    let re = Regex::new("\\s*//(\\[.*\\])?~.*").unwrap();
-    re.is_match(line) || ANNOTATIONS_TO_IGNORE.iter().any(|a| line.contains(a))
+    lazy_static::lazy_static! {
+        static ref ANNOTATION_RE: Regex = Regex::new("\\s*//(\\[.*\\])?~.*").unwrap();
+    }
+    // For `ui_test`-style UI test directives, also ignore
+    // - `//@[rev] compile-flags`
+    // - `//@[rev] normalize-stderr-test`
+    lazy_static::lazy_static! {
+        static ref UI_TEST_LONG_DIRECTIVES_RE: Regex =
+        Regex::new("\\s*//@(\\[.*\\]) (compile-flags|normalize-stderr-test|error-pattern).*")
+            .unwrap();
+    }
+    ANNOTATION_RE.is_match(line)
+        || ANNOTATIONS_TO_IGNORE.iter().any(|a| line.contains(a))
+        || UI_TEST_LONG_DIRECTIVES_RE.is_match(line)
 }
 
 /// Returns `true` if `line` is allowed to be longer than the normal limit.
@@ -427,9 +442,12 @@ pub fn check(path: &Path, bad: &mut bool) {
                     "copyright notices attributed to the Rust Project Developers are deprecated"
                 );
             }
-            if is_unexplained_ignore(&extension, line) {
-                err(UNEXPLAINED_IGNORE_DOCTEST_INFO);
+            if !file.components().any(|c| c.as_os_str() == "rustc_baked_icu_data") {
+                if is_unexplained_ignore(&extension, line) {
+                    err(UNEXPLAINED_IGNORE_DOCTEST_INFO);
+                }
             }
+
             if filename.ends_with(".cpp") && line.contains("llvm_unreachable") {
                 err(LLVM_UNREACHABLE_INFO);
             }
@@ -491,7 +509,7 @@ pub fn check(path: &Path, bad: &mut bool) {
             let mut err = |_| {
                 tidy_error!(bad, "{}: leading newline", file.display());
             };
-            suppressible_tidy_err!(err, skip_leading_newlines, "mising leading newline");
+            suppressible_tidy_err!(err, skip_leading_newlines, "missing leading newline");
         }
         let mut err = |msg: &str| {
             tidy_error!(bad, "{}: {}", file.display(), msg);

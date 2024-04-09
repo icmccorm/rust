@@ -8,10 +8,6 @@ resolve_add_as_non_derive =
 resolve_added_macro_use =
     have you added the `#[macro_use]` on the module/import?
 
-resolve_ampersand_used_without_explicit_lifetime_name =
-    `&` without an explicit lifetime name cannot be used here
-    .note = explicit lifetime name needed here
-
 resolve_ancestor_only =
     visibilities can only be restricted to ancestor modules
 
@@ -35,6 +31,10 @@ resolve_attempt_to_use_non_constant_value_in_constant_with_suggestion =
 
 resolve_attempt_to_use_non_constant_value_in_constant_without_suggestion =
     this would need to be a `{$suggestion}`
+
+resolve_binding_in_never_pattern =
+    never patterns cannot contain variable bindings
+    .suggestion = use a wildcard `_` instead
 
 resolve_binding_shadows_something_unacceptable =
     {$shadowing_binding}s cannot shadow {$shadowed_binding}s
@@ -83,6 +83,10 @@ resolve_consider_declaring_with_pub =
 resolve_consider_marking_as_pub =
     consider marking `{$ident}` as `pub` in the imported module
 
+resolve_consider_move_macro_position =
+    consider moving the definition of `{$ident}` before this call
+
+
 resolve_const_not_member_of_trait =
     const `{$const_}` is not a member of trait `{$trait_}`
     .label = not a member of trait `{$trait_}`
@@ -96,12 +100,6 @@ resolve_const_param_in_non_trivial_anon_const =
 resolve_const_param_in_ty_of_const_param =
     const parameters may not be used in the type of const parameters
 
-resolve_crate_may_not_be_imported =
-    `$crate` may not be imported
-
-resolve_crate_root_imports_must_be_named_explicitly =
-    crate root imports need to be explicitly named: `use crate as name;`
-
 resolve_expected_found =
     expected module, found {$res} `{$path_str}`
     .label = not a module
@@ -114,10 +112,18 @@ resolve_forward_declared_generic_param =
     .label = defaulted generic parameters cannot be forward declared
 
 resolve_generic_params_from_outer_item =
-    can't use generic parameters from outer item
-    .label = use of generic parameter from outer item
+    can't use {$is_self ->
+        [true] `Self`
+        *[false] generic parameters
+    } from outer item
+    .label = use of {$is_self ->
+        [true] `Self`
+        *[false] generic parameter
+    } from outer item
     .refer_to_type_directly = refer to the type directly here instead
     .suggestion = try introducing a local generic parameter here
+
+resolve_generic_params_from_outer_item_const = a `const` is a separate item from the item that contains it
 
 resolve_generic_params_from_outer_item_const_param = const parameter from outer item
 
@@ -125,13 +131,10 @@ resolve_generic_params_from_outer_item_self_ty_alias = `Self` type implicitly de
 
 resolve_generic_params_from_outer_item_self_ty_param = can't use `Self` here
 
+resolve_generic_params_from_outer_item_static = a `static` is a separate item from the item that contains it
+
 resolve_generic_params_from_outer_item_ty_param = type parameter from outer item
 
-resolve_glob_import_doesnt_reexport =
-    glob import doesn't reexport anything because no candidate is public enough
-
-resolve_help_try_using_local_generic_param =
-    try using a local generic parameter instead
 
 resolve_ident_bound_more_than_once_in_parameter_list =
     identifier `{$identifier}` is bound more than once in this parameter list
@@ -177,6 +180,9 @@ resolve_lowercase_self =
     attempt to use a non-constant value in a constant
     .suggestion = try using `Self`
 
+resolve_macro_defined_later =
+    a macro with the same name exists, but it appears later at here
+
 resolve_macro_expected_found =
     expected {$expected}, found {$found} `{$macro_path}`
 
@@ -185,6 +191,8 @@ resolve_macro_use_extern_crate_self = `#[macro_use]` is not supported on `extern
 resolve_method_not_member_of_trait =
     method `{$method}` is not a member of trait `{$trait_}`
     .label = not a member of trait `{$trait_}`
+
+resolve_missing_macro_rules_name = maybe you have forgotten to define a name for this `macro_rules!`
 
 resolve_module_only =
     visibility must resolve to a module
@@ -203,14 +211,11 @@ resolve_param_in_non_trivial_anon_const =
     .label = cannot perform const operation using `{$name}`
 
 resolve_param_in_non_trivial_anon_const_help =
-    use `#![feature(generic_const_exprs)]` to allow generic const expressions
+    add `#![feature(generic_const_exprs)]` to allow generic const expressions
 
 resolve_param_in_ty_of_const_param =
     the type of const parameters must not depend on other generic parameters
     .label = the type must not depend on the parameter `{$name}`
-
-resolve_parent_module_reset_for_binding =
-    parent module is reset for binding
 
 resolve_proc_macro_same_crate = can't use a procedural macro from the same crate that defines it
     .help = you can define integration tests in a directory named `tests`
@@ -249,9 +254,6 @@ resolve_self_in_generic_param_default =
     generic parameters cannot use `Self` in their defaults
     .label = `Self` in generic parameter default
 
-resolve_self_type_implicitly_declared_by_impl =
-    `Self` type implicitly declared here, by this `impl`
-
 resolve_tool_module_imported =
     cannot use a tool module through an import
     .note = the tool module imported here
@@ -261,17 +263,6 @@ resolve_trait_impl_duplicate =
     .label = duplicate definition
     .old_span_label = previous definition here
     .trait_item_span = item in trait
-
-resolve_trait_impl_mismatch =
-    item `{$name}` is an associated {$kind}, which doesn't match its trait `{$trait_path}`
-    .label = does not match trait
-    .label_trait_item = item in trait
-
-resolve_try_adding_local_generic_param_on_method =
-    try adding a local generic parameter in this method instead
-
-resolve_try_using_local_generic_parameter =
-    try using a local generic parameter instead
 
 resolve_try_using_similarly_named_label =
     try using similarly named label
@@ -293,9 +284,11 @@ resolve_undeclared_label =
     use of undeclared label `{$name}`
     .label = undeclared label `{$name}`
 
-resolve_underscore_lifetime_name_cannot_be_used_here =
-    `'_` cannot be used here
-    .note = `'_` is a reserved lifetime name
+resolve_unexpected_res_change_ty_to_const_param_sugg =
+    you might have meant to write a const parameter here
+
+resolve_unexpected_res_use_at_op_in_slice_pat_with_range_sugg =
+    if you meant to collect the rest of the slice in `{$ident}`, use the at operator
 
 resolve_unreachable_label =
     use of unreachable label `{$name}`

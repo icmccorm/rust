@@ -168,7 +168,7 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     let fn_abi = cx.fn_abi_of_instance(instance, ty::List::empty());
     debug!("fn_abi: {:?}", fn_abi);
 
-    let debug_context = cx.create_function_debug_context(instance, &fn_abi, llfn, &mir);
+    let debug_context = cx.create_function_debug_context(instance, fn_abi, llfn, mir);
 
     let start_llbb = Bx::append_block(cx, llfn, "start");
     let mut start_bx = Bx::build(cx, start_llbb);
@@ -180,7 +180,7 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     }
 
     let cleanup_kinds =
-        base::wants_new_eh_instructions(cx.tcx().sess).then(|| analyze::cleanup_kinds(&mir));
+        base::wants_new_eh_instructions(cx.tcx().sess).then(|| analyze::cleanup_kinds(mir));
 
     let cached_llbbs: IndexVec<mir::BasicBlock, CachedLlbb<Bx::BasicBlock>> =
         mir.basic_blocks
@@ -209,18 +209,12 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         caller_location: None,
     };
 
-    fx.per_local_var_debug_info = fx.compute_per_local_var_debug_info(&mut start_bx);
+    // It may seem like we should iterate over `required_consts` to ensure they all successfully
+    // evaluate; however, the `MirUsedCollector` already did that during the collection phase of
+    // monomorphization, and if there is an error during collection then codegen never starts -- so
+    // we don't have to do it again.
 
-    // Rust post-monomorphization checks; we later rely on them.
-    if let Err(err) =
-        mir.post_mono_checks(cx.tcx(), ty::ParamEnv::reveal_all(), |c| Ok(fx.monomorphize(c)))
-    {
-        err.emit_err(cx.tcx());
-        // This IR shouldn't ever be emitted, but let's try to guard against any of this code
-        // ever running.
-        start_bx.abort();
-        return;
-    }
+    fx.per_local_var_debug_info = fx.compute_per_local_var_debug_info(&mut start_bx);
 
     let memory_locals = analyze::non_ssa_locals(&fx);
 
@@ -263,13 +257,22 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     // Apply debuginfo to the newly allocated locals.
     fx.debug_introduce_locals(&mut start_bx);
 
+    let reachable_blocks = mir.reachable_blocks_in_mono(cx.tcx(), instance);
+
     // The builders will be created separately for each basic block at `codegen_block`.
     // So drop the builder of `start_llbb` to avoid having two at the same time.
     drop(start_bx);
 
     // Codegen the body of each block using reverse postorder
-    for (bb, _) in traversal::reverse_postorder(&mir) {
-        fx.codegen_block(bb);
+    for (bb, _) in traversal::reverse_postorder(mir) {
+        if reachable_blocks.contains(bb) {
+            fx.codegen_block(bb);
+        } else {
+            // This may have references to things we didn't monomorphize, so we
+            // don't actually codegen the body. We still create the block so
+            // terminators in other blocks can reference it without worry.
+            fx.codegen_block_as_unreachable(bb);
+        }
     }
 }
 
@@ -374,29 +377,45 @@ fn arg_local_refs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
                 }
             }
 
-            if arg.is_sized_indirect() {
-                // Don't copy an indirect argument to an alloca, the caller
-                // already put it in a temporary alloca and gave it up.
-                // FIXME: lifetimes
-                let llarg = bx.get_param(llarg_idx);
-                llarg_idx += 1;
-                LocalRef::Place(PlaceRef::new_sized(llarg, arg.layout))
-            } else if arg.is_unsized_indirect() {
-                // As the storage for the indirect argument lives during
-                // the whole function call, we just copy the fat pointer.
-                let llarg = bx.get_param(llarg_idx);
-                llarg_idx += 1;
-                let llextra = bx.get_param(llarg_idx);
-                llarg_idx += 1;
-                let indirect_operand = OperandValue::Pair(llarg, llextra);
+            match arg.mode {
+                // Sized indirect arguments
+                PassMode::Indirect { attrs, meta_attrs: None, on_stack: _ } => {
+                    // Don't copy an indirect argument to an alloca, the caller already put it
+                    // in a temporary alloca and gave it up.
+                    // FIXME: lifetimes
+                    if let Some(pointee_align) = attrs.pointee_align
+                        && pointee_align < arg.layout.align.abi
+                    {
+                        // ...unless the argument is underaligned, then we need to copy it to
+                        // a higher-aligned alloca.
+                        let tmp = PlaceRef::alloca(bx, arg.layout);
+                        bx.store_fn_arg(arg, &mut llarg_idx, tmp);
+                        LocalRef::Place(tmp)
+                    } else {
+                        let llarg = bx.get_param(llarg_idx);
+                        llarg_idx += 1;
+                        LocalRef::Place(PlaceRef::new_sized(llarg, arg.layout))
+                    }
+                }
+                // Unsized indirect qrguments
+                PassMode::Indirect { attrs: _, meta_attrs: Some(_), on_stack: _ } => {
+                    // As the storage for the indirect argument lives during
+                    // the whole function call, we just copy the fat pointer.
+                    let llarg = bx.get_param(llarg_idx);
+                    llarg_idx += 1;
+                    let llextra = bx.get_param(llarg_idx);
+                    llarg_idx += 1;
+                    let indirect_operand = OperandValue::Pair(llarg, llextra);
 
-                let tmp = PlaceRef::alloca_unsized_indirect(bx, arg.layout);
-                indirect_operand.store(bx, tmp);
-                LocalRef::UnsizedPlace(tmp)
-            } else {
-                let tmp = PlaceRef::alloca(bx, arg.layout);
-                bx.store_fn_arg(arg, &mut llarg_idx, tmp);
-                LocalRef::Place(tmp)
+                    let tmp = PlaceRef::alloca_unsized_indirect(bx, arg.layout);
+                    indirect_operand.store(bx, tmp);
+                    LocalRef::UnsizedPlace(tmp)
+                }
+                _ => {
+                    let tmp = PlaceRef::alloca(bx, arg.layout);
+                    bx.store_fn_arg(arg, &mut llarg_idx, tmp);
+                    LocalRef::Place(tmp)
+                }
             }
         })
         .collect::<Vec<_>>();

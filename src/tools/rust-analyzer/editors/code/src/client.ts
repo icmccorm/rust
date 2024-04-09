@@ -10,6 +10,7 @@ import { type Config, prepareVSCodeConfig } from "./config";
 import { randomUUID } from "crypto";
 import { sep as pathSeparator } from "path";
 import { unwrapUndefinable } from "./undefinable";
+import { RaLanguageClient } from "./lang_client";
 
 export interface Env {
     [name: string]: string;
@@ -363,7 +364,7 @@ export async function createClient(
         },
     };
 
-    const client = new lc.LanguageClient(
+    const client = new RaLanguageClient(
         "rust-analyzer",
         "Rust Analyzer Language Server",
         serverOptions,
@@ -371,13 +372,18 @@ export async function createClient(
     );
 
     // To turn on all proposed features use: client.registerProposedFeatures();
-    client.registerFeature(new ExperimentalFeatures());
+    client.registerFeature(new ExperimentalFeatures(config));
     client.registerFeature(new OverrideFeatures());
 
     return client;
 }
 
 class ExperimentalFeatures implements lc.StaticFeature {
+    private readonly testExplorer: boolean;
+
+    constructor(config: Config) {
+        this.testExplorer = config.testExplorer || false;
+    }
     getState(): lc.FeatureState {
         return { kind: "static" };
     }
@@ -389,6 +395,8 @@ class ExperimentalFeatures implements lc.StaticFeature {
             serverStatusNotification: true,
             colorDiagnosticOutput: true,
             openServerLogs: true,
+            localDocs: true,
+            testExplorer: this.testExplorer,
             commands: {
                 commands: [
                     "rust-analyzer.runSingle",

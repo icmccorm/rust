@@ -1,10 +1,10 @@
 use crate::base::ExtCtxt;
 use rustc_ast::ptr::P;
-use rustc_ast::{self as ast, AttrVec, BlockCheckMode, Expr, LocalKind, PatKind, UnOp};
+use rustc_ast::{self as ast, AttrVec, BlockCheckMode, Expr, LocalKind, MatchKind, PatKind, UnOp};
 use rustc_ast::{attr, token, util::literal};
 use rustc_span::source_map::Spanned;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
-use rustc_span::Span;
+use rustc_span::{Span, DUMMY_SP};
 use thin_vec::{thin_vec, ThinVec};
 
 impl<'a> ExtCtxt<'a> {
@@ -46,6 +46,23 @@ impl<'a> ExtCtxt<'a> {
             args,
         });
         ast::Path { span, segments, tokens: None }
+    }
+
+    pub fn macro_call(
+        &self,
+        span: Span,
+        path: ast::Path,
+        delim: ast::token::Delimiter,
+        tokens: ast::tokenstream::TokenStream,
+    ) -> P<ast::MacCall> {
+        P(ast::MacCall {
+            path,
+            args: P(ast::DelimArgs {
+                dspan: ast::tokenstream::DelimSpan { open: span, close: span },
+                delim,
+                tokens,
+            }),
+        })
     }
 
     pub fn ty_mt(&self, ty: P<ast::Ty>, mutbl: ast::Mutability) -> ast::MutTy {
@@ -134,10 +151,14 @@ impl<'a> ExtCtxt<'a> {
     pub fn trait_bound(&self, path: ast::Path, is_const: bool) -> ast::GenericBound {
         ast::GenericBound::Trait(
             self.poly_trait_ref(path.span, path),
-            if is_const {
-                ast::TraitBoundModifier::MaybeConst
-            } else {
-                ast::TraitBoundModifier::None
+            ast::TraitBoundModifiers {
+                polarity: ast::BoundPolarity::Positive,
+                constness: if is_const {
+                    ast::BoundConstness::Maybe(DUMMY_SP)
+                } else {
+                    ast::BoundConstness::Never
+                },
+                asyncness: ast::BoundAsyncness::Normal,
             },
         )
     }
@@ -161,6 +182,7 @@ impl<'a> ExtCtxt<'a> {
             id: ast::DUMMY_NODE_ID,
             kind: LocalKind::Init(ex),
             span: sp,
+            colon_sp: None,
             attrs: AttrVec::new(),
             tokens: None,
         });
@@ -190,6 +212,7 @@ impl<'a> ExtCtxt<'a> {
             id: ast::DUMMY_NODE_ID,
             kind: LocalKind::Init(ex),
             span: sp,
+            colon_sp: None,
             attrs: AttrVec::new(),
             tokens: None,
         });
@@ -204,6 +227,7 @@ impl<'a> ExtCtxt<'a> {
             id: ast::DUMMY_NODE_ID,
             kind: LocalKind::Decl,
             span,
+            colon_sp: None,
             attrs: AttrVec::new(),
             tokens: None,
         });
@@ -211,7 +235,7 @@ impl<'a> ExtCtxt<'a> {
     }
 
     pub fn stmt_local(&self, local: P<ast::Local>, span: Span) -> ast::Stmt {
-        ast::Stmt { id: ast::DUMMY_NODE_ID, kind: ast::StmtKind::Local(local), span }
+        ast::Stmt { id: ast::DUMMY_NODE_ID, kind: ast::StmtKind::Let(local), span }
     }
 
     pub fn stmt_item(&self, sp: Span, item: P<ast::Item>) -> ast::Stmt {
@@ -256,6 +280,10 @@ impl<'a> ExtCtxt<'a> {
 
     pub fn expr_field(&self, span: Span, expr: P<Expr>, field: Ident) -> P<ast::Expr> {
         self.expr(span, ast::ExprKind::Field(expr, field))
+    }
+
+    pub fn expr_macro_call(&self, span: Span, call: P<ast::MacCall>) -> P<ast::Expr> {
+        self.expr(span, ast::ExprKind::MacCall(call))
     }
 
     pub fn expr_binary(
@@ -403,16 +431,19 @@ impl<'a> ExtCtxt<'a> {
         self.expr(sp, ast::ExprKind::Tup(exprs))
     }
 
-    pub fn expr_fail(&self, span: Span, msg: Symbol) -> P<ast::Expr> {
-        self.expr_call_global(
-            span,
-            [sym::std, sym::rt, sym::begin_panic].iter().map(|s| Ident::new(*s, span)).collect(),
-            thin_vec![self.expr_str(span, msg)],
-        )
-    }
-
     pub fn expr_unreachable(&self, span: Span) -> P<ast::Expr> {
-        self.expr_fail(span, Symbol::intern("internal error: entered unreachable code"))
+        self.expr_macro_call(
+            span,
+            self.macro_call(
+                span,
+                self.path_global(
+                    span,
+                    [sym::std, sym::unreachable].map(|s| Ident::new(s, span)).to_vec(),
+                ),
+                ast::token::Delimiter::Parenthesis,
+                ast::tokenstream::TokenStream::default(),
+            ),
+        )
     }
 
     pub fn expr_ok(&self, sp: Span, expr: P<ast::Expr>) -> P<ast::Expr> {
@@ -488,7 +519,7 @@ impl<'a> ExtCtxt<'a> {
         path: ast::Path,
         field_pats: ThinVec<ast::PatField>,
     ) -> P<ast::Pat> {
-        self.pat(span, PatKind::Struct(None, path, field_pats, false))
+        self.pat(span, PatKind::Struct(None, path, field_pats, ast::PatFieldsRest::None))
     }
     pub fn pat_tuple(&self, span: Span, pats: ThinVec<P<ast::Pat>>) -> P<ast::Pat> {
         self.pat(span, PatKind::Tuple(pats))
@@ -505,7 +536,7 @@ impl<'a> ExtCtxt<'a> {
             attrs: AttrVec::new(),
             pat,
             guard: None,
-            body: expr,
+            body: Some(expr),
             span,
             id: ast::DUMMY_NODE_ID,
             is_placeholder: false,
@@ -517,7 +548,7 @@ impl<'a> ExtCtxt<'a> {
     }
 
     pub fn expr_match(&self, span: Span, arg: P<ast::Expr>, arms: ThinVec<ast::Arm>) -> P<Expr> {
-        self.expr(span, ast::ExprKind::Match(arg, arms))
+        self.expr(span, ast::ExprKind::Match(arg, arms, MatchKind::Prefix))
     }
 
     pub fn expr_if(
@@ -547,7 +578,7 @@ impl<'a> ExtCtxt<'a> {
                 binder: ast::ClosureBinder::NotPresent,
                 capture_clause: ast::CaptureBy::Ref,
                 constness: ast::Const::No,
-                asyncness: ast::Async::No,
+                coroutine_kind: None,
                 movability: ast::Movability::Movable,
                 fn_decl,
                 body,
@@ -658,7 +689,7 @@ impl<'a> ExtCtxt<'a> {
 
     // Builds `#[name]`.
     pub fn attr_word(&self, name: Symbol, span: Span) -> ast::Attribute {
-        let g = &self.sess.parse_sess.attr_id_generator;
+        let g = &self.sess.psess.attr_id_generator;
         attr::mk_attr_word(g, ast::AttrStyle::Outer, name, span)
     }
 
@@ -666,13 +697,13 @@ impl<'a> ExtCtxt<'a> {
     //
     // Note: `span` is used for both the identifier and the value.
     pub fn attr_name_value_str(&self, name: Symbol, val: Symbol, span: Span) -> ast::Attribute {
-        let g = &self.sess.parse_sess.attr_id_generator;
+        let g = &self.sess.psess.attr_id_generator;
         attr::mk_attr_name_value_str(g, ast::AttrStyle::Outer, name, val, span)
     }
 
     // Builds `#[outer(inner)]`.
     pub fn attr_nested_word(&self, outer: Symbol, inner: Symbol, span: Span) -> ast::Attribute {
-        let g = &self.sess.parse_sess.attr_id_generator;
+        let g = &self.sess.psess.attr_id_generator;
         attr::mk_attr_nested_word(g, ast::AttrStyle::Outer, outer, inner, span)
     }
 }

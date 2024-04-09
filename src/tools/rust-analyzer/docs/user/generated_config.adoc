@@ -57,6 +57,12 @@ build procedural macros. The command is required to output json
 and should therefore include `--message-format=json` or a similar
 option.
 
+If there are multiple linked projects/workspaces, this command is invoked for
+each of them, with the working directory being the workspace root
+(i.e., the folder containing the `Cargo.toml`). This can be overwritten
+by changing `#rust-analyzer.cargo.buildScripts.invocationStrategy#` and
+`#rust-analyzer.cargo.buildScripts.invocationLocation#`.
+
 By default, a cargo invocation will be constructed for the configured
 targets and features, with the following base command line:
 
@@ -64,6 +70,12 @@ targets and features, with the following base command line:
 cargo check --quiet --workspace --message-format=json --all-targets
 ```
 .
+--
+[[rust-analyzer.cargo.buildScripts.rebuildOnSave]]rust-analyzer.cargo.buildScripts.rebuildOnSave (default: `true`)::
++
+--
+Rerun proc-macros building/build-scripts running when proc-macro
+or build-script sources change and are saved.
 --
 [[rust-analyzer.cargo.buildScripts.useRustcWrapper]]rust-analyzer.cargo.buildScripts.useRustcWrapper (default: `true`)::
 +
@@ -109,6 +121,16 @@ Unsetting this disables sysroot loading.
 
 This option does not take effect until rust-analyzer is restarted.
 --
+[[rust-analyzer.cargo.sysrootQueryMetadata]]rust-analyzer.cargo.sysrootQueryMetadata (default: `false`)::
++
+--
+Whether to run cargo metadata on the sysroot library allowing rust-analyzer to analyze
+third-party dependencies of the standard libraries.
+
+This will cause `cargo` to create a lockfile in your sysroot directory. rust-analyzer
+will attempt to clean up afterwards, but nevertheless requires the location to be
+writable to.
+--
 [[rust-analyzer.cargo.sysrootSrc]]rust-analyzer.cargo.sysrootSrc (default: `null`)::
 +
 --
@@ -121,6 +143,16 @@ This option does not take effect until rust-analyzer is restarted.
 +
 --
 Compilation target override (target triple).
+--
+[[rust-analyzer.cargo.targetDir]]rust-analyzer.cargo.targetDir (default: `null`)::
++
+--
+Optional path to a rust-analyzer specific target directory.
+This prevents rust-analyzer's `cargo check` and initial build-script and proc-macro
+building from locking the `Cargo.lock` at the expense of duplicating build artifacts.
+
+Set to `true` to use a subdirectory of the existing target directory or
+set to a path relative to the workspace to use that path.
 --
 [[rust-analyzer.cargo.unsetTest]]rust-analyzer.cargo.unsetTest (default: `["core"]`)::
 +
@@ -173,9 +205,9 @@ For example for `cargo check`: `dead_code`, `unused_imports`, `unused_variables`
 --
 Specifies the working directory for running checks.
 - "workspace": run checks for workspaces in the corresponding workspaces' root directories.
-  This falls back to "root" if `#rust-analyzer.cargo.check.invocationStrategy#` is set to `once`.
+  This falls back to "root" if `#rust-analyzer.check.invocationStrategy#` is set to `once`.
 - "root": run checks in the project's root directory.
-This config only has an effect when `#rust-analyzer.cargo.check.overrideCommand#`
+This config only has an effect when `#rust-analyzer.check.overrideCommand#`
 is set.
 --
 [[rust-analyzer.check.invocationStrategy]]rust-analyzer.check.invocationStrategy (default: `"per_workspace"`)::
@@ -184,7 +216,7 @@ is set.
 Specifies the invocation strategy to use when running the check command.
 If `per_workspace` is set, the command will be executed for each workspace.
 If `once` is set, the command will be executed once.
-This config only has an effect when `#rust-analyzer.cargo.check.overrideCommand#`
+This config only has an effect when `#rust-analyzer.check.overrideCommand#`
 is set.
 --
 [[rust-analyzer.check.noDefaultFeatures]]rust-analyzer.check.noDefaultFeatures (default: `null`)::
@@ -206,9 +238,16 @@ If you're changing this because you're using some tool wrapping
 Cargo, you might also want to change
 `#rust-analyzer.cargo.buildScripts.overrideCommand#`.
 
-If there are multiple linked projects, this command is invoked for
-each of them, with the working directory being the project root
-(i.e., the folder containing the `Cargo.toml`).
+If there are multiple linked projects/workspaces, this command is invoked for
+each of them, with the working directory being the workspace root
+(i.e., the folder containing the `Cargo.toml`). This can be overwritten
+by changing `#rust-analyzer.check.invocationStrategy#` and
+`#rust-analyzer.check.invocationLocation#`.
+
+If `$saved_file` is part of the command, rust-analyzer will pass
+the absolute path of the saved file to the provided command. This is
+intended to be used with non-Cargo build systems.
+Note that `$saved_file` is experimental and may be removed in the futureg.
 
 An example command would be:
 
@@ -227,6 +266,12 @@ Can be a single target, e.g. `"x86_64-unknown-linux-gnu"` or a list of targets, 
 
 Aliased as `"checkOnSave.targets"`.
 --
+[[rust-analyzer.check.workspace]]rust-analyzer.check.workspace (default: `true`)::
++
+--
+Whether `--workspace` should be passed to `cargo check`.
+If false, `-p <package>` will be passed instead.
+--
 [[rust-analyzer.completion.autoimport.enable]]rust-analyzer.completion.autoimport.enable (default: `true`)::
 +
 --
@@ -243,6 +288,11 @@ with `self` prefixed to them when inside a method.
 +
 --
 Whether to add parenthesis and argument snippets when completing function.
+--
+[[rust-analyzer.completion.fullFunctionSignatures.enable]]rust-analyzer.completion.fullFunctionSignatures.enable (default: `false`)::
++
+--
+Whether to show full function/method signatures in completion docs.
 --
 [[rust-analyzer.completion.limit]]rust-analyzer.completion.limit (default: `null`)::
 +
@@ -309,6 +359,11 @@ Default:
 Custom completion snippets.
 
 --
+[[rust-analyzer.completion.termSearch.enable]]rust-analyzer.completion.termSearch.enable (default: `false`)::
++
+--
+Whether to enable term search based snippets like `Some(foo.bar().baz())`.
+--
 [[rust-analyzer.diagnostics.disabled]]rust-analyzer.diagnostics.disabled (default: `[]`)::
 +
 --
@@ -330,6 +385,11 @@ have more false positives than usual.
 --
 Map of prefixes to be substituted when parsing diagnostic file paths.
 This should be the reverse mapping of what is passed to `rustc` as `--remap-path-prefix`.
+--
+[[rust-analyzer.diagnostics.styleLints.enable]]rust-analyzer.diagnostics.styleLints.enable (default: `false`)::
++
+--
+Whether to run additional style lints.
 --
 [[rust-analyzer.diagnostics.warningsAsHint]]rust-analyzer.diagnostics.warningsAsHint (default: `[]`)::
 +
@@ -460,6 +520,16 @@ How to render the offset information in a memory layout hover.
 --
 How to render the size information in a memory layout hover.
 --
+[[rust-analyzer.hover.show.structFields]]rust-analyzer.hover.show.structFields (default: `null`)::
++
+--
+How many fields of a struct to display when hovering a struct.
+--
+[[rust-analyzer.hover.show.traitAssocItems]]rust-analyzer.hover.show.traitAssocItems (default: `null`)::
++
+--
+How many associated items of a trait to display when hovering a trait.
+--
 [[rust-analyzer.imports.granularity.enforce]]rust-analyzer.imports.granularity.enforce (default: `false`)::
 +
 --
@@ -480,10 +550,15 @@ Group inserted imports by the https://rust-analyzer.github.io/manual.html#auto-i
 --
 Whether to allow import insertion to merge new imports into single path glob imports like `use std::fmt::*;`.
 --
-[[rust-analyzer.imports.prefer.no.std]]rust-analyzer.imports.prefer.no.std (default: `false`)::
+[[rust-analyzer.imports.preferNoStd]]rust-analyzer.imports.preferNoStd (default: `false`)::
 +
 --
 Prefer to unconditionally use imports of the core and alloc crate, over the std crate.
+--
+[[rust-analyzer.imports.preferPrelude]]rust-analyzer.imports.preferPrelude (default: `false`)::
++
+--
+Whether to prefer import paths containing a `prelude` module.
 --
 [[rust-analyzer.imports.prefix]]rust-analyzer.imports.prefix (default: `"plain"`)::
 +
@@ -546,6 +621,11 @@ Whether to hide inlay hints for type adjustments outside of `unsafe` blocks.
 --
 Whether to show inlay hints as postfix ops (`.*` instead of `*`, etc).
 --
+[[rust-analyzer.inlayHints.implicitDrops.enable]]rust-analyzer.inlayHints.implicitDrops.enable (default: `false`)::
++
+--
+Whether to show implicit drop hints.
+--
 [[rust-analyzer.inlayHints.lifetimeElisionHints.enable]]rust-analyzer.inlayHints.lifetimeElisionHints.enable (default: `"never"`)::
 +
 --
@@ -566,6 +646,11 @@ Maximum length for inlay hints. Set to null to have an unlimited length.
 --
 Whether to show function parameter name inlay hints at the call
 site.
+--
+[[rust-analyzer.inlayHints.rangeExclusiveHints.enable]]rust-analyzer.inlayHints.rangeExclusiveHints.enable (default: `false`)::
++
+--
+Whether to show exclusive range inlay hints.
 --
 [[rust-analyzer.inlayHints.reborrowHints.enable]]rust-analyzer.inlayHints.reborrowHints.enable (default: `"never"`)::
 +
@@ -701,6 +786,11 @@ Sets the LRU capacity of the specified queries.
 --
 Whether to show `can't find Cargo.toml` error message.
 --
+[[rust-analyzer.notifications.unindexedProject]]rust-analyzer.notifications.unindexedProject (default: `false`)::
++
+--
+Whether to send an UnindexedProject notification to the client.
+--
 [[rust-analyzer.numThreads]]rust-analyzer.numThreads (default: `null`)::
 +
 --
@@ -732,6 +822,11 @@ Internal config, path to proc-macro server executable.
 +
 --
 Exclude imports from find-all-references.
+--
+[[rust-analyzer.references.excludeTests]]rust-analyzer.references.excludeTests (default: `false`)::
++
+--
+Exclude tests from find-all-references.
 --
 [[rust-analyzer.runnables.command]]rust-analyzer.runnables.command (default: `null`)::
 +

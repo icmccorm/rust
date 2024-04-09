@@ -1,9 +1,17 @@
+lint_ambiguous_wide_pointer_comparisons = ambiguous wide pointer comparison, the comparison includes metadata which may not be expected
+    .addr_metadata_suggestion = use explicit `std::ptr::eq` method to compare metadata and addresses
+    .addr_suggestion = use `std::ptr::addr_eq` or untyped pointers to only compare their addresses
+
 lint_array_into_iter =
     this method call resolves to `<&{$target} as IntoIterator>::into_iter` (due to backwards compatibility), but will resolve to <{$target} as IntoIterator>::into_iter in Rust 2021
     .use_iter_suggestion = use `.iter()` instead of `.into_iter()` to avoid ambiguity
     .remove_into_iter_suggestion = or remove `.into_iter()` to iterate by value
     .use_explicit_into_iter_suggestion =
         or use `IntoIterator::into_iter(..)` instead of `.into_iter()` to explicitly iterate by value
+
+lint_async_fn_in_trait = use of `async fn` in public traits is discouraged as auto trait bounds cannot be specified
+    .note = you can suppress this lint if you plan to use the trait only in your own code, or do not care about auto traits like `Send` on the `Future`
+    .suggestion = you can alternatively desugar to a normal `fn` that returns `impl Future` and add any desired bounds such as `Send`, but these cannot be relaxed without a breaking API change
 
 lint_atomic_ordering_fence = memory fences cannot have `Relaxed` ordering
     .help = consider using ordering modes `Acquire`, `Release`, `AcqRel` or `SeqCst`
@@ -64,8 +72,11 @@ lint_builtin_explicit_outlives = outlives requirements can be inferred
 
 lint_builtin_export_name_fn = declaration of a function with `export_name`
 lint_builtin_export_name_method = declaration of a method with `export_name`
-
 lint_builtin_export_name_static = declaration of a static with `export_name`
+
+lint_builtin_global_asm = usage of `core::arch::global_asm`
+lint_builtin_global_macro_unsafety = using this macro is unsafe even though it does not need an `unsafe` block
+
 lint_builtin_impl_unsafe_method = implementation of an `unsafe` method
 
 lint_builtin_incomplete_features = the feature `{$name}` is incomplete and may not be safe to use and/or cause compiler crashes
@@ -124,12 +135,6 @@ lint_builtin_type_alias_generic_bounds = bounds on generic parameters are not en
 lint_builtin_type_alias_where_clause = where clauses are not enforced in type aliases
     .suggestion = the clause will not be checked when the type alias is used, and should be removed
 
-lint_builtin_unexpected_cli_config_name = unexpected `{$name}` as condition name
-    .help = was set with `--cfg` but isn't in the `--check-cfg` expected names
-
-lint_builtin_unexpected_cli_config_value = unexpected condition value `{$value}` for condition name `{$name}`
-    .help = was set with `--cfg` but isn't in the `--check-cfg` expected values
-
 lint_builtin_unpermitted_type_init_label = this code causes undefined behavior when executed
 lint_builtin_unpermitted_type_init_label_suggestion = help: use `MaybeUninit<T>` instead, and only call `assume_init` after initialization is done
 
@@ -146,7 +151,7 @@ lint_builtin_unsafe_impl = implementation of an `unsafe` trait
 
 lint_builtin_unsafe_trait = declaration of an `unsafe` trait
 
-lint_builtin_unstable_features = unstable feature
+lint_builtin_unstable_features = use of an unstable feature
 
 lint_builtin_unused_doc_comment = unused doc comment
     .label = rustdoc does not generate documentation for {$kind}
@@ -181,7 +186,7 @@ lint_deprecated_lint_name =
     .help = change it to {$replace}
 
 lint_diag_out_of_impl =
-    diagnostics should only be created in `IntoDiagnostic`/`AddToDiagnostic` impls
+    diagnostics should only be created in `Diagnostic`/`Subdiagnostic`/`LintDiagnostic` impls
 
 lint_drop_glue =
     types that do not implement `Drop` can still have drop glue, consider instead using `{$needs_drop}` to detect whether a type is trivially dropped
@@ -238,7 +243,29 @@ lint_hidden_unicode_codepoints = unicode codepoint changing visible direction of
 
 lint_identifier_non_ascii_char = identifier contains non-ASCII characters
 
-lint_identifier_uncommon_codepoints = identifier contains uncommon Unicode codepoints
+lint_identifier_uncommon_codepoints = identifier contains {$codepoints_len ->
+    [one] { $identifier_type ->
+        [Exclusion] a character from an archaic script
+        [Technical] a character that is for non-linguistic, specialized usage
+        [Limited_Use] a character from a script in limited use
+        [Not_NFKC] a non normalized (NFKC) character
+        *[other] an uncommon character
+    }
+    *[other] { $identifier_type ->
+        [Exclusion] {$codepoints_len} characters from archaic scripts
+        [Technical] {$codepoints_len} characters that are for non-linguistic, specialized usage
+        [Limited_Use] {$codepoints_len} characters from scripts in limited use
+        [Not_NFKC] {$codepoints_len} non normalized (NFKC) characters
+        *[other] uncommon characters
+    }
+}: {$codepoints}
+    .note = {$codepoints_len ->
+        [one] this character is
+        *[other] these characters are
+    } included in the{$identifier_type ->
+        [Restricted] {""}
+        *[other] {" "}{$identifier_type}
+    } Unicode general security profile
 
 lint_ignored_unless_crate_specified = {$level}({$name}) is ignored unless specified at crate level
 
@@ -314,10 +341,17 @@ lint_invalid_nan_comparisons_lt_le_gt_ge = incorrect NaN comparison, NaN is not 
 lint_invalid_reference_casting_assign_to_ref = assigning to `&T` is undefined behavior, consider using an `UnsafeCell`
     .label = casting happend here
 
+lint_invalid_reference_casting_bigger_layout = casting references to a bigger memory layout than the backing allocation is undefined behavior, even if the reference is unused
+    .label = casting happend here
+    .alloc = backing allocation comes from here
+    .layout = casting from `{$from_ty}` ({$from_size} bytes) to `{$to_ty}` ({$to_size} bytes)
+
 lint_invalid_reference_casting_borrow_as_mut = casting `&T` to `&mut T` is undefined behavior, even if the reference is unused, consider instead using an `UnsafeCell`
     .label = casting happend here
 
 lint_invalid_reference_casting_note_book = for more information, visit <https://doc.rust-lang.org/book/ch15-05-interior-mutability.html>
+
+lint_invalid_reference_casting_note_ty_has_interior_mutability = even for types with interior mutability, the only legal way to obtain a mutable pointer from a shared reference is through `UnsafeCell::get`
 
 lint_lintpass_by_hand = implementing `LintPass` by hand
     .help = try using `declare_lint_pass!` or `impl_lint_pass!` instead
@@ -340,6 +374,9 @@ lint_multiple_supertrait_upcastable = `{$ident}` is object-safe and has multiple
 
 lint_node_source = `forbid` level set here
     .note = {$reason}
+
+lint_non_binding_let_multi_drop_fn =
+    consider immediately dropping the value using `drop(..)` after the `let` statement
 
 lint_non_binding_let_multi_suggestion =
     consider immediately dropping the value
@@ -396,6 +433,29 @@ lint_non_fmt_panic_unused =
     }
     .add_fmt_suggestion = or add a "{"{"}{"}"}" format string to use the message literally
 
+lint_non_local_definitions_cargo_update = the {$macro_kind} `{$macro_name}` may come from an old version of the `{$crate_name}` crate, try updating your dependency with `cargo update -p {$crate_name}`
+
+lint_non_local_definitions_deprecation = this lint may become deny-by-default in the edition 2024 and higher, see the tracking issue <https://github.com/rust-lang/rust/issues/120363>
+
+lint_non_local_definitions_impl = non-local `impl` definition, they should be avoided as they go against expectation
+    .help =
+        move this `impl` block outside the of the current {$body_kind_descr} {$depth ->
+            [one] `{$body_name}`
+           *[other] `{$body_name}` and up {$depth} bodies
+        }
+    .non_local = an `impl` definition is non-local if it is nested inside an item and may impact type checking outside of that item. This can be the case if neither the trait or the self type are at the same nesting level as the `impl`
+    .exception = one exception to the rule are anon-const (`const _: () = {"{"} ... {"}"}`) at top-level module and anon-const at the same nesting as the trait or type
+    .const_anon = use a const-anon item to suppress this lint
+
+lint_non_local_definitions_macro_rules = non-local `macro_rules!` definition, they should be avoided as they go against expectation
+    .help =
+        remove the `#[macro_export]` or move this `macro_rules!` outside the of the current {$body_kind_descr} {$depth ->
+            [one] `{$body_name}`
+           *[other] `{$body_name}` and up {$depth} bodies
+        }
+    .non_local = a `macro_rules!` definition is non-local if it is nested inside an item and has a `#[macro_export]` attribute
+    .exception = one exception to the rule are anon-const (`const _: () = {"{"} ... {"}"}`) at top-level module
+
 lint_non_snake_case = {$sort} `{$name}` should have a snake case name
     .rename_or_convert_suggestion = rename the identifier or convert it to a snake case raw identifier
     .cannot_convert_note = `{$sc}` cannot be used as a raw identifier
@@ -411,6 +471,7 @@ lint_non_upper_case_global = {$sort} `{$name}` should have an upper case name
 lint_noop_method_call = call to `.{$method}()` on a reference in this situation does nothing
     .suggestion = remove this redundant call
     .note = the type `{$orig_ty}` does not implement `{$trait_}`, so calling `{$method}` on `&{$orig_ty}` copies the reference, which does not do anything and can be removed
+    .derive_suggestion = if you meant to clone `{$orig_ty}`, implement `Clone` for it
 
 lint_only_cast_u8_to_char = only `u8` can be cast into `char`
     .suggestion = use a `char` literal instead
@@ -488,16 +549,18 @@ lint_renamed_lint = lint `{$name}` has been renamed to `{$replace}`
 
 lint_requested_level = requested on the command line with `{$level} {$lint_name}`
 
-lint_supertrait_as_deref_target = `{$t}` implements `Deref` with supertrait `{$target_principal}` as target
-    .label = target type is set here
+lint_span_use_eq_ctxt = use `.eq_ctxt()` instead of `.ctxt() == .ctxt()`
+
+lint_supertrait_as_deref_target = this `Deref` implementation is covered by an implicit supertrait coercion
+    .label = `{$self_ty}` implements `Deref<Target = dyn {$target_principal}>` which conflicts with supertrait `{$supertrait_principal}`
+    .label2 = target type is a supertrait of `{$self_ty}`
+    .help = consider removing this implementation or replacing it with a method instead
 
 lint_suspicious_double_ref_clone =
     using `.clone()` on a double reference, which returns `{$ty}` instead of cloning the inner type
 
 lint_suspicious_double_ref_deref =
     using `.deref()` on a double reference, which returns `{$ty}` instead of dereferencing the inner type
-
-lint_trivial_untranslatable_diag = diagnostic with static strings only
 
 lint_ty_qualified = usage of qualified `ty::{$ty}`
     .suggestion = try importing it and using it unqualified
@@ -515,14 +578,23 @@ lint_undropped_manually_drops = calls to `std::mem::drop` with `std::mem::Manual
 lint_ungated_async_fn_track_caller = `#[track_caller]` on async functions is a no-op
      .label = this function will not propagate the caller location
 
+lint_unit_bindings = binding has unit type `()`
+    .label = this pattern is inferred to be the unit type `()`
+
 lint_unknown_gated_lint =
     unknown lint: `{$name}`
     .note = the `{$name}` lint is unstable
 
 lint_unknown_lint =
     unknown lint: `{$name}`
-    .suggestion = did you mean
-    .help = did you mean: `{$replace}`
+    .suggestion = {$from_rustc ->
+        [true] a lint with a similar name exists in `rustc` lints
+        *[false] did you mean
+    }
+    .help = {$from_rustc ->
+        [true] a lint with a similar name exists in `rustc` lints: `{$replace}`
+        *[false] did you mean: `{$replace}`
+    }
 
 lint_unknown_tool_in_scoped_lint = unknown tool name `{$tool_name}` found in scoped lint: `{$tool_name}::{$lint_name}`
     .help = add `#![register_tool({$tool_name})]` to the crate root
@@ -543,18 +615,18 @@ lint_unused_closure =
 
 lint_unused_comparisons = comparison is useless due to type limits
 
+lint_unused_coroutine =
+    unused {$pre}{$count ->
+        [one] coroutine
+        *[other] coroutine
+    }{$post} that must be used
+    .note = coroutines are lazy and do nothing unless resumed
+
 lint_unused_def = unused {$pre}`{$def}`{$post} that must be used
     .suggestion = use `let _ = ...` to ignore the resulting value
 
 lint_unused_delim = unnecessary {$delim} around {$item}
     .suggestion = remove these {$delim}
-
-lint_unused_generator =
-    unused {$pre}{$count ->
-        [one] generator
-        *[other] generator
-    }{$post} that must be used
-    .note = generators are lazy and do nothing unless resumed
 
 lint_unused_import_braces = braces around {$node} is unnecessary
 

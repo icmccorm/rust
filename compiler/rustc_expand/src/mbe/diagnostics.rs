@@ -7,11 +7,11 @@ use crate::mbe::{
 use rustc_ast::token::{self, Token, TokenKind};
 use rustc_ast::tokenstream::TokenStream;
 use rustc_ast_pretty::pprust;
-use rustc_errors::{Applicability, Diagnostic, DiagnosticBuilder, DiagnosticMessage};
+use rustc_errors::{Applicability, Diag, DiagCtxt, DiagMessage};
 use rustc_parse::parser::{Parser, Recovery};
 use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::Ident;
-use rustc_span::Span;
+use rustc_span::{ErrorGuaranteed, Span};
 use std::borrow::Cow;
 
 use super::macro_rules::{parser_from_cx, NoopTracker};
@@ -24,17 +24,20 @@ pub(super) fn failed_to_match_macro<'cx>(
     arg: TokenStream,
     lhses: &[Vec<MatcherLoc>],
 ) -> Box<dyn MacResult + 'cx> {
-    let sess = &cx.sess.parse_sess;
+    let psess = &cx.sess.psess;
 
     // An error occurred, try the expansion again, tracking the expansion closely for better diagnostics.
     let mut tracker = CollectTrackerAndEmitter::new(cx, sp);
 
-    let try_success_result = try_match_macro(sess, name, &arg, lhses, &mut tracker);
+    let try_success_result = try_match_macro(psess, name, &arg, lhses, &mut tracker);
 
     if try_success_result.is_ok() {
         // Nonterminal parser recovery might turn failed matches into successful ones,
         // but for that it must have emitted an error already
-        tracker.cx.sess.delay_span_bug(sp, "Macro matching returned a success on the second try");
+        assert!(
+            tracker.cx.dcx().has_errors().is_some(),
+            "Macro matching returned a success on the second try"
+        );
     }
 
     if let Some(result) = tracker.result {
@@ -44,18 +47,18 @@ pub(super) fn failed_to_match_macro<'cx>(
 
     let Some(BestFailure { token, msg: label, remaining_matcher, .. }) = tracker.best_failure
     else {
-        return DummyResult::any(sp);
+        return DummyResult::any(sp, cx.dcx().span_delayed_bug(sp, "failed to match a macro"));
     };
 
     let span = token.span.substitute_dummy(sp);
 
-    let mut err = cx.struct_span_err(span, parse_failure_msg(&token));
+    let mut err = cx.dcx().struct_span_err(span, parse_failure_msg(&token));
     err.span_label(span, label);
     if !def_span.is_dummy() && !cx.source_map().is_imported(def_span) {
         err.span_label(cx.source_map().guess_head_span(def_span), "when calling this macro");
     }
 
-    annotate_doc_comment(&mut err, sess.source_map(), span);
+    annotate_doc_comment(cx.sess.dcx(), &mut err, psess.source_map(), span);
 
     if let Some(span) = remaining_matcher.span() {
         err.span_note(span, format!("while trying to match {remaining_matcher}"));
@@ -67,6 +70,12 @@ pub(super) fn failed_to_match_macro<'cx>(
         && (matches!(expected_token.kind, TokenKind::Interpolated(_))
             || matches!(token.kind, TokenKind::Interpolated(_)))
     {
+        if let TokenKind::Interpolated(node) = &expected_token.kind {
+            err.span_label(node.1, "");
+        }
+        if let TokenKind::Interpolated(node) = &token.kind {
+            err.span_label(node.1, "");
+        }
         err.note("captured metavariables except for `:tt`, `:ident` and `:lifetime` cannot be compared to other tokens");
         err.note("see <https://doc.rust-lang.org/nightly/reference/macros-by-example.html#forwarding-a-matched-fragment> for more information");
 
@@ -78,7 +87,7 @@ pub(super) fn failed_to_match_macro<'cx>(
     // Check whether there's a missing comma in this macro call, like `println!("{}" a);`
     if let Some((arg, comma_span)) = arg.add_comma() {
         for lhs in lhses {
-            let parser = parser_from_cx(sess, arg.clone(), Recovery::Allowed);
+            let parser = parser_from_cx(psess, arg.clone(), Recovery::Allowed);
             let mut tt_parser = TtParser::new(name);
 
             if let Success(_) =
@@ -97,9 +106,9 @@ pub(super) fn failed_to_match_macro<'cx>(
             }
         }
     }
-    err.emit();
+    let guar = err.emit();
     cx.trace_macros_diag();
-    DummyResult::any(sp)
+    DummyResult::any(sp, guar)
 }
 
 /// The tracker used for the slow error path that collects useful info for diagnostics.
@@ -145,7 +154,7 @@ impl<'a, 'cx, 'matcher> Tracker<'matcher> for CollectTrackerAndEmitter<'a, 'cx, 
             Success(_) => {
                 // Nonterminal parser recovery might turn failed matches into successful ones,
                 // but for that it must have emitted an error already
-                self.cx.sess.delay_span_bug(
+                self.cx.dcx().span_delayed_bug(
                     self.root_span,
                     "should not collect detailed info for successful macro match",
                 );
@@ -171,10 +180,10 @@ impl<'a, 'cx, 'matcher> Tracker<'matcher> for CollectTrackerAndEmitter<'a, 'cx, 
             }
             Error(err_sp, msg) => {
                 let span = err_sp.substitute_dummy(self.root_span);
-                self.cx.struct_span_err(span, msg.clone()).emit();
-                self.result = Some(DummyResult::any(span));
+                let guar = self.cx.dcx().span_err(span, msg.clone());
+                self.result = Some(DummyResult::any(span, guar));
             }
-            ErrorReported(_) => self.result = Some(DummyResult::any(self.root_span)),
+            ErrorReported(guar) => self.result = Some(DummyResult::any(self.root_span, *guar)),
         }
     }
 
@@ -209,21 +218,21 @@ impl<'matcher> Tracker<'matcher> for FailureForwarder {
 }
 
 pub(super) fn emit_frag_parse_err(
-    mut e: DiagnosticBuilder<'_, rustc_errors::ErrorGuaranteed>,
+    mut e: Diag<'_>,
     parser: &Parser<'_>,
     orig_parser: &mut Parser<'_>,
     site_span: Span,
     arm_span: Span,
     kind: AstFragmentKind,
-) {
+) -> ErrorGuaranteed {
     // FIXME(davidtwco): avoid depending on the error message text
     if parser.token == token::Eof
-        && let DiagnosticMessage::Str(message) = &e.message[0].0
+        && let DiagMessage::Str(message) = &e.messages[0].0
         && message.ends_with(", found `<eof>`")
     {
-        let msg = &e.message[0];
-        e.message[0] = (
-            DiagnosticMessage::from(format!(
+        let msg = &e.messages[0];
+        e.messages[0] = (
+            DiagMessage::from(format!(
                 "macro expansion ends with an incomplete expression: {}",
                 message.replace(", found `<eof>`", ""),
             )),
@@ -237,10 +246,10 @@ pub(super) fn emit_frag_parse_err(
     if e.span.is_dummy() {
         // Get around lack of span in error (#30128)
         e.replace_span_with(site_span, true);
-        if !parser.sess.source_map().is_imported(arm_span) {
+        if !parser.psess.source_map().is_imported(arm_span) {
             e.span_label(arm_span, "in this macro arm");
         }
-    } else if parser.sess.source_map().is_imported(parser.token.span) {
+    } else if parser.psess.source_map().is_imported(parser.token.span) {
         e.span_label(site_span, "in this macro invocation");
     }
     match kind {
@@ -253,7 +262,7 @@ pub(super) fn emit_frag_parse_err(
                 );
 
                 if parser.token == token::Semi {
-                    if let Ok(snippet) = parser.sess.source_map().span_to_snippet(site_span) {
+                    if let Ok(snippet) = parser.psess.source_map().span_to_snippet(site_span) {
                         e.span_suggestion_verbose(
                             site_span,
                             "surround the macro invocation with `{}` to interpret the expansion as a statement",
@@ -273,10 +282,10 @@ pub(super) fn emit_frag_parse_err(
         },
         _ => annotate_err_with_kind(&mut e, kind, site_span),
     };
-    e.emit();
+    e.emit()
 }
 
-pub(crate) fn annotate_err_with_kind(err: &mut Diagnostic, kind: AstFragmentKind, span: Span) {
+pub(crate) fn annotate_err_with_kind(err: &mut Diag<'_>, kind: AstFragmentKind, span: Span) {
     match kind {
         AstFragmentKind::Ty => {
             err.span_label(span, "this macro call doesn't expand to a type");
@@ -302,12 +311,12 @@ enum ExplainDocComment {
     },
 }
 
-pub(super) fn annotate_doc_comment(err: &mut Diagnostic, sm: &SourceMap, span: Span) {
+pub(super) fn annotate_doc_comment(dcx: &DiagCtxt, err: &mut Diag<'_>, sm: &SourceMap, span: Span) {
     if let Ok(src) = sm.span_to_snippet(span) {
         if src.starts_with("///") || src.starts_with("/**") {
-            err.subdiagnostic(ExplainDocComment::Outer { span });
+            err.subdiagnostic(dcx, ExplainDocComment::Outer { span });
         } else if src.starts_with("//!") || src.starts_with("/*!") {
-            err.subdiagnostic(ExplainDocComment::Inner { span });
+            err.subdiagnostic(dcx, ExplainDocComment::Inner { span });
         }
     }
 }

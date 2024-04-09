@@ -1,10 +1,14 @@
-// Check warning for unexpected cfg value
+// Check that we detect unexpected value when none are allowed
 //
-// check-pass
-// compile-flags: --check-cfg=values() -Z unstable-options
+//@ check-pass
+//@ compile-flags: --check-cfg=cfg(foo,values()) -Zunstable-options
 
-#[cfg(test = "value")]
+#[cfg(foo = "foo")]
 //~^ WARNING unexpected `cfg` condition value
-pub fn f() {}
+fn do_foo() {}
+
+#[cfg(foo)]
+//~^ WARNING unexpected `cfg` condition value
+fn do_foo() {}
 
 fn main() {}

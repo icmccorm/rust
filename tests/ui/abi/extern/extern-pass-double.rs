@@ -1,5 +1,4 @@
-// run-pass
-// ignore-wasm32-bare no libc for ffi testing
+//@ run-pass
 
 #[link(name = "rust_test_helpers", kind = "static")]
 extern "C" {

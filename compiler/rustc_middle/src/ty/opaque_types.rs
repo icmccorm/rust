@@ -102,8 +102,9 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
             // Ignore bound regions and `'static` regions that appear in the
             // type, we only need to remap regions that reference lifetimes
             // from the function declaration.
-            // This would ignore `'r` in a type like `for<'r> fn(&'r u32)`.
-            ty::ReLateBound(..) | ty::ReStatic => return r,
+            //
+            // E.g. We ignore `'r` in a type like `for<'r> fn(&'r u32)`.
+            ty::ReBound(..) | ty::ReStatic => return r,
 
             // If regions have been erased (by writeback), don't try to unerase
             // them.
@@ -112,7 +113,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
             ty::ReError(_) => return r,
 
             // The regions that we expect from borrow checking.
-            ty::ReEarlyBound(_) | ty::ReFree(_) => {}
+            ty::ReEarlyParam(_) | ty::ReLateParam(_) => {}
 
             ty::RePlaceholder(_) | ty::ReVar(_) => {
                 // All of the regions in the type should either have been
@@ -129,9 +130,9 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
             None => {
                 let e = self
                     .tcx
-                    .sess
+                    .dcx()
                     .struct_span_err(self.span, "non-defining opaque type use in defining scope")
-                    .span_label(
+                    .with_span_label(
                         self.span,
                         format!(
                             "lifetime `{r}` is part of concrete type but not used in \
@@ -152,20 +153,20 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
                 Ty::new_closure(self.tcx, def_id, args)
             }
 
-            ty::Generator(def_id, args, movability) => {
+            ty::Coroutine(def_id, args) => {
                 let args = self.fold_closure_args(def_id, args);
-                Ty::new_generator(self.tcx, def_id, args, movability)
+                Ty::new_coroutine(self.tcx, def_id, args)
             }
 
-            ty::GeneratorWitness(def_id, args) => {
+            ty::CoroutineWitness(def_id, args) => {
                 let args = self.fold_closure_args(def_id, args);
-                Ty::new_generator_witness(self.tcx, def_id, args)
+                Ty::new_coroutine_witness(self.tcx, def_id, args)
             }
 
             ty::Param(param) => {
-                // Look it up in the substitution list.
+                // Look it up in the generic parameters list.
                 match self.map.get(&ty.into()).map(|k| k.unpack()) {
-                    // Found it in the substitution list; replace with the parameter from the
+                    // Found it in the generic parameters list; replace with the parameter from the
                     // opaque type.
                     Some(GenericArgKind::Type(t1)) => t1,
                     Some(u) => panic!("type mapped to unexpected kind: {u:?}"),
@@ -173,7 +174,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
                         debug!(?param, ?self.map);
                         if !self.ignore_errors {
                             self.tcx
-                                .sess
+                                .dcx()
                                 .struct_span_err(
                                     self.span,
                                     format!(
@@ -198,16 +199,16 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
         // Find a const parameter
         match ct.kind() {
             ty::ConstKind::Param(..) => {
-                // Look it up in the substitution list.
+                // Look it up in the generic parameters list.
                 match self.map.get(&ct.into()).map(|k| k.unpack()) {
-                    // Found it in the substitution list, replace with the parameter from the
+                    // Found it in the generic parameters list, replace with the parameter from the
                     // opaque type.
                     Some(GenericArgKind::Const(c1)) => c1,
                     Some(u) => panic!("const mapped to unexpected kind: {u:?}"),
                     None => {
                         let guar = self
                             .tcx
-                            .sess
+                            .dcx()
                             .create_err(ConstNotUsedTraitAlias {
                                 ct: ct.to_string(),
                                 span: self.span,

@@ -9,10 +9,9 @@
     html_playground_url = "https://play.rust-lang.org/",
     test(attr(deny(warnings)))
 )]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
-// We want to be able to build this crate with a stable compiler, so no
-// `#![feature]` attributes should be added.
+// We want to be able to build this crate with a stable compiler,
+// so no `#![feature]` attributes should be added.
+#![deny(unstable_features)]
 
 use rustc_lexer::unescape;
 pub use Alignment::*;
@@ -289,10 +288,10 @@ impl<'a> Iterator for Parser<'a> {
                             }
                         } else {
                             if let Some(&(_, maybe)) = self.cur.peek() {
-                                if maybe == '?' {
-                                    self.suggest_format();
-                                } else {
-                                    self.suggest_positional_arg_instead_of_captured_arg(arg);
+                                match maybe {
+                                    '?' => self.suggest_format_debug(),
+                                    '<' | '^' | '>' => self.suggest_format_align(maybe),
+                                    _ => self.suggest_positional_arg_instead_of_captured_arg(arg),
                                 }
                             }
                         }
@@ -868,10 +867,9 @@ impl<'a> Parser<'a> {
         found.then_some(cur)
     }
 
-    fn suggest_format(&mut self) {
+    fn suggest_format_debug(&mut self) {
         if let (Some(pos), Some(_)) = (self.consume_pos('?'), self.consume_pos(':')) {
             let word = self.word();
-            let _end = self.current_pos();
             let pos = self.to_span_index(pos);
             self.errors.insert(
                 0,
@@ -887,30 +885,69 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn suggest_format_align(&mut self, alignment: char) {
+        if let Some(pos) = self.consume_pos(alignment) {
+            let pos = self.to_span_index(pos);
+            self.errors.insert(
+                0,
+                ParseError {
+                    description: "expected format parameter to occur after `:`".to_owned(),
+                    note: None,
+                    label: format!("expected `{}` to occur after `:`", alignment),
+                    span: pos.to(pos),
+                    secondary_label: None,
+                    suggestion: Suggestion::None,
+                },
+            );
+        }
+    }
+
     fn suggest_positional_arg_instead_of_captured_arg(&mut self, arg: Argument<'a>) {
         if let Some(end) = self.consume_pos('.') {
             let byte_pos = self.to_span_index(end);
             let start = InnerOffset(byte_pos.0 + 1);
             let field = self.argument(start);
-            // We can only parse `foo.bar` field access, any deeper nesting,
-            // or another type of expression, like method calls, are not supported
+            // We can only parse simple `foo.bar` field access or `foo.0` tuple index access, any
+            // deeper nesting, or another type of expression, like method calls, are not supported
             if !self.consume('}') {
                 return;
             }
             if let ArgumentNamed(_) = arg.position {
-                if let ArgumentNamed(_) = field.position {
-                    self.errors.insert(
-                        0,
-                        ParseError {
-                            description: "field access isn't supported".to_string(),
-                            note: None,
-                            label: "not supported".to_string(),
-                            span: InnerSpan::new(arg.position_span.start, field.position_span.end),
-                            secondary_label: None,
-                            suggestion: Suggestion::UsePositional,
-                        },
-                    );
-                }
+                match field.position {
+                    ArgumentNamed(_) => {
+                        self.errors.insert(
+                            0,
+                            ParseError {
+                                description: "field access isn't supported".to_string(),
+                                note: None,
+                                label: "not supported".to_string(),
+                                span: InnerSpan::new(
+                                    arg.position_span.start,
+                                    field.position_span.end,
+                                ),
+                                secondary_label: None,
+                                suggestion: Suggestion::UsePositional,
+                            },
+                        );
+                    }
+                    ArgumentIs(_) => {
+                        self.errors.insert(
+                            0,
+                            ParseError {
+                                description: "tuple index access isn't supported".to_string(),
+                                note: None,
+                                label: "not supported".to_string(),
+                                span: InnerSpan::new(
+                                    arg.position_span.start,
+                                    field.position_span.end,
+                                ),
+                                secondary_label: None,
+                                suggestion: Suggestion::UsePositional,
+                            },
+                        );
+                    }
+                    _ => {}
+                };
             }
         }
     }
@@ -1039,7 +1076,7 @@ fn find_width_map_from_snippet(
 fn unescape_string(string: &str) -> Option<string::String> {
     let mut buf = string::String::new();
     let mut ok = true;
-    unescape::unescape_literal(string, unescape::Mode::Str, &mut |_, unescaped_char| {
+    unescape::unescape_unicode(string, unescape::Mode::Str, &mut |_, unescaped_char| {
         match unescaped_char {
             Ok(c) => buf.push(c),
             Err(_) => ok = false,
@@ -1050,7 +1087,7 @@ fn unescape_string(string: &str) -> Option<string::String> {
 }
 
 // Assert a reasonable size for `Piece`
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_pointer_width = "64"))]
 rustc_index::static_assert_size!(Piece<'_>, 16);
 
 #[cfg(test)]

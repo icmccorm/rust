@@ -27,9 +27,15 @@ attr_incorrect_meta_item =
 attr_incorrect_repr_format_align_one_arg =
     incorrect `repr(align)` attribute format: `align` takes exactly one argument in parentheses
 
+attr_incorrect_repr_format_expect_literal_integer =
+    incorrect `repr(align)` attribute format: `align` expects a literal integer as argument
+
 attr_incorrect_repr_format_generic =
     incorrect `repr({$repr_arg})` attribute format
     .suggestion = use parentheses instead
+
+attr_incorrect_repr_format_packed_expect_integer =
+    incorrect `repr(packed)` attribute format: `packed` expects a literal integer as argument
 
 attr_incorrect_repr_format_packed_one_or_zero_arg =
     incorrect `repr(packed)` attribute format: `packed` takes exactly one parenthesized argument, or no parentheses at all
@@ -57,6 +63,9 @@ attr_invalid_repr_hint_no_paren =
 
 attr_invalid_repr_hint_no_value =
     invalid representation hint: `{$name}` does not take a value
+
+attr_invalid_since =
+    'since' must be a Rust version number, such as "1.31.0"
 
 attr_missing_feature =
     missing 'feature'

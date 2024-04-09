@@ -12,7 +12,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         abi: Abi,
         link_name: Symbol,
         args: &[OpTy<'tcx, Provenance>],
-        dest: &PlaceTy<'tcx, Provenance>,
+        dest: &MPlaceTy<'tcx, Provenance>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let [flags] = this.check_shim(abi, Abi::Rust, link_name, args)?;
@@ -32,12 +32,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         abi: Abi,
         link_name: Symbol,
         args: &[OpTy<'tcx, Provenance>],
-        dest: &PlaceTy<'tcx, Provenance>,
+        dest: &MPlaceTy<'tcx, Provenance>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let tcx = this.tcx;
 
-        let flags = if let Some(flags_op) = args.get(0) {
+        let flags = if let Some(flags_op) = args.first() {
             this.read_scalar(flags_op)?.to_u64()?
         } else {
             throw_ub_format!("expected at least 1 argument")
@@ -135,7 +135,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             this.tcx.sess.source_map().lookup_char_pos(BytePos(offset.bytes().try_into().unwrap()));
 
         let name = fn_instance.to_string();
-        let filename = lo.file.name.prefer_remapped().to_string();
+        let filename = lo.file.name.prefer_remapped_unconditionaly().to_string();
 
         Ok((fn_instance, lo, name, filename))
     }
@@ -145,7 +145,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         abi: Abi,
         link_name: Symbol,
         args: &[OpTy<'tcx, Provenance>],
-        dest: &PlaceTy<'tcx, Provenance>,
+        dest: &MPlaceTy<'tcx, Provenance>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let [ptr, flags] = this.check_shim(abi, Abi::Rust, link_name, args)?;
@@ -174,7 +174,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         // `lo.col` is 0-based - add 1 to make it 1-based for the caller.
         let colno: u32 = u32::try_from(lo.col.0.saturating_add(1)).unwrap_or(0);
 
-        let dest = this.force_allocation(dest)?;
         if let ty::Adt(adt, _) = dest.layout.ty.kind() {
             if !adt.repr().c() {
                 throw_ub_format!(
@@ -191,29 +190,29 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let filename_alloc =
                     this.allocate_str(&filename, MiriMemoryKind::Rust.into(), Mutability::Mut)?;
 
-                this.write_immediate(name_alloc.to_ref(this), &this.project_field(&dest, 0)?)?;
-                this.write_immediate(filename_alloc.to_ref(this), &this.project_field(&dest, 1)?)?;
+                this.write_immediate(name_alloc.to_ref(this), &this.project_field(dest, 0)?)?;
+                this.write_immediate(filename_alloc.to_ref(this), &this.project_field(dest, 1)?)?;
             }
             1 => {
                 this.write_scalar(
                     Scalar::from_target_usize(name.len().try_into().unwrap(), this),
-                    &this.project_field(&dest, 0)?,
+                    &this.project_field(dest, 0)?,
                 )?;
                 this.write_scalar(
                     Scalar::from_target_usize(filename.len().try_into().unwrap(), this),
-                    &this.project_field(&dest, 1)?,
+                    &this.project_field(dest, 1)?,
                 )?;
             }
             _ => throw_unsup_format!("unknown `miri_resolve_frame` flags {}", flags),
         }
 
-        this.write_scalar(Scalar::from_u32(lineno), &this.project_field(&dest, 2)?)?;
-        this.write_scalar(Scalar::from_u32(colno), &this.project_field(&dest, 3)?)?;
+        this.write_scalar(Scalar::from_u32(lineno), &this.project_field(dest, 2)?)?;
+        this.write_scalar(Scalar::from_u32(colno), &this.project_field(dest, 3)?)?;
 
         // Support a 4-field struct for now - this is deprecated
         // and slated for removal.
         if num_fields == 5 {
-            this.write_pointer(fn_ptr, &this.project_field(&dest, 4)?)?;
+            this.write_pointer(fn_ptr, &this.project_field(dest, 4)?)?;
         }
 
         Ok(())

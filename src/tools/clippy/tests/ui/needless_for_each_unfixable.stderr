@@ -1,5 +1,5 @@
 error: needless use of `for_each`
-  --> $DIR/needless_for_each_unfixable.rs:8:5
+  --> tests/ui/needless_for_each_unfixable.rs:8:5
    |
 LL | /     v.iter().for_each(|v| {
 LL | |
@@ -29,5 +29,5 @@ help: ...and replace `return` with `continue`
 LL |             continue;
    |             ~~~~~~~~
 
-error: aborting due to previous error
+error: aborting due to 1 previous error
 

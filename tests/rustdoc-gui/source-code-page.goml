@@ -1,4 +1,5 @@
 // Checks that the interactions with the source code pages are working as expected.
+include: "utils.goml"
 go-to: "file://" + |DOC_PATH| + "/src/test_docs/lib.rs.html"
 show-text: true
 // Check that we can click on the line number.
@@ -21,10 +22,9 @@ assert-attribute-false: (".src-line-numbers > a:nth-child(7)", {"class": "line-h
 
 define-function: (
     "check-colors",
-    (theme, color, background_color, highlight_color, highlight_background_color),
+    [theme, color, background_color, highlight_color, highlight_background_color],
     block {
-        set-local-storage: {"rustdoc-theme": |theme|, "rustdoc-use-system-theme": "false"}
-        reload:
+        call-function: ("switch-theme", {"theme": |theme|})
         assert-css: (
             ".src-line-numbers > a:not(.line-highlighted)",
             {"color": |color|, "background-color": |background_color|},
@@ -61,7 +61,7 @@ call-function: ("check-colors", {
 })
 
 // This is to ensure that the content is correctly align with the line numbers.
-compare-elements-position: ("//*[@id='1']", ".rust > code > span", ("y"))
+compare-elements-position: ("//*[@id='1']", ".rust > code > span", ["y"])
 // Check the `href` property so that users can treat anchors as links.
 assert-property: (".src-line-numbers > a:nth-child(1)", {
     "href": |DOC_PATH| + "/src/test_docs/lib.rs.html#1"
@@ -89,15 +89,15 @@ assert-css: (".src-line-numbers", {"text-align": "right"})
 // do anything (and certainly not add a `#NaN` to the URL!).
 go-to: "file://" + |DOC_PATH| + "/src/test_docs/lib.rs.html"
 // We use this assert-position to know where we will click.
-assert-position: ("//*[@id='1']", {"x": 88, "y": 112})
+assert-position: ("//*[@id='1']", {"x": 88, "y": 86})
 // We click on the left of the "1" anchor but still in the "src-line-number" `<pre>`.
-click: (87, 103)
+click: (87, 77)
 assert-document-property: ({"URL": "/lib.rs.html"}, ENDS_WITH)
 
 // Checking the source code sidebar.
 
 // First we "open" it.
-click: "#src-sidebar-toggle"
+click: "#sidebar-button"
 assert: ".src-sidebar-expanded"
 
 // We check that the first entry of the sidebar is collapsed
@@ -122,7 +122,7 @@ store-property: (
 )
 define-function: (
     "check-sidebar-dir-entry",
-    (x, y),
+    [x, y],
     block {
         assert: "details:first-of-type.dir-entry[open] > summary::marker"
         assert-css: ("#src-sidebar > details:first-of-type.dir-entry", {"padding-left": "4px"})
@@ -146,14 +146,14 @@ define-function: (
         )
     }
 )
-store-property: ("#src-sidebar > .title", {
+store-property: (".src-sidebar-title", {
     "offsetHeight": source_sidebar_title_height,
     "offsetTop": source_sidebar_title_y,
 })
 call-function: ("check-sidebar-dir-entry", {
     "x": 0,
-    // border + margin = 6
-    "y": |source_sidebar_title_y| + |source_sidebar_title_height| + 6,
+    // margin = 7px
+    "y": |source_sidebar_title_y| + |source_sidebar_title_height| + 7,
 })
 
 // Check the search form
@@ -163,25 +163,26 @@ assert-css: ("nav.sub", {"flex-direction": "row"})
 // To check this, we maintain the invariant:
 //
 // offsetTop[nav.sub form] = offsetTop[#main-content] - offsetHeight[nav.sub form] - offsetTop[nav.sub form]
-assert-property: ("nav.sub form", {"offsetTop": 28, "offsetHeight": 34})
-assert-property: ("#main-content", {"offsetTop": 90})
-// 28 = 90 - 34 - 28
+assert-property: ("nav.sub form", {"offsetTop": 15, "offsetHeight": 34})
+assert-property: ("#main-content", {"offsetTop": 64})
+// 15 = 64 - 34 - 15
 
 // Now do the same check on moderately-sized, tablet mobile.
 set-window-size: (700, 700)
 assert-css: ("nav.sub", {"flex-direction": "row"})
-assert-property: ("nav.sub form", {"offsetTop": 21, "offsetHeight": 34})
-assert-property: ("#main-content", {"offsetTop": 76})
-// 21 = 76 - 34 - 21
+assert-property: ("nav.sub form", {"offsetTop": 8, "offsetHeight": 34})
+assert-property: ("#main-content", {"offsetTop": 50})
+// 8 = 50 - 34 - 8
 
 // Check the sidebar directory entries have a marker and spacing (tablet).
-store-property: ("#src-sidebar > .title", {
+store-property: (".src-sidebar-title", {
     "offsetHeight": source_sidebar_title_height,
     "offsetTop": source_sidebar_title_y,
 })
 call-function: ("check-sidebar-dir-entry", {
     "x": 0,
-    "y": |source_sidebar_title_y| + |source_sidebar_title_height| + 6,
+    // margin = 7px
+    "y": |source_sidebar_title_y| + |source_sidebar_title_height| + 7,
 })
 
 // Tiny, phone mobile gets a different display where the logo is stacked on top.
@@ -189,16 +190,12 @@ set-window-size: (450, 700)
 assert-css: ("nav.sub", {"flex-direction": "column"})
 
 // Check the sidebar directory entries have a marker and spacing (phone).
-store-property: ("#src-sidebar > .title", {
+store-property: (".src-sidebar-title", {
     "offsetHeight": source_sidebar_title_height,
     "offsetTop": source_sidebar_title_y,
 })
 call-function: ("check-sidebar-dir-entry", {
     "x": 0,
-    "y": |source_sidebar_title_y| + |source_sidebar_title_height| + 6,
+    // margin = 7px
+    "y": |source_sidebar_title_y| + |source_sidebar_title_height| + 7,
 })
-
-// Now we check that the logo has a bottom margin so it's not stuck to the search input.
-assert-css: (".sub-logo-container > img", {"margin-bottom": "8px"})
-store-property: (".sub-logo-container", {"clientHeight": logo_height})
-assert-position: (".search-form", {"y": |logo_height| + 8})

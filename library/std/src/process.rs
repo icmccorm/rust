@@ -111,7 +111,7 @@ use crate::ffi::OsStr;
 use crate::fmt;
 use crate::fs;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
-use crate::num::NonZeroI32;
+use crate::num::NonZero;
 use crate::path::Path;
 use crate::str;
 use crate::sys::pipe::{read2, AnonPipe};
@@ -171,7 +171,7 @@ pub struct Child {
     /// The handle for writing to the child's standard input (stdin), if it
     /// has been captured. You might find it helpful to do
     ///
-    /// ```compile_fail,E0425
+    /// ```ignore (incomplete)
     /// let stdin = child.stdin.take().unwrap();
     /// ```
     ///
@@ -183,7 +183,7 @@ pub struct Child {
     /// The handle for reading from the child's standard output (stdout), if it
     /// has been captured. You might find it helpful to do
     ///
-    /// ```compile_fail,E0425
+    /// ```ignore (incomplete)
     /// let stdout = child.stdout.take().unwrap();
     /// ```
     ///
@@ -195,7 +195,7 @@ pub struct Child {
     /// The handle for reading from the child's standard error (stderr), if it
     /// has been captured. You might find it helpful to do
     ///
-    /// ```compile_fail,E0425
+    /// ```ignore (incomplete)
     /// let stderr = child.stderr.take().unwrap();
     /// ```
     ///
@@ -526,6 +526,7 @@ impl fmt::Debug for ChildStderr {
 /// list_dir.status().expect("process failed to execute");
 /// ```
 #[stable(feature = "process", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "Command")]
 pub struct Command {
     inner: imp::Command,
 }
@@ -607,7 +608,7 @@ impl Command {
     ///
     /// Note that the argument is not passed through a shell, but given
     /// literally to the program. This means that shell syntax like quotes,
-    /// escaped characters, word splitting, glob patterns, substitution, etc.
+    /// escaped characters, word splitting, glob patterns, variable substitution, etc.
     /// have no effect.
     ///
     /// # Examples
@@ -637,7 +638,7 @@ impl Command {
     ///
     /// Note that the arguments are not passed through a shell, but given
     /// literally to the program. This means that shell syntax like quotes,
-    /// escaped characters, word splitting, glob patterns, substitution, etc.
+    /// escaped characters, word splitting, glob patterns, variable substitution, etc.
     /// have no effect.
     ///
     /// # Examples
@@ -1107,7 +1108,7 @@ impl fmt::Debug for Command {
     ///
     /// The default format approximates a shell invocation of the program along with its
     /// arguments. It does not include most of the other command properties. The output is not guaranteed to work
-    /// (e.g. due to lack of shell-escaping or differences in path resolution)
+    /// (e.g. due to lack of shell-escaping or differences in path resolution).
     /// On some platforms you can use [the alternate syntax] to show more fields.
     ///
     /// Note that the debug implementation is platform-specific.
@@ -1499,7 +1500,7 @@ impl From<fs::File> for Stdio {
     }
 }
 
-#[stable(feature = "stdio_from_stdio", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "stdio_from_stdio", since = "1.74.0")]
 impl From<io::Stdout> for Stdio {
     /// Redirect command stdout/stderr to our stdout
     ///
@@ -1530,7 +1531,7 @@ impl From<io::Stdout> for Stdio {
     }
 }
 
-#[stable(feature = "stdio_from_stdio", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "stdio_from_stdio", since = "1.74.0")]
 impl From<io::Stderr> for Stdio {
     /// Redirect command stdout/stderr to our stderr
     ///
@@ -1593,7 +1594,7 @@ impl From<io::Stderr> for Stdio {
 pub struct ExitStatus(imp::ExitStatus);
 
 /// The default value is one which indicates successful completion.
-#[stable(feature = "process-exitcode-default", since = "1.73.0")]
+#[stable(feature = "process_exitstatus_default", since = "1.73.0")]
 impl Default for ExitStatus {
     fn default() -> Self {
         // Ideally this would be done by ExitCode::default().into() but that is complicated.
@@ -1774,9 +1775,9 @@ impl ExitStatusError {
         self.code_nonzero().map(Into::into)
     }
 
-    /// Reports the exit code, if applicable, from an `ExitStatusError`, as a `NonZero`
+    /// Reports the exit code, if applicable, from an `ExitStatusError`, as a [`NonZero`].
     ///
-    /// This is exactly like [`code()`](Self::code), except that it returns a `NonZeroI32`.
+    /// This is exactly like [`code()`](Self::code), except that it returns a <code>[NonZero]<[i32]></code>.
     ///
     /// Plain `code`, returning a plain integer, is provided because it is often more convenient.
     /// The returned value from `code()` is indeed also nonzero; use `code_nonzero()` when you want
@@ -1785,17 +1786,17 @@ impl ExitStatusError {
     /// # Examples
     ///
     /// ```
-    /// #![feature(exit_status_error)]
+    /// #![feature(exit_status_error, generic_nonzero)]
     /// # if cfg!(unix) {
-    /// use std::num::NonZeroI32;
+    /// use std::num::NonZero;
     /// use std::process::Command;
     ///
     /// let bad = Command::new("false").status().unwrap().exit_ok().unwrap_err();
-    /// assert_eq!(bad.code_nonzero().unwrap(), NonZeroI32::try_from(1).unwrap());
+    /// assert_eq!(bad.code_nonzero().unwrap(), NonZero::new(1).unwrap());
     /// # } // cfg!(unix)
     /// ```
     #[must_use]
-    pub fn code_nonzero(&self) -> Option<NonZeroI32> {
+    pub fn code_nonzero(&self) -> Option<NonZero<i32>> {
         self.0.code()
     }
 
@@ -1956,6 +1957,14 @@ impl ExitCode {
     #[doc(hidden)]
     pub fn to_i32(self) -> i32 {
         self.0.as_i32()
+    }
+}
+
+/// The default value is [`ExitCode::SUCCESS`]
+#[stable(feature = "process_exitcode_default", since = "1.75.0")]
+impl Default for ExitCode {
+    fn default() -> Self {
+        ExitCode::SUCCESS
     }
 }
 
@@ -2196,6 +2205,7 @@ impl Child {
 /// process::exit(0x0100);
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "process_exit")]
 pub fn exit(code: i32) -> ! {
     crate::rt::cleanup();
     crate::sys::os::exit(code)
@@ -2301,7 +2311,7 @@ pub fn id() -> u32 {
 /// of the `main` function, this trait is likely to be available only on
 /// standard library's runtime for convenience. Other runtimes are not required
 /// to provide similar functionality.
-#[cfg_attr(not(test), lang = "termination")]
+#[cfg_attr(not(any(test, doctest)), lang = "termination")]
 #[stable(feature = "termination_trait_lib", since = "1.61.0")]
 #[rustc_on_unimplemented(on(
     cause = "MainFunctionType",

@@ -1,7 +1,7 @@
 //@aux-build:proc_macros.rs
 #![feature(let_chains)]
 #![allow(
-    clippy::blocks_in_if_conditions,
+    clippy::blocks_in_conditions,
     clippy::if_same_then_else,
     clippy::ifs_same_cond,
     clippy::let_unit_value,
@@ -10,6 +10,7 @@
     clippy::nonminimal_bool,
     clippy::short_circuit_statement,
     clippy::unnecessary_operation,
+    clippy::redundant_pattern_matching,
     unused
 )]
 #![warn(clippy::needless_if)]
@@ -39,11 +40,21 @@ fn main() {
     }
     // Do not lint `if let` or let chains
     if let true = true {}
-    if let true = true && true {}
-    if true && let true = true {}
+    if let true = true
+        && true
+    {}
+    if true
+        && let true = true
+    {}
     // Can lint nested `if let`s
     if {
-        if let true = true && true { true } else { false }
+        if let true = true
+            && true
+        {
+            true
+        } else {
+            false
+        }
     } && true
     {}
     external! { if (true) {} }

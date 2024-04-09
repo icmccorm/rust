@@ -2,7 +2,10 @@
 
 use std::{cmp::Ordering, iter};
 
-use hir_expand::name::{known, AsName, Name};
+use hir_expand::{
+    name::{known, AsName, Name},
+    Lookup,
+};
 use rustc_hash::FxHashSet;
 
 use crate::{
@@ -10,7 +13,7 @@ use crate::{
     item_scope::ItemInNs,
     nameres::DefMap,
     path::{ModPath, PathKind},
-    visibility::Visibility,
+    visibility::{Visibility, VisibilityExplicitness},
     CrateRootModuleId, ModuleDefId, ModuleId,
 };
 
@@ -21,9 +24,10 @@ pub fn find_path(
     item: ItemInNs,
     from: ModuleId,
     prefer_no_std: bool,
+    prefer_prelude: bool,
 ) -> Option<ModPath> {
-    let _p = profile::span("find_path");
-    find_path_inner(db, item, from, None, prefer_no_std)
+    let _p = tracing::span!(tracing::Level::INFO, "find_path").entered();
+    find_path_inner(FindPathCtx { db, prefixed: None, prefer_no_std, prefer_prelude }, item, from)
 }
 
 pub fn find_path_prefixed(
@@ -32,9 +36,14 @@ pub fn find_path_prefixed(
     from: ModuleId,
     prefix_kind: PrefixKind,
     prefer_no_std: bool,
+    prefer_prelude: bool,
 ) -> Option<ModPath> {
-    let _p = profile::span("find_path_prefixed");
-    find_path_inner(db, item, from, Some(prefix_kind), prefer_no_std)
+    let _p = tracing::span!(tracing::Level::INFO, "find_path_prefixed").entered();
+    find_path_inner(
+        FindPathCtx { db, prefixed: Some(prefix_kind), prefer_no_std, prefer_prelude },
+        item,
+        from,
+    )
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -81,62 +90,62 @@ impl PrefixKind {
     }
 }
 
-/// Attempts to find a path to refer to the given `item` visible from the `from` ModuleId
-fn find_path_inner(
-    db: &dyn DefDatabase,
-    item: ItemInNs,
-    from: ModuleId,
+#[derive(Copy, Clone)]
+struct FindPathCtx<'db> {
+    db: &'db dyn DefDatabase,
     prefixed: Option<PrefixKind>,
     prefer_no_std: bool,
-) -> Option<ModPath> {
+    prefer_prelude: bool,
+}
+
+/// Attempts to find a path to refer to the given `item` visible from the `from` ModuleId
+fn find_path_inner(ctx: FindPathCtx<'_>, item: ItemInNs, from: ModuleId) -> Option<ModPath> {
     // - if the item is a builtin, it's in scope
     if let ItemInNs::Types(ModuleDefId::BuiltinType(builtin)) = item {
         return Some(ModPath::from_segments(PathKind::Plain, Some(builtin.as_name())));
     }
 
-    let def_map = from.def_map(db);
+    let def_map = from.def_map(ctx.db);
     let crate_root = def_map.crate_root();
     // - if the item is a module, jump straight to module search
     if let ItemInNs::Types(ModuleDefId::ModuleId(module_id)) = item {
         let mut visited_modules = FxHashSet::default();
         return find_path_for_module(
-            db,
+            FindPathCtx {
+                prefer_no_std: ctx.prefer_no_std || ctx.db.crate_supports_no_std(crate_root.krate),
+                ..ctx
+            },
             &def_map,
             &mut visited_modules,
             crate_root,
             from,
             module_id,
             MAX_PATH_LEN,
-            prefixed,
-            prefer_no_std || db.crate_supports_no_std(crate_root.krate),
         )
         .map(|(item, _)| item);
     }
 
     // - if the item is already in scope, return the name under which it is
-    let scope_name = find_in_scope(db, &def_map, from, item);
-    if prefixed.is_none() {
+    let scope_name = find_in_scope(ctx.db, &def_map, from, item);
+    if ctx.prefixed.is_none() {
         if let Some(scope_name) = scope_name {
             return Some(ModPath::from_segments(PathKind::Plain, Some(scope_name)));
         }
     }
 
     // - if the item is in the prelude, return the name from there
-    if let value @ Some(_) = find_in_prelude(db, &crate_root.def_map(db), &def_map, item, from) {
+    if let value @ Some(_) =
+        find_in_prelude(ctx.db, &crate_root.def_map(ctx.db), &def_map, item, from)
+    {
         return value;
     }
 
     if let Some(ModuleDefId::EnumVariantId(variant)) = item.as_module_def_id() {
         // - if the item is an enum variant, refer to it via the enum
-        if let Some(mut path) = find_path_inner(
-            db,
-            ItemInNs::Types(variant.parent.into()),
-            from,
-            prefixed,
-            prefer_no_std,
-        ) {
-            let data = db.enum_data(variant.parent);
-            path.push_segment(data.variants[variant.local_id].name.clone());
+        if let Some(mut path) =
+            find_path_inner(ctx, ItemInNs::Types(variant.lookup(ctx.db).parent.into()), from)
+        {
+            path.push_segment(ctx.db.enum_variant_data(variant).name.clone());
             return Some(path);
         }
         // If this doesn't work, it seems we have no way of referring to the
@@ -147,30 +156,30 @@ fn find_path_inner(
     let mut visited_modules = FxHashSet::default();
 
     calculate_best_path(
-        db,
+        FindPathCtx {
+            prefer_no_std: ctx.prefer_no_std || ctx.db.crate_supports_no_std(crate_root.krate),
+            ..ctx
+        },
         &def_map,
         &mut visited_modules,
         crate_root,
         MAX_PATH_LEN,
         item,
         from,
-        prefixed,
-        prefer_no_std || db.crate_supports_no_std(crate_root.krate),
         scope_name,
     )
     .map(|(item, _)| item)
 }
 
+#[tracing::instrument(skip_all)]
 fn find_path_for_module(
-    db: &dyn DefDatabase,
+    ctx: FindPathCtx<'_>,
     def_map: &DefMap,
     visited_modules: &mut FxHashSet<ModuleId>,
     crate_root: CrateRootModuleId,
     from: ModuleId,
     module_id: ModuleId,
     max_len: usize,
-    prefixed: Option<PrefixKind>,
-    prefer_no_std: bool,
 ) -> Option<(ModPath, Stability)> {
     if max_len == 0 {
         return None;
@@ -178,8 +187,8 @@ fn find_path_for_module(
 
     // Base cases:
     // - if the item is already in scope, return the name under which it is
-    let scope_name = find_in_scope(db, def_map, from, ItemInNs::Types(module_id.into()));
-    if prefixed.is_none() {
+    let scope_name = find_in_scope(ctx.db, def_map, from, ItemInNs::Types(module_id.into()));
+    if ctx.prefixed.is_none() {
         if let Some(scope_name) = scope_name {
             return Some((ModPath::from_segments(PathKind::Plain, Some(scope_name)), Stable));
         }
@@ -191,20 +200,20 @@ fn find_path_for_module(
     }
 
     // - if relative paths are fine, check if we are searching for a parent
-    if prefixed.filter(PrefixKind::is_absolute).is_none() {
+    if ctx.prefixed.filter(PrefixKind::is_absolute).is_none() {
         if let modpath @ Some(_) = find_self_super(def_map, module_id, from) {
             return modpath.zip(Some(Stable));
         }
     }
 
     // - if the item is the crate root of a dependency crate, return the name from the extern prelude
-    let root_def_map = crate_root.def_map(db);
+    let root_def_map = crate_root.def_map(ctx.db);
     for (name, (def_id, _extern_crate)) in root_def_map.extern_prelude() {
         if module_id == def_id {
             let name = scope_name.unwrap_or_else(|| name.clone());
 
             let name_already_occupied_in_type_ns = def_map
-                .with_ancestor_maps(db, from.local_id, &mut |def_map, local_id| {
+                .with_ancestor_maps(ctx.db, from.local_id, &mut |def_map, local_id| {
                     def_map[local_id]
                         .scope
                         .type_(&name)
@@ -222,20 +231,18 @@ fn find_path_for_module(
     }
 
     if let value @ Some(_) =
-        find_in_prelude(db, &root_def_map, &def_map, ItemInNs::Types(module_id.into()), from)
+        find_in_prelude(ctx.db, &root_def_map, def_map, ItemInNs::Types(module_id.into()), from)
     {
         return value.zip(Some(Stable));
     }
     calculate_best_path(
-        db,
+        ctx,
         def_map,
         visited_modules,
         crate_root,
         max_len,
         ItemInNs::Types(module_id.into()),
         from,
-        prefixed,
-        prefer_no_std,
         scope_name,
     )
 }
@@ -248,7 +255,7 @@ fn find_in_scope(
     item: ItemInNs,
 ) -> Option<Name> {
     def_map.with_ancestor_maps(db, from.local_id, &mut |def_map, local_id| {
-        def_map[local_id].scope.name_of(item).map(|(name, _)| name.clone())
+        def_map[local_id].scope.name_of(item).map(|(name, _, _)| name.clone())
     })
 }
 
@@ -265,7 +272,7 @@ fn find_in_prelude(
     // Preludes in block DefMaps are ignored, only the crate DefMap is searched
     let prelude_def_map = prelude_module.def_map(db);
     let prelude_scope = &prelude_def_map[prelude_module.local_id].scope;
-    let (name, vis) = prelude_scope.name_of(item)?;
+    let (name, vis, _declared) = prelude_scope.name_of(item)?;
     if !vis.is_visible_from(db, from) {
         return None;
     }
@@ -306,16 +313,15 @@ fn find_self_super(def_map: &DefMap, item: ModuleId, from: ModuleId) -> Option<M
     }
 }
 
+#[tracing::instrument(skip_all)]
 fn calculate_best_path(
-    db: &dyn DefDatabase,
+    ctx: FindPathCtx<'_>,
     def_map: &DefMap,
     visited_modules: &mut FxHashSet<ModuleId>,
     crate_root: CrateRootModuleId,
     max_len: usize,
     item: ItemInNs,
     from: ModuleId,
-    mut prefixed: Option<PrefixKind>,
-    prefer_no_std: bool,
     scope_name: Option<Name>,
 ) -> Option<(ModPath, Stability)> {
     if max_len <= 1 {
@@ -332,30 +338,30 @@ fn calculate_best_path(
         };
     // Recursive case:
     // - otherwise, look for modules containing (reexporting) it and import it from one of those
-    if item.krate(db) == Some(from.krate) {
+    if item.krate(ctx.db) == Some(from.krate) {
         let mut best_path_len = max_len;
         // Item was defined in the same crate that wants to import it. It cannot be found in any
         // dependency in this case.
-        for (module_id, name) in find_local_import_locations(db, item, from) {
+        for (module_id, name) in find_local_import_locations(ctx.db, item, from) {
             if !visited_modules.insert(module_id) {
                 cov_mark::hit!(recursive_imports);
                 continue;
             }
             if let Some(mut path) = find_path_for_module(
-                db,
+                ctx,
                 def_map,
                 visited_modules,
                 crate_root,
                 from,
                 module_id,
                 best_path_len - 1,
-                prefixed,
-                prefer_no_std,
             ) {
                 path.0.push_segment(name);
 
                 let new_path = match best_path.take() {
-                    Some(best_path) => select_best_path(best_path, path, prefer_no_std),
+                    Some(best_path) => {
+                        select_best_path(best_path, path, ctx.prefer_no_std, ctx.prefer_prelude)
+                    }
                     None => path,
                 };
                 best_path_len = new_path.0.len();
@@ -367,47 +373,52 @@ fn calculate_best_path(
         // too (unless we can't name it at all). It could *also* be (re)exported by the same crate
         // that wants to import it here, but we always prefer to use the external path here.
 
-        let crate_graph = db.crate_graph();
-        let extern_paths = crate_graph[from.krate].dependencies.iter().filter_map(|dep| {
-            let import_map = db.import_map(dep.crate_id);
-            import_map.import_info_for(item).and_then(|info| {
+        for dep in &ctx.db.crate_graph()[from.krate].dependencies {
+            let import_map = ctx.db.import_map(dep.crate_id);
+            let Some(import_info_for) = import_map.import_info_for(item) else { continue };
+            for info in import_info_for {
                 if info.is_doc_hidden {
                     // the item or import is `#[doc(hidden)]`, so skip it as it is in an external crate
-                    return None;
+                    continue;
                 }
 
                 // Determine best path for containing module and append last segment from `info`.
                 // FIXME: we should guide this to look up the path locally, or from the same crate again?
-                let (mut path, path_stability) = find_path_for_module(
-                    db,
+                let Some((mut path, path_stability)) = find_path_for_module(
+                    ctx,
                     def_map,
                     visited_modules,
                     crate_root,
                     from,
                     info.container,
                     max_len - 1,
-                    prefixed,
-                    prefer_no_std,
-                )?;
+                ) else {
+                    continue;
+                };
                 cov_mark::hit!(partially_imported);
                 path.push_segment(info.name.clone());
-                Some((
+
+                let path_with_stab = (
                     path,
                     zip_stability(path_stability, if info.is_unstable { Unstable } else { Stable }),
-                ))
-            })
-        });
+                );
 
-        for path in extern_paths {
-            let new_path = match best_path.take() {
-                Some(best_path) => select_best_path(best_path, path, prefer_no_std),
-                None => path,
-            };
-            update_best_path(&mut best_path, new_path);
+                let new_path_with_stab = match best_path.take() {
+                    Some(best_path) => select_best_path(
+                        best_path,
+                        path_with_stab,
+                        ctx.prefer_no_std,
+                        ctx.prefer_prelude,
+                    ),
+                    None => path_with_stab,
+                };
+                update_best_path(&mut best_path, new_path_with_stab);
+            }
         }
     }
-    if let Some(module) = item.module(db) {
-        if module.containing_block().is_some() && prefixed.is_some() {
+    let mut prefixed = ctx.prefixed;
+    if let Some(module) = item.module(ctx.db) {
+        if module.containing_block().is_some() && ctx.prefixed.is_some() {
             cov_mark::hit!(prefixed_in_block_expression);
             prefixed = Some(PrefixKind::Plain);
         }
@@ -420,24 +431,53 @@ fn calculate_best_path(
     }
 }
 
+/// Select the best (most relevant) path between two paths.
+/// This accounts for stability, path length whether std should be chosen over alloc/core paths as
+/// well as ignoring prelude like paths or not.
 fn select_best_path(
-    old_path: (ModPath, Stability),
-    new_path: (ModPath, Stability),
+    old_path @ (_, old_stability): (ModPath, Stability),
+    new_path @ (_, new_stability): (ModPath, Stability),
     prefer_no_std: bool,
+    prefer_prelude: bool,
 ) -> (ModPath, Stability) {
-    match (old_path.1, new_path.1) {
+    match (old_stability, new_stability) {
         (Stable, Unstable) => return old_path,
         (Unstable, Stable) => return new_path,
         _ => {}
     }
     const STD_CRATES: [Name; 3] = [known::std, known::core, known::alloc];
+
+    let choose = |new: (ModPath, _), old: (ModPath, _)| {
+        let (new_path, _) = &new;
+        let (old_path, _) = &old;
+        let new_has_prelude = new_path.segments().iter().any(|seg| seg == &known::prelude);
+        let old_has_prelude = old_path.segments().iter().any(|seg| seg == &known::prelude);
+        match (new_has_prelude, old_has_prelude, prefer_prelude) {
+            (true, false, true) | (false, true, false) => new,
+            (true, false, false) | (false, true, true) => old,
+            // no prelude difference in the paths, so pick the shorter one
+            (true, true, _) | (false, false, _) => {
+                let new_path_is_shorter = new_path
+                    .len()
+                    .cmp(&old_path.len())
+                    .then_with(|| new_path.textual_len().cmp(&old_path.textual_len()))
+                    .is_lt();
+                if new_path_is_shorter {
+                    new
+                } else {
+                    old
+                }
+            }
+        }
+    };
+
     match (old_path.0.segments().first(), new_path.0.segments().first()) {
         (Some(old), Some(new)) if STD_CRATES.contains(old) && STD_CRATES.contains(new) => {
             let rank = match prefer_no_std {
                 false => |name: &Name| match name {
                     name if name == &known::core => 0,
-                    name if name == &known::alloc => 0,
-                    name if name == &known::std => 1,
+                    name if name == &known::alloc => 1,
+                    name if name == &known::std => 2,
                     _ => unreachable!(),
                 },
                 true => |name: &Name| match name {
@@ -451,23 +491,11 @@ fn select_best_path(
             let orank = rank(old);
             match nrank.cmp(&orank) {
                 Ordering::Less => old_path,
-                Ordering::Equal => {
-                    if new_path.0.len() < old_path.0.len() {
-                        new_path
-                    } else {
-                        old_path
-                    }
-                }
+                Ordering::Equal => choose(new_path, old_path),
                 Ordering::Greater => new_path,
             }
         }
-        _ => {
-            if new_path.0.len() < old_path.0.len() {
-                new_path
-            } else {
-                old_path
-            }
-        }
+        _ => choose(new_path, old_path),
     }
 }
 
@@ -478,7 +506,7 @@ fn find_local_import_locations(
     item: ItemInNs,
     from: ModuleId,
 ) -> Vec<(ModuleId, Name)> {
-    let _p = profile::span("find_local_import_locations");
+    let _p = tracing::span!(tracing::Level::INFO, "find_local_import_locations").entered();
 
     // `from` can import anything below `from` with visibility of at least `from`, and anything
     // above `from` with any visibility. That means we do not need to descend into private siblings
@@ -522,34 +550,35 @@ fn find_local_import_locations(
             &ext_def_map[module.local_id]
         };
 
-        if let Some((name, vis)) = data.scope.name_of(item) {
+        if let Some((name, vis, declared)) = data.scope.name_of(item) {
             if vis.is_visible_from(db, from) {
-                let is_private = match vis {
-                    Visibility::Module(private_to) => private_to.local_id == module.local_id,
-                    Visibility::Public => false,
-                };
-                let is_original_def = match item.as_module_def_id() {
-                    Some(module_def_id) => data.scope.declarations().any(|it| it == module_def_id),
-                    None => false,
+                let is_pub_or_explicit = match vis {
+                    Visibility::Module(_, VisibilityExplicitness::Explicit) => {
+                        cov_mark::hit!(explicit_private_imports);
+                        true
+                    }
+                    Visibility::Module(_, VisibilityExplicitness::Implicit) => {
+                        cov_mark::hit!(discount_private_imports);
+                        false
+                    }
+                    Visibility::Public => true,
                 };
 
-                // Ignore private imports. these could be used if we are
+                // Ignore private imports unless they are explicit. these could be used if we are
                 // in a submodule of this module, but that's usually not
                 // what the user wants; and if this module can import
                 // the item and we're a submodule of it, so can we.
                 // Also this keeps the cached data smaller.
-                if !is_private || is_original_def {
+                if is_pub_or_explicit || declared {
                     locations.push((module, name.clone()));
                 }
             }
         }
 
         // Descend into all modules visible from `from`.
-        for (ty, vis) in data.scope.types() {
-            if let ModuleDefId::ModuleId(module) = ty {
-                if vis.is_visible_from(db, from) {
-                    worklist.push(module);
-                }
+        for (module, vis) in data.scope.modules_in_scope() {
+            if vis.is_visible_from(db, from) {
+                worklist.push(module);
             }
         }
     }
@@ -559,9 +588,9 @@ fn find_local_import_locations(
 
 #[cfg(test)]
 mod tests {
-    use base_db::fixture::WithFixture;
-    use hir_expand::hygiene::Hygiene;
+    use hir_expand::db::ExpandDatabase;
     use syntax::ast::AstNode;
+    use test_fixture::WithFixture;
 
     use crate::test_db::TestDB;
 
@@ -570,13 +599,22 @@ mod tests {
     /// `code` needs to contain a cursor marker; checks that `find_path` for the
     /// item the `path` refers to returns that same path when called from the
     /// module the cursor is in.
-    fn check_found_path_(ra_fixture: &str, path: &str, prefix_kind: Option<PrefixKind>) {
+    #[track_caller]
+    fn check_found_path_(
+        ra_fixture: &str,
+        path: &str,
+        prefix_kind: Option<PrefixKind>,
+        prefer_prelude: bool,
+    ) {
         let (db, pos) = TestDB::with_position(ra_fixture);
         let module = db.module_at_position(pos);
         let parsed_path_file = syntax::SourceFile::parse(&format!("use {path};"));
         let ast_path =
             parsed_path_file.syntax_node().descendants().find_map(syntax::ast::Path::cast).unwrap();
-        let mod_path = ModPath::from_src(&db, ast_path, &Hygiene::new_unhygienic()).unwrap();
+        let mod_path = ModPath::from_src(&db, ast_path, &mut |range| {
+            db.span_map(pos.file_id.into()).as_ref().span_for_range(range).ctx
+        })
+        .unwrap();
 
         let def_map = module.def_map(&db);
         let resolved = def_map
@@ -589,13 +627,17 @@ mod tests {
             )
             .0
             .take_types()
-            .unwrap();
+            .expect("path does not resolve to a type");
 
-        let found_path =
-            find_path_inner(&db, ItemInNs::Types(resolved), module, prefix_kind, false);
-        assert_eq!(found_path, Some(mod_path), "{prefix_kind:?}");
+        let found_path = find_path_inner(
+            FindPathCtx { prefer_no_std: false, db: &db, prefixed: prefix_kind, prefer_prelude },
+            ItemInNs::Types(resolved),
+            module,
+        );
+        assert_eq!(found_path, Some(mod_path), "on kind: {prefix_kind:?}");
     }
 
+    #[track_caller]
     fn check_found_path(
         ra_fixture: &str,
         unprefixed: &str,
@@ -603,10 +645,23 @@ mod tests {
         absolute: &str,
         self_prefixed: &str,
     ) {
-        check_found_path_(ra_fixture, unprefixed, None);
-        check_found_path_(ra_fixture, prefixed, Some(PrefixKind::Plain));
-        check_found_path_(ra_fixture, absolute, Some(PrefixKind::ByCrate));
-        check_found_path_(ra_fixture, self_prefixed, Some(PrefixKind::BySelf));
+        check_found_path_(ra_fixture, unprefixed, None, false);
+        check_found_path_(ra_fixture, prefixed, Some(PrefixKind::Plain), false);
+        check_found_path_(ra_fixture, absolute, Some(PrefixKind::ByCrate), false);
+        check_found_path_(ra_fixture, self_prefixed, Some(PrefixKind::BySelf), false);
+    }
+
+    fn check_found_path_prelude(
+        ra_fixture: &str,
+        unprefixed: &str,
+        prefixed: &str,
+        absolute: &str,
+        self_prefixed: &str,
+    ) {
+        check_found_path_(ra_fixture, unprefixed, None, true);
+        check_found_path_(ra_fixture, prefixed, Some(PrefixKind::Plain), true);
+        check_found_path_(ra_fixture, absolute, Some(PrefixKind::ByCrate), true);
+        check_found_path_(ra_fixture, self_prefixed, Some(PrefixKind::BySelf), true);
     }
 
     #[test]
@@ -952,6 +1007,7 @@ pub use crate::foo::bar::S;
 
     #[test]
     fn discount_private_imports() {
+        cov_mark::check!(discount_private_imports);
         check_found_path(
             r#"
 //- /main.rs
@@ -966,6 +1022,47 @@ $0
             "crate::bar::S",
             "crate::bar::S",
             "crate::bar::S",
+        );
+    }
+
+    #[test]
+    fn explicit_private_imports_crate() {
+        cov_mark::check!(explicit_private_imports);
+        check_found_path(
+            r#"
+//- /main.rs
+mod foo;
+pub mod bar { pub struct S; }
+pub(crate) use bar::S;
+//- /foo.rs
+$0
+        "#,
+            "crate::S",
+            "crate::S",
+            "crate::S",
+            "crate::S",
+        );
+    }
+
+    #[test]
+    fn explicit_private_imports() {
+        cov_mark::check!(explicit_private_imports);
+        check_found_path(
+            r#"
+//- /main.rs
+pub mod bar {
+    mod foo;
+    pub mod baz { pub struct S; }
+    pub(self) use baz::S;
+}
+
+//- /bar/foo.rs
+$0
+        "#,
+            "super::S",
+            "super::S",
+            "crate::bar::S",
+            "super::S",
         );
     }
 
@@ -1419,6 +1516,70 @@ pub mod error {
             "std::error::Error",
             "std::error::Error",
             "std::error::Error",
+        );
+    }
+
+    #[test]
+    fn respects_prelude_setting() {
+        let ra_fixture = r#"
+//- /main.rs crate:main deps:krate
+$0
+//- /krate.rs crate:krate
+pub mod prelude {
+    pub use crate::foo::*;
+}
+
+pub mod foo {
+    pub struct Foo;
+}
+"#;
+        check_found_path(
+            ra_fixture,
+            "krate::foo::Foo",
+            "krate::foo::Foo",
+            "krate::foo::Foo",
+            "krate::foo::Foo",
+        );
+        check_found_path_prelude(
+            ra_fixture,
+            "krate::prelude::Foo",
+            "krate::prelude::Foo",
+            "krate::prelude::Foo",
+            "krate::prelude::Foo",
+        );
+    }
+
+    #[test]
+    fn respect_segment_length() {
+        check_found_path(
+            r#"
+//- /main.rs crate:main deps:petgraph
+$0
+//- /petgraph.rs crate:petgraph
+pub mod graph {
+    pub use crate::graph_impl::{
+        NodeIndex
+    };
+}
+
+mod graph_impl {
+    pub struct NodeIndex<Ix>(Ix);
+}
+
+pub mod stable_graph {
+    #[doc(no_inline)]
+    pub use crate::graph::{NodeIndex};
+}
+
+pub mod prelude {
+    #[doc(no_inline)]
+    pub use crate::graph::{NodeIndex};
+}
+"#,
+            "petgraph::graph::NodeIndex",
+            "petgraph::graph::NodeIndex",
+            "petgraph::graph::NodeIndex",
+            "petgraph::graph::NodeIndex",
         );
     }
 }

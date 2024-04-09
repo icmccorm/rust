@@ -11,8 +11,8 @@ use crate::infer::lexical_region_resolve::RegionResolutionError;
 use crate::infer::SubregionOrigin;
 use crate::infer::TyCtxt;
 
-use rustc_errors::AddToDiagnostic;
-use rustc_errors::{Diagnostic, ErrorGuaranteed};
+use rustc_errors::Subdiagnostic;
+use rustc_errors::{Diag, ErrorGuaranteed};
 use rustc_hir::Ty;
 use rustc_middle::ty::Region;
 
@@ -70,9 +70,9 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
 
         let anon_reg_sub = self.tcx().is_suitable_region(sub)?;
         let scope_def_id_sup = anon_reg_sup.def_id;
-        let bregion_sup = anon_reg_sup.boundregion;
+        let bregion_sup = anon_reg_sup.bound_region;
         let scope_def_id_sub = anon_reg_sub.def_id;
-        let bregion_sub = anon_reg_sub.boundregion;
+        let bregion_sub = anon_reg_sub.bound_region;
 
         let ty_sup = find_anon_type(self.tcx(), sup, &bregion_sup)?;
 
@@ -130,7 +130,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         let suggestion =
             AddLifetimeParamsSuggestion { tcx: self.tcx(), sub, ty_sup, ty_sub, add_note: true };
         let err = LifetimeMismatch { span, labels, suggestion };
-        let reported = self.tcx().sess.emit_err(err);
+        let reported = self.tcx().dcx().emit_err(err);
         Some(reported)
     }
 }
@@ -142,8 +142,8 @@ pub fn suggest_adding_lifetime_params<'tcx>(
     sub: Region<'tcx>,
     ty_sup: &'tcx Ty<'_>,
     ty_sub: &'tcx Ty<'_>,
-    err: &mut Diagnostic,
+    err: &mut Diag<'_>,
 ) {
     let suggestion = AddLifetimeParamsSuggestion { tcx, sub, ty_sup, ty_sub, add_note: false };
-    suggestion.add_to_diagnostic(err);
+    suggestion.add_to_diag(err);
 }

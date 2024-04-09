@@ -19,7 +19,7 @@
 //! [canonicalized]: https://rustc-dev-guide.rust-lang.org/solve/canonicalization.html
 
 use super::{
-    CandidateSource, Canonical, CanonicalInput, Certainty, Goal, IsNormalizesToHack, NoSolution,
+    CandidateSource, Canonical, CanonicalInput, Certainty, Goal, GoalSource, NoSolution,
     QueryInput, QueryResult,
 };
 use crate::{infer::canonical::CanonicalVarValues, ty};
@@ -42,12 +42,6 @@ pub struct State<'tcx, T> {
 
 pub type CanonicalState<'tcx, T> = Canonical<'tcx, State<'tcx, T>>;
 
-#[derive(Debug, Eq, PartialEq)]
-pub enum CacheHit {
-    Provisional,
-    Global,
-}
-
 /// When evaluating the root goals we also store the
 /// original values for the `CanonicalVarValues` of the
 /// canonicalized goal. We use this to map any [CanonicalState]
@@ -56,7 +50,7 @@ pub enum CacheHit {
 #[derive(Eq, PartialEq)]
 pub enum GoalEvaluationKind<'tcx> {
     Root { orig_values: Vec<ty::GenericArg<'tcx>> },
-    Nested { is_normalizes_to_hack: IsNormalizesToHack },
+    Nested,
 }
 
 #[derive(Eq, PartialEq)]
@@ -64,8 +58,6 @@ pub struct GoalEvaluation<'tcx> {
     pub uncanonicalized_goal: Goal<'tcx, ty::Predicate<'tcx>>,
     pub kind: GoalEvaluationKind<'tcx>,
     pub evaluation: CanonicalGoalEvaluation<'tcx>,
-    /// The nested goals from instantiating the query response.
-    pub returned_goals: Vec<Goal<'tcx, ty::Predicate<'tcx>>>,
 }
 
 #[derive(Eq, PartialEq)]
@@ -78,8 +70,9 @@ pub struct CanonicalGoalEvaluation<'tcx> {
 #[derive(Eq, PartialEq)]
 pub enum CanonicalGoalEvaluationKind<'tcx> {
     Overflow,
-    CacheHit(CacheHit),
-    Uncached { revisions: Vec<GoalEvaluationStep<'tcx>> },
+    CycleInStack,
+    ProvisionalCacheHit,
+    Evaluation { revisions: &'tcx [GoalEvaluationStep<'tcx>] },
 }
 impl Debug for GoalEvaluation<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -121,7 +114,7 @@ impl Debug for Probe<'_> {
 pub enum ProbeStep<'tcx> {
     /// We added a goal to the `EvalCtxt` which will get proven
     /// the next time `EvalCtxt::try_evaluate_added_goals` is called.
-    AddGoal(CanonicalState<'tcx, Goal<'tcx, ty::Predicate<'tcx>>>),
+    AddGoal(GoalSource, CanonicalState<'tcx, Goal<'tcx, ty::Predicate<'tcx>>>),
     /// The inside of a `EvalCtxt::try_evaluate_added_goals` call.
     EvaluateGoals(AddedGoalsEvaluation<'tcx>),
     /// A call to `probe` while proving the current goal. This is
@@ -137,6 +130,8 @@ pub enum ProbeStep<'tcx> {
 pub enum ProbeKind<'tcx> {
     /// The root inference context while proving a goal.
     Root { result: QueryResult<'tcx> },
+    /// Trying to normalize an alias by at least one step in `NormalizesTo`.
+    TryNormalizeNonRigid { result: QueryResult<'tcx> },
     /// Probe entered when normalizing the self ty during candidate assembly
     NormalizedSelfTyAssembly,
     /// Some candidate to prove the current goal.

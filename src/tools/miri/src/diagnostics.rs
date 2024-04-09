@@ -1,10 +1,8 @@
 use std::fmt::{self, Write};
-use std::num::NonZeroU64;
+use std::num::NonZero;
 
-use log::trace;
-
-use rustc_errors::DiagnosticMessage;
-use rustc_span::{source_map::DUMMY_SP, SpanData, Symbol};
+use rustc_errors::{Diag, DiagMessage, Level};
+use rustc_span::{SpanData, Symbol, DUMMY_SP};
 use rustc_target::abi::{Align, Size};
 
 use crate::borrow_tracker::stacked_borrows::diagnostics::TagHistory;
@@ -50,9 +48,12 @@ pub enum TerminationInfo {
         span: SpanData,
     },
     DataRace {
+        involves_non_atomic: bool,
+        ptr: Pointer<AllocId>,
         op1: RacingOp,
         op2: RacingOp,
-        ptr: Pointer,
+        extra: Option<&'static str>,
+        retag_explain: bool,
     },
 }
 
@@ -84,7 +85,7 @@ impl fmt::Display for TerminationInfo {
             Int2PtrWithStrictProvenance =>
                 write!(
                     f,
-                    "integer-to-pointer casts and `ptr::from_exposed_addr` are not supported with `-Zmiri-strict-provenance`"
+                    "integer-to-pointer casts and `ptr::with_exposed_provenance` are not supported with `-Zmiri-strict-provenance`"
                 ),
             StackedBorrowsUb { msg, .. } => write!(f, "{msg}"),
             TreeBorrowsUb { title, .. } => write!(f, "{title}"),
@@ -93,11 +94,15 @@ impl fmt::Display for TerminationInfo {
                 write!(f, "multiple definitions of symbol `{link_name}`"),
             SymbolShimClashing { link_name, .. } =>
                 write!(f, "found `{link_name}` symbol definition that clashes with a built-in shim",),
-            DataRace { ptr, op1, op2 } =>
+            DataRace { involves_non_atomic, ptr, op1, op2, .. } =>
                 write!(
                     f,
-                    "Data race detected between (1) {} on {} and (2) {} on {} at {ptr:?}. (2) just happened here",
-                    op1.action, op1.thread_info, op2.action, op2.thread_info
+                    "{} detected between (1) {} on {} and (2) {} on {} at {ptr:?}. (2) just happened here",
+                    if *involves_non_atomic { "Data race" } else { "Race condition" },
+                    op1.action,
+                    op1.thread_info,
+                    op2.action,
+                    op2.thread_info
                 ),
         }
     }
@@ -110,15 +115,12 @@ impl fmt::Debug for TerminationInfo {
 }
 
 impl MachineStopType for TerminationInfo {
-    fn diagnostic_message(&self) -> DiagnosticMessage {
+    fn diagnostic_message(&self) -> DiagMessage {
         self.to_string().into()
     }
     fn add_args(
         self: Box<Self>,
-        _: &mut dyn FnMut(
-            std::borrow::Cow<'static, str>,
-            rustc_errors::DiagnosticArgValue<'static>,
-        ),
+        _: &mut dyn FnMut(std::borrow::Cow<'static, str>, rustc_errors::DiagArgValue),
     ) {
     }
 }
@@ -128,12 +130,13 @@ pub enum NonHaltingDiagnostic {
     /// (new_tag, new_perm, (alloc_id, base_offset, orig_tag))
     ///
     /// new_perm is `None` for base tags.
-    CreatedPointerTag(NonZeroU64, Option<String>, Option<(AllocId, AllocRange, ProvenanceExtra)>),
+    CreatedPointerTag(NonZero<u64>, Option<String>, Option<(AllocId, AllocRange, ProvenanceExtra)>),
     /// This `Item` was popped from the borrow stack. The string explains the reason.
     PoppedPointerTag(Item, String),
     CreatedCallId(CallId),
     CreatedAlloc(AllocId, Size, Align, MemoryKind<MiriMemoryKind>),
     FreedAlloc(AllocId),
+    AccessedAlloc(AllocId, AccessKind),
     RejectedIsolatedOp(String),
     ProgressReport {
         block_count: u64, // how many basic blocks have been run so far
@@ -285,12 +288,22 @@ pub fn report_error<'tcx, 'mir>(
                 vec![(Some(*span), format!("the `{link_name}` symbol is defined here"))],
             Int2PtrWithStrictProvenance =>
                 vec![(None, format!("use Strict Provenance APIs (https://doc.rust-lang.org/nightly/std/ptr/index.html#strict-provenance, https://crates.io/crates/sptr) instead"))],
-            DataRace { op1, .. } =>
-                vec![
-                    (Some(op1.span), format!("and (1) occurred earlier here")),
-                    (None, format!("this indicates a bug in the program: it performed an invalid operation, and caused Undefined Behavior")),
-                    (None, format!("see https://doc.rust-lang.org/nightly/reference/behavior-considered-undefined.html for further information")),
-                ],
+            DataRace { op1, extra, retag_explain, .. } => {
+                let mut helps = vec![(Some(op1.span), format!("and (1) occurred earlier here"))];
+                if let Some(extra) = extra {
+                    helps.push((None, format!("{extra}")));
+                    helps.push((None, format!("see https://doc.rust-lang.org/nightly/std/sync/atomic/index.html#memory-model-for-atomic-accesses for more information about the Rust memory model")));
+                }
+                if *retag_explain {
+                    helps.push((None, "retags occur on all (re)borrows and as well as when references are copied or moved".to_owned()));
+                    helps.push((None, "retags permit optimizations that insert speculative reads or writes".to_owned()));
+                    helps.push((None, "therefore from the perspective of data races, a retag has the same implications as a read or write".to_owned()));
+                }
+                helps.push((None, format!("this indicates a bug in the program: it performed an invalid operation, and caused Undefined Behavior")));
+                helps.push((None, format!("see https://doc.rust-lang.org/nightly/reference/behavior-considered-undefined.html for further information")));
+                helps
+            }
+                ,
             _ => vec![],
         };
         (title, helps)
@@ -303,7 +316,10 @@ pub fn report_error<'tcx, 'mir>(
                 ) =>
             {
                 ecx.handle_ice(); // print interpreter backtrace
-                bug!("This validation error should be impossible in Miri: {}", ecx.format_error(e));
+                bug!(
+                    "This validation error should be impossible in Miri: {}",
+                    format_interp_error(ecx.tcx.dcx(), e)
+                );
             }
             UndefinedBehavior(ub_info) if descriptive_ub =>
                 match ub_info {
@@ -349,7 +365,10 @@ pub fn report_error<'tcx, 'mir>(
             ) => "post-monomorphization error",
             _ => {
                 ecx.handle_ice(); // print interpreter backtrace
-                bug!("This error should be impossible in Miri: {}", ecx.format_error(e));
+                bug!(
+                    "This error should be impossible in Miri: {}",
+                    format_interp_error(ecx.tcx.dcx(), e)
+                );
             }
         };
         #[rustfmt::skip]
@@ -415,7 +434,7 @@ pub fn report_error<'tcx, 'mir>(
         _ => {}
     }
 
-    msg.insert(0, ecx.format_error(e));
+    msg.insert(0, format_interp_error(ecx.tcx.dcx(), e));
 
     report_msg(
         DiagLevel::Error,
@@ -429,7 +448,7 @@ pub fn report_error<'tcx, 'mir>(
 
     // Include a note like `std` does when we omit frames from a backtrace
     if was_pruned {
-        ecx.tcx.sess.diagnostic().note_without_error(
+        ecx.tcx.dcx().note(
             "some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace",
         );
     }
@@ -476,7 +495,7 @@ pub fn report_leaks<'mir, 'tcx>(
         );
     }
     if any_pruned {
-        ecx.tcx.sess.diagnostic().note_without_error(
+        ecx.tcx.dcx().note(
             "some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace",
         );
     }
@@ -498,11 +517,13 @@ pub fn report_msg<'tcx>(
 ) {
     let span = stacktrace.first().map_or(DUMMY_SP, |fi| fi.span);
     let sess = machine.tcx.sess;
-    let mut err = match diag_level {
-        DiagLevel::Error => sess.struct_span_err(span, title).forget_guarantee(),
-        DiagLevel::Warning => sess.struct_span_warn(span, title),
-        DiagLevel::Note => sess.diagnostic().span_note_diag(span, title),
+    let level = match diag_level {
+        DiagLevel::Error => Level::Error,
+        DiagLevel::Warning => Level::Warning,
+        DiagLevel::Note => Level::Note,
     };
+    let mut err = Diag::<()>::new(sess.dcx(), level, title);
+    err.span(span);
 
     // Show main message.
     if span != DUMMY_SP {
@@ -519,7 +540,6 @@ pub fn report_msg<'tcx>(
 
     // Show note and help messages.
     let mut extra_span = false;
-    let notes_len = notes.len();
     for (span_data, note) in notes {
         if let Some(span_data) = span_data {
             err.span_note(span_data.span(), note);
@@ -528,7 +548,6 @@ pub fn report_msg<'tcx>(
             err.note(note);
         }
     }
-    let helps_len = helps.len();
     for (span_data, help) in helps {
         if let Some(span_data) = span_data {
             err.span_help(span_data.span(), help);
@@ -537,19 +556,25 @@ pub fn report_msg<'tcx>(
             err.help(help);
         }
     }
-    if notes_len + helps_len > 0 {
-        // Add visual separator before backtrace.
-        err.note(if extra_span { "BACKTRACE (of the first span):" } else { "BACKTRACE:" });
-    }
-
-    let (mut err, handler) = err.into_diagnostic().unwrap();
 
     // Add backtrace
+    let mut backtrace_title = String::from("BACKTRACE");
+    if extra_span {
+        write!(backtrace_title, " (of the first span)").unwrap();
+    }
+    let thread_name =
+        machine.threads.get_thread_display_name(machine.threads.get_active_thread_id());
+    if thread_name != "main" {
+        // Only print thread name if it is not `main`.
+        write!(backtrace_title, " on thread `{thread_name}`").unwrap();
+    };
+    write!(backtrace_title, ":").unwrap();
+    err.note(backtrace_title);
     for (idx, frame_info) in stacktrace.iter().enumerate() {
         let is_local = machine.is_local(frame_info);
         // No span for non-local frames and the first frame (which is the error site).
         if is_local && idx > 0 {
-            err.eager_subdiagnostic(handler, frame_info.as_note(machine.tcx));
+            err.subdiagnostic(err.dcx, frame_info.as_note(machine.tcx));
         } else {
             let sm = sess.source_map();
             let span = sm.span_to_embeddable_string(frame_info.span);
@@ -557,15 +582,14 @@ pub fn report_msg<'tcx>(
         }
     }
 
-    handler.emit_diagnostic(&mut err);
+    err.emit();
 }
 
 impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
     pub fn emit_diagnostic(&self, e: NonHaltingDiagnostic) {
         use NonHaltingDiagnostic::*;
 
-        let stacktrace =
-            MiriInterpCx::generate_stacktrace_from_stack(self.threads.active_thread_stack());
+        let stacktrace = Frame::generate_stacktrace_from_stack(self.threads.active_thread_stack());
         let (stacktrace, _was_pruned) = prune_stacktrace(stacktrace, self);
 
         let (title, diag_level) = match &e {
@@ -576,6 +600,7 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
             | PoppedPointerTag(..)
             | CreatedCallId(..)
             | CreatedAlloc(..)
+            | AccessedAlloc(..)
             | FreedAlloc(..)
             | ProgressReport { .. }
             | WeakMemoryOutdatedLoad => ("tracking was triggered".to_string(), DiagLevel::Note),
@@ -597,6 +622,8 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
                     size = size.bytes(),
                     align = align.bytes(),
                 ),
+            AccessedAlloc(AllocId(id), access_kind) =>
+                format!("{access_kind} to allocation with id {id}"),
             FreedAlloc(AllocId(id)) => format!("freed allocation with id {id}"),
             RejectedIsolatedOp(ref op) =>
                 format!("{op} was made to return an error due to isolation"),
@@ -622,7 +649,7 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
                     (
                         None,
                         format!(
-                            "This program is using integer-to-pointer casts or (equivalently) `ptr::from_exposed_addr`,"
+                            "This program is using integer-to-pointer casts or (equivalently) `ptr::with_exposed_provenance`,"
                         ),
                     ),
                     (
@@ -632,7 +659,7 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
                     (
                         None,
                         format!(
-                            "See https://doc.rust-lang.org/nightly/std/ptr/fn.from_exposed_addr.html for more details on that operation."
+                            "See https://doc.rust-lang.org/nightly/std/ptr/fn.with_exposed_provenance.html for more details on that operation."
                         ),
                     ),
                     (
@@ -644,7 +671,7 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
                     (
                         None,
                         format!(
-                            "You can then pass the `-Zmiri-strict-provenance` flag to Miri, to ensure you are not relying on `from_exposed_addr` semantics."
+                            "You can then pass the `-Zmiri-strict-provenance` flag to Miri, to ensure you are not relying on `with_exposed_provenance` semantics."
                         ),
                     ),
                     (

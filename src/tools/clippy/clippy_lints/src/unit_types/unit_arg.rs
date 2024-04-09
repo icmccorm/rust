@@ -1,9 +1,8 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::is_from_proc_macro;
 use clippy_utils::source::{indent_of, reindent_multiline, snippet_opt};
-use if_chain::if_chain;
 use rustc_errors::Applicability;
-use rustc_hir::{self as hir, Block, Expr, ExprKind, MatchSource, Node, StmtKind};
+use rustc_hir::{Block, Expr, ExprKind, MatchSource, Node, StmtKind};
 use rustc_lint::LateContext;
 
 use super::{utils, UNIT_ARG};
@@ -20,14 +19,10 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
     if is_questionmark_desugar_marked_call(expr) {
         return;
     }
-    let map = &cx.tcx.hir();
-    let opt_parent_node = map.find_parent(expr.hir_id);
-    if_chain! {
-        if let Some(hir::Node::Expr(parent_expr)) = opt_parent_node;
-        if is_questionmark_desugar_marked_call(parent_expr);
-        then {
-            return;
-        }
+    if let Node::Expr(parent_expr) = cx.tcx.parent_hir_node(expr.hir_id)
+        && is_questionmark_desugar_marked_call(parent_expr)
+    {
+        return;
     }
 
     let args: Vec<_> = match expr.kind {
@@ -74,27 +69,21 @@ fn lint_unit_args(cx: &LateContext<'_>, expr: &Expr<'_>, args_to_recover: &[&Exp
         cx,
         UNIT_ARG,
         expr.span,
-        &format!("passing {singular}unit value{plural} to a function"),
+        format!("passing {singular}unit value{plural} to a function"),
         |db| {
             let mut or = "";
             args_to_recover
                 .iter()
                 .filter_map(|arg| {
-                    if_chain! {
-                        if let ExprKind::Block(block, _) = arg.kind;
-                        if block.expr.is_none();
-                        if let Some(last_stmt) = block.stmts.iter().last();
-                        if let StmtKind::Semi(last_expr) = last_stmt.kind;
-                        if let Some(snip) = snippet_opt(cx, last_expr.span);
-                        then {
-                            Some((
-                                last_stmt.span,
-                                snip,
-                            ))
-                        }
-                        else {
-                            None
-                        }
+                    if let ExprKind::Block(block, _) = arg.kind
+                        && block.expr.is_none()
+                        && let Some(last_stmt) = block.stmts.iter().last()
+                        && let StmtKind::Semi(last_expr) = last_stmt.kind
+                        && let Some(snip) = snippet_opt(cx, last_expr.span)
+                    {
+                        Some((last_stmt.span, snip))
+                    } else {
+                        None
                     }
                 })
                 .for_each(|(span, sugg)| {
@@ -192,8 +181,8 @@ fn fmt_stmts_and_call(
 
     let mut stmts_and_call_snippet = stmts_and_call.join(&format!("{}{}", ";\n", " ".repeat(call_expr_indent)));
     // expr is not in a block statement or result expression position, wrap in a block
-    let parent_node = cx.tcx.hir().find_parent(call_expr.hir_id);
-    if !matches!(parent_node, Some(Node::Block(_))) && !matches!(parent_node, Some(Node::Stmt(_))) {
+    let parent_node = cx.tcx.parent_hir_node(call_expr.hir_id);
+    if !matches!(parent_node, Node::Block(_)) && !matches!(parent_node, Node::Stmt(_)) {
         let block_indent = call_expr_indent + 4;
         stmts_and_call_snippet =
             reindent_multiline(stmts_and_call_snippet.into(), true, Some(block_indent)).into_owned();

@@ -187,7 +187,7 @@ passes_doc_attr_not_crate_level =
     `#![doc({$attr_name} = "...")]` isn't allowed as a crate-level attribute
 
 passes_doc_cfg_hide_takes_list =
-    `#[doc(cfg_hide(...)]` takes a list of attributes
+    `#[doc(cfg_hide(...))]` takes a list of attributes
 
 passes_doc_expect_str =
     doc {$attr_name} attribute expects a string: #[doc({$attr_name} = "a")]
@@ -302,9 +302,6 @@ passes_export_name =
     attribute should be applied to a free function, impl method or static
     .label = not a free function, impl method or static
 
-passes_expr_not_allowed_in_context =
-    {$expr} is not allowed in a `{$context}`
-
 passes_extern_main =
     the `main` function cannot be declared in an `extern` block
 
@@ -322,9 +319,6 @@ passes_ffi_const_invalid_target =
 
 passes_ffi_pure_invalid_target =
     `#[ffi_pure]` may only be used on foreign functions
-
-passes_ffi_returns_twice_invalid_target =
-    `#[ffi_returns_twice]` may only be used on foreign functions
 
 passes_has_incoherent_inherent_impl =
     `rustc_has_incoherent_inherent_impls` attribute should be applied to types or traits.
@@ -393,19 +387,12 @@ passes_invalid_attr_at_crate_level =
     `{$name}` attribute cannot be used at crate level
     .suggestion = perhaps you meant to use an outer attribute
 
-passes_invalid_deprecation_version =
-    invalid deprecation version found
-    .label = invalid deprecation version
-    .item = the stability attribute annotates this item
+passes_invalid_attr_at_crate_level_item =
+    the inner attribute doesn't annotate this {$kind}
 
 passes_invalid_macro_export_arguments = `{$name}` isn't a valid `#[macro_export]` argument
 
 passes_invalid_macro_export_arguments_too_many_items = `#[macro_export]` can only take 1 or 0 arguments
-
-passes_invalid_stability =
-    invalid stability version found
-    .label = invalid stability version
-    .item = the stability attribute annotates this item
 
 passes_lang_item_fn_with_target_feature =
     `{$name}` language item function is not allowed to have `#[target_feature]`
@@ -415,8 +402,6 @@ passes_lang_item_on_incorrect_target =
     `{$name}` language item must be applied to a {$expected_target}
     .label = attribute should be applied to a {$expected_target}, not a {$actual_target}
 
-passes_layout =
-    layout error: {$layout_error}
 passes_layout_abi =
     abi: {$abi}
 passes_layout_align =
@@ -580,6 +565,13 @@ passes_outside_loop =
         *[false] {""}
     }
 
+passes_outside_loop_suggestion = consider labeling this block to be able to break within it
+
+passes_panic_unwind_without_std =
+    unwinding panics are not supported without std
+    .note = since the core library is usually precompiled with panic="unwind", rebuilding your crate with panic="abort" may not be enough to fix the problem
+    .help = using nightly cargo, use -Zbuild-std with panic="abort" to avoid unwinding
+
 passes_params_not_allowed =
     referencing function parameters is not allowed in naked functions
     .help = follow the calling convention in asm block to use parameters
@@ -593,9 +585,6 @@ passes_parent_info =
 passes_pass_by_value =
     `pass_by_value` attribute should be applied to a struct, enum or type alias
     .label = is not a struct, enum or type alias
-
-passes_plugin_registrar =
-    `#[plugin_registrar]` only has an effect on functions
 
 passes_proc_macro_bad_sig = {$kind} has incorrect signature
 
@@ -778,12 +767,15 @@ passes_unused_var_maybe_capture_ref = unused variable: `{$name}`
 passes_unused_var_remove_field = unused variable: `{$name}`
 passes_unused_var_remove_field_suggestion = try removing the field
 
+passes_unused_variable_args_in_macro = `{$name}` is captured in macro and introduced a unused variable
+
 passes_unused_variable_try_ignore = unused variable: `{$name}`
     .suggestion = try ignoring the field
 
 passes_unused_variable_try_prefix = unused variable: `{$name}`
     .label = unused variable
     .suggestion = if this is intentional, prefix it with an underscore
+
 
 passes_used_compiler_linker =
     `used(compiler)` and `used(linker)` can't be used together

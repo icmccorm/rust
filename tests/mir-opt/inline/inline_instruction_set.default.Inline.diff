@@ -10,8 +10,6 @@
 +     scope 1 (inlined instruction_set_default) {
 +     }
 +     scope 2 (inlined inline_always_and_using_inline_asm) {
-+         scope 3 {
-+         }
 +     }
   
       bb0: {
@@ -35,7 +33,7 @@
           StorageDead(_3);
           StorageLive(_4);
 -         _4 = inline_always_and_using_inline_asm() -> [return: bb4, unwind unreachable];
-+         asm!("/* do nothing */", options((empty))) -> [return: bb3, unwind unreachable];
++         asm!("/* do nothing */", options()) -> [return: bb3, unwind unreachable];
       }
   
 -     bb4: {

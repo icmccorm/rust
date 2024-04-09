@@ -25,6 +25,7 @@ RUN yum upgrade -y && \
       openssl-devel \
       patch \
       perl \
+      perl-core \
       pkgconfig \
       python3 \
       unzip \
@@ -57,9 +58,9 @@ COPY host-x86_64/dist-x86_64-linux/build-clang.sh /tmp/
 RUN ./build-clang.sh
 ENV CC=clang CXX=clang++
 
-# rustc-perf version from 2023-05-30
+# rustc-perf version from 2023-10-22
 # Should also be changed in the opt-dist tool for other environments.
-ENV PERF_COMMIT 8b2ac3042e1ff2c0074455a0a3618adef97156b1
+ENV PERF_COMMIT 4f313add609f43e928e98132358e8426ed3969ae
 RUN curl -LS -o perf.zip https://ci-mirrors.rust-lang.org/rustc/rustc-perf-$PERF_COMMIT.zip && \
     unzip perf.zip && \
     mv rustc-perf-$PERF_COMMIT rustc-perf && \
@@ -84,7 +85,8 @@ ENV RUST_CONFIGURE_ARGS \
       --set llvm.ninja=false \
       --set rust.jemalloc \
       --set rust.use-lld=true \
-      --set rust.lto=thin
+      --set rust.lto=thin \
+      --set rust.codegen-units=1
 
 ENV SCRIPT python3 ../x.py build --set rust.debug=true opt-dist && \
     ./build/$HOSTS/stage0-tools-bin/opt-dist linux-ci -- python3 ../x.py dist \

@@ -2,10 +2,11 @@ use super::ObjectSafetyViolation;
 
 use crate::infer::InferCtxt;
 use rustc_data_structures::fx::FxIndexSet;
-use rustc_errors::{struct_span_err, DiagnosticBuilder, ErrorGuaranteed, MultiSpan};
+use rustc_errors::{codes::*, struct_span_code_err, Applicability, Diag, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::print::with_no_trimmed_paths;
+use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::Span;
 use std::fmt;
 use std::iter;
@@ -17,9 +18,9 @@ impl<'tcx> InferCtxt<'tcx> {
         impl_item_def_id: LocalDefId,
         trait_item_def_id: DefId,
         requirement: &dyn fmt::Display,
-    ) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
-        let mut err = struct_span_err!(
-            self.tcx.sess,
+    ) -> Diag<'tcx> {
+        let mut err = struct_span_code_err!(
+            self.tcx.dcx(),
             error_span,
             E0276,
             "impl has stricter requirements than trait"
@@ -41,16 +42,17 @@ impl<'tcx> InferCtxt<'tcx> {
 pub fn report_object_safety_error<'tcx>(
     tcx: TyCtxt<'tcx>,
     span: Span,
+    hir_id: Option<hir::HirId>,
     trait_def_id: DefId,
     violations: &[ObjectSafetyViolation],
-) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
+) -> Diag<'tcx> {
     let trait_str = tcx.def_path_str(trait_def_id);
     let trait_span = tcx.hir().get_if_local(trait_def_id).and_then(|node| match node {
         hir::Node::Item(item) => Some(item.ident.span),
         _ => None,
     });
-    let mut err = struct_span_err!(
-        tcx.sess,
+    let mut err = struct_span_code_err!(
+        tcx.dcx(),
         span,
         E0038,
         "the trait `{}` cannot be made into an object",
@@ -58,11 +60,31 @@ pub fn report_object_safety_error<'tcx>(
     );
     err.span_label(span, format!("`{trait_str}` cannot be made into an object"));
 
+    if let Some(hir_id) = hir_id
+        && let hir::Node::Ty(ty) = tcx.hir_node(hir_id)
+        && let hir::TyKind::TraitObject([trait_ref, ..], ..) = ty.kind
+    {
+        let mut hir_id = hir_id;
+        while let hir::Node::Ty(ty) = tcx.parent_hir_node(hir_id) {
+            hir_id = ty.hir_id;
+        }
+        if tcx.parent_hir_node(hir_id).fn_sig().is_some() {
+            // Do not suggest `impl Trait` when dealing with things like super-traits.
+            err.span_suggestion_verbose(
+                ty.span.until(trait_ref.span),
+                "consider using an opaque type instead",
+                "impl ",
+                Applicability::MaybeIncorrect,
+            );
+        }
+    }
     let mut reported_violations = FxIndexSet::default();
     let mut multi_span = vec![];
     let mut messages = vec![];
     for violation in violations {
-        if let ObjectSafetyViolation::SizedSelf(sp) = &violation && !sp.is_empty() {
+        if let ObjectSafetyViolation::SizedSelf(sp) = &violation
+            && !sp.is_empty()
+        {
             // Do not report `SizedSelf` without spans pointing at `SizedSelf` obligations
             // with a `Span`.
             reported_violations.insert(ObjectSafetyViolation::SizedSelf(vec![].into()));
@@ -98,13 +120,85 @@ pub fn report_object_safety_error<'tcx>(
          to be resolvable dynamically; for more information visit \
          <https://doc.rust-lang.org/reference/items/traits.html#object-safety>",
     );
+
+    // Only provide the help if its a local trait, otherwise it's not actionable.
     if trait_span.is_some() {
         let mut reported_violations: Vec<_> = reported_violations.into_iter().collect();
         reported_violations.sort();
-        for violation in reported_violations {
-            // Only provide the help if its a local trait, otherwise it's not actionable.
-            violation.solution(&mut err);
+
+        let mut potential_solutions: Vec<_> =
+            reported_violations.into_iter().map(|violation| violation.solution()).collect();
+        potential_solutions.sort();
+        // Allows us to skip suggesting that the same item should be moved to another trait multiple times.
+        potential_solutions.dedup();
+        for solution in potential_solutions {
+            solution.add_to(&mut err);
         }
     }
+
+    let impls_of = tcx.trait_impls_of(trait_def_id);
+    let impls = if impls_of.blanket_impls().is_empty() {
+        impls_of
+            .non_blanket_impls()
+            .values()
+            .flatten()
+            .filter(|def_id| {
+                !matches!(tcx.type_of(*def_id).instantiate_identity().kind(), ty::Dynamic(..))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
+    let externally_visible = if !impls.is_empty()
+        && let Some(def_id) = trait_def_id.as_local()
+        // We may be executing this during typeck, which would result in cycle
+        // if we used effective_visibilities query, which looks into opaque types
+        // (and therefore calls typeck).
+        && tcx.resolutions(()).effective_visibilities.is_exported(def_id)
+    {
+        true
+    } else {
+        false
+    };
+    match &impls[..] {
+        [] => {}
+        _ if impls.len() > 9 => {}
+        [only] if externally_visible => {
+            err.help(with_no_trimmed_paths!(format!(
+                "only type `{}` is seen to implement the trait in this crate, consider using it \
+                 directly instead",
+                tcx.type_of(*only).instantiate_identity(),
+            )));
+        }
+        [only] => {
+            err.help(with_no_trimmed_paths!(format!(
+                "only type `{}` implements the trait, consider using it directly instead",
+                tcx.type_of(*only).instantiate_identity(),
+            )));
+        }
+        impls => {
+            let mut types = impls
+                .iter()
+                .map(|t| {
+                    with_no_trimmed_paths!(format!("  {}", tcx.type_of(*t).instantiate_identity(),))
+                })
+                .collect::<Vec<_>>();
+            types.sort();
+            err.help(format!(
+                "the following types implement the trait, consider defining an enum where each \
+                 variant holds one of these types, implementing `{}` for this new enum and using \
+                 it instead:\n{}",
+                trait_str,
+                types.join("\n"),
+            ));
+        }
+    }
+    if externally_visible {
+        err.note(format!(
+            "`{trait_str}` can be implemented in other crates; if you want to support your users \
+             passing their own types here, you can't refer to a specific type",
+        ));
+    }
+
     err
 }

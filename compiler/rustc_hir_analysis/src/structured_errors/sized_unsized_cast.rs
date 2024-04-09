@@ -1,5 +1,5 @@
-use crate::{errors, structured_errors::StructuredDiagnostic};
-use rustc_errors::{DiagnosticBuilder, DiagnosticId, ErrorGuaranteed};
+use crate::{errors, structured_errors::StructuredDiag};
+use rustc_errors::{codes::*, Diag};
 use rustc_middle::ty::{Ty, TypeVisitableExt};
 use rustc_session::Session;
 use rustc_span::Span;
@@ -11,17 +11,17 @@ pub struct SizedUnsizedCast<'tcx> {
     pub cast_ty: String,
 }
 
-impl<'tcx> StructuredDiagnostic<'tcx> for SizedUnsizedCast<'tcx> {
+impl<'tcx> StructuredDiag<'tcx> for SizedUnsizedCast<'tcx> {
     fn session(&self) -> &Session {
         self.sess
     }
 
-    fn code(&self) -> DiagnosticId {
-        rustc_errors::error_code!(E0607)
+    fn code(&self) -> ErrCode {
+        E0607
     }
 
-    fn diagnostic_common(&self) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
-        let mut err = self.sess.create_err(errors::CastThinPointerToFatPointer {
+    fn diagnostic_common(&self) -> Diag<'tcx> {
+        let mut err = self.sess.dcx().create_err(errors::CastThinPointerToFatPointer {
             span: self.span,
             expr_ty: self.expr_ty,
             cast_ty: self.cast_ty.to_owned(),
@@ -34,10 +34,7 @@ impl<'tcx> StructuredDiagnostic<'tcx> for SizedUnsizedCast<'tcx> {
         err
     }
 
-    fn diagnostic_extended(
-        &self,
-        mut err: DiagnosticBuilder<'tcx, ErrorGuaranteed>,
-    ) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
+    fn diagnostic_extended(&self, mut err: Diag<'tcx>) -> Diag<'tcx> {
         err.help(
             "Thin pointers are \"simple\" pointers: they are purely a reference to a
 memory address.

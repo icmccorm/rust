@@ -4,6 +4,8 @@
     clippy::no_effect,
     clippy::unit_arg,
     clippy::useless_conversion,
+    clippy::diverging_sub_expression,
+    clippy::let_unit_value,
     unused
 )]
 
@@ -35,5 +37,93 @@ fn main() -> Result<(), ()> {
     with_span! {
         return Err(())?;
     }
+
+    // Issue #11765
+    // Should not lint
+    let Some(s) = Some("") else {
+        return Err(())?;
+    };
+
+    let Some(s) = Some("") else {
+        let Some(s) = Some("") else {
+            return Err(())?;
+        };
+
+        return Err(())?;
+    };
+
+    let Some(_): Option<()> = ({
+        return Err(())?;
+    }) else {
+        panic!();
+    };
+
     Err(())
+}
+
+fn issue11616() -> Result<(), ()> {
+    let _x: String = {
+        return Err(())?;
+    };
+    let _x: () = {
+        Err(())?;
+        //~^ ERROR: unneeded `return` statement with `?` operator
+    };
+    let _x = match 1 {
+        1 => vec![1, 2],
+        _ => {
+            return Err(())?;
+        },
+    };
+    Ok(())
+}
+
+fn issue11982() {
+    mod bar {
+        pub struct Error;
+        pub fn foo(_: bool) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    pub struct Error;
+
+    impl From<bar::Error> for Error {
+        fn from(_: bar::Error) -> Self {
+            Error
+        }
+    }
+
+    fn foo(ok: bool) -> Result<(), Error> {
+        if !ok {
+            return bar::foo(ok).map(|_| Ok::<(), Error>(()))?;
+        };
+        Ok(())
+    }
+}
+
+fn issue11982_no_conversion() {
+    mod bar {
+        pub struct Error;
+        pub fn foo(_: bool) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn foo(ok: bool) -> Result<(), bar::Error> {
+        if !ok {
+            return bar::foo(ok).map(|_| Ok::<(), bar::Error>(()))?;
+        };
+        Ok(())
+    }
+}
+
+fn general_return() {
+    fn foo(ok: bool) -> Result<(), ()> {
+        let bar = Result::Ok(Result::<(), ()>::Ok(()));
+        if !ok {
+            return bar?;
+        };
+        Ok(())
+    }
 }

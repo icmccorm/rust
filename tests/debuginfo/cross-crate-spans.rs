@@ -1,16 +1,16 @@
 #![feature(omit_gdb_pretty_printer_section)]
 #![omit_gdb_pretty_printer_section]
 
-// min-lldb-version: 310
+//@ min-lldb-version: 310
 
 // This fails on lldb 6.0.1 on x86-64 Fedora 28; so mark it macOS-only
 // for now.
-// only-macos
+//@ only-macos
 
-// aux-build:cross_crate_spans.rs
+//@ aux-build:cross_crate_spans.rs
 extern crate cross_crate_spans;
 
-// compile-flags:-g
+//@ compile-flags:-g
 
 
 // === GDB TESTS ===================================================================================
@@ -43,25 +43,25 @@ extern crate cross_crate_spans;
 // lldb-command:b cross_crate_spans.rs:14
 // lldb-command:run
 
-// lldb-command:print result
-// lldbg-check:[...]$0 = { 0 = 17 1 = 17 }
+// lldb-command:v result
+// lldbg-check:[...] { 0 = 17 1 = 17 }
 // lldbr-check:((u32, u32)) result = { 0 = 17 1 = 17 }
-// lldb-command:print a_variable
-// lldbg-check:[...]$1 = 123456789
+// lldb-command:v a_variable
+// lldbg-check:[...] 123456789
 // lldbr-check:(u32) a_variable = 123456789
-// lldb-command:print another_variable
-// lldbg-check:[...]$2 = 123456789.5
+// lldb-command:v another_variable
+// lldbg-check:[...] 123456789.5
 // lldbr-check:(f64) another_variable = 123456789.5
 // lldb-command:continue
 
-// lldb-command:print result
-// lldbg-check:[...]$3 = { 0 = 1212 1 = 1212 }
+// lldb-command:v result
+// lldbg-check:[...] { 0 = 1212 1 = 1212 }
 // lldbr-check:((i16, i16)) result = { 0 = 1212 1 = 1212 }
-// lldb-command:print a_variable
-// lldbg-check:[...]$4 = 123456789
+// lldb-command:v a_variable
+// lldbg-check:[...] 123456789
 // lldbr-check:(u32) a_variable = 123456789
-// lldb-command:print another_variable
-// lldbg-check:[...]$5 = 123456789.5
+// lldb-command:v another_variable
+// lldbg-check:[...] 123456789.5
 // lldbr-check:(f64) another_variable = 123456789.5
 // lldb-command:continue
 

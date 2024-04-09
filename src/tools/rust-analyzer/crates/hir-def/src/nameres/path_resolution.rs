@@ -10,19 +10,19 @@
 //!
 //! `ReachedFixedPoint` signals about this.
 
-use base_db::Edition;
-use hir_expand::name::Name;
+use hir_expand::{name::Name, Lookup};
+use span::Edition;
 use triomphe::Arc;
 
 use crate::{
-    data::adt::VariantData,
     db::DefDatabase,
     item_scope::{ImportOrExternCrate, BUILTIN_SCOPE},
+    item_tree::Fields,
     nameres::{sub_namespace_match, BlockInfo, BuiltinShadowMode, DefMap, MacroSubNs},
     path::{ModPath, PathKind},
     per_ns::PerNs,
     visibility::{RawVisibility, Visibility},
-    AdtId, CrateId, EnumVariantId, LocalModuleId, ModuleDefId,
+    AdtId, LocalModuleId, ModuleDefId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,21 +42,21 @@ pub(super) struct ResolvePathResult {
     pub(super) resolved_def: PerNs,
     pub(super) segment_index: Option<usize>,
     pub(super) reached_fixedpoint: ReachedFixedPoint,
-    pub(super) krate: Option<CrateId>,
+    pub(super) from_differing_crate: bool,
 }
 
 impl ResolvePathResult {
     fn empty(reached_fixedpoint: ReachedFixedPoint) -> ResolvePathResult {
-        ResolvePathResult::with(PerNs::none(), reached_fixedpoint, None, None)
+        ResolvePathResult::new(PerNs::none(), reached_fixedpoint, None, false)
     }
 
-    fn with(
+    fn new(
         resolved_def: PerNs,
         reached_fixedpoint: ReachedFixedPoint,
         segment_index: Option<usize>,
-        krate: Option<CrateId>,
+        from_differing_crate: bool,
     ) -> ResolvePathResult {
-        ResolvePathResult { resolved_def, segment_index, reached_fixedpoint, krate }
+        ResolvePathResult { resolved_def, segment_index, reached_fixedpoint, from_differing_crate }
     }
 }
 
@@ -87,7 +87,7 @@ impl DefMap {
         within_impl: bool,
     ) -> Option<Visibility> {
         let mut vis = match visibility {
-            RawVisibility::Module(path) => {
+            RawVisibility::Module(path, explicitness) => {
                 let (result, remaining) =
                     self.resolve_path(db, original_module, path, BuiltinShadowMode::Module, None);
                 if remaining.is_some() {
@@ -95,9 +95,9 @@ impl DefMap {
                 }
                 let types = result.take_types()?;
                 match types {
-                    ModuleDefId::ModuleId(m) => Visibility::Module(m),
+                    ModuleDefId::ModuleId(m) => Visibility::Module(m, *explicitness),
+                    // error: visibility needs to refer to module
                     _ => {
-                        // error: visibility needs to refer to module
                         return None;
                     }
                 }
@@ -108,11 +108,11 @@ impl DefMap {
         // In block expressions, `self` normally refers to the containing non-block module, and
         // `super` to its parent (etc.). However, visibilities must only refer to a module in the
         // DefMap they're written in, so we restrict them when that happens.
-        if let Visibility::Module(m) = vis {
+        if let Visibility::Module(m, mv) = vis {
             // ...unless we're resolving visibility for an associated item in an impl.
             if self.block_id() != m.block && !within_impl {
                 cov_mark::hit!(adjust_vis_in_block_def_map);
-                vis = Visibility::Module(self.module_id(Self::ROOT));
+                vis = Visibility::Module(self.module_id(Self::ROOT), mv);
                 tracing::debug!("visibility {:?} points outside DefMap, adjusting to {:?}", m, vis);
             }
         }
@@ -134,7 +134,19 @@ impl DefMap {
         // resolving them to. Pass `None` otherwise, e.g. when we're resolving import paths.
         expected_macro_subns: Option<MacroSubNs>,
     ) -> ResolvePathResult {
-        let mut result = ResolvePathResult::empty(ReachedFixedPoint::No);
+        let mut result = self.resolve_path_fp_with_macro_single(
+            db,
+            mode,
+            original_module,
+            path,
+            shadow,
+            expected_macro_subns,
+        );
+
+        if self.block.is_none() {
+            // If we're in the root `DefMap`, we can resolve the path directly.
+            return result;
+        }
 
         let mut arc;
         let mut current_map = self;
@@ -153,8 +165,7 @@ impl DefMap {
             if result.reached_fixedpoint == ReachedFixedPoint::No {
                 result.reached_fixedpoint = new.reached_fixedpoint;
             }
-            // FIXME: this doesn't seem right; what if the different namespace resolutions come from different crates?
-            result.krate = result.krate.or(new.krate);
+            result.from_differing_crate |= new.from_differing_crate;
             result.segment_index = match (result.segment_index, new.segment_index) {
                 (Some(idx), None) => Some(idx),
                 (Some(old), Some(new)) => Some(old.max(new)),
@@ -183,15 +194,6 @@ impl DefMap {
         shadow: BuiltinShadowMode,
         expected_macro_subns: Option<MacroSubNs>,
     ) -> ResolvePathResult {
-        let graph = db.crate_graph();
-        let _cx = stdx::panic_context::enter(format!(
-            "DefMap {:?} crate_name={:?} block={:?} path={}",
-            self.krate,
-            graph[self.krate].display_name,
-            self.block,
-            path.display(db.upcast())
-        ));
-
         let mut segments = path.segments().iter().enumerate();
         let mut curr_per_ns = match path.kind {
             PathKind::DollarCrate(krate) => {
@@ -278,7 +280,7 @@ impl DefMap {
                 stdx::never!(module.is_block_module());
 
                 if self.block != def_map.block {
-                    // If we have a different `DefMap` from `self` (the orignal `DefMap` we started
+                    // If we have a different `DefMap` from `self` (the original `DefMap` we started
                     // with), resolve the remaining path segments in that `DefMap`.
                     let path =
                         ModPath::from_segments(PathKind::Super(0), path.segments().iter().cloned());
@@ -342,11 +344,11 @@ impl DefMap {
                         // expectation is discarded.
                         let (def, s) =
                             defp_map.resolve_path(db, module.local_id, &path, shadow, None);
-                        return ResolvePathResult::with(
+                        return ResolvePathResult::new(
                             def,
                             ReachedFixedPoint::Yes,
                             s.map(|s| s + i),
-                            Some(module.krate),
+                            true,
                         );
                     }
 
@@ -364,29 +366,42 @@ impl DefMap {
                 ModuleDefId::AdtId(AdtId::EnumId(e)) => {
                     // enum variant
                     cov_mark::hit!(can_import_enum_variant);
-                    let enum_data = db.enum_data(e);
-                    match enum_data.variant(segment) {
-                        Some(local_id) => {
-                            let variant = EnumVariantId { parent: e, local_id };
-                            match &*enum_data.variants[local_id].variant_data {
-                                VariantData::Record(_) => {
-                                    PerNs::types(variant.into(), Visibility::Public, None)
-                                }
-                                VariantData::Tuple(_) | VariantData::Unit => PerNs::both(
-                                    variant.into(),
-                                    variant.into(),
-                                    Visibility::Public,
-                                    None,
-                                ),
+                    let def_map;
+
+                    let loc = e.lookup(db);
+                    let tree = loc.id.item_tree(db);
+                    let current_def_map =
+                        self.krate == loc.container.krate && self.block_id() == loc.container.block;
+                    let res = if current_def_map {
+                        &self.enum_definitions[&e]
+                    } else {
+                        def_map = loc.container.def_map(db);
+                        &def_map.enum_definitions[&e]
+                    }
+                    .iter()
+                    .find_map(|&variant| {
+                        let variant_data = &tree[variant.lookup(db).id.value];
+                        (variant_data.name == *segment).then(|| match variant_data.fields {
+                            Fields::Record(_) => {
+                                PerNs::types(variant.into(), Visibility::Public, None)
                             }
-                        }
+                            Fields::Tuple(_) | Fields::Unit => PerNs::both(
+                                variant.into(),
+                                variant.into(),
+                                Visibility::Public,
+                                None,
+                            ),
+                        })
+                    });
+                    match res {
+                        Some(res) => res,
                         None => {
-                            return ResolvePathResult::with(
+                            return ResolvePathResult::new(
                                 PerNs::types(e.into(), vis, imp),
                                 ReachedFixedPoint::Yes,
                                 Some(i),
-                                Some(self.krate),
-                            );
+                                false,
+                            )
                         }
                     }
                 }
@@ -399,11 +414,11 @@ impl DefMap {
                         curr,
                     );
 
-                    return ResolvePathResult::with(
+                    return ResolvePathResult::new(
                         PerNs::types(s, vis, imp),
                         ReachedFixedPoint::Yes,
                         Some(i),
-                        Some(self.krate),
+                        false,
                     );
                 }
             };
@@ -412,7 +427,7 @@ impl DefMap {
                 .filter_visibility(|vis| vis.is_visible_from_def_map(db, self, original_module));
         }
 
-        ResolvePathResult::with(curr_per_ns, ReachedFixedPoint::Yes, None, Some(self.krate))
+        ResolvePathResult::new(curr_per_ns, ReachedFixedPoint::Yes, None, false)
     }
 
     fn resolve_name_in_module(
@@ -471,7 +486,7 @@ impl DefMap {
         let macro_use_prelude = || {
             self.macro_use_prelude.get(name).map_or(PerNs::none(), |&(it, _extern_crate)| {
                 PerNs::macros(
-                    it.into(),
+                    it,
                     Visibility::Public,
                     // FIXME?
                     None, // extern_crate.map(ImportOrExternCrate::ExternCrate),
@@ -536,7 +551,7 @@ impl DefMap {
     }
 }
 
-/// Given a block module, returns its nearest non-block module and the `DefMap` it blongs to.
+/// Given a block module, returns its nearest non-block module and the `DefMap` it belongs to.
 fn adjust_to_nearest_non_block_module(
     db: &dyn DefDatabase,
     def_map: &DefMap,

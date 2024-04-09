@@ -1,9 +1,15 @@
-// unit-test: DeadStoreElimination
-// compile-flags: -Zmir-keep-place-mention
+// Verify that we account for the `PlaceMention` statement as a use of the tuple,
+// and don't remove it as a dead store.
+//
+//@ unit-test: DeadStoreElimination-initial
+//@ compile-flags: -Zmir-keep-place-mention
 
-// EMIT_MIR place_mention.main.DeadStoreElimination.diff
+// EMIT_MIR place_mention.main.DeadStoreElimination-initial.diff
 fn main() {
-    // Verify that we account for the `PlaceMention` statement as a use of the tuple,
-    // and don't remove it as a dead store.
+    // CHECK-LABEL: fn main(
+    // CHECK-NOT: PlaceMention(
+    // CHECK: [[tmp:_.*]] =
+    // CHECK-NEXT: PlaceMention([[tmp:_.*]]);
+
     let (_, _) = ("Hello", "World");
 }

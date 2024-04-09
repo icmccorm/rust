@@ -12,14 +12,17 @@
 //! The code in this file doesn't *do anything* with those results; it
 //! just returns them for other code to use.
 
-use rustc_data_structures::fx::FxHashMap;
-use rustc_errors::Diagnostic;
-use rustc_hir as hir;
+#![allow(rustc::diagnostic_outside_of_impl)]
+#![allow(rustc::untranslatable_diagnostic)]
+
+use rustc_data_structures::fx::FxIndexMap;
+use rustc_errors::Diag;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::lang_items::LangItem;
 use rustc_hir::BodyOwnerKind;
 use rustc_index::IndexVec;
 use rustc_infer::infer::NllRegionVariableOrigin;
+use rustc_macros::extension;
 use rustc_middle::ty::fold::TypeFoldable;
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, InlineConstArgs, InlineConstArgsParts, RegionVid, Ty, TyCtxt};
@@ -58,7 +61,7 @@ pub struct UniversalRegions<'tcx> {
     num_universals: usize,
 
     /// The "defining" type for this function, with all universal
-    /// regions instantiated. For a closure or generator, this is the
+    /// regions instantiated. For a closure or coroutine, this is the
     /// closure type, but for a top-level function it's the `FnDef`.
     pub defining_ty: DefiningTy<'tcx>,
 
@@ -77,6 +80,8 @@ pub struct UniversalRegions<'tcx> {
     pub unnormalized_input_tys: &'tcx [Ty<'tcx>],
 
     pub yield_ty: Option<Ty<'tcx>>,
+
+    pub resume_ty: Option<Ty<'tcx>>,
 }
 
 /// The "defining type" for this MIR. The key feature of the "defining
@@ -91,10 +96,17 @@ pub enum DefiningTy<'tcx> {
     /// `ClosureArgs::closure_sig_ty`.
     Closure(DefId, GenericArgsRef<'tcx>),
 
-    /// The MIR is a generator. The signature is that generators take
+    /// The MIR is a coroutine. The signature is that coroutines take
     /// no parameters and return the result of
-    /// `ClosureArgs::generator_return_ty`.
-    Generator(DefId, GenericArgsRef<'tcx>, hir::Movability),
+    /// `ClosureArgs::coroutine_return_ty`.
+    Coroutine(DefId, GenericArgsRef<'tcx>),
+
+    /// The MIR is a special kind of closure that returns coroutines.
+    ///
+    /// See the documentation on `CoroutineClosureSignature` for details
+    /// on how to construct the callable signature of the coroutine from
+    /// its args.
+    CoroutineClosure(DefId, GenericArgsRef<'tcx>),
 
     /// The MIR is a fn item with the given `DefId` and args. The signature
     /// of the function can be bound then with the `fn_sig` query.
@@ -112,13 +124,14 @@ pub enum DefiningTy<'tcx> {
 
 impl<'tcx> DefiningTy<'tcx> {
     /// Returns a list of all the upvar types for this MIR. If this is
-    /// not a closure or generator, there are no upvars, and hence it
+    /// not a closure or coroutine, there are no upvars, and hence it
     /// will be an empty list. The order of types in this list will
     /// match up with the upvar order in the HIR, typesystem, and MIR.
     pub fn upvar_tys(self) -> &'tcx ty::List<Ty<'tcx>> {
         match self {
             DefiningTy::Closure(_, args) => args.as_closure().upvar_tys(),
-            DefiningTy::Generator(_, args, _) => args.as_generator().upvar_tys(),
+            DefiningTy::CoroutineClosure(_, args) => args.as_coroutine_closure().upvar_tys(),
+            DefiningTy::Coroutine(_, args) => args.as_coroutine().upvar_tys(),
             DefiningTy::FnDef(..) | DefiningTy::Const(..) | DefiningTy::InlineConst(..) => {
                 ty::List::empty()
             }
@@ -130,7 +143,9 @@ impl<'tcx> DefiningTy<'tcx> {
     /// user's code.
     pub fn implicit_inputs(self) -> usize {
         match self {
-            DefiningTy::Closure(..) | DefiningTy::Generator(..) => 1,
+            DefiningTy::Closure(..)
+            | DefiningTy::CoroutineClosure(..)
+            | DefiningTy::Coroutine(..) => 1,
             DefiningTy::FnDef(..) | DefiningTy::Const(..) | DefiningTy::InlineConst(..) => 0,
         }
     }
@@ -146,7 +161,8 @@ impl<'tcx> DefiningTy<'tcx> {
     pub fn def_id(&self) -> DefId {
         match *self {
             DefiningTy::Closure(def_id, ..)
-            | DefiningTy::Generator(def_id, ..)
+            | DefiningTy::CoroutineClosure(def_id, ..)
+            | DefiningTy::Coroutine(def_id, ..)
             | DefiningTy::FnDef(def_id, ..)
             | DefiningTy::Const(def_id, ..)
             | DefiningTy::InlineConst(def_id, ..) => def_id,
@@ -164,8 +180,8 @@ struct UniversalRegionIndices<'tcx> {
     /// be able to map them to our internal `RegionVid`. This is
     /// basically equivalent to an `GenericArgs`, except that it also
     /// contains an entry for `ReStatic` -- it might be nice to just
-    /// use a args, and then handle `ReStatic` another way.
-    indices: FxHashMap<ty::Region<'tcx>, RegionVid>,
+    /// use an args, and then handle `ReStatic` another way.
+    indices: FxIndexMap<ty::Region<'tcx>, RegionVid>,
 
     /// The vid assigned to `'static`. Used only for diagnostics.
     pub fr_static: RegionVid,
@@ -178,7 +194,7 @@ pub enum RegionClassification {
     Global,
 
     /// An **external** region is only relevant for
-    /// closures, generators, and inline consts. In that
+    /// closures, coroutines, and inline consts. In that
     /// case, it refers to regions that are free in the type
     /// -- basically, something bound in the surrounding context.
     ///
@@ -196,7 +212,7 @@ pub enum RegionClassification {
     /// Here, the lifetimes `'a` and `'b` would be **external** to the
     /// closure.
     ///
-    /// If we are not analyzing a closure/generator/inline-const,
+    /// If we are not analyzing a closure/coroutine/inline-const,
     /// there are no external lifetimes.
     External,
 
@@ -290,7 +306,7 @@ impl<'tcx> UniversalRegions<'tcx> {
         (FIRST_GLOBAL_INDEX..self.num_universals).map(RegionVid::from_usize)
     }
 
-    /// Returns `true` if `r` is classified as an local region.
+    /// Returns `true` if `r` is classified as a local region.
     pub fn is_local_free_region(&self, r: RegionVid) -> bool {
         self.region_classification(r) == Some(RegionClassification::Local)
     }
@@ -310,9 +326,6 @@ impl<'tcx> UniversalRegions<'tcx> {
     }
 
     /// Gets an iterator over all the early-bound regions that have names.
-    /// Iteration order may be unstable, so this should only be used when
-    /// iteration order doesn't affect anything
-    #[allow(rustc::potential_query_instability)]
     pub fn named_universal_regions<'s>(
         &'s self,
     ) -> impl Iterator<Item = (ty::Region<'tcx>, ty::RegionVid)> + 's {
@@ -330,7 +343,7 @@ impl<'tcx> UniversalRegions<'tcx> {
     /// that this region imposes on others. The methods in this file
     /// handle the part about dumping the inference context internal
     /// state.
-    pub(crate) fn annotate(&self, tcx: TyCtxt<'tcx>, err: &mut Diagnostic) {
+    pub(crate) fn annotate(&self, tcx: TyCtxt<'tcx>, err: &mut Diag<'_, ()>) {
         match self.defining_ty {
             DefiningTy::Closure(def_id, args) => {
                 let v = with_no_trimmed_paths!(
@@ -354,7 +367,10 @@ impl<'tcx> UniversalRegions<'tcx> {
                     err.note(format!("late-bound region is {:?}", self.to_region_vid(r)));
                 });
             }
-            DefiningTy::Generator(def_id, args, _) => {
+            DefiningTy::CoroutineClosure(..) => {
+                todo!()
+            }
+            DefiningTy::Coroutine(def_id, args) => {
                 let v = with_no_trimmed_paths!(
                     args[tcx.generics_of(def_id).parent_count..]
                         .iter()
@@ -362,7 +378,7 @@ impl<'tcx> UniversalRegions<'tcx> {
                         .collect::<Vec<_>>()
                 );
                 err.note(format!(
-                    "defining type: {} with generator args [\n    {},\n]",
+                    "defining type: {} with coroutine args [\n    {},\n]",
                     tcx.def_path_str_with_args(def_id, args),
                     v.join(",\n    "),
                 ));
@@ -426,13 +442,13 @@ impl<'cx, 'tcx> UniversalRegionsBuilder<'cx, 'tcx> {
 
         let typeck_root_def_id = self.infcx.tcx.typeck_root_def_id(self.mir_def.to_def_id());
 
-        // If this is a 'root' body (not a closure/generator/inline const), then
+        // If this is a 'root' body (not a closure/coroutine/inline const), then
         // there are no extern regions, so the local regions start at the same
         // position as the (empty) sub-list of extern regions
         let first_local_index = if self.mir_def.to_def_id() == typeck_root_def_id {
             first_extern_index
         } else {
-            // If this is a closure, generator, or inline-const, then the late-bound regions from the enclosing
+            // If this is a closure, coroutine, or inline-const, then the late-bound regions from the enclosing
             // function/closures are actually external regions to us. For example, here, 'a is not local
             // to the closure c (although it is local to the fn foo):
             // fn foo<'a>() {
@@ -462,7 +478,6 @@ impl<'cx, 'tcx> UniversalRegionsBuilder<'cx, 'tcx> {
 
         // "Liberate" the late-bound regions. These correspond to
         // "local" free regions.
-
         let bound_inputs_and_output = self.compute_inputs_and_output(&indices, defining_ty);
 
         let inputs_and_output = self.infcx.replace_bound_regions_with_nll_infer_vars(
@@ -527,9 +542,12 @@ impl<'cx, 'tcx> UniversalRegionsBuilder<'cx, 'tcx> {
         debug!("build: extern regions = {}..{}", first_extern_index, first_local_index);
         debug!("build: local regions  = {}..{}", first_local_index, num_universals);
 
-        let yield_ty = match defining_ty {
-            DefiningTy::Generator(_, args, _) => Some(args.as_generator().yield_ty()),
-            _ => None,
+        let (resume_ty, yield_ty) = match defining_ty {
+            DefiningTy::Coroutine(_, args) => {
+                let tys = args.as_coroutine();
+                (Some(tys.resume_ty()), Some(tys.yield_ty()))
+            }
+            _ => (None, None),
         };
 
         UniversalRegions {
@@ -543,6 +561,7 @@ impl<'cx, 'tcx> UniversalRegionsBuilder<'cx, 'tcx> {
             unnormalized_output_ty: *unnormalized_output_ty,
             unnormalized_input_tys,
             yield_ty,
+            resume_ty,
         }
     }
 
@@ -563,8 +582,9 @@ impl<'cx, 'tcx> UniversalRegionsBuilder<'cx, 'tcx> {
 
                 match *defining_ty.kind() {
                     ty::Closure(def_id, args) => DefiningTy::Closure(def_id, args),
-                    ty::Generator(def_id, args, movability) => {
-                        DefiningTy::Generator(def_id, args, movability)
+                    ty::Coroutine(def_id, args) => DefiningTy::Coroutine(def_id, args),
+                    ty::CoroutineClosure(def_id, args) => {
+                        DefiningTy::CoroutineClosure(def_id, args)
                     }
                     ty::FnDef(def_id, args) => DefiningTy::FnDef(def_id, args),
                     _ => span_bug!(
@@ -621,7 +641,8 @@ impl<'cx, 'tcx> UniversalRegionsBuilder<'cx, 'tcx> {
         let identity_args = GenericArgs::identity_for_item(tcx, typeck_root_def_id);
         let fr_args = match defining_ty {
             DefiningTy::Closure(_, args)
-            | DefiningTy::Generator(_, args, _)
+            | DefiningTy::CoroutineClosure(_, args)
+            | DefiningTy::Coroutine(_, args)
             | DefiningTy::InlineConst(_, args) => {
                 // In the case of closures, we rely on the fact that
                 // the first N elements in the ClosureArgs are
@@ -665,8 +686,12 @@ impl<'cx, 'tcx> UniversalRegionsBuilder<'cx, 'tcx> {
                     var: ty::BoundVar::from_usize(bound_vars.len() - 1),
                     kind: ty::BrEnv,
                 };
-                let env_region = ty::Region::new_late_bound(tcx, ty::INNERMOST, br);
-                let closure_ty = tcx.closure_env_ty(def_id, args, env_region).unwrap();
+                let env_region = ty::Region::new_bound(tcx, ty::INNERMOST, br);
+                let closure_ty = tcx.closure_env_ty(
+                    Ty::new_closure(tcx, def_id, args),
+                    args.as_closure().kind(),
+                    env_region,
+                );
 
                 // The "inputs" of the closure in the
                 // signature appear as a tuple. The MIR side
@@ -686,14 +711,63 @@ impl<'cx, 'tcx> UniversalRegionsBuilder<'cx, 'tcx> {
                 )
             }
 
-            DefiningTy::Generator(def_id, args, movability) => {
+            DefiningTy::Coroutine(def_id, args) => {
                 assert_eq!(self.mir_def.to_def_id(), def_id);
-                let resume_ty = args.as_generator().resume_ty();
-                let output = args.as_generator().return_ty();
-                let generator_ty = Ty::new_generator(tcx, def_id, args, movability);
+                let resume_ty = args.as_coroutine().resume_ty();
+                let output = args.as_coroutine().return_ty();
+                let coroutine_ty = Ty::new_coroutine(tcx, def_id, args);
                 let inputs_and_output =
-                    self.infcx.tcx.mk_type_list(&[generator_ty, resume_ty, output]);
+                    self.infcx.tcx.mk_type_list(&[coroutine_ty, resume_ty, output]);
                 ty::Binder::dummy(inputs_and_output)
+            }
+
+            // Construct the signature of the CoroutineClosure for the purposes of borrowck.
+            // This is pretty straightforward -- we:
+            // 1. first grab the `coroutine_closure_sig`,
+            // 2. compute the self type (`&`/`&mut`/no borrow),
+            // 3. flatten the tupled_input_tys,
+            // 4. construct the correct generator type to return with
+            //    `CoroutineClosureSignature::to_coroutine_given_kind_and_upvars`.
+            // Then we wrap it all up into a list of inputs and output.
+            DefiningTy::CoroutineClosure(def_id, args) => {
+                assert_eq!(self.mir_def.to_def_id(), def_id);
+                let closure_sig = args.as_coroutine_closure().coroutine_closure_sig();
+                let bound_vars = tcx.mk_bound_variable_kinds_from_iter(
+                    closure_sig
+                        .bound_vars()
+                        .iter()
+                        .chain(iter::once(ty::BoundVariableKind::Region(ty::BrEnv))),
+                );
+                let br = ty::BoundRegion {
+                    var: ty::BoundVar::from_usize(bound_vars.len() - 1),
+                    kind: ty::BrEnv,
+                };
+                let env_region = ty::Region::new_bound(tcx, ty::INNERMOST, br);
+                let closure_kind = args.as_coroutine_closure().kind();
+
+                let closure_ty = tcx.closure_env_ty(
+                    Ty::new_coroutine_closure(tcx, def_id, args),
+                    closure_kind,
+                    env_region,
+                );
+
+                let inputs = closure_sig.skip_binder().tupled_inputs_ty.tuple_fields();
+                let output = closure_sig.skip_binder().to_coroutine_given_kind_and_upvars(
+                    tcx,
+                    args.as_coroutine_closure().parent_args(),
+                    tcx.coroutine_for_closure(def_id),
+                    closure_kind,
+                    env_region,
+                    args.as_coroutine_closure().tupled_upvars_ty(),
+                    args.as_coroutine_closure().coroutine_captures_by_ref_ty(),
+                );
+
+                ty::Binder::bind_with_vars(
+                    tcx.mk_type_list_from_iter(
+                        iter::once(closure_ty).chain(inputs).chain(iter::once(output)),
+                    ),
+                    bound_vars,
+                )
             }
 
             DefiningTy::FnDef(def_id, _) => {
@@ -720,39 +794,8 @@ impl<'cx, 'tcx> UniversalRegionsBuilder<'cx, 'tcx> {
     }
 }
 
-trait InferCtxtExt<'tcx> {
-    fn replace_free_regions_with_nll_infer_vars<T>(
-        &self,
-        origin: NllRegionVariableOrigin,
-        value: T,
-    ) -> T
-    where
-        T: TypeFoldable<TyCtxt<'tcx>>;
-
-    fn replace_bound_regions_with_nll_infer_vars<T>(
-        &self,
-        origin: NllRegionVariableOrigin,
-        all_outlive_scope: LocalDefId,
-        value: ty::Binder<'tcx, T>,
-        indices: &mut UniversalRegionIndices<'tcx>,
-    ) -> T
-    where
-        T: TypeFoldable<TyCtxt<'tcx>>;
-
-    fn replace_late_bound_regions_with_nll_infer_vars_in_recursive_scope(
-        &self,
-        mir_def_id: LocalDefId,
-        indices: &mut UniversalRegionIndices<'tcx>,
-    );
-
-    fn replace_late_bound_regions_with_nll_infer_vars_in_item(
-        &self,
-        mir_def_id: LocalDefId,
-        indices: &mut UniversalRegionIndices<'tcx>,
-    );
-}
-
-impl<'cx, 'tcx> InferCtxtExt<'tcx> for BorrowckInferCtxt<'cx, 'tcx> {
+#[extension(trait InferCtxtExt<'tcx>)]
+impl<'cx, 'tcx> BorrowckInferCtxt<'cx, 'tcx> {
     #[instrument(skip(self), level = "debug")]
     fn replace_free_regions_with_nll_infer_vars<T>(
         &self,
@@ -781,10 +824,10 @@ impl<'cx, 'tcx> InferCtxtExt<'tcx> for BorrowckInferCtxt<'cx, 'tcx> {
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        let (value, _map) = self.tcx.replace_late_bound_regions(value, |br| {
+        let (value, _map) = self.tcx.instantiate_bound_regions(value, |br| {
             debug!(?br);
             let liberated_region =
-                ty::Region::new_free(self.tcx, all_outlive_scope.to_def_id(), br.kind);
+                ty::Region::new_late_param(self.tcx, all_outlive_scope.to_def_id(), br.kind);
             let region_vid = {
                 let name = match br.kind.get_name() {
                     Some(name) => name,
@@ -800,61 +843,13 @@ impl<'cx, 'tcx> InferCtxtExt<'tcx> for BorrowckInferCtxt<'cx, 'tcx> {
         });
         value
     }
-
-    /// Finds late-bound regions that do not appear in the parameter listing and adds them to the
-    /// indices vector. Typically, we identify late-bound regions as we process the inputs and
-    /// outputs of the closure/function. However, sometimes there are late-bound regions which do
-    /// not appear in the fn parameters but which are nonetheless in scope. The simplest case of
-    /// this are unused functions, like fn foo<'a>() { } (see e.g., #51351). Despite not being used,
-    /// users can still reference these regions (e.g., let x: &'a u32 = &22;), so we need to create
-    /// entries for them and store them in the indices map. This code iterates over the complete
-    /// set of late-bound regions and checks for any that we have not yet seen, adding them to the
-    /// inputs vector.
-    #[instrument(skip(self, indices))]
-    fn replace_late_bound_regions_with_nll_infer_vars_in_recursive_scope(
-        &self,
-        mir_def_id: LocalDefId,
-        indices: &mut UniversalRegionIndices<'tcx>,
-    ) {
-        for_each_late_bound_region_in_recursive_scope(self.tcx, mir_def_id, |r| {
-            debug!(?r);
-            if !indices.indices.contains_key(&r) {
-                let region_vid = {
-                    let name = r.get_name_or_anon();
-                    self.next_nll_region_var(FR, || RegionCtxt::LateBound(name))
-                };
-
-                debug!(?region_vid);
-                indices.insert_late_bound_region(r, region_vid.as_var());
-            }
-        });
-    }
-
-    #[instrument(skip(self, indices))]
-    fn replace_late_bound_regions_with_nll_infer_vars_in_item(
-        &self,
-        mir_def_id: LocalDefId,
-        indices: &mut UniversalRegionIndices<'tcx>,
-    ) {
-        for_each_late_bound_region_in_item(self.tcx, mir_def_id, |r| {
-            debug!(?r);
-            if !indices.indices.contains_key(&r) {
-                let region_vid = {
-                    let name = r.get_name_or_anon();
-                    self.next_nll_region_var(FR, || RegionCtxt::LateBound(name))
-                };
-
-                indices.insert_late_bound_region(r, region_vid.as_var());
-            }
-        });
-    }
 }
 
 impl<'tcx> UniversalRegionIndices<'tcx> {
     /// Initially, the `UniversalRegionIndices` map contains only the
     /// early-bound regions in scope. Once that is all setup, we come
     /// in later and instantiate the late-bound regions, and then we
-    /// insert the `ReFree` version of those into the map as
+    /// insert the `ReLateParam` version of those into the map as
     /// well. These are used for error reporting.
     fn insert_late_bound_region(&mut self, r: ty::Region<'tcx>, vid: ty::RegionVid) {
         debug!("insert_late_bound_region({:?}, {:?})", r, vid);
@@ -929,11 +924,12 @@ fn for_each_late_bound_region_in_item<'tcx>(
         return;
     }
 
-    for bound_var in tcx.late_bound_vars(tcx.hir().local_def_id_to_hir_id(mir_def_id)) {
+    for bound_var in tcx.late_bound_vars(tcx.local_def_id_to_hir_id(mir_def_id)) {
         let ty::BoundVariableKind::Region(bound_region) = bound_var else {
             continue;
         };
-        let liberated_region = ty::Region::new_free(tcx, mir_def_id.to_def_id(), bound_region);
+        let liberated_region =
+            ty::Region::new_late_param(tcx, mir_def_id.to_def_id(), bound_region);
         f(liberated_region);
     }
 }

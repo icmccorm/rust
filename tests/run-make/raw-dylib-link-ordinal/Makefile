@@ -13,10 +13,5 @@ ifdef IS_MSVC
 else
 	$(CC) "$(TMPDIR)"/exporter.obj exporter.def -shared -o "$(TMPDIR)"/exporter.dll
 endif
-	"$(TMPDIR)"/driver > "$(TMPDIR)"/output.txt
-
-ifdef RUSTC_BLESS_TEST
-	cp "$(TMPDIR)"/output.txt output.txt
-else
-	$(DIFF) output.txt "$(TMPDIR)"/output.txt
-endif
+	"$(TMPDIR)"/driver | tr -d '\r' > "$(TMPDIR)"/output.txt
+	$(RUSTC_TEST_OP) "$(TMPDIR)"/output.txt output.txt

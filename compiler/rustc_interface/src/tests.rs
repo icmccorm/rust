@@ -1,54 +1,36 @@
 #![allow(rustc::bad_opt_access)]
-use crate::interface::parse_cfgspecs;
-
-use rustc_data_structures::fx::FxHashSet;
+use crate::interface::parse_cfg;
 use rustc_data_structures::profiling::TimePassesFormat;
 use rustc_errors::{emitter::HumanReadableErrorType, registry, ColorConfig};
-use rustc_session::config::rustc_optgroups;
-use rustc_session::config::DebugInfo;
-use rustc_session::config::Input;
-use rustc_session::config::InstrumentXRay;
-use rustc_session::config::LinkSelfContained;
-use rustc_session::config::TraitSolver;
-use rustc_session::config::{build_configuration, build_session_options, to_crate_config};
 use rustc_session::config::{
-    BranchProtection, Externs, OomStrategy, OutFileName, OutputType, OutputTypes, PAuthKey, PacRet,
-    ProcMacroExecutionStrategy, SymbolManglingVersion, WasiExecModel,
+    build_configuration, build_session_options, rustc_optgroups, BranchProtection, CFGuard, Cfg,
+    CollapseMacroDebuginfo, CoverageOptions, DebugInfo, DumpMonoStatsFormat, ErrorOutputType,
+    ExternEntry, ExternLocation, Externs, FunctionReturn, InliningThreshold, Input,
+    InstrumentCoverage, InstrumentXRay, LinkSelfContained, LinkerPluginLto, LocationDetail, LtoCli,
+    NextSolverConfig, OomStrategy, Options, OutFileName, OutputType, OutputTypes, PAuthKey, PacRet,
+    Passes, Polonius, ProcMacroExecutionStrategy, Strip, SwitchWithOptPath, SymbolManglingVersion,
+    WasiExecModel,
 };
-use rustc_session::config::{CFGuard, ExternEntry, LinkerPluginLto, LtoCli, SwitchWithOptPath};
-use rustc_session::config::{DumpMonoStatsFormat, MirSpanview};
-use rustc_session::config::{ErrorOutputType, ExternLocation, LocationDetail, Options, Strip};
-use rustc_session::config::{InstrumentCoverage, Passes};
 use rustc_session::lint::Level;
 use rustc_session::search_paths::SearchPath;
 use rustc_session::utils::{CanonicalizedPath, NativeLib, NativeLibKind};
-use rustc_session::{build_session, getopts, Session};
-use rustc_session::{CompilerIO, EarlyErrorHandler};
+use rustc_session::{build_session, filesearch, getopts, CompilerIO, EarlyDiagCtxt, Session};
 use rustc_span::edition::{Edition, DEFAULT_EDITION};
 use rustc_span::symbol::sym;
-use rustc_span::FileName;
-use rustc_span::SourceFileHashAlgorithm;
+use rustc_span::{FileName, SourceFileHashAlgorithm};
 use rustc_target::spec::{CodeModel, LinkerFlavorCli, MergeFunctions, PanicStrategy, RelocModel};
 use rustc_target::spec::{RelroLevel, SanitizerSet, SplitDebuginfo, StackProtector, TlsModel};
-
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroUsize;
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-type CfgSpecs = FxHashSet<(String, Option<String>)>;
+fn mk_session(matches: getopts::Matches) -> (Session, Cfg) {
+    let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
+    early_dcx.initialize_checked_jobserver();
 
-fn build_session_options_and_crate_config(
-    handler: &mut EarlyErrorHandler,
-    matches: getopts::Matches,
-) -> (Options, CfgSpecs) {
-    let sessopts = build_session_options(handler, &matches);
-    let cfg = parse_cfgspecs(handler, matches.opt_strs("cfg"));
-    (sessopts, cfg)
-}
-
-fn mk_session(handler: &mut EarlyErrorHandler, matches: getopts::Matches) -> (Session, CfgSpecs) {
     let registry = registry::Registry::new(&[]);
-    let (sessopts, cfg) = build_session_options_and_crate_config(handler, matches);
+    let sessopts = build_session_options(&mut early_dcx, &matches);
     let temps_dir = sessopts.unstable_opts.temps_dir.as_deref().map(PathBuf::from);
     let io = CompilerIO {
         input: Input::Str { name: FileName::Custom(String::new()), input: String::new() },
@@ -56,8 +38,13 @@ fn mk_session(handler: &mut EarlyErrorHandler, matches: getopts::Matches) -> (Se
         output_file: None,
         temps_dir,
     };
+
+    let sysroot = filesearch::materialize_sysroot(sessopts.maybe_sysroot.clone());
+
+    let target = rustc_session::config::build_target_config(&early_dcx, &sessopts, &sysroot);
+
     let sess = build_session(
-        handler,
+        early_dcx,
         sessopts,
         io,
         None,
@@ -65,11 +52,14 @@ fn mk_session(handler: &mut EarlyErrorHandler, matches: getopts::Matches) -> (Se
         vec![],
         Default::default(),
         None,
-        None,
+        target,
+        sysroot,
         "",
         None,
+        Arc::default(),
         Default::default(),
     );
+    let cfg = parse_cfg(&sess.dcx(), matches.opt_strs("cfg"));
     (sess, cfg)
 }
 
@@ -115,6 +105,7 @@ fn assert_same_hash(x: &Options, y: &Options) {
     assert_same_clone(y);
 }
 
+#[track_caller]
 fn assert_different_hash(x: &Options, y: &Options) {
     assert_ne!(x.dep_tracking_hash(true), y.dep_tracking_hash(true));
     assert_ne!(x.dep_tracking_hash(false), y.dep_tracking_hash(false));
@@ -136,9 +127,8 @@ fn assert_non_crate_hash_different(x: &Options, y: &Options) {
 fn test_switch_implies_cfg_test() {
     rustc_span::create_default_session_globals_then(|| {
         let matches = optgroups().parse(&["--test".to_string()]).unwrap();
-        let mut handler = EarlyErrorHandler::new(ErrorOutputType::default());
-        let (sess, cfg) = mk_session(&mut handler, matches);
-        let cfg = build_configuration(&sess, to_crate_config(cfg));
+        let (sess, cfg) = mk_session(matches);
+        let cfg = build_configuration(&sess, cfg);
         assert!(cfg.contains(&(sym::test, None)));
     });
 }
@@ -148,9 +138,8 @@ fn test_switch_implies_cfg_test() {
 fn test_switch_implies_cfg_test_unless_cfg_test() {
     rustc_span::create_default_session_globals_then(|| {
         let matches = optgroups().parse(&["--test".to_string(), "--cfg=test".to_string()]).unwrap();
-        let mut handler = EarlyErrorHandler::new(ErrorOutputType::default());
-        let (sess, cfg) = mk_session(&mut handler, matches);
-        let cfg = build_configuration(&sess, to_crate_config(cfg));
+        let (sess, cfg) = mk_session(matches);
+        let cfg = build_configuration(&sess, cfg);
         let mut test_items = cfg.iter().filter(|&&(name, _)| name == sym::test);
         assert!(test_items.next().is_some());
         assert!(test_items.next().is_none());
@@ -161,24 +150,21 @@ fn test_switch_implies_cfg_test_unless_cfg_test() {
 fn test_can_print_warnings() {
     rustc_span::create_default_session_globals_then(|| {
         let matches = optgroups().parse(&["-Awarnings".to_string()]).unwrap();
-        let mut handler = EarlyErrorHandler::new(ErrorOutputType::default());
-        let (sess, _) = mk_session(&mut handler, matches);
-        assert!(!sess.diagnostic().can_emit_warnings());
+        let (sess, _) = mk_session(matches);
+        assert!(!sess.dcx().can_emit_warnings());
     });
 
     rustc_span::create_default_session_globals_then(|| {
         let matches =
             optgroups().parse(&["-Awarnings".to_string(), "-Dwarnings".to_string()]).unwrap();
-        let mut handler = EarlyErrorHandler::new(ErrorOutputType::default());
-        let (sess, _) = mk_session(&mut handler, matches);
-        assert!(sess.diagnostic().can_emit_warnings());
+        let (sess, _) = mk_session(matches);
+        assert!(sess.dcx().can_emit_warnings());
     });
 
     rustc_span::create_default_session_globals_then(|| {
         let matches = optgroups().parse(&["-Adead_code".to_string()]).unwrap();
-        let mut handler = EarlyErrorHandler::new(ErrorOutputType::default());
-        let (sess, _) = mk_session(&mut handler, matches);
-        assert!(sess.diagnostic().can_emit_warnings());
+        let (sess, _) = mk_session(matches);
+        assert!(sess.dcx().can_emit_warnings());
     });
 }
 
@@ -323,36 +309,45 @@ fn test_search_paths_tracking_hash_different_order() {
     let mut v3 = Options::default();
     let mut v4 = Options::default();
 
-    let handler = EarlyErrorHandler::new(JSON);
+    let early_dcx = EarlyDiagCtxt::new(JSON);
     const JSON: ErrorOutputType = ErrorOutputType::Json {
         pretty: false,
         json_rendered: HumanReadableErrorType::Default(ColorConfig::Never),
     };
 
+    let push = |opts: &mut Options, search_path| {
+        opts.search_paths.push(SearchPath::from_cli_opt(
+            "not-a-sysroot".as_ref(),
+            &opts.target_triple,
+            &early_dcx,
+            search_path,
+        ));
+    };
+
     // Reference
-    v1.search_paths.push(SearchPath::from_cli_opt(&handler, "native=abc"));
-    v1.search_paths.push(SearchPath::from_cli_opt(&handler, "crate=def"));
-    v1.search_paths.push(SearchPath::from_cli_opt(&handler, "dependency=ghi"));
-    v1.search_paths.push(SearchPath::from_cli_opt(&handler, "framework=jkl"));
-    v1.search_paths.push(SearchPath::from_cli_opt(&handler, "all=mno"));
+    push(&mut v1, "native=abc");
+    push(&mut v1, "crate=def");
+    push(&mut v1, "dependency=ghi");
+    push(&mut v1, "framework=jkl");
+    push(&mut v1, "all=mno");
 
-    v2.search_paths.push(SearchPath::from_cli_opt(&handler, "native=abc"));
-    v2.search_paths.push(SearchPath::from_cli_opt(&handler, "dependency=ghi"));
-    v2.search_paths.push(SearchPath::from_cli_opt(&handler, "crate=def"));
-    v2.search_paths.push(SearchPath::from_cli_opt(&handler, "framework=jkl"));
-    v2.search_paths.push(SearchPath::from_cli_opt(&handler, "all=mno"));
+    push(&mut v2, "native=abc");
+    push(&mut v2, "dependency=ghi");
+    push(&mut v2, "crate=def");
+    push(&mut v2, "framework=jkl");
+    push(&mut v2, "all=mno");
 
-    v3.search_paths.push(SearchPath::from_cli_opt(&handler, "crate=def"));
-    v3.search_paths.push(SearchPath::from_cli_opt(&handler, "framework=jkl"));
-    v3.search_paths.push(SearchPath::from_cli_opt(&handler, "native=abc"));
-    v3.search_paths.push(SearchPath::from_cli_opt(&handler, "dependency=ghi"));
-    v3.search_paths.push(SearchPath::from_cli_opt(&handler, "all=mno"));
+    push(&mut v3, "crate=def");
+    push(&mut v3, "framework=jkl");
+    push(&mut v3, "native=abc");
+    push(&mut v3, "dependency=ghi");
+    push(&mut v3, "all=mno");
 
-    v4.search_paths.push(SearchPath::from_cli_opt(&handler, "all=mno"));
-    v4.search_paths.push(SearchPath::from_cli_opt(&handler, "native=abc"));
-    v4.search_paths.push(SearchPath::from_cli_opt(&handler, "crate=def"));
-    v4.search_paths.push(SearchPath::from_cli_opt(&handler, "dependency=ghi"));
-    v4.search_paths.push(SearchPath::from_cli_opt(&handler, "framework=jkl"));
+    push(&mut v4, "all=mno");
+    push(&mut v4, "native=abc");
+    push(&mut v4, "crate=def");
+    push(&mut v4, "dependency=ghi");
+    push(&mut v4, "framework=jkl");
 
     assert_same_hash(&v1, &v2);
     assert_same_hash(&v1, &v3);
@@ -611,7 +606,7 @@ fn test_codegen_options_tracking_hash() {
     tracked!(force_frame_pointers, Some(false));
     tracked!(force_unwind_tables, Some(true));
     tracked!(inline_threshold, Some(0xf007ba11));
-    tracked!(instrument_coverage, Some(InstrumentCoverage::All));
+    tracked!(instrument_coverage, InstrumentCoverage::Yes);
     tracked!(link_dead_code, Some(true));
     tracked!(linker_plugin_lto, LinkerPluginLto::LinkerPluginAuto);
     tracked!(llvm_args, vec![String::from("1"), String::from("2")]);
@@ -681,15 +676,12 @@ fn test_unstable_options_tracking_hash() {
     // tidy-alphabetical-start
     untracked!(assert_incr_state, Some(String::from("loaded")));
     untracked!(deduplicate_diagnostics, false);
-    untracked!(dep_tasks, true);
-    untracked!(dont_buffer_diagnostics, true);
     untracked!(dump_dep_graph, true);
     untracked!(dump_mir, Some(String::from("abc")));
     untracked!(dump_mir_dataflow, true);
     untracked!(dump_mir_dir, String::from("abc"));
     untracked!(dump_mir_exclude_pass_number, true);
     untracked!(dump_mir_graphviz, true);
-    untracked!(dump_mir_spanview, Some(MirSpanview::Statement));
     untracked!(dump_mono_stats, SwitchWithOptPath::Enabled(Some("mono-items-dir/".into())));
     untracked!(dump_mono_stats_format, DumpMonoStatsFormat::Json);
     untracked!(dylib_lto, true);
@@ -700,7 +692,6 @@ fn test_unstable_options_tracking_hash() {
     untracked!(incremental_info, true);
     untracked!(incremental_verify_ich, true);
     untracked!(input_stats, true);
-    untracked!(keep_hygiene_data, true);
     untracked!(link_native_libraries, false);
     untracked!(llvm_time_trace, true);
     untracked!(ls, vec!["all".to_owned()]);
@@ -710,9 +701,8 @@ fn test_unstable_options_tracking_hash() {
     untracked!(nll_facts, true);
     untracked!(no_analysis, true);
     untracked!(no_leak_check, true);
-    untracked!(no_parallel_llvm, true);
+    untracked!(no_parallel_backend, true);
     untracked!(parse_only, true);
-    untracked!(perf_stats, true);
     // `pre_link_arg` is omitted because it just forwards to `pre_link_args`.
     untracked!(pre_link_args, vec![String::from("abc"), String::from("def")]);
     untracked!(print_codegen_stats, true);
@@ -725,6 +715,7 @@ fn test_unstable_options_tracking_hash() {
     untracked!(query_dep_graph, true);
     untracked!(self_profile, SwitchWithOptPath::Enabled(None));
     untracked!(self_profile_events, Some(vec![String::new()]));
+    untracked!(shell_argfiles, true);
     untracked!(span_debug, true);
     untracked!(span_free_formats, true);
     untracked!(temps_dir, Some(String::from("abc")));
@@ -739,7 +730,6 @@ fn test_unstable_options_tracking_hash() {
     untracked!(unpretty, Some("expanded".to_string()));
     untracked!(unstable_options, true);
     untracked!(validate_mir, true);
-    untracked!(verbose, true);
     untracked!(write_long_types_to_disk, false);
     // tidy-alphabetical-end
 
@@ -768,10 +758,15 @@ fn test_unstable_options_tracking_hash() {
         })
     );
     tracked!(codegen_backend, Some("abc".to_string()));
+    tracked!(collapse_macro_debuginfo, CollapseMacroDebuginfo::Yes);
+    tracked!(coverage_options, CoverageOptions { branch: true });
     tracked!(crate_attr, vec!["abc".to_string()]);
+    tracked!(cross_crate_inline_threshold, InliningThreshold::Always);
     tracked!(debug_info_for_profiling, true);
     tracked!(debug_macros, true);
+    tracked!(default_hidden_visibility, Some(true));
     tracked!(dep_info_omit_d_target, true);
+    tracked!(direct_access_external_data, Some(true));
     tracked!(dual_proc_macros, true);
     tracked!(dwarf_version, Some(5));
     tracked!(emit_thin_lto, false);
@@ -780,6 +775,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(flatten_format_args, false);
     tracked!(force_unstable_if_unmarked, true);
     tracked!(fuel, Some(("abc".to_string(), 99)));
+    tracked!(function_return, FunctionReturn::ThunkExtern);
     tracked!(function_sections, Some(false));
     tracked!(human_readable_cgu_names, true);
     tracked!(incremental_ignore_spans, true);
@@ -787,11 +783,11 @@ fn test_unstable_options_tracking_hash() {
     tracked!(inline_mir, Some(true));
     tracked!(inline_mir_hint_threshold, Some(123));
     tracked!(inline_mir_threshold, Some(123));
-    tracked!(instrument_coverage, Some(InstrumentCoverage::All));
     tracked!(instrument_mcount, true);
     tracked!(instrument_xray, Some(InstrumentXRay::default()));
     tracked!(link_directives, false);
     tracked!(link_only, true);
+    tracked!(llvm_module_flag, vec![("bar".to_string(), 123, "max".to_string())]);
     tracked!(llvm_plugins, vec![String::from("plugin_name")]);
     tracked!(location_detail, LocationDetail { file: true, line: false, column: false });
     tracked!(maximal_hir_to_mir_coverage, true);
@@ -802,6 +798,10 @@ fn test_unstable_options_tracking_hash() {
     tracked!(mir_opt_level, Some(4));
     tracked!(move_size_limit, Some(4096));
     tracked!(mutable_noalias, false);
+    tracked!(
+        next_solver,
+        Some(NextSolverConfig { coherence: true, globally: false, dump_tree: Default::default() })
+    );
     tracked!(no_generate_arange_section, true);
     tracked!(no_jump_tables, true);
     tracked!(no_link, true);
@@ -814,7 +814,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(panic_abort_tests, true);
     tracked!(panic_in_drop, PanicStrategy::Abort);
     tracked!(plt, Some(true));
-    tracked!(polonius, true);
+    tracked!(polonius, Polonius::Legacy);
     tracked!(precise_enum_drop_elaboration, false);
     tracked!(print_fuel, Some("abc".to_string()));
     tracked!(profile, true);
@@ -824,11 +824,11 @@ fn test_unstable_options_tracking_hash() {
     tracked!(relax_elf_relocations, Some(true));
     tracked!(relro_level, Some(RelroLevel::Full));
     tracked!(remap_cwd_prefix, Some(PathBuf::from("abc")));
-    tracked!(report_delayed_bugs, true);
     tracked!(sanitizer, SanitizerSet::ADDRESS);
     tracked!(sanitizer_cfi_canonical_jump_tables, None);
     tracked!(sanitizer_cfi_generalize_pointers, Some(true));
     tracked!(sanitizer_cfi_normalize_integers, Some(true));
+    tracked!(sanitizer_dataflow_abilist, vec![String::from("/rustc/abc")]);
     tracked!(sanitizer_memory_track_origins, 2);
     tracked!(sanitizer_recover, SanitizerSet::ADDRESS);
     tracked!(saturating_float_casts, Some(true));
@@ -838,16 +838,13 @@ fn test_unstable_options_tracking_hash() {
     tracked!(split_lto_unit, Some(true));
     tracked!(src_hash_algorithm, Some(SourceFileHashAlgorithm::Sha1));
     tracked!(stack_protector, StackProtector::All);
-    tracked!(symbol_mangling_version, Some(SymbolManglingVersion::V0));
     tracked!(teach, true);
     tracked!(thinlto, Some(true));
-    tracked!(thir_unsafeck, true);
     tracked!(tiny_const_eval_limit, true);
     tracked!(tls_model, Some(TlsModel::GeneralDynamic));
-    tracked!(trait_solver, TraitSolver::NextCoherence);
     tracked!(translate_remapped_path_to_local_path, false);
     tracked!(trap_unreachable, Some(false));
-    tracked!(treat_err_as_bug, NonZeroUsize::new(1));
+    tracked!(treat_err_as_bug, NonZero::new(1));
     tracked!(tune_cpu, Some(String::from("abc")));
     tracked!(uninit_const_chunk_threshold, 123);
     tracked!(unleash_the_miri_inside_of_you, true);
@@ -866,6 +863,7 @@ fn test_unstable_options_tracking_hash() {
         };
     }
     tracked_no_crate_hash!(no_codegen, true);
+    tracked_no_crate_hash!(verbose_internals, true);
 }
 
 #[test]
@@ -874,9 +872,9 @@ fn test_edition_parsing() {
     let options = Options::default();
     assert!(options.edition == DEFAULT_EDITION);
 
-    let mut handler = EarlyErrorHandler::new(ErrorOutputType::default());
+    let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     let matches = optgroups().parse(&["--edition=2018".to_string()]).unwrap();
-    let (sessopts, _) = build_session_options_and_crate_config(&mut handler, matches);
+    let sessopts = build_session_options(&mut early_dcx, &matches);
     assert!(sessopts.edition == Edition::Edition2018)
 }

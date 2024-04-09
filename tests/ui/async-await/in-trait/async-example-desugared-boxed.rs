@@ -1,19 +1,18 @@
-// edition: 2021
-
-#![feature(async_fn_in_trait)]
-#![feature(return_position_impl_trait_in_trait)]
-#![allow(incomplete_features)]
+//@ edition: 2021
+//@ check-pass
 
 use std::future::Future;
 use std::pin::Pin;
 
-trait MyTrait {
+#[allow(async_fn_in_trait)]
+pub trait MyTrait {
     async fn foo(&self) -> i32;
 }
 
 impl MyTrait for i32 {
+    #[warn(refining_impl_trait)]
     fn foo(&self) -> Pin<Box<dyn Future<Output = i32> + '_>> {
-        //~^ ERROR method `foo` should be async
+        //~^ WARN impl trait in impl method signature does not match trait method signature
         Box::pin(async { *self })
     }
 }

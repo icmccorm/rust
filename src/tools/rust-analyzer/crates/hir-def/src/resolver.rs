@@ -1,8 +1,11 @@
 //! Name resolution façade.
-use std::{fmt, hash::BuildHasherDefault};
+use std::{fmt, hash::BuildHasherDefault, mem};
 
 use base_db::CrateId;
-use hir_expand::name::{name, Name};
+use hir_expand::{
+    name::{name, Name},
+    MacroDefId,
+};
 use indexmap::IndexMap;
 use intern::Interned;
 use rustc_hash::FxHashSet;
@@ -21,12 +24,13 @@ use crate::{
     nameres::{DefMap, MacroSubNs},
     path::{ModPath, Path, PathKind},
     per_ns::PerNs,
+    type_ref::LifetimeRef,
     visibility::{RawVisibility, Visibility},
     AdtId, ConstId, ConstParamId, CrateRootModuleId, DefWithBodyId, EnumId, EnumVariantId,
     ExternBlockId, ExternCrateId, FunctionId, GenericDefId, GenericParamId, HasModule, ImplId,
-    ItemContainerId, LifetimeParamId, LocalModuleId, Lookup, Macro2Id, MacroId, MacroRulesId,
-    ModuleDefId, ModuleId, ProcMacroId, StaticId, StructId, TraitAliasId, TraitId, TypeAliasId,
-    TypeOrConstParamId, TypeOwnerId, TypeParamId, UseId, VariantId,
+    ItemContainerId, ItemTreeLoc, LifetimeParamId, LocalModuleId, Lookup, Macro2Id, MacroId,
+    MacroRulesId, ModuleDefId, ModuleId, ProcMacroId, StaticId, StructId, TraitAliasId, TraitId,
+    TypeAliasId, TypeOrConstParamId, TypeOwnerId, TypeParamId, UseId, VariantId,
 };
 
 #[derive(Debug, Clone)]
@@ -115,6 +119,12 @@ pub enum ValueNs {
     StructId(StructId),
     EnumVariantId(EnumVariantId),
     GenericParam(ConstParamId),
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum LifetimeNs {
+    Static,
+    LifetimeParam(LifetimeParamId),
 }
 
 impl Resolver {
@@ -236,16 +246,16 @@ impl Resolver {
         db: &dyn DefDatabase,
         visibility: &RawVisibility,
     ) -> Option<Visibility> {
-        let within_impl =
-            self.scopes().find(|scope| matches!(scope, Scope::ImplDefScope(_))).is_some();
+        let within_impl = self.scopes().any(|scope| matches!(scope, Scope::ImplDefScope(_)));
         match visibility {
-            RawVisibility::Module(_) => {
+            RawVisibility::Module(_, _) => {
                 let (item_map, module) = self.item_scope();
                 item_map.resolve_visibility(db, module, visibility, within_impl)
             }
             RawVisibility::Public => Some(Visibility::Public),
         }
     }
+
     pub fn resolve_path_in_value_ns(
         &self,
         db: &dyn DefDatabase,
@@ -406,6 +416,28 @@ impl Resolver {
             .take_macros_import()
     }
 
+    pub fn resolve_path_as_macro_def(
+        &self,
+        db: &dyn DefDatabase,
+        path: &ModPath,
+        expected_macro_kind: Option<MacroSubNs>,
+    ) -> Option<MacroDefId> {
+        self.resolve_path_as_macro(db, path, expected_macro_kind).map(|(it, _)| db.macro_def(it))
+    }
+
+    pub fn resolve_lifetime(&self, lifetime: &LifetimeRef) -> Option<LifetimeNs> {
+        if lifetime.name == name::known::STATIC_LIFETIME {
+            return Some(LifetimeNs::Static);
+        }
+
+        self.scopes().find_map(|scope| match scope {
+            Scope::GenericParams { def, params } => {
+                params.find_lifetime_by_name(&lifetime.name, *def).map(LifetimeNs::LifetimeParam)
+            }
+            _ => None,
+        })
+    }
+
     /// Returns a set of names available in the current scope.
     ///
     /// Note that this is a somewhat fuzzy concept -- internally, the compiler
@@ -497,7 +529,7 @@ impl Resolver {
             .map(|id| ExternCrateDeclData::extern_crate_decl_data_query(db, id).name.clone())
     }
 
-    pub fn extern_crates_in_scope<'a>(&'a self) -> impl Iterator<Item = (Name, ModuleId)> + 'a {
+    pub fn extern_crates_in_scope(&self) -> impl Iterator<Item = (Name, ModuleId)> + '_ {
         self.module_scope
             .def_map
             .extern_prelude()
@@ -588,6 +620,24 @@ impl Resolver {
             _ => None,
         })
     }
+
+    pub fn type_owner(&self) -> Option<TypeOwnerId> {
+        self.scopes().find_map(|scope| match scope {
+            Scope::BlockScope(_) => None,
+            &Scope::GenericParams { def, .. } => Some(def.into()),
+            &Scope::ImplDefScope(id) => Some(id.into()),
+            &Scope::AdtScope(adt) => Some(adt.into()),
+            Scope::ExprScope(it) => Some(it.owner.into()),
+        })
+    }
+
+    pub fn impl_def(&self) -> Option<ImplId> {
+        self.scopes().find_map(|scope| match scope {
+            Scope::ImplDefScope(def) => Some(*def),
+            _ => None,
+        })
+    }
+
     /// `expr_id` is required to be an expression id that comes after the top level expression scope in the given resolver
     #[must_use]
     pub fn update_to_inner_scope(
@@ -779,7 +829,7 @@ fn resolver_for_scope_(
     for scope in scope_chain.into_iter().rev() {
         if let Some(block) = scopes.block(scope) {
             let def_map = db.block_def_map(block);
-            r = r.push_block_scope(def_map, DefMap::ROOT);
+            r = r.push_block_scope(def_map);
             // FIXME: This adds as many module scopes as there are blocks, but resolving in each
             // already traverses all parents, so this is O(n²). I think we could only store the
             // innermost module scope instead?
@@ -805,8 +855,9 @@ impl Resolver {
         self.push_scope(Scope::ImplDefScope(impl_def))
     }
 
-    fn push_block_scope(self, def_map: Arc<DefMap>, module_id: LocalModuleId) -> Resolver {
-        self.push_scope(Scope::BlockScope(ModuleItemMap { def_map, module_id }))
+    fn push_block_scope(self, def_map: Arc<DefMap>) -> Resolver {
+        debug_assert!(def_map.block_id().is_some());
+        self.push_scope(Scope::BlockScope(ModuleItemMap { def_map, module_id: DefMap::ROOT }))
     }
 
     fn push_expr_scope(
@@ -956,19 +1007,27 @@ pub trait HasResolver: Copy {
 impl HasResolver for ModuleId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
         let mut def_map = self.def_map(db);
-        let mut modules: SmallVec<[_; 1]> = smallvec![];
         let mut module_id = self.local_id;
+        let mut modules: SmallVec<[_; 1]> = smallvec![];
+
+        if !self.is_block_module() {
+            return Resolver { scopes: vec![], module_scope: ModuleItemMap { def_map, module_id } };
+        }
+
         while let Some(parent) = def_map.parent() {
-            modules.push((def_map, module_id));
-            def_map = parent.def_map(db);
-            module_id = parent.local_id;
+            let block_def_map = mem::replace(&mut def_map, parent.def_map(db));
+            modules.push(block_def_map);
+            if !parent.is_block_module() {
+                module_id = parent.local_id;
+                break;
+            }
         }
         let mut resolver = Resolver {
             scopes: Vec::with_capacity(modules.len()),
             module_scope: ModuleItemMap { def_map, module_id },
         };
-        for (def_map, module) in modules.into_iter().rev() {
-            resolver = resolver.push_block_scope(def_map, module);
+        for def_map in modules.into_iter().rev() {
+            resolver = resolver.push_block_scope(def_map);
         }
         resolver
     }
@@ -985,13 +1044,13 @@ impl HasResolver for CrateRootModuleId {
 
 impl HasResolver for TraitId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
-        self.lookup(db).container.resolver(db).push_generic_params_scope(db, self.into())
+        lookup_resolver(db, self).push_generic_params_scope(db, self.into())
     }
 }
 
 impl HasResolver for TraitAliasId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
-        self.lookup(db).container.resolver(db).push_generic_params_scope(db, self.into())
+        lookup_resolver(db, self).push_generic_params_scope(db, self.into())
     }
 }
 
@@ -1007,25 +1066,25 @@ impl<T: Into<AdtId> + Copy> HasResolver for T {
 
 impl HasResolver for FunctionId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
-        self.lookup(db).container.resolver(db).push_generic_params_scope(db, self.into())
+        lookup_resolver(db, self).push_generic_params_scope(db, self.into())
     }
 }
 
 impl HasResolver for ConstId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
-        self.lookup(db).container.resolver(db)
+        lookup_resolver(db, self)
     }
 }
 
 impl HasResolver for StaticId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
-        self.lookup(db).container.resolver(db)
+        lookup_resolver(db, self)
     }
 }
 
 impl HasResolver for TypeAliasId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
-        self.lookup(db).container.resolver(db).push_generic_params_scope(db, self.into())
+        lookup_resolver(db, self).push_generic_params_scope(db, self.into())
     }
 }
 
@@ -1042,19 +1101,19 @@ impl HasResolver for ImplId {
 impl HasResolver for ExternBlockId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
         // Same as parent's
-        self.lookup(db).container.resolver(db)
+        lookup_resolver(db, self)
     }
 }
 
 impl HasResolver for ExternCrateId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
-        self.lookup(db).container.resolver(db)
+        lookup_resolver(db, self)
     }
 }
 
 impl HasResolver for UseId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
-        self.lookup(db).container.resolver(db)
+        lookup_resolver(db, self)
     }
 }
 
@@ -1071,7 +1130,6 @@ impl HasResolver for TypeOwnerId {
             TypeOwnerId::TypeAliasId(it) => it.resolver(db),
             TypeOwnerId::ImplId(it) => it.resolver(db),
             TypeOwnerId::EnumVariantId(it) => it.resolver(db),
-            TypeOwnerId::ModuleId(it) => it.resolver(db),
         }
     }
 }
@@ -1082,7 +1140,7 @@ impl HasResolver for DefWithBodyId {
             DefWithBodyId::ConstId(c) => c.resolver(db),
             DefWithBodyId::FunctionId(f) => f.resolver(db),
             DefWithBodyId::StaticId(s) => s.resolver(db),
-            DefWithBodyId::VariantId(v) => v.parent.resolver(db),
+            DefWithBodyId::VariantId(v) => v.resolver(db),
             DefWithBodyId::InTypeConstId(c) => c.lookup(db).owner.resolver(db),
         }
     }
@@ -1108,7 +1166,7 @@ impl HasResolver for GenericDefId {
             GenericDefId::TraitAliasId(inner) => inner.resolver(db),
             GenericDefId::TypeAliasId(inner) => inner.resolver(db),
             GenericDefId::ImplId(inner) => inner.resolver(db),
-            GenericDefId::EnumVariantId(inner) => inner.parent.resolver(db),
+            GenericDefId::EnumVariantId(inner) => inner.resolver(db),
             GenericDefId::ConstId(inner) => inner.resolver(db),
         }
     }
@@ -1116,14 +1174,14 @@ impl HasResolver for GenericDefId {
 
 impl HasResolver for EnumVariantId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
-        self.parent.resolver(db)
+        self.lookup(db).parent.resolver(db)
     }
 }
 
 impl HasResolver for VariantId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
         match self {
-            VariantId::EnumVariantId(it) => it.parent.resolver(db),
+            VariantId::EnumVariantId(it) => it.resolver(db),
             VariantId::StructId(it) => it.resolver(db),
             VariantId::UnionId(it) => it.resolver(db),
         }
@@ -1142,18 +1200,28 @@ impl HasResolver for MacroId {
 
 impl HasResolver for Macro2Id {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
-        self.lookup(db).container.resolver(db)
+        lookup_resolver(db, self)
     }
 }
 
 impl HasResolver for ProcMacroId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
-        self.lookup(db).container.resolver(db)
+        lookup_resolver(db, self)
     }
 }
 
 impl HasResolver for MacroRulesId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
-        self.lookup(db).container.resolver(db)
+        lookup_resolver(db, self)
     }
+}
+
+fn lookup_resolver<'db>(
+    db: &(dyn DefDatabase + 'db),
+    lookup: impl Lookup<
+        Database<'db> = dyn DefDatabase + 'db,
+        Data = impl ItemTreeLoc<Container = impl HasResolver>,
+    >,
+) -> Resolver {
+    lookup.lookup(db).container().resolver(db)
 }

@@ -221,7 +221,7 @@ metrics.
 ## link-self-contained
 
 On `windows-gnu`, `linux-musl`, and `wasi` targets, this flag controls whether the
-linker will use libraries and objects shipped with Rust instead or those in the system.
+linker will use libraries and objects shipped with Rust instead of those in the system.
 It takes one of the following values:
 
 * no value: rustc will use heuristic to disable self-contained mode if system has necessary tools.
@@ -249,11 +249,6 @@ flavor. Valid options are:
 * `gcc`: use the `cc` executable, which is typically gcc or clang on many systems.
 * `ld`: use the `ld` executable.
 * `msvc`: use the `link.exe` executable from Microsoft Visual Studio MSVC.
-* `ptx-linker`: use
-  [`rust-ptx-linker`](https://github.com/denzp/rust-ptx-linker) for Nvidia
-  NVPTX GPGPU support.
-* `bpf-linker`: use
-  [`bpf-linker`](https://github.com/alessandrod/bpf-linker) for eBPF support.
 * `wasm-ld`: use the [`wasm-ld`](https://lld.llvm.org/WebAssembly.html)
   executable, a port of LLVM `lld` for WebAssembly.
 * `ld64.lld`: use the LLVM `lld` executable with the [`-flavor darwin`
@@ -558,9 +553,17 @@ Supported values for this option are:
   of MSVC).
 - `debuginfo` - debuginfo sections and debuginfo symbols from the symbol table
   section are stripped at link time and are not copied to the produced binary
-  or separate files.
-- `symbols` - same as `debuginfo`, but the rest of the symbol table section is
-  stripped as well if the linker supports it.
+  or separate files. This should leave backtraces mostly-intact but may make
+  using a debugger like gdb or lldb ineffectual.
+- `symbols` - same as `debuginfo`, but the rest of the symbol table section is stripped as well,
+  depending on platform support. On platforms which depend on this symbol table for backtraces,
+  profiling, and similar, this can affect them so negatively as to make the trace incomprehensible.
+  Programs which may be combined with others, such as CLI pipelines and developer tooling,
+  or even anything which wants crash-reporting, should usually avoid `-Cstrip=symbols`.
+
+Note that, at any level, removing debuginfo only necessarily impacts "friendly" introspection.
+`-Cstrip` cannot be relied on as a meaningful security or obfuscation measure, as disassemblers
+and decompilers can extract considerable information even in the absence of symbols.
 
 ## symbol-mangling-version
 

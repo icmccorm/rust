@@ -4,12 +4,11 @@ use clippy_utils::{def_path_def_ids, trait_ref_of_method};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir as hir;
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::query::Key;
 use rustc_middle::ty::{Adt, Ty};
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_session::impl_lint_pass;
 use rustc_span::def_id::LocalDefId;
-use rustc_span::source_map::Span;
 use rustc_span::symbol::sym;
+use rustc_span::Span;
 use std::iter;
 
 declare_clippy_lint! {
@@ -47,7 +46,7 @@ declare_clippy_lint! {
     /// [#6745](https://github.com/rust-lang/rust-clippy/issues/6745).
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// use std::cmp::{PartialEq, Eq};
     /// use std::collections::HashSet;
     /// use std::hash::{Hash, Hasher};
@@ -122,7 +121,7 @@ impl<'tcx> LateLintPass<'tcx> for MutableKeyType {
         }
     }
 
-    fn check_local(&mut self, cx: &LateContext<'_>, local: &hir::Local<'_>) {
+    fn check_local(&mut self, cx: &LateContext<'_>, local: &hir::LetStmt<'_>) {
         if let hir::PatKind::Wild = local.pat.kind {
             return;
         }
@@ -143,7 +142,11 @@ impl MutableKeyType {
         for (hir_ty, ty) in iter::zip(decl.inputs, fn_sig.inputs().skip_binder()) {
             self.check_ty_(cx, hir_ty.span, *ty);
         }
-        self.check_ty_(cx, decl.output.span(), cx.tcx.erase_late_bound_regions(fn_sig.output()));
+        self.check_ty_(
+            cx,
+            decl.output.span(),
+            cx.tcx.instantiate_bound_regions_with_erased(fn_sig.output()),
+        );
     }
 
     // We want to lint 1. sets or maps with 2. not immutable key types and 3. no unerased
@@ -162,7 +165,7 @@ impl MutableKeyType {
             // Determines if a type contains interior mutability which would affect its implementation of
             // [`Hash`] or [`Ord`].
             if is_interior_mut_ty(cx, subst_ty)
-                && !matches!(subst_ty.ty_adt_id(), Some(adt_id) if self.ignore_mut_def_ids.contains(&adt_id))
+                && !matches!(subst_ty.ty_adt_def(), Some(adt) if self.ignore_mut_def_ids.contains(&adt.did()))
             {
                 span_lint(cx, MUTABLE_KEY_TYPE, span, "mutable key type");
             }

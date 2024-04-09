@@ -1,4 +1,5 @@
 use super::*;
+use core::mem::size_of;
 use std::cell::Cell;
 
 #[test]
@@ -104,13 +105,14 @@ fn zst() {
     let v: RawVec<ZST> = RawVec::with_capacity_in(100, Global);
     zst_sanity(&v);
 
-    let v: RawVec<ZST> = RawVec::allocate_in(0, AllocInit::Uninitialized, Global);
+    let v: RawVec<ZST> = RawVec::try_allocate_in(0, AllocInit::Uninitialized, Global).unwrap();
     zst_sanity(&v);
 
-    let v: RawVec<ZST> = RawVec::allocate_in(100, AllocInit::Uninitialized, Global);
+    let v: RawVec<ZST> = RawVec::try_allocate_in(100, AllocInit::Uninitialized, Global).unwrap();
     zst_sanity(&v);
 
-    let mut v: RawVec<ZST> = RawVec::allocate_in(usize::MAX, AllocInit::Uninitialized, Global);
+    let mut v: RawVec<ZST> =
+        RawVec::try_allocate_in(usize::MAX, AllocInit::Uninitialized, Global).unwrap();
     zst_sanity(&v);
 
     // Check all these operations work as expected with zero-sized elements.
@@ -160,4 +162,12 @@ fn zst_reserve_exact_panic() {
     zst_sanity(&v);
 
     v.reserve_exact(101, usize::MAX - 100);
+}
+
+#[test]
+fn niches() {
+    let baseline = size_of::<RawVec<u8>>();
+    assert_eq!(size_of::<Option<RawVec<u8>>>(), baseline);
+    assert_eq!(size_of::<Option<Option<RawVec<u8>>>>(), baseline);
+    assert_eq!(size_of::<Option<Option<Option<RawVec<u8>>>>>(), baseline);
 }

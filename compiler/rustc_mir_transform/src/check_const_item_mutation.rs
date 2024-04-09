@@ -13,7 +13,7 @@ pub struct CheckConstItemMutation;
 impl<'tcx> MirLint<'tcx> for CheckConstItemMutation {
     fn run_lint(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
         let mut checker = ConstMutationChecker { body, tcx, target_local: None };
-        checker.visit_body(&body);
+        checker.visit_body(body);
     }
 }
 
@@ -97,13 +97,15 @@ impl<'tcx> Visitor<'tcx> for ConstMutationChecker<'_, 'tcx> {
             // so emitting a lint would be redundant.
             if !lhs.projection.is_empty() {
                 if let Some(def_id) = self.is_const_item_without_destructor(lhs.local)
-                    && let Some((lint_root, span, item)) = self.should_lint_const_item_usage(&lhs, def_id, loc) {
-                        self.tcx.emit_spanned_lint(
-                            CONST_ITEM_MUTATION,
-                            lint_root,
-                            span,
-                            errors::ConstMutate::Modify { konst: item }
-                        );
+                    && let Some((lint_root, span, item)) =
+                        self.should_lint_const_item_usage(lhs, def_id, loc)
+                {
+                    self.tcx.emit_node_span_lint(
+                        CONST_ITEM_MUTATION,
+                        lint_root,
+                        span,
+                        errors::ConstMutate::Modify { konst: item },
+                    );
                 }
             }
             // We are looking for MIR of the form:
@@ -130,12 +132,7 @@ impl<'tcx> Visitor<'tcx> for ConstMutationChecker<'_, 'tcx> {
                 // the `self` parameter of a method call (as the terminator of our current
                 // BasicBlock). If so, we emit a more specific lint.
                 let method_did = self.target_local.and_then(|target_local| {
-                    rustc_middle::util::find_self_call(
-                        self.tcx,
-                        &self.body,
-                        target_local,
-                        loc.block,
-                    )
+                    rustc_middle::util::find_self_call(self.tcx, self.body, target_local, loc.block)
                 });
                 let lint_loc =
                     if method_did.is_some() { self.body.terminator_loc(loc.block) } else { loc };
@@ -148,7 +145,7 @@ impl<'tcx> Visitor<'tcx> for ConstMutationChecker<'_, 'tcx> {
                 if let Some((lint_root, span, item)) =
                     self.should_lint_const_item_usage(place, def_id, lint_loc)
                 {
-                    self.tcx.emit_spanned_lint(
+                    self.tcx.emit_node_span_lint(
                         CONST_ITEM_MUTATION,
                         lint_root,
                         span,

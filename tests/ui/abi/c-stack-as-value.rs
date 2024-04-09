@@ -1,6 +1,5 @@
-// run-pass
-// pretty-expanded FIXME #23616
-// ignore-wasm32-bare no libc to test ffi with
+//@ run-pass
+//@ pretty-expanded FIXME #23616
 
 #![feature(rustc_private)]
 

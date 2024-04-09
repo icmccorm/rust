@@ -6,8 +6,8 @@ use clippy_utils::diagnostics::span_lint;
 use clippy_utils::ty::is_type_diagnostic_item;
 use rustc_hir::Expr;
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::ty::{self, Ty};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_middle::ty::{self, IntTy, Ty, UintTy};
+use rustc_session::declare_lint_pass;
 use rustc_span::sym;
 
 declare_clippy_lint! {
@@ -29,14 +29,14 @@ declare_clippy_lint! {
     /// for waiting before a critical section.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let y = true;
     /// # use std::sync::Mutex;
     /// let x = Mutex::new(&y);
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # let y = true;
     /// # use std::sync::atomic::AtomicBool;
     /// let x = AtomicBool::new(y);
@@ -62,13 +62,13 @@ declare_clippy_lint! {
     /// for waiting before a critical section.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # use std::sync::Mutex;
     /// let x = Mutex::new(0usize);
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # use std::sync::atomic::AtomicUsize;
     /// let x = AtomicUsize::new(0usize);
     /// ```
@@ -92,9 +92,9 @@ impl<'tcx> LateLintPass<'tcx> for Mutex {
                          behavior and not the internal type, consider using `Mutex<()>`"
                     );
                     match *mutex_param.kind() {
-                        ty::Uint(t) if t != ty::UintTy::Usize => span_lint(cx, MUTEX_INTEGER, expr.span, &msg),
-                        ty::Int(t) if t != ty::IntTy::Isize => span_lint(cx, MUTEX_INTEGER, expr.span, &msg),
-                        _ => span_lint(cx, MUTEX_ATOMIC, expr.span, &msg),
+                        ty::Uint(t) if t != UintTy::Usize => span_lint(cx, MUTEX_INTEGER, expr.span, msg),
+                        ty::Int(t) if t != IntTy::Isize => span_lint(cx, MUTEX_INTEGER, expr.span, msg),
+                        _ => span_lint(cx, MUTEX_ATOMIC, expr.span, msg),
                     };
                 }
             }
@@ -105,9 +105,29 @@ impl<'tcx> LateLintPass<'tcx> for Mutex {
 fn get_atomic_name(ty: Ty<'_>) -> Option<&'static str> {
     match ty.kind() {
         ty::Bool => Some("AtomicBool"),
-        ty::Uint(_) => Some("AtomicUsize"),
-        ty::Int(_) => Some("AtomicIsize"),
-        ty::RawPtr(_) => Some("AtomicPtr"),
+        ty::Uint(uint_ty) => {
+            match uint_ty {
+                UintTy::U8 => Some("AtomicU8"),
+                UintTy::U16 => Some("AtomicU16"),
+                UintTy::U32 => Some("AtomicU32"),
+                UintTy::U64 => Some("AtomicU64"),
+                UintTy::Usize => Some("AtomicUsize"),
+                // There's no `AtomicU128`.
+                UintTy::U128 => None,
+            }
+        },
+        ty::Int(int_ty) => {
+            match int_ty {
+                IntTy::I8 => Some("AtomicI8"),
+                IntTy::I16 => Some("AtomicI16"),
+                IntTy::I32 => Some("AtomicI32"),
+                IntTy::I64 => Some("AtomicI64"),
+                IntTy::Isize => Some("AtomicIsize"),
+                // There's no `AtomicI128`.
+                IntTy::I128 => None,
+            }
+        },
+        ty::RawPtr(_, _) => Some("AtomicPtr"),
         _ => None,
     }
 }

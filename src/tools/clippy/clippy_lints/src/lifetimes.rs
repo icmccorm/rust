@@ -18,10 +18,10 @@ use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::hir::map::Map;
 use rustc_middle::hir::nested_filter as middle_nested_filter;
 use rustc_middle::lint::in_external_macro;
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 use rustc_span::def_id::LocalDefId;
-use rustc_span::source_map::Span;
 use rustc_span::symbol::{kw, Ident, Symbol};
+use rustc_span::Span;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -38,7 +38,7 @@ declare_clippy_lint! {
     /// are mentioned due to potential false positives.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// // Unnecessary lifetime annotations
     /// fn in_and_out<'a>(x: &'a u8, y: u8) -> &'a u8 {
     ///     x
@@ -46,7 +46,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// fn elided(x: &u8, y: u8) -> &u8 {
     ///     x
     /// }
@@ -69,7 +69,7 @@ declare_clippy_lint! {
     /// them leads to more readable code.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// // unnecessary lifetimes
     /// fn unused_lifetime<'a>(x: u8) {
     ///     // ..
@@ -77,7 +77,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// fn no_lifetime(x: u8) {
     ///     // ...
     /// }
@@ -176,7 +176,7 @@ fn check_fn_inner<'tcx>(
                             _ => None,
                         });
                         for bound in lifetimes {
-                            if !bound.is_static() && !bound.is_elided() {
+                            if bound.res != LifetimeName::Static && !bound.is_elided() {
                                 return;
                             }
                         }
@@ -195,7 +195,7 @@ fn check_fn_inner<'tcx>(
             .iter()
             // In principle, the result of the call to `Node::ident` could be `unwrap`ped, as `DefId` should refer to a
             // `Node::GenericParam`.
-            .filter_map(|&def_id| cx.tcx.hir().get_by_def_id(def_id).ident())
+            .filter_map(|&def_id| cx.tcx.hir_node_by_def_id(def_id).ident())
             .map(|ident| ident.to_string())
             .collect::<Vec<_>>()
             .join(", ");
@@ -216,7 +216,7 @@ fn check_fn_inner<'tcx>(
                     None
                 }))
                 .collect_vec(),
-            &format!("the following explicit lifetimes could be elided: {lts}"),
+            format!("the following explicit lifetimes could be elided: {lts}"),
             |diag| {
                 if sig.header.is_async() {
                     // async functions have usages whose spans point at the lifetime declaration which messes up
@@ -285,7 +285,7 @@ fn elision_suggestions(
             .iter()
             .filter(|usage| named_lifetime(usage).map_or(false, |id| elidable_lts.contains(&id)))
             .map(|usage| {
-                match cx.tcx.hir().get_parent(usage.hir_id) {
+                match cx.tcx.parent_hir_node(usage.hir_id) {
                     Node::Ty(Ty {
                         kind: TyKind::Ref(..), ..
                     }) => {
@@ -310,20 +310,17 @@ fn elision_suggestions(
 
 // elision doesn't work for explicit self types, see rust-lang/rust#69064
 fn explicit_self_type<'tcx>(cx: &LateContext<'tcx>, func: &FnDecl<'tcx>, ident: Option<Ident>) -> bool {
-    if_chain! {
-        if let Some(ident) = ident;
-        if ident.name == kw::SelfLower;
-        if !func.implicit_self.has_implicit_self();
+    if let Some(ident) = ident
+        && ident.name == kw::SelfLower
+        && !func.implicit_self.has_implicit_self()
+        && let Some(self_ty) = func.inputs.first()
+    {
+        let mut visitor = RefVisitor::new(cx);
+        visitor.visit_ty(self_ty);
 
-        if let Some(self_ty) = func.inputs.first();
-        then {
-            let mut visitor = RefVisitor::new(cx);
-            visitor.visit_ty(self_ty);
-
-            !visitor.all_lts().is_empty()
-        } else {
-            false
-        }
+        !visitor.all_lts().is_empty()
+    } else {
+        false
     }
 }
 
@@ -517,9 +514,11 @@ impl<'a, 'tcx> Visitor<'tcx> for RefVisitor<'a, 'tcx> {
 
     fn visit_poly_trait_ref(&mut self, poly_tref: &'tcx PolyTraitRef<'tcx>) {
         let trait_ref = &poly_tref.trait_ref;
-        if let Some(id) = trait_ref.trait_def_id() && lang_items::FN_TRAITS.iter().any(|&item| {
-            self.cx.tcx.lang_items().get(item) == Some(id)
-        }) {
+        if let Some(id) = trait_ref.trait_def_id()
+            && lang_items::FN_TRAITS
+                .iter()
+                .any(|&item| self.cx.tcx.lang_items().get(item) == Some(id))
+        {
             let mut sub_visitor = RefVisitor::new(self.cx);
             sub_visitor.visit_trait_ref(trait_ref);
             self.nested_elision_site_lts.append(&mut sub_visitor.all_lts());

@@ -1,19 +1,12 @@
-#![feature(box_patterns)]
 #![feature(decl_macro)]
-#![feature(internal_output_capture)]
-#![feature(thread_spawn_unchecked)]
+#![feature(generic_nonzero)]
 #![feature(lazy_cell)]
+#![feature(let_chains)]
+#![feature(thread_spawn_unchecked)]
 #![feature(try_blocks)]
-#![recursion_limit = "256"]
-#![allow(rustc::potential_query_instability)]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
 
 #[macro_use]
 extern crate tracing;
-
-use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
-use rustc_fluent_macro::fluent_messages;
 
 mod callbacks;
 mod errors;
@@ -31,4 +24,4 @@ pub use queries::Queries;
 #[cfg(test)]
 mod tests;
 
-fluent_messages! { "../messages.ftl" }
+rustc_fluent_macro::fluent_messages! { "../messages.ftl" }

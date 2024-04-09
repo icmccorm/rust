@@ -121,22 +121,32 @@ impl<'tcx> LateLintPass<'tcx> for NoopMethodCall {
         let orig_ty = expr_ty.peel_refs();
 
         if receiver_ty == expr_ty {
-            cx.emit_spanned_lint(
+            let suggest_derive = match orig_ty.kind() {
+                ty::Adt(def, _) => Some(cx.tcx.def_span(def.did()).shrink_to_lo()),
+                _ => None,
+            };
+            cx.emit_span_lint(
                 NOOP_METHOD_CALL,
                 span,
-                NoopMethodCallDiag { method: call.ident.name, orig_ty, trait_, label: span },
+                NoopMethodCallDiag {
+                    method: call.ident.name,
+                    orig_ty,
+                    trait_,
+                    label: span,
+                    suggest_derive,
+                },
             );
         } else {
             match name {
                 // If `type_of(x) == T` and `x.borrow()` is used to get `&T`,
                 // then that should be allowed
                 sym::noop_method_borrow => return,
-                sym::noop_method_clone => cx.emit_spanned_lint(
+                sym::noop_method_clone => cx.emit_span_lint(
                     SUSPICIOUS_DOUBLE_REF_OP,
                     span,
                     SuspiciousDoubleRefCloneDiag { ty: expr_ty },
                 ),
-                sym::noop_method_deref => cx.emit_spanned_lint(
+                sym::noop_method_deref => cx.emit_span_lint(
                     SUSPICIOUS_DOUBLE_REF_OP,
                     span,
                     SuspiciousDoubleRefDerefDiag { ty: expr_ty },

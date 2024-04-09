@@ -77,7 +77,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
             // Inherent impls only require not relying on autoref and autoderef in order to
             // ensure that the trait implementation won't be used
-            self.tcx.struct_span_lint_hir(
+            self.tcx.node_span_lint(
                 prelude_or_array_lint,
                 self_expr.hir_id,
                 self_expr.span,
@@ -122,14 +122,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             format!("disambiguate the method call with `({self_adjusted})`",),
                         );
                     }
-
-                    lint
                 },
             );
         } else {
             // trait implementations require full disambiguation to not clash with the new prelude
             // additions (i.e. convert from dot-call to fully-qualified call)
-            self.tcx.struct_span_lint_hir(
+            self.tcx.node_span_lint(
                 prelude_or_array_lint,
                 call_expr.hir_id,
                 call_expr.span,
@@ -187,8 +185,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             ),
                         );
                     }
-
-                    lint
                 },
             );
         }
@@ -242,7 +238,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return;
         }
 
-        self.tcx.struct_span_lint_hir(
+        self.tcx.node_span_lint(
             RUST_2021_PRELUDE_COLLISIONS,
             expr_id,
             span,
@@ -307,8 +303,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     format!("<{} as {}>::{}", self_ty_name, trait_name, method_name.name,),
                     Applicability::MachineApplicable,
                 );
-
-                lint
             },
         );
     }

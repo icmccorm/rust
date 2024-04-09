@@ -1,5 +1,5 @@
 error[E0261]: use of undeclared lifetime name `'missing`
-  --> $DIR/missing-lt-outlives-in-rpitit-114274.rs:8:55
+  --> $DIR/missing-lt-outlives-in-rpitit-114274.rs:6:55
    |
 LL |     fn iter(&self) -> impl Iterator<Item = Self::Item<'missing>>;
    |                                                       ^^^^^^^^ undeclared lifetime
@@ -18,6 +18,6 @@ help: consider introducing lifetime `'missing` here
 LL | trait Iterable<'missing> {
    |               ++++++++++
 
-error: aborting due to previous error
+error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0261`.

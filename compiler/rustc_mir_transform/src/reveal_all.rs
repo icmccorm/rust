@@ -1,6 +1,5 @@
 //! Normalizes MIR in RevealAll mode.
 
-use crate::MirPass;
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt};
@@ -46,16 +45,18 @@ impl<'tcx> MutVisitor<'tcx> for RevealAllVisitor<'tcx> {
                 .filter(|elem| !matches!(elem, ProjectionElem::OpaqueCast(_)))
                 .collect::<Vec<_>>(),
         );
+        self.super_place(place, _context, _location);
     }
 
     #[inline]
-    fn visit_constant(&mut self, constant: &mut ConstOperand<'tcx>, _: Location) {
+    fn visit_constant(&mut self, constant: &mut ConstOperand<'tcx>, location: Location) {
         // We have to use `try_normalize_erasing_regions` here, since it's
         // possible that we visit impossible-to-satisfy where clauses here,
         // see #91745
         if let Ok(c) = self.tcx.try_normalize_erasing_regions(self.param_env, constant.const_) {
             constant.const_ = c;
         }
+        self.super_constant(constant, location);
     }
 
     #[inline]

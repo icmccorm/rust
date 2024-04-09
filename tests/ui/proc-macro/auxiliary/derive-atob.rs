@@ -1,5 +1,5 @@
-// force-host
-// no-prefer-dynamic
+//@ force-host
+//@ no-prefer-dynamic
 
 #![crate_type = "proc-macro"]
 
@@ -10,6 +10,6 @@ use proc_macro::TokenStream;
 #[proc_macro_derive(AToB)]
 pub fn derive(input: TokenStream) -> TokenStream {
     let input = input.to_string();
-    assert_eq!(input, "struct A ;");
+    assert_eq!(input, "struct A;");
     "struct B;".parse().unwrap()
 }

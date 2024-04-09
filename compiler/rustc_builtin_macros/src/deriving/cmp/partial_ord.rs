@@ -8,7 +8,7 @@ use rustc_span::Span;
 use thin_vec::thin_vec;
 
 pub fn expand_deriving_partial_ord(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     span: Span,
     mitem: &MetaItem,
     item: &Annotatable,
@@ -21,25 +21,26 @@ pub fn expand_deriving_partial_ord(
 
     // Order in which to perform matching
     let tag_then_data = if let Annotatable::Item(item) = item
-        && let ItemKind::Enum(def, _) = &item.kind {
-            let dataful: Vec<bool> = def.variants.iter().map(|v| !v.data.fields().is_empty()).collect();
-            match dataful.iter().filter(|&&b| b).count() {
-                // No data, placing the tag check first makes codegen simpler
-                0 => true,
-                1..=2 => false,
-                _ => {
-                    (0..dataful.len()-1).any(|i| {
-                        if dataful[i] && let Some(idx) = dataful[i+1..].iter().position(|v| *v) {
-                            idx >= 2
-                        } else {
-                            false
-                        }
-                    })
+        && let ItemKind::Enum(def, _) = &item.kind
+    {
+        let dataful: Vec<bool> = def.variants.iter().map(|v| !v.data.fields().is_empty()).collect();
+        match dataful.iter().filter(|&&b| b).count() {
+            // No data, placing the tag check first makes codegen simpler
+            0 => true,
+            1..=2 => false,
+            _ => (0..dataful.len() - 1).any(|i| {
+                if dataful[i]
+                    && let Some(idx) = dataful[i + 1..].iter().position(|v| *v)
+                {
+                    idx >= 2
+                } else {
+                    false
                 }
-            }
-        } else {
-            true
-        };
+            }),
+        }
+    } else {
+        true
+    };
     let partial_cmp_def = MethodDef {
         name: sym::partial_cmp,
         generics: Bounds::empty(),
@@ -68,7 +69,7 @@ pub fn expand_deriving_partial_ord(
 }
 
 fn cs_partial_cmp(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     span: Span,
     substr: &Substructure<'_>,
     tag_then_data: bool,
@@ -94,7 +95,7 @@ fn cs_partial_cmp(
         |cx, fold| match fold {
             CsFold::Single(field) => {
                 let [other_expr] = &field.other_selflike_exprs[..] else {
-                    cx.span_bug(field.span, "not exactly 2 arguments in `derive(Ord)`");
+                    cx.dcx().span_bug(field.span, "not exactly 2 arguments in `derive(Ord)`");
                 };
                 let args = thin_vec![field.self_expr.clone(), other_expr.clone()];
                 cx.expr_call_global(field.span, partial_cmp_path.clone(), args)
@@ -131,14 +132,18 @@ fn cs_partial_cmp(
                 // Reference: https://github.com/rust-lang/rust/pull/103659#issuecomment-1328126354
 
                 if !tag_then_data
-                    && let ExprKind::Match(_, arms) = &mut expr1.kind
+                    && let ExprKind::Match(_, arms, _) = &mut expr1.kind
                     && let Some(last) = arms.last_mut()
-                    && let PatKind::Wild = last.pat.kind {
-                        last.body = expr2;
-                        expr1
+                    && let PatKind::Wild = last.pat.kind
+                {
+                    last.body = Some(expr2);
+                    expr1
                 } else {
-                    let eq_arm =
-                        cx.arm(span, cx.pat_some(span, cx.pat_path(span, equal_path.clone())), expr1);
+                    let eq_arm = cx.arm(
+                        span,
+                        cx.pat_some(span, cx.pat_path(span, equal_path.clone())),
+                        expr1,
+                    );
                     let neq_arm =
                         cx.arm(span, cx.pat_ident(span, test_id), cx.expr_ident(span, test_id));
                     cx.expr_match(span, expr2, thin_vec![eq_arm, neq_arm])

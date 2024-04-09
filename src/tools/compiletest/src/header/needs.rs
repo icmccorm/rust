@@ -30,6 +30,11 @@ pub(super) fn handle_needs(
             ignore_reason: "ignored on targets without CFI sanitizer",
         },
         Need {
+            name: "needs-sanitizer-dataflow",
+            condition: cache.sanitizer_dataflow,
+            ignore_reason: "ignored on targets without dataflow sanitizer",
+        },
+        Need {
             name: "needs-sanitizer-kcfi",
             condition: cache.sanitizer_kcfi,
             ignore_reason: "ignored on targets without kernel CFI sanitizer",
@@ -78,6 +83,11 @@ pub(super) fn handle_needs(
             name: "needs-run-enabled",
             condition: config.run_enabled(),
             ignore_reason: "ignored when running the resulting test binaries is disabled",
+        },
+        Need {
+            name: "needs-threads",
+            condition: config.has_threads(),
+            ignore_reason: "ignored on targets without threading support",
         },
         Need {
             name: "needs-unwind",
@@ -139,6 +149,11 @@ pub(super) fn handle_needs(
             condition: config.target_cfg().relocation_model == "pic",
             ignore_reason: "ignored on targets without PIC relocation model",
         },
+        Need {
+            name: "needs-wasmtime",
+            condition: config.runner.as_ref().is_some_and(|r| r.contains("wasmtime")),
+            ignore_reason: "ignored when wasmtime runner is not available",
+        },
     ];
 
     let (name, comment) = match ln.split_once([':', ' ']) {
@@ -190,6 +205,7 @@ pub(super) struct CachedNeedsConditions {
     sanitizer_support: bool,
     sanitizer_address: bool,
     sanitizer_cfi: bool,
+    sanitizer_dataflow: bool,
     sanitizer_kcfi: bool,
     sanitizer_kasan: bool,
     sanitizer_leak: bool,
@@ -229,6 +245,7 @@ impl CachedNeedsConditions {
             sanitizer_support: std::env::var_os("RUSTC_SANITIZER_SUPPORT").is_some(),
             sanitizer_address: sanitizers.contains(&Sanitizer::Address),
             sanitizer_cfi: sanitizers.contains(&Sanitizer::Cfi),
+            sanitizer_dataflow: sanitizers.contains(&Sanitizer::Dataflow),
             sanitizer_kcfi: sanitizers.contains(&Sanitizer::Kcfi),
             sanitizer_kasan: sanitizers.contains(&Sanitizer::KernelAddress),
             sanitizer_leak: sanitizers.contains(&Sanitizer::Leak),
@@ -238,11 +255,11 @@ impl CachedNeedsConditions {
             sanitizer_memtag: sanitizers.contains(&Sanitizer::Memtag),
             sanitizer_shadow_call_stack: sanitizers.contains(&Sanitizer::ShadowCallStack),
             sanitizer_safestack: sanitizers.contains(&Sanitizer::Safestack),
-            profiler_support: std::env::var_os("RUSTC_PROFILER_SUPPORT").is_some(),
+            profiler_support: config.profiler_support,
             xray: config.target_cfg().xray,
 
-            // For tests using the `needs-rust-lld` directive (e.g. for `-Zgcc-ld=lld`), we need to find
-            // whether `rust-lld` is present in the compiler under test.
+            // For tests using the `needs-rust-lld` directive (e.g. for `-Clink-self-contained=+linker`),
+            // we need to find whether `rust-lld` is present in the compiler under test.
             //
             // The --compile-lib-path is the path to host shared libraries, but depends on the OS. For
             // example:

@@ -1,6 +1,6 @@
 //! limit defines a struct to enforce limits.
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![warn(rust_2018_idioms, unused_lifetimes)]
 
 #[cfg(feature = "tracking")]
 use std::sync::atomic::AtomicUsize;
@@ -55,13 +55,12 @@ impl Limit {
                 if other <= old_max || old_max == 0 {
                     break;
                 }
-                if self
-                    .max
-                    .compare_exchange_weak(old_max, other, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    eprintln!("new max: {other}");
-                }
+                _ = self.max.compare_exchange_weak(
+                    old_max,
+                    other,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
             }
 
             Ok(())

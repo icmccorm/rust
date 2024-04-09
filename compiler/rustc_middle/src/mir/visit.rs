@@ -63,9 +63,7 @@
 //! `is_cleanup` above.
 
 use crate::mir::*;
-use crate::ty::GenericArgsRef;
-use crate::ty::{self, CanonicalUserTypeAnnotation, Ty};
-use rustc_span::Span;
+use crate::ty::CanonicalUserTypeAnnotation;
 
 macro_rules! make_mir_visitor {
     ($visitor_trait_name:ident, $($mutability:ident)?) => {
@@ -158,10 +156,10 @@ macro_rules! make_mir_visitor {
 
             fn visit_coverage(
                 &mut self,
-                coverage: & $($mutability)? Coverage,
+                kind: & $($mutability)? coverage::CoverageKind,
                 location: Location,
             ) {
-                self.super_coverage(coverage, location);
+                self.super_coverage(kind, location);
             }
 
             fn visit_retag(
@@ -184,6 +182,8 @@ macro_rules! make_mir_visitor {
 
             visit_place_fns!($($mutability)?);
 
+            /// This is called for every constant in the MIR body and every `required_consts`
+            /// (i.e., including consts that have been dead-code-eliminated).
             fn visit_constant(
                 &mut self,
                 constant: & $($mutability)? ConstOperand<'tcx>,
@@ -341,10 +341,15 @@ macro_rules! make_mir_visitor {
 
                         ty::InstanceDef::Intrinsic(_def_id) |
                         ty::InstanceDef::VTableShim(_def_id) |
-                        ty::InstanceDef::ReifyShim(_def_id) |
+                        ty::InstanceDef::ReifyShim(_def_id, _) |
                         ty::InstanceDef::Virtual(_def_id, _) |
                         ty::InstanceDef::ThreadLocalShim(_def_id) |
                         ty::InstanceDef::ClosureOnceShim { call_once: _def_id, track_caller: _ } |
+                        ty::InstanceDef::ConstructCoroutineInClosureShim {
+                            coroutine_closure_def_id: _def_id,
+                            receiver_by_ref: _,
+                        } |
+                        ty::InstanceDef::CoroutineKindShim { coroutine_def_id: _def_id } |
                         ty::InstanceDef::DropGlue(_def_id, None) => {}
 
                         ty::InstanceDef::FnPtrShim(_def_id, ty) |
@@ -471,7 +476,7 @@ macro_rules! make_mir_visitor {
                     TerminatorKind::Goto { .. } |
                     TerminatorKind::UnwindResume |
                     TerminatorKind::UnwindTerminate(_) |
-                    TerminatorKind::GeneratorDrop |
+                    TerminatorKind::CoroutineDrop |
                     TerminatorKind::Unreachable |
                     TerminatorKind::FalseEdge { .. } |
                     TerminatorKind::FalseUnwind { .. } => {}
@@ -524,7 +529,7 @@ macro_rules! make_mir_visitor {
                     } => {
                         self.visit_operand(func, location);
                         for arg in args {
-                            self.visit_operand(arg, location);
+                            self.visit_operand(&$($mutability)? arg.node, location);
                         }
                         self.visit_place(
                             destination,
@@ -563,7 +568,7 @@ macro_rules! make_mir_visitor {
                         operands,
                         options: _,
                         line_spans: _,
-                        destination: _,
+                        targets: _,
                         unwind: _,
                     } => {
                         for op in operands {
@@ -593,7 +598,8 @@ macro_rules! make_mir_visitor {
                                     self.visit_constant(value, location);
                                 }
                                 InlineAsmOperand::Out { place: None, .. }
-                                | InlineAsmOperand::SymStatic { def_id: _ } => {}
+                                | InlineAsmOperand::SymStatic { def_id: _ }
+                                | InlineAsmOperand::Label { target_index: _ } => {}
                             }
                         }
                     }
@@ -647,8 +653,8 @@ macro_rules! make_mir_visitor {
                             BorrowKind::Shared => PlaceContext::NonMutatingUse(
                                 NonMutatingUseContext::SharedBorrow
                             ),
-                            BorrowKind::Shallow => PlaceContext::NonMutatingUse(
-                                NonMutatingUseContext::ShallowBorrow
+                            BorrowKind::Fake => PlaceContext::NonMutatingUse(
+                                NonMutatingUseContext::FakeBorrow
                             ),
                             BorrowKind::Mut { .. } =>
                                 PlaceContext::MutatingUse(MutatingUseContext::Borrow),
@@ -733,12 +739,17 @@ macro_rules! make_mir_visitor {
                             ) => {
                                 self.visit_args(closure_args, location);
                             }
-                            AggregateKind::Generator(
+                            AggregateKind::Coroutine(
                                 _,
-                                generator_args,
-                                _movability,
+                                coroutine_args,
                             ) => {
-                                self.visit_args(generator_args, location);
+                                self.visit_args(coroutine_args, location);
+                            }
+                            AggregateKind::CoroutineClosure(
+                                _,
+                                coroutine_closure_args,
+                            ) => {
+                                self.visit_args(coroutine_closure_args, location);
                             }
                         }
 
@@ -792,7 +803,7 @@ macro_rules! make_mir_visitor {
             }
 
             fn super_coverage(&mut self,
-                              _coverage: & $($mutability)? Coverage,
+                              _kind: & $($mutability)? coverage::CoverageKind,
                               _location: Location) {
             }
 
@@ -815,7 +826,6 @@ macro_rules! make_mir_visitor {
                     ty,
                     user_ty,
                     source_info,
-                    internal: _,
                     local_info: _,
                 } = local_decl;
 
@@ -991,11 +1001,17 @@ macro_rules! extra_body_methods {
 macro_rules! super_body {
     ($self:ident, $body:ident, $($mutability:ident, $invalidate:tt)?) => {
         let span = $body.span;
-        if let Some(gen) = &$($mutability)? $body.generator {
+        if let Some(gen) = &$($mutability)? $body.coroutine {
             if let Some(yield_ty) = $(& $mutability)? gen.yield_ty {
                 $self.visit_ty(
                     yield_ty,
                     TyContext::YieldTy(SourceInfo::outermost(span))
+                );
+            }
+            if let Some(resume_ty) = $(& $mutability)? gen.resume_ty {
+                $self.visit_ty(
+                    resume_ty,
+                    TyContext::ResumeTy(SourceInfo::outermost(span))
                 );
             }
         }
@@ -1109,6 +1125,11 @@ macro_rules! visit_place_fns {
                     self.visit_ty(&mut new_ty, TyContext::Location(location));
                     if ty != new_ty { Some(PlaceElem::OpaqueCast(new_ty)) } else { None }
                 }
+                PlaceElem::Subtype(ty) => {
+                    let mut new_ty = ty;
+                    self.visit_ty(&mut new_ty, TyContext::Location(location));
+                    if ty != new_ty { Some(PlaceElem::Subtype(new_ty)) } else { None }
+                }
                 PlaceElem::Deref
                 | PlaceElem::ConstantIndex { .. }
                 | PlaceElem::Subslice { .. }
@@ -1175,7 +1196,9 @@ macro_rules! visit_place_fns {
             location: Location,
         ) {
             match elem {
-                ProjectionElem::OpaqueCast(ty) | ProjectionElem::Field(_, ty) => {
+                ProjectionElem::OpaqueCast(ty)
+                | ProjectionElem::Subtype(ty)
+                | ProjectionElem::Field(_, ty) => {
                     self.visit_ty(ty, TyContext::Location(location));
                 }
                 ProjectionElem::Index(local) => {
@@ -1239,6 +1262,8 @@ pub enum TyContext {
 
     YieldTy(SourceInfo),
 
+    ResumeTy(SourceInfo),
+
     /// A type found at some location.
     Location(Location),
 }
@@ -1253,8 +1278,8 @@ pub enum NonMutatingUseContext {
     Move,
     /// Shared borrow.
     SharedBorrow,
-    /// Shallow borrow.
-    ShallowBorrow,
+    /// A fake borrow.
+    FakeBorrow,
     /// AddressOf for *const pointer.
     AddressOf,
     /// PlaceMention statement.
@@ -1333,7 +1358,7 @@ impl PlaceContext {
         matches!(
             self,
             PlaceContext::NonMutatingUse(
-                NonMutatingUseContext::SharedBorrow | NonMutatingUseContext::ShallowBorrow
+                NonMutatingUseContext::SharedBorrow | NonMutatingUseContext::FakeBorrow
             ) | PlaceContext::MutatingUse(MutatingUseContext::Borrow)
         )
     }

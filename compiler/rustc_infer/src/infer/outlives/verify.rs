@@ -1,7 +1,7 @@
 use crate::infer::outlives::components::{compute_alias_components_recursive, Component};
 use crate::infer::outlives::env::RegionBoundPairs;
 use crate::infer::region_constraints::VerifyIfEq;
-use crate::infer::VerifyBound;
+use crate::infer::{GenericKind, VerifyBound};
 use rustc_data_structures::sso::SsoHashSet;
 use rustc_middle::ty::GenericArg;
 use rustc_middle::ty::{self, OutlivesPredicate, Ty, TyCtxt};
@@ -23,7 +23,7 @@ pub struct VerifyBoundCx<'cx, 'tcx> {
     /// Outside of borrowck the only way to prove `T: '?0` is by
     /// setting  `'?0` to `'empty`.
     implicit_region_bound: Option<ty::Region<'tcx>>,
-    param_env: ty::ParamEnv<'tcx>,
+    caller_bounds: &'cx [ty::PolyTypeOutlivesPredicate<'tcx>],
 }
 
 impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
@@ -31,17 +31,17 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
         tcx: TyCtxt<'tcx>,
         region_bound_pairs: &'cx RegionBoundPairs<'tcx>,
         implicit_region_bound: Option<ty::Region<'tcx>>,
-        param_env: ty::ParamEnv<'tcx>,
+        caller_bounds: &'cx [ty::PolyTypeOutlivesPredicate<'tcx>],
     ) -> Self {
-        Self { tcx, region_bound_pairs, implicit_region_bound, param_env }
+        Self { tcx, region_bound_pairs, implicit_region_bound, caller_bounds }
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub fn param_bound(&self, param_ty: ty::ParamTy) -> VerifyBound<'tcx> {
+    pub fn param_or_placeholder_bound(&self, ty: Ty<'tcx>) -> VerifyBound<'tcx> {
         // Start with anything like `T: 'a` we can scrape from the
         // environment. If the environment contains something like
         // `for<'a> T: 'a`, then we know that `T` outlives everything.
-        let declared_bounds_from_env = self.declared_generic_bounds_from_env(param_ty);
+        let declared_bounds_from_env = self.declared_generic_bounds_from_env(ty);
         debug!(?declared_bounds_from_env);
         let mut param_bounds = vec![];
         for declared_bound in declared_bounds_from_env {
@@ -51,7 +51,7 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
                 param_bounds.push(VerifyBound::OutlivedBy(region));
             } else {
                 // This is `for<'a> T: 'a`. This means that `T` outlives everything! All done here.
-                debug!("found that {param_ty:?} outlives any lifetime, returning empty vector");
+                debug!("found that {ty:?} outlives any lifetime, returning empty vector");
                 return VerifyBound::AllBounds(vec![]);
             }
         }
@@ -108,20 +108,20 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
         let alias_ty_as_ty = alias_ty.to_ty(self.tcx);
 
         // Search the env for where clauses like `P: 'a`.
-        let env_bounds = self
-            .approx_declared_bounds_from_env(alias_ty)
-            .into_iter()
-            .map(|binder| {
-                if let Some(ty::OutlivesPredicate(ty, r)) = binder.no_bound_vars() && ty == alias_ty_as_ty {
-                    // Micro-optimize if this is an exact match (this
-                    // occurs often when there are no region variables
-                    // involved).
-                    VerifyBound::OutlivedBy(r)
-                } else {
-                    let verify_if_eq_b = binder.map_bound(|ty::OutlivesPredicate(ty, bound)| VerifyIfEq { ty, bound });
-                    VerifyBound::IfEq(verify_if_eq_b)
-                }
-            });
+        let env_bounds = self.approx_declared_bounds_from_env(alias_ty).into_iter().map(|binder| {
+            if let Some(ty::OutlivesPredicate(ty, r)) = binder.no_bound_vars()
+                && ty == alias_ty_as_ty
+            {
+                // Micro-optimize if this is an exact match (this
+                // occurs often when there are no region variables
+                // involved).
+                VerifyBound::OutlivedBy(r)
+            } else {
+                let verify_if_eq_b =
+                    binder.map_bound(|ty::OutlivesPredicate(ty, bound)| VerifyIfEq { ty, bound });
+                VerifyBound::IfEq(verify_if_eq_b)
+            }
+        });
 
         // Extend with bounds that we can find from the definition.
         let definition_bounds =
@@ -130,12 +130,7 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
         // see the extensive comment in projection_must_outlive
         let recursive_bound = {
             let mut components = smallvec![];
-            compute_alias_components_recursive(
-                self.tcx,
-                alias_ty_as_ty.into(),
-                &mut components,
-                visited,
-            );
+            compute_alias_components_recursive(self.tcx, alias_ty_as_ty, &mut components, visited);
             self.bound_from_components(&components, visited)
         };
 
@@ -168,20 +163,22 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
     ) -> VerifyBound<'tcx> {
         match *component {
             Component::Region(lt) => VerifyBound::OutlivedBy(lt),
-            Component::Param(param_ty) => self.param_bound(param_ty),
+            Component::Param(param_ty) => self.param_or_placeholder_bound(param_ty.to_ty(self.tcx)),
+            Component::Placeholder(placeholder_ty) => {
+                self.param_or_placeholder_bound(Ty::new_placeholder(self.tcx, placeholder_ty))
+            }
             Component::Alias(alias_ty) => self.alias_bound(alias_ty, visited),
             Component::EscapingAlias(ref components) => {
                 self.bound_from_components(components, visited)
             }
             Component::UnresolvedInferenceVariable(v) => {
-                // ignore this, we presume it will yield an error
-                // later, since if a type variable is not resolved by
-                // this point it never will be
-                self.tcx.sess.delay_span_bug(
-                    rustc_span::DUMMY_SP,
-                    format!("unresolved inference variable in outlives: {v:?}"),
-                );
-                // add a bound that never holds
+                // Ignore this, we presume it will yield an error later, since
+                // if a type variable is not resolved by this point it never
+                // will be.
+                self.tcx
+                    .dcx()
+                    .delayed_bug(format!("unresolved inference variable in outlives: {v:?}"));
+                // Add a bound that never holds.
                 VerifyBound::AnyBound(vec![])
             }
         }
@@ -195,9 +192,9 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
     /// bounds, but all the bounds it returns can be relied upon.
     fn declared_generic_bounds_from_env(
         &self,
-        param_ty: ty::ParamTy,
+        generic_ty: Ty<'tcx>,
     ) -> Vec<ty::Binder<'tcx, ty::OutlivesPredicate<Ty<'tcx>, ty::Region<'tcx>>>> {
-        let generic_ty = param_ty.to_ty(self.tcx);
+        assert!(matches!(generic_ty.kind(), ty::Param(_) | ty::Placeholder(_)));
         self.declared_generic_bounds_from_env_for_erased_ty(generic_ty)
     }
 
@@ -222,8 +219,9 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
         // To start, collect bounds from user environment. Note that
         // parameter environments are already elaborated, so we don't
         // have to worry about that.
-        let c_b = self.param_env.caller_bounds();
-        let param_bounds = self.collect_outlives_from_clause_list(erased_ty, c_b.into_iter());
+        let param_bounds = self.caller_bounds.iter().copied().filter(move |outlives_predicate| {
+            super::test_type_match::can_match_erased_ty(tcx, *outlives_predicate, erased_ty)
+        });
 
         // Next, collect regions we scraped from the well-formedness
         // constraints in the fn signature. To do that, we walk the list
@@ -242,10 +240,20 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
                     "declared_generic_bounds_from_env_for_erased_ty: region_bound_pair = {:?}",
                     (r, p)
                 );
+                // Fast path for the common case.
+                match (&p, erased_ty.kind()) {
+                    // In outlive routines, all types are expected to be fully normalized.
+                    // And therefore we can safely use structural equality for alias types.
+                    (GenericKind::Param(p1), ty::Param(p2)) if p1 == p2 => {}
+                    (GenericKind::Placeholder(p1), ty::Placeholder(p2)) if p1 == p2 => {}
+                    (GenericKind::Alias(a1), ty::Alias(_, a2)) if a1.def_id == a2.def_id => {}
+                    _ => return None,
+                }
+
                 let p_ty = p.to_ty(tcx);
                 let erased_p_ty = self.tcx.erase_regions(p_ty);
                 (erased_p_ty == erased_ty)
-                    .then_some(ty::Binder::dummy(ty::OutlivesPredicate(p.to_ty(tcx), r)))
+                    .then_some(ty::Binder::dummy(ty::OutlivesPredicate(p_ty, r)))
             });
 
         param_bounds
@@ -269,7 +277,7 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
     /// ```
     ///
     /// If we were given the `DefId` of `Foo::Bar`, we would return
-    /// `'a`. You could then apply the substitutions from the
+    /// `'a`. You could then apply the instantiations from the
     /// projection to convert this into your namespace. This also
     /// works if the user writes `where <Self as Foo<'a>>::Bar: 'a` on
     /// the trait. In fact, it works by searching for just such a
@@ -292,36 +300,12 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
         alias_ty: ty::AliasTy<'tcx>,
     ) -> impl Iterator<Item = ty::Region<'tcx>> {
         let tcx = self.tcx;
-        let bounds = tcx.item_bounds(alias_ty.def_id);
+        let bounds = tcx.item_super_predicates(alias_ty.def_id);
         trace!("{:#?}", bounds.skip_binder());
         bounds
             .iter_instantiated(tcx, alias_ty.args)
             .filter_map(|p| p.as_type_outlives_clause())
             .filter_map(|p| p.no_bound_vars())
             .map(|OutlivesPredicate(_, r)| r)
-    }
-
-    /// Searches through a predicate list for a predicate `T: 'a`.
-    ///
-    /// Careful: does not elaborate predicates, and just uses `==`
-    /// when comparing `ty` for equality, so `ty` must be something
-    /// that does not involve inference variables and where you
-    /// otherwise want a precise match.
-    fn collect_outlives_from_clause_list(
-        &self,
-        erased_ty: Ty<'tcx>,
-        clauses: impl Iterator<Item = ty::Clause<'tcx>>,
-    ) -> impl Iterator<Item = ty::Binder<'tcx, ty::OutlivesPredicate<Ty<'tcx>, ty::Region<'tcx>>>>
-    {
-        let tcx = self.tcx;
-        let param_env = self.param_env;
-        clauses.filter_map(|p| p.as_type_outlives_clause()).filter(move |outlives_predicate| {
-            super::test_type_match::can_match_erased_ty(
-                tcx,
-                param_env,
-                *outlives_predicate,
-                erased_ty,
-            )
-        })
     }
 }

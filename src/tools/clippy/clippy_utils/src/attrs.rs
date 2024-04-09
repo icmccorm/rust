@@ -1,8 +1,14 @@
 use rustc_ast::{ast, attr};
 use rustc_errors::Applicability;
+use rustc_lexer::TokenKind;
+use rustc_lint::LateContext;
+use rustc_middle::ty::{AdtDef, TyCtxt};
 use rustc_session::Session;
-use rustc_span::sym;
+use rustc_span::{sym, Span};
 use std::str::FromStr;
+
+use crate::source::snippet_opt;
+use crate::tokenize_with_text;
 
 /// Deprecation status of attributes known by Clippy.
 pub enum DeprecationStatus {
@@ -76,12 +82,14 @@ pub fn get_attr<'a>(
                 })
                 .map_or_else(
                     || {
-                        sess.span_err(attr_segments[1].ident.span, "usage of unknown attribute");
+                        sess.dcx()
+                            .span_err(attr_segments[1].ident.span, "usage of unknown attribute");
                         false
                     },
                     |deprecation_status| {
-                        let mut diag =
-                            sess.struct_span_err(attr_segments[1].ident.span, "usage of deprecated attribute");
+                        let mut diag = sess
+                            .dcx()
+                            .struct_span_err(attr_segments[1].ident.span, "usage of deprecated attribute");
                         match *deprecation_status {
                             DeprecationStatus::Deprecated => {
                                 diag.emit();
@@ -116,10 +124,10 @@ fn parse_attrs<F: FnMut(u64)>(sess: &Session, attrs: &[ast::Attribute], name: &'
             if let Ok(value) = FromStr::from_str(value.as_str()) {
                 f(value);
             } else {
-                sess.span_err(attr.span, "not a number");
+                sess.dcx().span_err(attr.span, "not a number");
             }
         } else {
-            sess.span_err(attr.span, "bad clippy attribute");
+            sess.dcx().span_err(attr.span, "bad clippy attribute");
         }
     }
 }
@@ -132,8 +140,9 @@ pub fn get_unique_attr<'a>(
     let mut unique_attr: Option<&ast::Attribute> = None;
     for attr in get_attr(sess, attrs, name) {
         if let Some(duplicate) = unique_attr {
-            sess.struct_span_err(attr.span, format!("`{name}` is defined multiple times"))
-                .span_note(duplicate.span, "first definition found here")
+            sess.dcx()
+                .struct_span_err(attr.span, format!("`{name}` is defined multiple times"))
+                .with_span_note(duplicate.span, "first definition found here")
                 .emit();
         } else {
             unique_attr = Some(attr);
@@ -155,4 +164,40 @@ pub fn is_doc_hidden(attrs: &[ast::Attribute]) -> bool {
         .filter(|attr| attr.has_name(sym::doc))
         .filter_map(ast::Attribute::meta_item_list)
         .any(|l| attr::list_contains_name(&l, sym::hidden))
+}
+
+pub fn has_non_exhaustive_attr(tcx: TyCtxt<'_>, adt: AdtDef<'_>) -> bool {
+    adt.is_variant_list_non_exhaustive()
+        || tcx.has_attr(adt.did(), sym::non_exhaustive)
+        || adt.variants().iter().any(|variant_def| {
+            variant_def.is_field_list_non_exhaustive() || tcx.has_attr(variant_def.def_id, sym::non_exhaustive)
+        })
+        || adt
+            .all_fields()
+            .any(|field_def| tcx.has_attr(field_def.did, sym::non_exhaustive))
+}
+
+/// Checks if the given span contains a `#[cfg(..)]` attribute
+pub fn span_contains_cfg(cx: &LateContext<'_>, s: Span) -> bool {
+    let Some(snip) = snippet_opt(cx, s) else {
+        // Assume true. This would require either an invalid span, or one which crosses file boundaries.
+        return true;
+    };
+    let mut iter = tokenize_with_text(&snip);
+
+    // Search for the token sequence [`#`, `[`, `cfg`]
+    while iter.any(|(t, _)| matches!(t, TokenKind::Pound)) {
+        let mut iter = iter.by_ref().skip_while(|(t, _)| {
+            matches!(
+                t,
+                TokenKind::Whitespace | TokenKind::LineComment { .. } | TokenKind::BlockComment { .. }
+            )
+        });
+        if matches!(iter.next(), Some((TokenKind::OpenBracket, _)))
+            && matches!(iter.next(), Some((TokenKind::Ident, "cfg")))
+        {
+            return true;
+        }
+    }
+    false
 }

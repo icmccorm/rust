@@ -40,10 +40,10 @@
 //!
 //! ## Examples
 //!
-//! Consider a situation where we want to log out a value passed to a function.
-//! We know the value we're working on implements Debug, but we don't know its
+//! Consider a situation where we want to log a value passed to a function.
+//! We know the value we're working on implements `Debug`, but we don't know its
 //! concrete type. We want to give special treatment to certain types: in this
-//! case printing out the length of String values prior to their value.
+//! case printing out the length of `String` values prior to their value.
 //! We don't know the concrete type of our value at compile time, so we need to
 //! use runtime reflection instead.
 //!
@@ -51,7 +51,7 @@
 //! use std::fmt::Debug;
 //! use std::any::Any;
 //!
-//! // Logger function for any type that implements Debug.
+//! // Logger function for any type that implements `Debug`.
 //! fn log<T: Any + Debug>(value: &T) {
 //!     let value_any = value as &dyn Any;
 //!
@@ -114,6 +114,11 @@ use crate::intrinsics;
 #[cfg_attr(not(test), rustc_diagnostic_item = "Any")]
 pub trait Any: 'static {
     /// Gets the `TypeId` of `self`.
+    ///
+    /// If called on a `dyn Any` trait object
+    /// (or a trait object of a subtrait of `Any`),
+    /// this returns the `TypeId` of the underlying
+    /// concrete type, not that of `dyn Any` itself.
     ///
     /// # Examples
     ///
@@ -600,7 +605,9 @@ impl dyn Any + Send + Sync {
 #[derive(Clone, Copy, Debug, Eq, PartialOrd, Ord)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct TypeId {
-    t: u128,
+    // We avoid using `u128` because that imposes higher alignment requirements on many platforms.
+    // See issue #115620 for more information.
+    t: (u64, u64),
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -632,7 +639,10 @@ impl TypeId {
     #[rustc_const_unstable(feature = "const_type_id", issue = "77125")]
     pub const fn of<T: ?Sized + 'static>() -> TypeId {
         let t: u128 = intrinsics::type_id::<T>();
-        TypeId { t }
+
+        let t1 = (t >> 64) as u64;
+        let t2 = t as u64;
+        TypeId { t: (t1, t2) }
     }
 }
 
@@ -652,7 +662,7 @@ impl hash::Hash for TypeId {
         // - It is correct to do so -- only hashing a subset of `self` is still
         //   with an `Eq` implementation that considers the entire value, as
         //   ours does.
-        (self.t as u64).hash(state);
+        self.t.1.hash(state);
     }
 }
 
@@ -690,44 +700,41 @@ pub const fn type_name<T: ?Sized>() -> &'static str {
     intrinsics::type_name::<T>()
 }
 
-/// Returns the name of the type of the pointed-to value as a string slice.
+/// Returns the type name of the pointed-to value as a string slice.
+///
 /// This is the same as `type_name::<T>()`, but can be used where the type of a
 /// variable is not easily available.
 ///
 /// # Note
 ///
-/// This is intended for diagnostic use. The exact contents and format of the
-/// string are not specified, other than being a best-effort description of the
-/// type. For example, `type_name_of_val::<Option<String>>(None)` could return
-/// `"Option<String>"` or `"std::option::Option<std::string::String>"`, but not
-/// `"foobar"`. In addition, the output may change between versions of the
-/// compiler.
+/// Like [`type_name`], this is intended for diagnostic use and the exact output is not
+/// guaranteed. It provides a best-effort description, but the output may change between
+/// versions of the compiler.
 ///
-/// This function does not resolve trait objects,
-/// meaning that `type_name_of_val(&7u32 as &dyn Debug)`
-/// may return `"dyn Debug"`, but not `"u32"`.
+/// In short: use this for debugging, avoid using the output to affect program behavior. More
+/// information is available at [`type_name`].
 ///
-/// The type name should not be considered a unique identifier of a type;
-/// multiple types may share the same type name.
-///
-/// The current implementation uses the same infrastructure as compiler
-/// diagnostics and debuginfo, but this is not guaranteed.
+/// Additionally, this function does not resolve trait objects. This means that
+/// `type_name_of_val(&7u32 as &dyn Debug)` may return `"dyn Debug"`, but will not return `"u32"`
+/// at this time.
 ///
 /// # Examples
 ///
 /// Prints the default integer and float types.
 ///
 /// ```rust
-/// #![feature(type_name_of_val)]
 /// use std::any::type_name_of_val;
 ///
-/// let x = 1;
-/// println!("{}", type_name_of_val(&x));
-/// let y = 1.0;
-/// println!("{}", type_name_of_val(&y));
+/// let s = "foo";
+/// let x: i32 = 1;
+/// let y: f32 = 1.0;
+///
+/// assert!(type_name_of_val(&s).contains("str"));
+/// assert!(type_name_of_val(&x).contains("i32"));
+/// assert!(type_name_of_val(&y).contains("f32"));
 /// ```
 #[must_use]
-#[unstable(feature = "type_name_of_val", issue = "66359")]
+#[stable(feature = "type_name_of_val", since = "1.76.0")]
 #[rustc_const_unstable(feature = "const_type_name", issue = "63084")]
 pub const fn type_name_of_val<T: ?Sized>(_val: &T) -> &'static str {
     type_name::<T>()

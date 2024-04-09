@@ -1,7 +1,10 @@
 use hir::InFile;
-use ide_db::{base_db::FileId, source_change::SourceChange};
+use ide_db::{
+    base_db::{FileId, FileRange},
+    source_change::SourceChange,
+};
 use itertools::Itertools;
-use syntax::{ast, AstNode, SyntaxNode};
+use syntax::{ast, AstNode, SyntaxNode, SyntaxNodePtr};
 use text_edit::TextEdit;
 
 use crate::{fix, Diagnostic, DiagnosticCode};
@@ -37,10 +40,10 @@ pub(crate) fn useless_braces(
         acc.push(
             Diagnostic::new(
                 DiagnosticCode::RustcLint("unused_braces"),
-                "Unnecessary braces in use statement".to_string(),
-                use_range,
+                "Unnecessary braces in use statement".to_owned(),
+                FileRange { file_id, range: use_range },
             )
-            .with_main_node(InFile::new(file_id.into(), node.clone()))
+            .with_main_node(InFile::new(file_id.into(), SyntaxNodePtr::new(node)))
             .with_fixes(Some(vec![fix(
                 "remove_braces",
                 "Remove unnecessary braces",
@@ -109,7 +112,7 @@ mod a {
         );
 
         let mut config = DiagnosticsConfig::test_sample();
-        config.disabled.insert("syntax-error".to_string());
+        config.disabled.insert("syntax-error".to_owned());
         check_diagnostics_with_config(
             config,
             r#"

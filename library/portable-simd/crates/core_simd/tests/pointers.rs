@@ -1,6 +1,9 @@
-#![feature(portable_simd, strict_provenance)]
+#![feature(portable_simd, strict_provenance, exposed_provenance)]
 
-use core_simd::simd::{Simd, SimdConstPtr, SimdMutPtr};
+use core_simd::simd::{
+    ptr::{SimdConstPtr, SimdMutPtr},
+    Simd,
+};
 
 macro_rules! common_tests {
     { $constness:ident } => {
@@ -29,10 +32,10 @@ macro_rules! common_tests {
                 );
             }
 
-            fn expose_addr<const LANES: usize>() {
+            fn expose_provenance<const LANES: usize>() {
                 test_helpers::test_unary_elementwise(
-                    &Simd::<*$constness u32, LANES>::expose_addr,
-                    &<*$constness u32>::expose_addr,
+                    &Simd::<*$constness u32, LANES>::expose_provenance,
+                    &<*$constness u32>::expose_provenance,
                     &|_| true,
                 );
             }
@@ -77,10 +80,10 @@ mod const_ptr {
             );
         }
 
-        fn from_exposed_addr<const LANES: usize>() {
+        fn with_exposed_provenance<const LANES: usize>() {
             test_helpers::test_unary_elementwise(
-                &Simd::<*const u32, LANES>::from_exposed_addr,
-                &core::ptr::from_exposed_addr::<u32>,
+                &Simd::<*const u32, LANES>::with_exposed_provenance,
+                &core::ptr::with_exposed_provenance::<u32>,
                 &|_| true,
             );
         }
@@ -100,10 +103,10 @@ mod mut_ptr {
             );
         }
 
-        fn from_exposed_addr<const LANES: usize>() {
+        fn with_exposed_provenance<const LANES: usize>() {
             test_helpers::test_unary_elementwise(
-                &Simd::<*mut u32, LANES>::from_exposed_addr,
-                &core::ptr::from_exposed_addr_mut::<u32>,
+                &Simd::<*mut u32, LANES>::with_exposed_provenance,
+                &core::ptr::with_exposed_provenance_mut::<u32>,
                 &|_| true,
             );
         }

@@ -1,16 +1,20 @@
 //! Print diagnostics to explain why values are borrowed.
 
-use rustc_errors::{Applicability, Diagnostic};
+#![allow(rustc::diagnostic_outside_of_impl)]
+#![allow(rustc::untranslatable_diagnostic)]
+
+use rustc_errors::{Applicability, Diag};
 use rustc_hir as hir;
 use rustc_hir::intravisit::Visitor;
 use rustc_index::IndexSlice;
 use rustc_infer::infer::NllRegionVariableOrigin;
+use rustc_middle::middle::resolve_bound_vars::ObjectLifetimeDefault;
 use rustc_middle::mir::{
     Body, CallSource, CastKind, ConstraintCategory, FakeReadCause, Local, LocalInfo, Location,
     Operand, Place, Rvalue, Statement, StatementKind, TerminatorKind,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
-use rustc_middle::ty::{self, RegionVid, TyCtxt};
+use rustc_middle::ty::{self, RegionVid, Ty, TyCtxt};
 use rustc_span::symbol::{kw, Symbol};
 use rustc_span::{sym, DesugaringKind, Span};
 use rustc_trait_selection::traits::error_reporting::FindExprBySpan;
@@ -61,7 +65,7 @@ impl<'tcx> BorrowExplanation<'tcx> {
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         local_names: &IndexSlice<Local, Option<Symbol>>,
-        err: &mut Diagnostic,
+        err: &mut Diag<'_>,
         borrow_desc: &str,
         borrow_span: Option<Span>,
         multiple_borrow_span: Option<(Span, Span)>,
@@ -76,22 +80,19 @@ impl<'tcx> BorrowExplanation<'tcx> {
                 expr_finder.visit_expr(body.value);
                 if let Some(mut expr) = expr_finder.result {
                     while let hir::ExprKind::AddrOf(_, _, inner)
-                        | hir::ExprKind::Unary(hir::UnOp::Deref, inner)
-                        | hir::ExprKind::Field(inner, _)
-                        | hir::ExprKind::MethodCall(_, inner, _, _)
-                        | hir::ExprKind::Index(inner, _, _) = &expr.kind
+                    | hir::ExprKind::Unary(hir::UnOp::Deref, inner)
+                    | hir::ExprKind::Field(inner, _)
+                    | hir::ExprKind::MethodCall(_, inner, _, _)
+                    | hir::ExprKind::Index(inner, _, _) = &expr.kind
                     {
                         expr = inner;
                     }
                     if let hir::ExprKind::Path(hir::QPath::Resolved(None, p)) = expr.kind
                         && let [hir::PathSegment { ident, args: None, .. }] = p.segments
                         && let hir::def::Res::Local(hir_id) = p.res
-                        && let Some(hir::Node::Pat(pat)) = tcx.hir().find(hir_id)
+                        && let hir::Node::Pat(pat) = tcx.hir_node(hir_id)
                     {
-                        err.span_label(
-                            pat.span,
-                            format!("binding `{ident}` declared here"),
-                        );
+                        err.span_label(pat.span, format!("binding `{ident}` declared here"));
                     }
                 }
             }
@@ -185,7 +186,7 @@ impl<'tcx> BorrowExplanation<'tcx> {
                     // Otherwise, just report the whole type (and use
                     // the intentionally fuzzy phrase "destructor")
                     ty::Closure(..) => ("destructor", "closure".to_owned()),
-                    ty::Generator(..) => ("destructor", "generator".to_owned()),
+                    ty::Coroutine(..) => ("destructor", "coroutine".to_owned()),
 
                     _ => ("destructor", format!("type `{}`", local_decl.ty)),
                 };
@@ -293,15 +294,72 @@ impl<'tcx> BorrowExplanation<'tcx> {
                     }
                 }
 
+                if let ConstraintCategory::Cast { unsize_to: Some(unsize_ty) } = category {
+                    self.add_object_lifetime_default_note(tcx, err, unsize_ty);
+                }
                 self.add_lifetime_bound_suggestion_to_diagnostic(err, &category, span, region_name);
             }
             _ => {}
         }
     }
 
+    fn add_object_lifetime_default_note(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        err: &mut Diag<'_>,
+        unsize_ty: Ty<'tcx>,
+    ) {
+        if let ty::Adt(def, args) = unsize_ty.kind() {
+            // We try to elaborate the object lifetime defaults and present those to the user. This should
+            // make it clear where the region constraint is coming from.
+            let generics = tcx.generics_of(def.did());
+
+            let mut has_dyn = false;
+            let mut failed = false;
+
+            let elaborated_args = std::iter::zip(*args, &generics.params).map(|(arg, param)| {
+                if let Some(ty::Dynamic(obj, _, ty::Dyn)) = arg.as_type().map(Ty::kind) {
+                    let default = tcx.object_lifetime_default(param.def_id);
+
+                    let re_static = tcx.lifetimes.re_static;
+
+                    let implied_region = match default {
+                        // This is not entirely precise.
+                        ObjectLifetimeDefault::Empty => re_static,
+                        ObjectLifetimeDefault::Ambiguous => {
+                            failed = true;
+                            re_static
+                        }
+                        ObjectLifetimeDefault::Param(param_def_id) => {
+                            let index = generics.param_def_id_to_index[&param_def_id] as usize;
+                            args.get(index).and_then(|arg| arg.as_region()).unwrap_or_else(|| {
+                                failed = true;
+                                re_static
+                            })
+                        }
+                        ObjectLifetimeDefault::Static => re_static,
+                    };
+
+                    has_dyn = true;
+
+                    Ty::new_dynamic(tcx, obj, implied_region, ty::Dyn).into()
+                } else {
+                    arg
+                }
+            });
+            let elaborated_ty = Ty::new_adt(tcx, *def, tcx.mk_args_from_iter(elaborated_args));
+
+            if has_dyn && !failed {
+                err.note(format!(
+                    "due to object lifetime defaults, `{unsize_ty}` actually means `{elaborated_ty}`"
+                ));
+            }
+        }
+    }
+
     fn add_lifetime_bound_suggestion_to_diagnostic(
         &self,
-        err: &mut Diagnostic,
+        err: &mut Diag<'_>,
         category: &ConstraintCategory<'tcx>,
         span: Span,
         region_name: &RegionName,
@@ -367,7 +425,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
         kind_place: Option<(WriteKind, Place<'tcx>)>,
     ) -> BorrowExplanation<'tcx> {
         let regioncx = &self.regioncx;
-        let body: &Body<'_> = &self.body;
+        let body: &Body<'_> = self.body;
         let tcx = self.infcx.tcx;
 
         let borrow_region_vid = borrow.region;
@@ -419,7 +477,8 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                 if self.local_names[local].is_some()
                     && let Some((WriteKind::StorageDeadOrDrop, place)) = kind_place
                     && let Some(borrowed_local) = place.as_local()
-                    && self.local_names[borrowed_local].is_some() && local != borrowed_local
+                    && self.local_names[borrowed_local].is_some()
+                    && local != borrowed_local
                 {
                     should_note_order = true;
                 }
@@ -635,7 +694,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                         );
                         // Check if one of the arguments to this function is the target place.
                         let found_target = args.iter().any(|arg| {
-                            if let Operand::Move(place) = arg {
+                            if let Operand::Move(place) = arg.node {
                                 if let Some(potential) = place.as_local() {
                                     potential == target
                                 } else {

@@ -1,23 +1,19 @@
 use std::collections::BTreeSet;
-use std::fmt::{self, Debug, Display, Write as _};
+use std::fmt::{Display, Write as _};
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
+use crate::mir::interpret::ConstAllocation;
+
 use super::graphviz::write_mir_fn_graphviz;
-use super::spanview::write_mir_fn_spanview;
-use either::Either;
-use rustc_ast::InlineAsmTemplatePiece;
-use rustc_data_structures::fx::FxHashMap;
-use rustc_hir::def_id::DefId;
-use rustc_index::Idx;
+use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_middle::mir::interpret::{
-    alloc_range, read_target_uint, AllocBytes, AllocId, Allocation, ConstAllocation, GlobalAlloc,
-    Pointer, Provenance,
+    alloc_range, read_target_uint, AllocBytes, AllocId, Allocation, GlobalAlloc, Pointer,
+    Provenance,
 };
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::*;
-use rustc_middle::ty::{self, TyCtxt};
 use rustc_target::abi::Size;
 
 const INDENT: &str = "    ";
@@ -130,8 +126,8 @@ fn dump_matched_mir_node<'tcx, F>(
             Some(promoted) => write!(file, "::{promoted:?}`")?,
         }
         writeln!(file, " {disambiguator} {pass_name}")?;
-        if let Some(ref layout) = body.generator_layout() {
-            writeln!(file, "/* generator_layout = {layout:#?} */")?;
+        if let Some(ref layout) = body.coroutine_layout_raw() {
+            writeln!(file, "/* coroutine_layout = {layout:#?} */")?;
         }
         writeln!(file)?;
         extra_data(PassWhere::BeforeCFG, &mut file)?;
@@ -146,27 +142,19 @@ fn dump_matched_mir_node<'tcx, F>(
             write_mir_fn_graphviz(tcx, body, false, &mut file)?;
         };
     }
-
-    if let Some(spanview) = tcx.sess.opts.unstable_opts.dump_mir_spanview {
-        let _: io::Result<()> = try {
-            let file_basename = dump_file_basename(tcx, pass_num, pass_name, disambiguator, body);
-            let mut file = create_dump_file_with_basename(tcx, &file_basename, "html")?;
-            if body.source.def_id().is_local() {
-                write_mir_fn_spanview(tcx, body, spanview, &file_basename, &mut file)?;
-            }
-        };
-    }
 }
 
-/// Returns the file basename portion (without extension) of a filename path
-/// where we should dump a MIR representation output files.
-fn dump_file_basename<'tcx>(
+/// Returns the path to the filename where we should dump a given MIR.
+/// Also used by other bits of code (e.g., NLL inference) that dump
+/// graphviz data or other things.
+fn dump_path<'tcx>(
     tcx: TyCtxt<'tcx>,
+    extension: &str,
     pass_num: bool,
     pass_name: &str,
     disambiguator: &dyn Display,
     body: &Body<'tcx>,
-) -> String {
+) -> PathBuf {
     let source = body.source;
     let promotion_id = match source.promoted {
         Some(id) => format!("-{id:?}"),
@@ -202,43 +190,16 @@ fn dump_file_basename<'tcx>(
         _ => String::new(),
     };
 
-    format!(
-        "{crate_name}.{item_name}{shim_disambiguator}{promotion_id}{pass_num}.{pass_name}.{disambiguator}",
-    )
-}
-
-/// Returns the path to the filename where we should dump a given MIR.
-/// Also used by other bits of code (e.g., NLL inference) that dump
-/// graphviz data or other things.
-fn dump_path(tcx: TyCtxt<'_>, basename: &str, extension: &str) -> PathBuf {
     let mut file_path = PathBuf::new();
     file_path.push(Path::new(&tcx.sess.opts.unstable_opts.dump_mir_dir));
 
-    let file_name = format!("{basename}.{extension}",);
+    let file_name = format!(
+        "{crate_name}.{item_name}{shim_disambiguator}{promotion_id}{pass_num}.{pass_name}.{disambiguator}.{extension}",
+    );
 
     file_path.push(&file_name);
 
     file_path
-}
-
-/// Attempts to open the MIR dump file with the given name and extension.
-fn create_dump_file_with_basename(
-    tcx: TyCtxt<'_>,
-    file_basename: &str,
-    extension: &str,
-) -> io::Result<io::BufWriter<fs::File>> {
-    let file_path = dump_path(tcx, file_basename, extension);
-    if let Some(parent) = file_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("IO error creating MIR dump directory: {parent:?}; {e}"),
-            )
-        })?;
-    }
-    Ok(io::BufWriter::new(fs::File::create(&file_path).map_err(|e| {
-        io::Error::new(e.kind(), format!("IO error creating MIR dump file: {file_path:?}; {e}"))
-    })?))
 }
 
 /// Attempts to open a file where we should dump a given MIR or other
@@ -253,11 +214,18 @@ pub fn create_dump_file<'tcx>(
     disambiguator: &dyn Display,
     body: &Body<'tcx>,
 ) -> io::Result<io::BufWriter<fs::File>> {
-    create_dump_file_with_basename(
-        tcx,
-        &dump_file_basename(tcx, pass_num, pass_name, disambiguator, body),
-        extension,
-    )
+    let file_path = dump_path(tcx, extension, pass_num, pass_name, disambiguator, body);
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("IO error creating MIR dump directory: {parent:?}; {e}"),
+            )
+        })?;
+    }
+    Ok(io::BufWriter::new(fs::File::create(&file_path).map_err(|e| {
+        io::Error::new(e.kind(), format!("IO error creating MIR dump file: {file_path:?}; {e}"))
+    })?))
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -493,6 +461,49 @@ pub fn write_mir_intro<'tcx>(
     // Add an empty line before the first block is printed.
     writeln!(w)?;
 
+    if let Some(branch_info) = &body.coverage_branch_info {
+        write_coverage_branch_info(branch_info, w)?;
+    }
+    if let Some(function_coverage_info) = &body.function_coverage_info {
+        write_function_coverage_info(function_coverage_info, w)?;
+    }
+
+    Ok(())
+}
+
+fn write_coverage_branch_info(
+    branch_info: &coverage::BranchInfo,
+    w: &mut dyn io::Write,
+) -> io::Result<()> {
+    let coverage::BranchInfo { branch_spans, .. } = branch_info;
+
+    for coverage::BranchSpan { span, true_marker, false_marker } in branch_spans {
+        writeln!(
+            w,
+            "{INDENT}coverage branch {{ true: {true_marker:?}, false: {false_marker:?} }} => {span:?}",
+        )?;
+    }
+    if !branch_spans.is_empty() {
+        writeln!(w)?;
+    }
+
+    Ok(())
+}
+
+fn write_function_coverage_info(
+    function_coverage_info: &coverage::FunctionCoverageInfo,
+    w: &mut dyn io::Write,
+) -> io::Result<()> {
+    let coverage::FunctionCoverageInfo { expressions, mappings, .. } = function_coverage_info;
+
+    for (id, expression) in expressions.iter_enumerated() {
+        writeln!(w, "{INDENT}coverage {id:?} => {expression:?};")?;
+    }
+    for coverage::Mapping { kind, code_region } in mappings {
+        writeln!(w, "{INDENT}coverage {kind:?} => {code_region:?};")?;
+    }
+    writeln!(w)?;
+
     Ok(())
 }
 
@@ -504,13 +515,17 @@ fn write_mir_sig(tcx: TyCtxt<'_>, body: &Body<'_>, w: &mut dyn io::Write) -> io:
     let kind = tcx.def_kind(def_id);
     let is_function = match kind {
         DefKind::Fn | DefKind::AssocFn | DefKind::Ctor(..) => true,
-        _ => tcx.is_closure(def_id),
+        _ => tcx.is_closure_like(def_id),
     };
     match (kind, body.source.promoted) {
-        (_, Some(i)) => write!(w, "{i:?} in ")?,
+        (_, Some(_)) => write!(w, "const ")?, // promoteds are the closest to consts
         (DefKind::Const | DefKind::AssocConst, _) => write!(w, "const ")?,
-        (DefKind::Static(hir::Mutability::Not), _) => write!(w, "static ")?,
-        (DefKind::Static(hir::Mutability::Mut), _) => write!(w, "static mut ")?,
+        (DefKind::Static { mutability: hir::Mutability::Not, nested: false }, _) => {
+            write!(w, "static ")?
+        }
+        (DefKind::Static { mutability: hir::Mutability::Mut, nested: false }, _) => {
+            write!(w, "static mut ")?
+        }
         (_, _) if is_function => write!(w, "fn ")?,
         (DefKind::AnonConst | DefKind::InlineConst, _) => {} // things like anon const, not an item
         _ => bug!("Unexpected def kind {:?}", kind),
@@ -519,6 +534,9 @@ fn write_mir_sig(tcx: TyCtxt<'_>, body: &Body<'_>, w: &mut dyn io::Write) -> io:
     ty::print::with_forced_impl_filename_line! {
         // see notes on #41697 elsewhere
         write!(w, "{}", tcx.def_path_str(def_id))?
+    }
+    if let Some(p) = body.source.promoted {
+        write!(w, "::{p:?}")?;
     }
 
     if body.source.promoted.is_none() && is_function {
@@ -611,7 +629,11 @@ where
                 w,
                 "{:A$} // {}{}",
                 indented_body,
-                if tcx.sess.verbose() { format!("{current_location:?}: ") } else { String::new() },
+                if tcx.sess.verbose_internals() {
+                    format!("{current_location:?}: ")
+                } else {
+                    String::new()
+                },
                 comment(tcx, statement.source_info),
                 A = ALIGN,
             )?;
@@ -636,7 +658,11 @@ where
             w,
             "{:A$} // {}{}",
             indented_terminator,
-            if tcx.sess.verbose() { format!("{current_location:?}: ") } else { String::new() },
+            if tcx.sess.verbose_internals() {
+                format!("{current_location:?}: ")
+            } else {
+                String::new()
+            },
             comment(tcx, data.terminator().source_info),
             A = ALIGN,
         )?;
@@ -685,10 +711,7 @@ impl Debug for Statement<'_> {
             AscribeUserType(box (ref place, ref c_ty), ref variance) => {
                 write!(fmt, "AscribeUserType({place:?}, {variance:?}, {c_ty:?})")
             }
-            Coverage(box self::Coverage { ref kind, code_region: Some(ref rgn) }) => {
-                write!(fmt, "Coverage::{kind:?} for {rgn:?}")
-            }
-            Coverage(box ref coverage) => write!(fmt, "Coverage::{:?}", coverage.kind),
+            Coverage(ref kind) => write!(fmt, "Coverage::{kind:?}"),
             Intrinsic(box ref intrinsic) => write!(fmt, "{intrinsic}"),
             ConstEvalCounter => write!(fmt, "ConstEvalCounter"),
             Nop => write!(fmt, "nop"),
@@ -764,10 +787,10 @@ impl<'tcx> TerminatorKind<'tcx> {
             Goto { .. } => write!(fmt, "goto"),
             SwitchInt { discr, .. } => write!(fmt, "switchInt({discr:?})"),
             Return => write!(fmt, "return"),
-            GeneratorDrop => write!(fmt, "generator_drop"),
+            CoroutineDrop => write!(fmt, "coroutine_drop"),
             UnwindResume => write!(fmt, "resume"),
             UnwindTerminate(reason) => {
-                write!(fmt, "abort({})", reason.as_short_str())
+                write!(fmt, "terminate({})", reason.as_short_str())
             }
             Yield { value, resume_arg, .. } => write!(fmt, "{resume_arg:?} = yield({value:?})"),
             Unreachable => write!(fmt, "unreachable"),
@@ -775,7 +798,7 @@ impl<'tcx> TerminatorKind<'tcx> {
             Call { func, args, destination, .. } => {
                 write!(fmt, "{destination:?} = ")?;
                 write!(fmt, "{func:?}(")?;
-                for (index, arg) in args.iter().enumerate() {
+                for (index, arg) in args.iter().map(|a| &a.node).enumerate() {
                     if index > 0 {
                         write!(fmt, ", ")?;
                     }
@@ -836,6 +859,9 @@ impl<'tcx> TerminatorKind<'tcx> {
                         InlineAsmOperand::SymStatic { def_id } => {
                             write!(fmt, "sym_static {def_id:?}")?;
                         }
+                        InlineAsmOperand::Label { target_index } => {
+                            write!(fmt, "label {target_index}")?;
+                        }
                     }
                 }
                 write!(fmt, ", options({options:?}))")
@@ -847,7 +873,7 @@ impl<'tcx> TerminatorKind<'tcx> {
     pub fn fmt_successor_labels(&self) -> Vec<Cow<'static, str>> {
         use self::TerminatorKind::*;
         match *self {
-            Return | UnwindResume | UnwindTerminate(_) | Unreachable | GeneratorDrop => vec![],
+            Return | UnwindResume | UnwindTerminate(_) | Unreachable | CoroutineDrop => vec![],
             Goto { .. } => vec!["".into()],
             SwitchInt { ref targets, .. } => targets
                 .values
@@ -874,16 +900,19 @@ impl<'tcx> TerminatorKind<'tcx> {
                 vec!["real".into(), "unwind".into()]
             }
             FalseUnwind { unwind: _, .. } => vec!["real".into()],
-            InlineAsm { destination: Some(_), unwind: UnwindAction::Cleanup(_), .. } => {
-                vec!["return".into(), "unwind".into()]
+            InlineAsm { options, ref targets, unwind, .. } => {
+                let mut vec = Vec::with_capacity(targets.len() + 1);
+                if !options.contains(InlineAsmOptions::NORETURN) {
+                    vec.push("return".into());
+                }
+                vec.resize(targets.len(), "label".into());
+
+                if let UnwindAction::Cleanup(_) = unwind {
+                    vec.push("unwind".into());
+                }
+
+                vec
             }
-            InlineAsm { destination: Some(_), unwind: _, .. } => {
-                vec!["return".into()]
-            }
-            InlineAsm { destination: None, unwind: UnwindAction::Cleanup(_), .. } => {
-                vec!["unwind".into()]
-            }
-            InlineAsm { destination: None, unwind: _, .. } => vec![],
         }
     }
 }
@@ -915,6 +944,7 @@ impl<'tcx> Debug for Rvalue<'tcx> {
                     NullOp::SizeOf => write!(fmt, "SizeOf({t})"),
                     NullOp::AlignOf => write!(fmt, "AlignOf({t})"),
                     NullOp::OffsetOf(fields) => write!(fmt, "OffsetOf({t}, {fields:?})"),
+                    NullOp::UbChecks => write!(fmt, "UbChecks()"),
                 }
             }
             ThreadLocalRef(did) => ty::tls::with(|tcx| {
@@ -924,13 +954,13 @@ impl<'tcx> Debug for Rvalue<'tcx> {
             Ref(region, borrow_kind, ref place) => {
                 let kind_str = match borrow_kind {
                     BorrowKind::Shared => "",
-                    BorrowKind::Shallow => "shallow ",
+                    BorrowKind::Fake => "fake ",
                     BorrowKind::Mut { .. } => "mut ",
                 };
 
                 // When printing regions, add trailing space if necessary.
                 let print_region = ty::tls::with(|tcx| {
-                    tcx.sess.verbose() || tcx.sess.opts.unstable_opts.identify_regions
+                    tcx.sess.verbose_internals() || tcx.sess.opts.unstable_opts.identify_regions
                 });
                 let region = if print_region {
                     let mut region = region.to_string();
@@ -980,9 +1010,9 @@ impl<'tcx> Debug for Rvalue<'tcx> {
                         ty::tls::with(|tcx| {
                             let variant_def = &tcx.adt_def(adt_did).variant(variant);
                             let args = tcx.lift(args).expect("could not lift for printing");
-                            let name = FmtPrinter::new(tcx, Namespace::ValueNS)
-                                .print_def_path(variant_def.def_id, args)?
-                                .into_buffer();
+                            let name = FmtPrinter::print_string(tcx, Namespace::ValueNS, |cx| {
+                                cx.print_def_path(variant_def.def_id, args)
+                            })?;
 
                             match variant_def.ctor_kind() {
                                 Some(CtorKind::Const) => fmt.write_str(&name),
@@ -998,7 +1028,8 @@ impl<'tcx> Debug for Rvalue<'tcx> {
                         })
                     }
 
-                    AggregateKind::Closure(def_id, args) => ty::tls::with(|tcx| {
+                    AggregateKind::Closure(def_id, args)
+                    | AggregateKind::CoroutineClosure(def_id, args) => ty::tls::with(|tcx| {
                         let name = if tcx.sess.opts.unstable_opts.span_free_formats {
                             let args = tcx.lift(args).unwrap();
                             format!("{{closure@{}}}", tcx.def_path_str_with_args(def_id, args),)
@@ -1028,8 +1059,8 @@ impl<'tcx> Debug for Rvalue<'tcx> {
                         struct_fmt.finish()
                     }),
 
-                    AggregateKind::Generator(def_id, _, _) => ty::tls::with(|tcx| {
-                        let name = format!("{{generator@{:?}}}", tcx.def_span(def_id));
+                    AggregateKind::Coroutine(def_id, _) => ty::tls::with(|tcx| {
+                        let name = format!("{{coroutine@{:?}}}", tcx.def_span(def_id));
                         let mut struct_fmt = fmt.debug_struct(&name);
 
                         // FIXME(project-rfc-2229#48): This should be a list of capture names/places
@@ -1103,12 +1134,13 @@ fn pre_fmt_projection(projection: &[PlaceElem<'_>], fmt: &mut Formatter<'_>) -> 
     for &elem in projection.iter().rev() {
         match elem {
             ProjectionElem::OpaqueCast(_)
+            | ProjectionElem::Subtype(_)
             | ProjectionElem::Downcast(_, _)
             | ProjectionElem::Field(_, _) => {
-                write!(fmt, "(").unwrap();
+                write!(fmt, "(")?;
             }
             ProjectionElem::Deref => {
-                write!(fmt, "(*").unwrap();
+                write!(fmt, "(*")?;
             }
             ProjectionElem::Index(_)
             | ProjectionElem::ConstantIndex { .. }
@@ -1124,6 +1156,9 @@ fn post_fmt_projection(projection: &[PlaceElem<'_>], fmt: &mut Formatter<'_>) ->
         match elem {
             ProjectionElem::OpaqueCast(ty) => {
                 write!(fmt, " as {ty})")?;
+            }
+            ProjectionElem::Subtype(ty) => {
+                write!(fmt, " as subtype {ty})")?;
             }
             ProjectionElem::Downcast(Some(name), _index) => {
                 write!(fmt, " as {name})")?;
@@ -1279,11 +1314,11 @@ impl<'tcx> Visitor<'tcx> for ExtraComments<'tcx> {
                     self.push(&format!("+ args: {args:#?}"));
                 }
 
-                AggregateKind::Generator(def_id, args, movability) => {
-                    self.push("generator");
+                AggregateKind::Coroutine(def_id, args) => {
+                    self.push("coroutine");
                     self.push(&format!("+ def_id: {def_id:?}"));
                     self.push(&format!("+ args: {args:#?}"));
-                    self.push(&format!("+ movability: {movability:?}"));
+                    self.push(&format!("+ kind: {:?}", self.tcx.coroutine_kind(def_id)));
                 }
 
                 AggregateKind::Adt(_, _, _, Some(user_ty), _) => {
@@ -1315,13 +1350,13 @@ pub fn write_allocations<'tcx>(
     fn alloc_ids_from_alloc(
         alloc: ConstAllocation<'_>,
     ) -> impl DoubleEndedIterator<Item = AllocId> + '_ {
-        alloc.inner().provenance().ptrs().values().map(|id| *id)
+        alloc.inner().provenance().ptrs().values().map(|p| p.alloc_id())
     }
 
     fn alloc_ids_from_const_val(val: ConstValue<'_>) -> impl Iterator<Item = AllocId> + '_ {
         match val {
             ConstValue::Scalar(interpret::Scalar::Ptr(ptr, _)) => {
-                Either::Left(std::iter::once(ptr.provenance))
+                Either::Left(std::iter::once(ptr.provenance.alloc_id()))
             }
             ConstValue::Scalar(interpret::Scalar::Int { .. }) => Either::Right(std::iter::empty()),
             ConstValue::ZeroSized => Either::Right(std::iter::empty()),
@@ -1651,7 +1686,7 @@ fn pretty_print_const_value_tcx<'tcx>(
 ) -> fmt::Result {
     use crate::ty::print::PrettyPrinter;
 
-    if tcx.sess.verbose() {
+    if tcx.sess.verbose_internals() {
         fmt.write_str(&format!("ConstValue({ct:?}: {ty})"))?;
         return Ok(());
     }
@@ -1691,7 +1726,7 @@ fn pretty_print_const_value_tcx<'tcx>(
         (_, ty::Array(..) | ty::Tuple(..) | ty::Adt(..)) if !ty.has_non_region_param() => {
             let ct = tcx.lift(ct).unwrap();
             let ty = tcx.lift(ty).unwrap();
-            if let Some(contents) = tcx.try_destructure_mir_constant_for_diagnostics(ct, ty) {
+            if let Some(contents) = tcx.try_destructure_mir_constant_for_user_output(ct, ty) {
                 let fields: Vec<(ConstValue<'_>, Ty<'_>)> = contents.fields.to_vec();
                 match *ty.kind() {
                     ty::Array(..) => {
@@ -1718,7 +1753,7 @@ fn pretty_print_const_value_tcx<'tcx>(
                         let args = tcx.lift(args).unwrap();
                         let mut cx = FmtPrinter::new(tcx, Namespace::ValueNS);
                         cx.print_alloc_ids = true;
-                        let cx = cx.print_value_path(variant_def.def_id, args)?;
+                        cx.print_value_path(variant_def.def_id, args)?;
                         fmt.write_str(&cx.into_buffer())?;
 
                         match variant_def.ctor_kind() {
@@ -1753,14 +1788,14 @@ fn pretty_print_const_value_tcx<'tcx>(
             let mut cx = FmtPrinter::new(tcx, Namespace::ValueNS);
             cx.print_alloc_ids = true;
             let ty = tcx.lift(ty).unwrap();
-            cx = cx.pretty_print_const_scalar(scalar, ty)?;
+            cx.pretty_print_const_scalar(scalar, ty)?;
             fmt.write_str(&cx.into_buffer())?;
             return Ok(());
         }
         (ConstValue::ZeroSized, ty::FnDef(d, s)) => {
             let mut cx = FmtPrinter::new(tcx, Namespace::ValueNS);
             cx.print_alloc_ids = true;
-            let cx = cx.print_value_path(*d, s)?;
+            cx.print_value_path(*d, s)?;
             fmt.write_str(&cx.into_buffer())?;
             return Ok(());
         }

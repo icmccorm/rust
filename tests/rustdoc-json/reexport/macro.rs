@@ -1,7 +1,4 @@
-// edition:2018
-
-#![no_core]
-#![feature(no_core)]
+//@ edition:2018
 
 // @set repro_id = "$.index[*][?(@.name=='repro')].id"
 #[macro_export]

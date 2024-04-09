@@ -1,8 +1,8 @@
 #![allow(clippy::wildcard_imports, clippy::enum_glob_use)]
 
+use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::ast_utils::{eq_field_pat, eq_id, eq_maybe_qself, eq_pat, eq_path};
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::over;
 use rustc_ast::mut_visit::*;
 use rustc_ast::ptr::P;
@@ -11,7 +11,7 @@ use rustc_ast::{self as ast, Mutability, Pat, PatKind, DUMMY_NODE_ID};
 use rustc_ast_pretty::pprust;
 use rustc_errors::Applicability;
 use rustc_lint::{EarlyContext, EarlyLintPass};
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_session::impl_lint_pass;
 use rustc_span::DUMMY_SP;
 use std::cell::Cell;
 use std::mem;
@@ -29,13 +29,13 @@ declare_clippy_lint! {
     /// In the example above, `Some` is repeated, which unnecessarily complicates the pattern.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// fn main() {
     ///     if let Some(0) | Some(2) = Some(0) {}
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// fn main() {
     ///     if let Some(0 | 2) = Some(0) {}
     /// }
@@ -215,7 +215,7 @@ macro_rules! always_pat {
 /// in `alternatives[focus_idx + 1..]`.
 fn transform_with_focus_on_idx(alternatives: &mut ThinVec<P<Pat>>, focus_idx: usize) -> bool {
     // Extract the kind; we'll need to make some changes in it.
-    let mut focus_kind = mem::replace(&mut alternatives[focus_idx].kind, PatKind::Wild);
+    let mut focus_kind = mem::replace(&mut alternatives[focus_idx].kind, Wild);
     // We'll focus on `alternatives[focus_idx]`,
     // so we're draining from `alternatives[focus_idx + 1..]`.
     let start = focus_idx + 1;
@@ -226,13 +226,13 @@ fn transform_with_focus_on_idx(alternatives: &mut ThinVec<P<Pat>>, focus_idx: us
         // Therefore they are not some form of constructor `C`,
         // with which a pattern `C(p_0)` may be formed,
         // which we would want to join with other `C(p_j)`s.
-        Ident(.., None) | Lit(_) | Wild | Path(..) | Range(..) | Rest | MacCall(_)
+        Ident(.., None) | Lit(_) | Wild | Err(_) | Never | Path(..) | Range(..) | Rest | MacCall(_)
         // Skip immutable refs, as grouping them saves few characters,
         // and almost always requires adding parens (increasing noisiness).
         // In the case of only two patterns, replacement adds net characters.
         | Ref(_, Mutability::Not)
         // Dealt with elsewhere.
-        | Or(_) | Paren(_) => false,
+        | Or(_) | Paren(_) | Deref(_) => false,
         // Transform `box x | ... | box y` into `box (x | y)`.
         //
         // The cases below until `Slice(...)` deal with *singleton* products.
@@ -293,7 +293,7 @@ fn extend_with_struct_pat(
     qself1: &Option<P<ast::QSelf>>,
     path1: &ast::Path,
     fps1: &mut [ast::PatField],
-    rest1: bool,
+    rest1: ast::PatFieldsRest,
     start: usize,
     alternatives: &mut ThinVec<P<Pat>>,
 ) -> bool {

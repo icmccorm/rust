@@ -4,17 +4,17 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::BitSet;
 use rustc_index::IndexVec;
 use rustc_infer::traits::Reveal;
+use rustc_middle::mir::coverage::CoverageKind;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::visit::{NonUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
-use rustc_middle::ty::{self, InstanceDef, ParamEnv, Ty, TyCtxt, TypeVisitableExt};
-use rustc_mir_dataflow::impls::MaybeStorageLive;
-use rustc_mir_dataflow::storage::always_storage_live_locals;
-use rustc_mir_dataflow::{Analysis, ResultsCursor};
+use rustc_middle::ty::{self, InstanceDef, ParamEnv, Ty, TyCtxt, TypeVisitableExt, Variance};
 use rustc_target::abi::{Size, FIRST_VARIANT};
 use rustc_target::spec::abi::Abi;
 
 use crate::util::is_within_packed;
+
+use crate::util::relate_types;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum EdgeKind {
@@ -49,12 +49,6 @@ impl<'tcx> MirPass<'tcx> for Validator {
             Reveal::All => tcx.param_env_reveal_all_normalized(def_id),
         };
 
-        let always_live_locals = always_storage_live_locals(body);
-        let storage_liveness = MaybeStorageLive::new(std::borrow::Cow::Owned(always_live_locals))
-            .into_engine(tcx, body)
-            .iterate_to_fixpoint()
-            .into_results_cursor(body);
-
         let can_unwind = if mir_phase <= MirPhase::Runtime(RuntimePhase::Initial) {
             // In this case `AbortUnwindingCalls` haven't yet been executed.
             true
@@ -65,7 +59,10 @@ impl<'tcx> MirPass<'tcx> for Validator {
             let body_abi = match body_ty.kind() {
                 ty::FnDef(..) => body_ty.fn_sig(tcx).abi(),
                 ty::Closure(..) => Abi::RustCall,
-                ty::Generator(..) => Abi::Rust,
+                ty::CoroutineClosure(..) => Abi::RustCall,
+                ty::Coroutine(..) => Abi::Rust,
+                // No need to do MIR validation on error bodies
+                ty::Error(_) => return,
                 _ => {
                     span_bug!(body.span, "unexpected body ty: {:?} phase {:?}", body_ty, mir_phase)
                 }
@@ -81,8 +78,6 @@ impl<'tcx> MirPass<'tcx> for Validator {
             mir_phase,
             unwind_edge_count: 0,
             reachable_blocks: traversal::reachable_as_bitset(body),
-            storage_liveness,
-            place_cache: FxHashSet::default(),
             value_cache: FxHashSet::default(),
             can_unwind,
         };
@@ -90,7 +85,7 @@ impl<'tcx> MirPass<'tcx> for Validator {
         cfg_checker.check_cleanup_control_flow();
 
         // Also run the TypeChecker.
-        for (location, msg) in validate_types(tcx, self.mir_phase, param_env, body) {
+        for (location, msg) in validate_types(tcx, self.mir_phase, param_env, body, body) {
             cfg_checker.fail(location, msg);
         }
 
@@ -104,6 +99,25 @@ impl<'tcx> MirPass<'tcx> for Validator {
                 }
             }
         }
+
+        // Enforce that coroutine-closure layouts are identical.
+        if let Some(layout) = body.coroutine_layout_raw()
+            && let Some(by_move_body) = body.coroutine_by_move_body()
+            && let Some(by_move_layout) = by_move_body.coroutine_layout_raw()
+        {
+            // FIXME(async_closures): We could do other validation here?
+            if layout.variant_fields.len() != by_move_layout.variant_fields.len() {
+                cfg_checker.fail(
+                    Location::START,
+                    format!(
+                        "Coroutine layout has different number of variant fields from \
+                        by-move coroutine layout:\n\
+                        layout: {layout:#?}\n\
+                        by_move_layout: {by_move_layout:#?}",
+                    ),
+                );
+            }
+        }
     }
 }
 
@@ -114,8 +128,6 @@ struct CfgChecker<'a, 'tcx> {
     mir_phase: MirPhase,
     unwind_edge_count: usize,
     reachable_blocks: BitSet<BasicBlock>,
-    storage_liveness: ResultsCursor<'a, 'tcx, MaybeStorageLive<'static>>,
-    place_cache: FxHashSet<PlaceRef<'tcx>>,
     value_cache: FxHashSet<u128>,
     // If `false`, then the MIR must not contain `UnwindAction::Continue` or
     // `TerminatorKind::Resume`.
@@ -125,18 +137,14 @@ struct CfgChecker<'a, 'tcx> {
 impl<'a, 'tcx> CfgChecker<'a, 'tcx> {
     #[track_caller]
     fn fail(&self, location: Location, msg: impl AsRef<str>) {
-        let span = self.body.source_info(location).span;
-        // We use `delay_span_bug` as we might see broken MIR when other errors have already
-        // occurred.
-        self.tcx.sess.diagnostic().delay_span_bug(
-            span,
-            format!(
-                "broken MIR in {:?} ({}) at {:?}:\n{}",
-                self.body.source.instance,
-                self.when,
-                location,
-                msg.as_ref()
-            ),
+        // We might see broken MIR when other errors have already occurred.
+        assert!(
+            self.tcx.dcx().has_errors().is_some(),
+            "broken MIR in {:?} ({}) at {:?}:\n{}",
+            self.body.source.instance,
+            self.when,
+            location,
+            msg.as_ref(),
         );
     }
 
@@ -283,48 +291,26 @@ impl<'a, 'tcx> CfgChecker<'a, 'tcx> {
             UnwindAction::Unreachable | UnwindAction::Terminate(UnwindTerminateReason::Abi) => (),
         }
     }
+
+    fn is_critical_call_edge(&self, target: Option<BasicBlock>, unwind: UnwindAction) -> bool {
+        let Some(target) = target else { return false };
+        matches!(unwind, UnwindAction::Cleanup(_) | UnwindAction::Terminate(_))
+            && self.body.basic_blocks.predecessors()[target].len() > 1
+    }
 }
 
 impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
-    fn visit_local(&mut self, local: Local, context: PlaceContext, location: Location) {
+    fn visit_local(&mut self, local: Local, _context: PlaceContext, location: Location) {
         if self.body.local_decls.get(local).is_none() {
             self.fail(
                 location,
                 format!("local {local:?} has no corresponding declaration in `body.local_decls`"),
             );
         }
-
-        if self.reachable_blocks.contains(location.block) && context.is_use() {
-            // We check that the local is live whenever it is used. Technically, violating this
-            // restriction is only UB and not actually indicative of not well-formed MIR. This means
-            // that an optimization which turns MIR that already has UB into MIR that fails this
-            // check is not necessarily wrong. However, we have no such optimizations at the moment,
-            // and so we include this check anyway to help us catch bugs. If you happen to write an
-            // optimization that might cause this to incorrectly fire, feel free to remove this
-            // check.
-            self.storage_liveness.seek_after_primary_effect(location);
-            let locals_with_storage = self.storage_liveness.get();
-            if !locals_with_storage.contains(local) {
-                self.fail(location, format!("use of local {local:?}, which has no storage here"));
-            }
-        }
     }
 
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
         match &statement.kind {
-            StatementKind::Assign(box (dest, rvalue)) => {
-                // FIXME(JakobDegen): Check this for all rvalues, not just this one.
-                if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue {
-                    // The sides of an assignment must not alias. Currently this just checks whether
-                    // the places are identical.
-                    if dest == src {
-                        self.fail(
-                            location,
-                            "encountered `Assign` statement with overlapping memory",
-                        );
-                    }
-                }
-            }
             StatementKind::AscribeUserType(..) => {
                 if self.mir_phase >= MirPhase::Runtime(RuntimePhase::Initial) {
                     self.fail(
@@ -355,32 +341,24 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
                 // FIXME(JakobDegen) The validator should check that `self.mir_phase <
                 // DropsLowered`. However, this causes ICEs with generation of drop shims, which
                 // seem to fail to set their `MirPhase` correctly.
-                if matches!(kind, RetagKind::Raw | RetagKind::TwoPhase) {
+                if matches!(kind, RetagKind::TwoPhase) {
                     self.fail(location, format!("explicit `{kind:?}` is forbidden"));
                 }
             }
-            StatementKind::StorageLive(local) => {
-                // We check that the local is not live when entering a `StorageLive` for it.
-                // Technically, violating this restriction is only UB and not actually indicative
-                // of not well-formed MIR. This means that an optimization which turns MIR that
-                // already has UB into MIR that fails this check is not necessarily wrong. However,
-                // we have no such optimizations at the moment, and so we include this check anyway
-                // to help us catch bugs. If you happen to write an optimization that might cause
-                // this to incorrectly fire, feel free to remove this check.
-                if self.reachable_blocks.contains(location.block) {
-                    self.storage_liveness.seek_before_primary_effect(location);
-                    let locals_with_storage = self.storage_liveness.get();
-                    if locals_with_storage.contains(*local) {
-                        self.fail(
-                            location,
-                            format!("StorageLive({local:?}) which already has storage here"),
-                        );
-                    }
+            StatementKind::Coverage(kind) => {
+                if self.mir_phase >= MirPhase::Analysis(AnalysisPhase::PostCleanup)
+                    && let CoverageKind::BlockMarker { .. } | CoverageKind::SpanMarker { .. } = kind
+                {
+                    self.fail(
+                        location,
+                        format!("{kind:?} should have been removed after analysis"),
+                    );
                 }
             }
-            StatementKind::StorageDead(_)
+            StatementKind::Assign(..)
+            | StatementKind::StorageLive(_)
+            | StatementKind::StorageDead(_)
             | StatementKind::Intrinsic(_)
-            | StatementKind::Coverage(_)
             | StatementKind::ConstEvalCounter
             | StatementKind::PlaceMention(..)
             | StatementKind::Nop => {}
@@ -423,11 +401,24 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
                 }
                 self.check_unwind_edge(location, *unwind);
 
+                // The code generation assumes that there are no critical call edges. The assumption
+                // is used to simplify inserting code that should be executed along the return edge
+                // from the call. FIXME(tmiasko): Since this is a strictly code generation concern,
+                // the code generation should be responsible for handling it.
+                if self.mir_phase >= MirPhase::Runtime(RuntimePhase::Optimized)
+                    && self.is_critical_call_edge(*target, *unwind)
+                {
+                    self.fail(
+                        location,
+                        format!(
+                            "encountered critical edge in `Call` terminator {:?}",
+                            terminator.kind,
+                        ),
+                    );
+                }
+
                 // The call destination place and Operand::Move place used as an argument might be
-                // passed by a reference to the callee. Consequently they must be non-overlapping
-                // and cannot be packed. Currently this simply checks for duplicate places.
-                self.place_cache.clear();
-                self.place_cache.insert(destination.as_ref());
+                // passed by a reference to the callee. Consequently they cannot be packed.
                 if is_within_packed(self.tcx, &self.body.local_decls, *destination).is_some() {
                     // This is bad! The callee will expect the memory to be aligned.
                     self.fail(
@@ -438,10 +429,8 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
                         ),
                     );
                 }
-                let mut has_duplicates = false;
                 for arg in args {
-                    if let Operand::Move(place) = arg {
-                        has_duplicates |= !self.place_cache.insert(place.as_ref());
+                    if let Operand::Move(place) = &arg.node {
                         if is_within_packed(self.tcx, &self.body.local_decls, *place).is_some() {
                             // This is bad! The callee will expect the memory to be aligned.
                             self.fail(
@@ -454,27 +443,17 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
                         }
                     }
                 }
-
-                if has_duplicates {
-                    self.fail(
-                        location,
-                        format!(
-                            "encountered overlapping memory in `Move` arguments to `Call` terminator: {:?}",
-                            terminator.kind,
-                        ),
-                    );
-                }
             }
             TerminatorKind::Assert { target, unwind, .. } => {
                 self.check_edge(location, *target, EdgeKind::Normal);
                 self.check_unwind_edge(location, *unwind);
             }
             TerminatorKind::Yield { resume, drop, .. } => {
-                if self.body.generator.is_none() {
-                    self.fail(location, "`Yield` cannot appear outside generator bodies");
+                if self.body.coroutine.is_none() {
+                    self.fail(location, "`Yield` cannot appear outside coroutine bodies");
                 }
                 if self.mir_phase >= MirPhase::Runtime(RuntimePhase::Initial) {
-                    self.fail(location, "`Yield` should have been replaced by generator lowering");
+                    self.fail(location, "`Yield` should have been replaced by coroutine lowering");
                 }
                 self.check_edge(location, *resume, EdgeKind::Normal);
                 if let Some(drop) = drop {
@@ -501,20 +480,20 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
                 self.check_edge(location, *real_target, EdgeKind::Normal);
                 self.check_unwind_edge(location, *unwind);
             }
-            TerminatorKind::InlineAsm { destination, unwind, .. } => {
-                if let Some(destination) = destination {
-                    self.check_edge(location, *destination, EdgeKind::Normal);
+            TerminatorKind::InlineAsm { targets, unwind, .. } => {
+                for &target in targets {
+                    self.check_edge(location, target, EdgeKind::Normal);
                 }
                 self.check_unwind_edge(location, *unwind);
             }
-            TerminatorKind::GeneratorDrop => {
-                if self.body.generator.is_none() {
-                    self.fail(location, "`GeneratorDrop` cannot appear outside generator bodies");
+            TerminatorKind::CoroutineDrop => {
+                if self.body.coroutine.is_none() {
+                    self.fail(location, "`CoroutineDrop` cannot appear outside coroutine bodies");
                 }
                 if self.mir_phase >= MirPhase::Runtime(RuntimePhase::Initial) {
                     self.fail(
                         location,
-                        "`GeneratorDrop` should have been replaced by generator lowering",
+                        "`CoroutineDrop` should have been replaced by coroutine lowering",
                     );
                 }
             }
@@ -547,7 +526,7 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
 
     fn visit_source_scope(&mut self, scope: SourceScope) {
         if self.body.source_scopes.get(scope).is_none() {
-            self.tcx.sess.diagnostic().delay_span_bug(
+            self.tcx.dcx().span_bug(
                 self.body.span,
                 format!(
                     "broken MIR in {:?} ({}):\ninvalid source scope {:?}",
@@ -560,19 +539,25 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
 
 /// A faster version of the validation pass that only checks those things which may break when
 /// instantiating any generic parameters.
+///
+/// `caller_body` is used to detect cycles in MIR inlining and MIR validation before
+/// `optimized_mir` is available.
 pub fn validate_types<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir_phase: MirPhase,
     param_env: ty::ParamEnv<'tcx>,
     body: &Body<'tcx>,
+    caller_body: &Body<'tcx>,
 ) -> Vec<(Location, String)> {
-    let mut type_checker = TypeChecker { body, tcx, param_env, mir_phase, failures: Vec::new() };
+    let mut type_checker =
+        TypeChecker { body, caller_body, tcx, param_env, mir_phase, failures: Vec::new() };
     type_checker.visit_body(body);
     type_checker.failures
 }
 
 struct TypeChecker<'a, 'tcx> {
     body: &'a Body<'tcx>,
+    caller_body: &'a Body<'tcx>,
     tcx: TyCtxt<'tcx>,
     param_env: ParamEnv<'tcx>,
     mir_phase: MirPhase,
@@ -602,7 +587,15 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             return true;
         }
 
-        crate::util::is_subtype(self.tcx, self.param_env, src, dest)
+        // After borrowck subtyping should be fully explicit via
+        // `Subtype` projections.
+        let variance = if self.mir_phase >= MirPhase::Runtime(RuntimePhase::Initial) {
+            Variance::Invariant
+        } else {
+            Variance::Covariant
+        };
+
+        crate::util::relate_types(self.tcx, self.param_env, variance, src, dest)
     }
 }
 
@@ -706,18 +699,32 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         };
                         check_equal(self, location, f_ty);
                     }
-                    &ty::Generator(def_id, args, _) => {
+                    ty::CoroutineClosure(_, args) => {
+                        let args = args.as_coroutine_closure();
+                        let Some(&f_ty) = args.upvar_tys().get(f.as_usize()) else {
+                            fail_out_of_bounds(self, location);
+                            return;
+                        };
+                        check_equal(self, location, f_ty);
+                    }
+                    &ty::Coroutine(def_id, args) => {
                         let f_ty = if let Some(var) = parent_ty.variant_index {
-                            let gen_body = if def_id == self.body.source.def_id() {
-                                self.body
+                            // If we're currently validating an inlined copy of this body,
+                            // then it will no longer be parameterized over the original
+                            // args of the coroutine. Otherwise, we prefer to use this body
+                            // since we may be in the process of computing this MIR in the
+                            // first place.
+                            let layout = if def_id == self.caller_body.source.def_id() {
+                                // FIXME: This is not right for async closures.
+                                self.caller_body.coroutine_layout_raw()
                             } else {
-                                self.tcx.optimized_mir(def_id)
+                                self.tcx.coroutine_layout(def_id, args.as_coroutine().kind_ty())
                             };
 
-                            let Some(layout) = gen_body.generator_layout() else {
+                            let Some(layout) = layout else {
                                 self.fail(
                                     location,
-                                    format!("No generator layout for {parent_ty:?}"),
+                                    format!("No coroutine layout for {parent_ty:?}"),
                                 );
                                 return;
                             };
@@ -737,7 +744,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
 
                             ty::EarlyBinder::bind(f_ty.ty).instantiate(self.tcx, args)
                         } else {
-                            let Some(&f_ty) = args.as_generator().prefix_tys().get(f.index())
+                            let Some(&f_ty) = args.as_coroutine().prefix_tys().get(f.index())
                             else {
                                 fail_out_of_bounds(self, location);
                                 return;
@@ -751,6 +758,23 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     _ => {
                         self.fail(location, format!("{:?} does not have fields", parent_ty.ty));
                     }
+                }
+            }
+            ProjectionElem::Subtype(ty) => {
+                if !relate_types(
+                    self.tcx,
+                    self.param_env,
+                    Variance::Covariant,
+                    ty,
+                    place_ref.ty(&self.body.local_decls, self.tcx).ty,
+                ) {
+                    self.fail(
+                        location,
+                        format!(
+                            "Failed subtyping {ty:#?} and {:#?}",
+                            place_ref.ty(&self.body.local_decls, self.tcx).ty
+                        ),
+                    )
                 }
             }
             _ => {}
@@ -820,12 +844,91 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
             };
         }
         match rvalue {
-            Rvalue::Use(_) | Rvalue::CopyForDeref(_) | Rvalue::Aggregate(..) => {}
-            Rvalue::Ref(_, BorrowKind::Shallow, _) => {
+            Rvalue::Use(_) | Rvalue::CopyForDeref(_) => {}
+            Rvalue::Aggregate(kind, fields) => match **kind {
+                AggregateKind::Tuple => {}
+                AggregateKind::Array(dest) => {
+                    for src in fields {
+                        if !self.mir_assign_valid_types(src.ty(self.body, self.tcx), dest) {
+                            self.fail(location, "array field has the wrong type");
+                        }
+                    }
+                }
+                AggregateKind::Adt(def_id, idx, args, _, Some(field)) => {
+                    let adt_def = self.tcx.adt_def(def_id);
+                    assert!(adt_def.is_union());
+                    assert_eq!(idx, FIRST_VARIANT);
+                    let dest_ty = self.tcx.normalize_erasing_regions(
+                        self.param_env,
+                        adt_def.non_enum_variant().fields[field].ty(self.tcx, args),
+                    );
+                    if fields.len() == 1 {
+                        let src_ty = fields.raw[0].ty(self.body, self.tcx);
+                        if !self.mir_assign_valid_types(src_ty, dest_ty) {
+                            self.fail(location, "union field has the wrong type");
+                        }
+                    } else {
+                        self.fail(location, "unions should have one initialized field");
+                    }
+                }
+                AggregateKind::Adt(def_id, idx, args, _, None) => {
+                    let adt_def = self.tcx.adt_def(def_id);
+                    assert!(!adt_def.is_union());
+                    let variant = &adt_def.variants()[idx];
+                    if variant.fields.len() != fields.len() {
+                        self.fail(location, "adt has the wrong number of initialized fields");
+                    }
+                    for (src, dest) in std::iter::zip(fields, &variant.fields) {
+                        let dest_ty = self
+                            .tcx
+                            .normalize_erasing_regions(self.param_env, dest.ty(self.tcx, args));
+                        if !self.mir_assign_valid_types(src.ty(self.body, self.tcx), dest_ty) {
+                            self.fail(location, "adt field has the wrong type");
+                        }
+                    }
+                }
+                AggregateKind::Closure(_, args) => {
+                    let upvars = args.as_closure().upvar_tys();
+                    if upvars.len() != fields.len() {
+                        self.fail(location, "closure has the wrong number of initialized fields");
+                    }
+                    for (src, dest) in std::iter::zip(fields, upvars) {
+                        if !self.mir_assign_valid_types(src.ty(self.body, self.tcx), dest) {
+                            self.fail(location, "closure field has the wrong type");
+                        }
+                    }
+                }
+                AggregateKind::Coroutine(_, args) => {
+                    let upvars = args.as_coroutine().upvar_tys();
+                    if upvars.len() != fields.len() {
+                        self.fail(location, "coroutine has the wrong number of initialized fields");
+                    }
+                    for (src, dest) in std::iter::zip(fields, upvars) {
+                        if !self.mir_assign_valid_types(src.ty(self.body, self.tcx), dest) {
+                            self.fail(location, "coroutine field has the wrong type");
+                        }
+                    }
+                }
+                AggregateKind::CoroutineClosure(_, args) => {
+                    let upvars = args.as_coroutine_closure().upvar_tys();
+                    if upvars.len() != fields.len() {
+                        self.fail(
+                            location,
+                            "coroutine-closure has the wrong number of initialized fields",
+                        );
+                    }
+                    for (src, dest) in std::iter::zip(fields, upvars) {
+                        if !self.mir_assign_valid_types(src.ty(self.body, self.tcx), dest) {
+                            self.fail(location, "coroutine-closure field has the wrong type");
+                        }
+                    }
+                }
+            },
+            Rvalue::Ref(_, BorrowKind::Fake, _) => {
                 if self.mir_phase >= MirPhase::Runtime(RuntimePhase::Initial) {
                     self.fail(
                         location,
-                        "`Assign` statement with a `Shallow` borrow should have been removed in runtime MIR",
+                        "`Assign` statement with a `Fake` borrow should have been removed in runtime MIR",
                     );
                 }
             }
@@ -880,6 +983,15 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                                     | ty::Float(..)
                                     | ty::RawPtr(..)
                                     | ty::FnPtr(..)
+                            )
+                        }
+                    }
+                    Cmp => {
+                        for x in [a, b] {
+                            check_kinds!(
+                                x,
+                                "Cannot three-way compare non-integer type {:?}",
+                                ty::Char | ty::Uint(..) | ty::Int(..)
                             )
                         }
                     }
@@ -964,8 +1076,8 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         // FIXME(dyn-star): make sure nothing needs to be done here.
                     }
                     // FIXME: Add Checks for these
-                    CastKind::PointerFromExposedAddress
-                    | CastKind::PointerExposeAddress
+                    CastKind::PointerWithExposedProvenance
+                    | CastKind::PointerExposeProvenance
                     | CastKind::PointerCoercion(_) => {}
                     CastKind::IntToInt | CastKind::IntToFloat => {
                         let input_valid = op_ty.is_integral() || op_ty.is_char() || op_ty.is_bool();
@@ -1029,16 +1141,23 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     }
                 }
             }
-            Rvalue::NullaryOp(NullOp::OffsetOf(fields), container) => {
+            Rvalue::NullaryOp(NullOp::OffsetOf(indices), container) => {
                 let fail_out_of_bounds = |this: &mut Self, location, field, ty| {
                     this.fail(location, format!("Out of bounds field {field:?} for {ty:?}"));
                 };
 
                 let mut current_ty = *container;
 
-                for field in fields.iter() {
+                for (variant, field) in indices.iter() {
                     match current_ty.kind() {
                         ty::Tuple(fields) => {
+                            if variant != FIRST_VARIANT {
+                                self.fail(
+                                    location,
+                                    format!("tried to get variant {variant:?} of tuple"),
+                                );
+                                return;
+                            }
                             let Some(&f_ty) = fields.get(field.as_usize()) else {
                                 fail_out_of_bounds(self, location, field, current_ty);
                                 return;
@@ -1047,15 +1166,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                             current_ty = self.tcx.normalize_erasing_regions(self.param_env, f_ty);
                         }
                         ty::Adt(adt_def, args) => {
-                            if adt_def.is_enum() {
-                                self.fail(
-                                    location,
-                                    format!("Cannot get field offset from enum {current_ty:?}"),
-                                );
-                                return;
-                            }
-
-                            let Some(field) = adt_def.non_enum_variant().fields.get(field) else {
+                            let Some(field) = adt_def.variant(variant).fields.get(field) else {
                                 fail_out_of_bounds(self, location, field, current_ty);
                                 return;
                             };
@@ -1066,7 +1177,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         _ => {
                             self.fail(
                                 location,
-                                format!("Cannot get field offset from non-adt type {current_ty:?}"),
+                                format!("Cannot get offset ({variant:?}, {field:?}) from type {current_ty:?}"),
                             );
                             return;
                         }
@@ -1076,7 +1187,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
             Rvalue::Repeat(_, _)
             | Rvalue::ThreadLocalRef(_)
             | Rvalue::AddressOf(_, _)
-            | Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf, _)
+            | Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf | NullOp::UbChecks, _)
             | Rvalue::Discriminant(_) => {}
         }
         self.super_rvalue(rvalue, location);
@@ -1088,6 +1199,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 // LHS and RHS of the assignment must have the same type.
                 let left_ty = dest.ty(&self.body.local_decls, self.tcx).ty;
                 let right_ty = rvalue.ty(&self.body.local_decls, self.tcx);
+
                 if !self.mir_assign_valid_types(right_ty, left_ty) {
                     self.fail(
                         location,
@@ -1105,17 +1217,6 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                             location,
                             "`CopyForDeref` should only be used for dereferenceable types",
                         )
-                    }
-                }
-                // FIXME(JakobDegen): Check this for all rvalues, not just this one.
-                if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue {
-                    // The sides of an assignment must not alias. Currently this just checks whether
-                    // the places are identical.
-                    if dest == src {
-                        self.fail(
-                            location,
-                            "encountered `Assign` statement with overlapping memory",
-                        );
                     }
                 }
             }
@@ -1183,11 +1284,11 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     self.fail(location, "`SetDiscriminant`is not allowed until deaggregation");
                 }
                 let pty = place.ty(&self.body.local_decls, self.tcx).ty.kind();
-                if !matches!(pty, ty::Adt(..) | ty::Generator(..) | ty::Alias(ty::Opaque, ..)) {
+                if !matches!(pty, ty::Adt(..) | ty::Coroutine(..) | ty::Alias(ty::Opaque, ..)) {
                     self.fail(
                         location,
                         format!(
-                            "`SetDiscriminant` is only allowed on ADTs and generators, not {pty:?}"
+                            "`SetDiscriminant` is only allowed on ADTs and coroutines, not {pty:?}"
                         ),
                     );
                 }
@@ -1201,7 +1302,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 // FIXME(JakobDegen) The validator should check that `self.mir_phase <
                 // DropsLowered`. However, this causes ICEs with generation of drop shims, which
                 // seem to fail to set their `MirPhase` correctly.
-                if matches!(kind, RetagKind::Raw | RetagKind::TwoPhase) {
+                if matches!(kind, RetagKind::TwoPhase) {
                     self.fail(location, format!("explicit `{kind:?}` is forbidden"));
                 }
             }
@@ -1267,7 +1368,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. }
             | TerminatorKind::InlineAsm { .. }
-            | TerminatorKind::GeneratorDrop
+            | TerminatorKind::CoroutineDrop
             | TerminatorKind::UnwindResume
             | TerminatorKind::UnwindTerminate(_)
             | TerminatorKind::Return

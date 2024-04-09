@@ -20,11 +20,9 @@ use crate::os::unix::fs::symlink as symlink_dir;
 #[cfg(unix)]
 use crate::os::unix::fs::symlink as symlink_file;
 #[cfg(unix)]
-use crate::os::unix::fs::symlink as symlink_junction;
+use crate::os::unix::fs::symlink as junction_point;
 #[cfg(windows)]
-use crate::os::windows::fs::{symlink_dir, symlink_file};
-#[cfg(windows)]
-use crate::sys::fs::symlink_junction;
+use crate::os::windows::fs::{junction_point, symlink_dir, symlink_file, OpenOptionsExt};
 #[cfg(target_os = "macos")]
 use crate::sys::weak::weak;
 
@@ -74,7 +72,7 @@ macro_rules! error_contains {
 // tests most of the time, but at least we do if the user has the right
 // permissions.
 pub fn got_symlink_permission(tmpdir: &TempDir) -> bool {
-    if cfg!(unix) {
+    if cfg!(not(windows)) || env::var_os("CI").is_some() {
         return true;
     }
     let link = tmpdir.join("some_hopefully_unique_link_name");
@@ -598,7 +596,7 @@ fn recursive_rmdir() {
     check!(fs::create_dir_all(&dtt));
     check!(fs::create_dir_all(&d2));
     check!(check!(File::create(&canary)).write(b"foo"));
-    check!(symlink_junction(&d2, &dt.join("d2")));
+    check!(junction_point(&d2, &dt.join("d2")));
     let _ = symlink_file(&canary, &d1.join("canary"));
     check!(fs::remove_dir_all(&d1));
 
@@ -615,7 +613,7 @@ fn recursive_rmdir_of_symlink() {
     let canary = dir.join("do_not_delete");
     check!(fs::create_dir_all(&dir));
     check!(check!(File::create(&canary)).write(b"foo"));
-    check!(symlink_junction(&dir, &link));
+    check!(junction_point(&dir, &link));
     check!(fs::remove_dir_all(&link));
 
     assert!(!link.is_dir());
@@ -936,8 +934,10 @@ fn read_link() {
         }
         // Check that readlink works with non-drive paths on Windows.
         let link = tmpdir.join("link_unc");
-        check!(symlink_dir(r"\\localhost\c$\", &link));
-        assert_eq!(check!(fs::read_link(&link)), Path::new(r"\\localhost\c$\"));
+        if got_symlink_permission(&tmpdir) {
+            check!(symlink_dir(r"\\localhost\c$\", &link));
+            assert_eq!(check!(fs::read_link(&link)), Path::new(r"\\localhost\c$\"));
+        };
     }
     let link = tmpdir.join("link");
     if !got_symlink_permission(&tmpdir) {
@@ -1401,7 +1401,7 @@ fn create_dir_all_with_junctions() {
 
     fs::create_dir(&target).unwrap();
 
-    check!(symlink_junction(&target, &junction));
+    check!(junction_point(&target, &junction));
     check!(fs::create_dir_all(&b));
     // the junction itself is not a directory, but `is_dir()` on a Path
     // follows links
@@ -1644,8 +1644,8 @@ fn test_file_times() {
     use crate::os::macos::fs::FileTimesExt;
     #[cfg(target_os = "tvos")]
     use crate::os::tvos::fs::FileTimesExt;
-    #[cfg(target_os = "tvos")]
-    use crate::os::tvos::fs::FileTimesExt;
+    #[cfg(target_os = "visionos")]
+    use crate::os::visionos::fs::FileTimesExt;
     #[cfg(target_os = "watchos")]
     use crate::os::watchos::fs::FileTimesExt;
     #[cfg(windows)]
@@ -1662,6 +1662,7 @@ fn test_file_times() {
         target_os = "macos",
         target_os = "ios",
         target_os = "watchos",
+        target_os = "visionos",
         target_os = "tvos",
     ))]
     let created = SystemTime::UNIX_EPOCH + Duration::from_secs(32123);
@@ -1670,6 +1671,7 @@ fn test_file_times() {
         target_os = "macos",
         target_os = "ios",
         target_os = "watchos",
+        target_os = "visionos",
         target_os = "tvos",
     ))]
     {
@@ -1701,9 +1703,130 @@ fn test_file_times() {
         target_os = "macos",
         target_os = "ios",
         target_os = "watchos",
+        target_os = "visionos",
         target_os = "tvos",
     ))]
     {
         assert_eq!(metadata.created().unwrap(), created);
     }
+}
+
+#[test]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+))]
+fn test_file_times_pre_epoch_with_nanos() {
+    #[cfg(target_os = "ios")]
+    use crate::os::ios::fs::FileTimesExt;
+    #[cfg(target_os = "macos")]
+    use crate::os::macos::fs::FileTimesExt;
+    #[cfg(target_os = "tvos")]
+    use crate::os::tvos::fs::FileTimesExt;
+    #[cfg(target_os = "visionos")]
+    use crate::os::visionos::fs::FileTimesExt;
+    #[cfg(target_os = "watchos")]
+    use crate::os::watchos::fs::FileTimesExt;
+
+    let tmp = tmpdir();
+    let file = File::create(tmp.join("foo")).unwrap();
+
+    for (accessed, modified, created) in [
+        // The first round is to set filetimes to something we know works, but this time
+        // it's validated with nanoseconds as well which probe the numeric boundary.
+        (
+            SystemTime::UNIX_EPOCH + Duration::new(12345, 1),
+            SystemTime::UNIX_EPOCH + Duration::new(54321, 100_000_000),
+            SystemTime::UNIX_EPOCH + Duration::new(32123, 999_999_999),
+        ),
+        // The second rounds uses pre-epoch dates along with nanoseconds that probe
+        // the numeric boundary.
+        (
+            SystemTime::UNIX_EPOCH - Duration::new(1, 1),
+            SystemTime::UNIX_EPOCH - Duration::new(60, 100_000_000),
+            SystemTime::UNIX_EPOCH - Duration::new(3600, 999_999_999),
+        ),
+    ] {
+        let mut times = FileTimes::new();
+        times = times.set_accessed(accessed).set_modified(modified).set_created(created);
+        file.set_times(times).unwrap();
+
+        let metadata = file.metadata().unwrap();
+        assert_eq!(metadata.accessed().unwrap(), accessed);
+        assert_eq!(metadata.modified().unwrap(), modified);
+        assert_eq!(metadata.created().unwrap(), created);
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_unix_socket_exists() {
+    use crate::sys::{c, net};
+    use crate::{mem, ptr};
+
+    let tmp = tmpdir();
+    let socket_path = tmp.join("socket");
+
+    // std doesn't currently support Unix sockets on Windows so manually create one here.
+    net::init();
+    unsafe {
+        let socket = c::WSASocketW(
+            c::AF_UNIX as i32,
+            c::SOCK_STREAM,
+            0,
+            ptr::null_mut(),
+            0,
+            c::WSA_FLAG_OVERLAPPED | c::WSA_FLAG_NO_HANDLE_INHERIT,
+        );
+        // AF_UNIX is not supported on earlier versions of Windows,
+        // so skip this test if it's unsupported and we're not in CI.
+        if socket == c::INVALID_SOCKET {
+            let error = c::WSAGetLastError();
+            if env::var_os("CI").is_none() && error == c::WSAEAFNOSUPPORT {
+                return;
+            } else {
+                panic!("Creating AF_UNIX socket failed (OS error {error})");
+            }
+        }
+        let mut addr = c::SOCKADDR_UN { sun_family: c::AF_UNIX, sun_path: mem::zeroed() };
+        let bytes = socket_path.as_os_str().as_encoded_bytes();
+        let bytes = core::slice::from_raw_parts(bytes.as_ptr().cast::<i8>(), bytes.len());
+        addr.sun_path[..bytes.len()].copy_from_slice(bytes);
+        let len = mem::size_of_val(&addr) as i32;
+        let result = c::bind(socket, ptr::addr_of!(addr).cast::<c::SOCKADDR>(), len);
+        c::closesocket(socket);
+        assert_eq!(result, 0);
+    }
+    // Make sure all ways of testing a file exist work for a Unix socket.
+    assert_eq!(socket_path.exists(), true);
+    assert_eq!(socket_path.try_exists().unwrap(), true);
+    assert_eq!(socket_path.metadata().is_ok(), true);
+}
+
+#[cfg(windows)]
+#[test]
+fn test_hidden_file_truncation() {
+    // Make sure that File::create works on an existing hidden file. See #115745.
+    let tmpdir = tmpdir();
+    let path = tmpdir.join("hidden_file.txt");
+
+    // Create a hidden file.
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 2;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .attributes(FILE_ATTRIBUTE_HIDDEN)
+        .open(&path)
+        .unwrap();
+    file.write("hidden world!".as_bytes()).unwrap();
+    file.flush().unwrap();
+    drop(file);
+
+    // Create a new file by truncating the existing one.
+    let file = File::create(&path).unwrap();
+    let metadata = file.metadata().unwrap();
+    assert_eq!(metadata.len(), 0);
 }

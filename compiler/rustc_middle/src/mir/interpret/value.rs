@@ -3,7 +3,7 @@ use std::fmt;
 use either::{Either, Left, Right};
 
 use rustc_apfloat::{
-    ieee::{Double, Single},
+    ieee::{Double, Half, Quad, Single},
     Float,
 };
 use rustc_macros::HashStable;
@@ -11,7 +11,10 @@ use rustc_target::abi::{HasDataLayout, Size};
 
 use crate::ty::ScalarInt;
 
-use super::{AllocId, InterpResult, Pointer, PointerArithmetic, Provenance, ScalarSizeMismatch};
+use super::{
+    AllocId, CtfeProvenance, InterpResult, Pointer, PointerArithmetic, Provenance,
+    ScalarSizeMismatch,
+};
 
 /// A `Scalar` represents an immediate, primitive value existing outside of a
 /// `memory::Allocation`. It is in many ways like a small chunk of an `Allocation`, up to 16 bytes in
@@ -22,7 +25,7 @@ use super::{AllocId, InterpResult, Pointer, PointerArithmetic, Provenance, Scala
 /// Do *not* match on a `Scalar`! Use the various `to_*` methods instead.
 #[derive(Clone, Copy, Eq, PartialEq, TyEncodable, TyDecodable, Hash)]
 #[derive(HashStable)]
-pub enum Scalar<Prov = AllocId> {
+pub enum Scalar<Prov = CtfeProvenance> {
     /// The raw bytes of a simple value.
     Int(ScalarInt),
 
@@ -34,7 +37,7 @@ pub enum Scalar<Prov = AllocId> {
     Ptr(Pointer<Prov>, u8),
 }
 
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_pointer_width = "64"))]
 static_assert_size!(Scalar, 24);
 
 // We want the `Debug` output to be readable as it is used by `derive(Debug)` for
@@ -199,12 +202,22 @@ impl<Prov> Scalar<Prov> {
     }
 
     #[inline]
+    pub fn from_f16(f: Half) -> Self {
+        Scalar::Int(f.into())
+    }
+
+    #[inline]
     pub fn from_f32(f: Single) -> Self {
         Scalar::Int(f.into())
     }
 
     #[inline]
     pub fn from_f64(f: Double) -> Self {
+        Scalar::Int(f.into())
+    }
+
+    #[inline]
+    pub fn from_f128(f: Quad) -> Self {
         Scalar::Int(f.into())
     }
 
@@ -267,6 +280,9 @@ impl<'tcx, Prov: Provenance> Scalar<Prov> {
     /// Will perform ptr-to-int casts if needed and possible.
     /// If that fails, we know the offset is relative, so we return an "erased" Scalar
     /// (which is useful for error messages but not much else).
+    ///
+    /// The error type is `AllocId`, not `CtfeProvenance`, since `AllocId` is the "minimal"
+    /// component all provenance types must have.
     #[inline]
     pub fn try_to_int(self) -> Result<ScalarInt, Scalar<AllocId>> {
         match self {
@@ -412,8 +428,13 @@ impl<'tcx, Prov: Provenance> Scalar<Prov> {
 
     #[inline]
     pub fn to_float<F: Float>(self) -> InterpResult<'tcx, F> {
-        // Going through `to_uint` to check size and truncation.
-        Ok(F::from_bits(self.to_uint(Size::from_bits(F::BITS))?))
+        // Going through `to_bits` to check size and truncation.
+        Ok(F::from_bits(self.to_bits(Size::from_bits(F::BITS))?))
+    }
+
+    #[inline]
+    pub fn to_f16(self) -> InterpResult<'tcx, Half> {
+        self.to_float()
     }
 
     #[inline]
@@ -423,6 +444,11 @@ impl<'tcx, Prov: Provenance> Scalar<Prov> {
 
     #[inline]
     pub fn to_f64(self) -> InterpResult<'tcx, Double> {
+        self.to_float()
+    }
+
+    #[inline]
+    pub fn to_f128(self) -> InterpResult<'tcx, Quad> {
         self.to_float()
     }
 }

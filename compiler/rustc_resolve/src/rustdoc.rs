@@ -167,12 +167,13 @@ pub fn unindent_doc_fragments(docs: &mut [DocFragment]) {
 ///
 /// Note: remove the trailing newline where appropriate
 pub fn add_doc_fragment(out: &mut String, frag: &DocFragment) {
-    let s = frag.doc.as_str();
-    let mut iter = s.lines();
-    if s.is_empty() {
+    if frag.doc == kw::Empty {
         out.push('\n');
         return;
     }
+    let s = frag.doc.as_str();
+    let mut iter = s.lines();
+
     while let Some(line) = iter.next() {
         if line.chars().any(|c| !c.is_whitespace()) {
             assert!(line.len() >= frag.indent);
@@ -346,7 +347,9 @@ pub fn has_primitive_or_keyword_docs(attrs: &[ast::Attribute]) -> bool {
     for attr in attrs {
         if attr.has_name(sym::rustc_doc_primitive) {
             return true;
-        } else if attr.has_name(sym::doc) && let Some(items) = attr.meta_item_list() {
+        } else if attr.has_name(sym::doc)
+            && let Some(items) = attr.meta_item_list()
+        {
             for item in items {
                 if item.has_name(sym::keyword) {
                     return true;
@@ -402,11 +405,10 @@ pub(crate) fn attrs_to_preprocessed_links(attrs: &[ast::Attribute]) -> Vec<Box<s
 fn parse_links<'md>(doc: &'md str) -> Vec<Box<str>> {
     let mut broken_link_callback = |link: BrokenLink<'md>| Some((link.reference, "".into()));
     let mut event_iter = Parser::new_with_broken_link_callback(
-        &doc,
+        doc,
         main_body_opts(),
         Some(&mut broken_link_callback),
-    )
-    .into_iter();
+    );
     let mut links = Vec::new();
 
     while let Some(event) = event_iter.next() {

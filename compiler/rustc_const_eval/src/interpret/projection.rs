@@ -19,6 +19,15 @@ use rustc_target::abi::{self, VariantIdx};
 
 use super::{InterpCx, InterpResult, MPlaceTy, Machine, MemPlaceMeta, OpTy, Provenance, Scalar};
 
+/// Describes the constraints placed on offset-projections.
+#[derive(Copy, Clone, Debug)]
+pub enum OffsetMode {
+    /// The offset has to be inbounds, like `ptr::offset`.
+    Inbounds,
+    /// No constraints, just wrap around the edge of the address space.
+    Wrapping,
+}
+
 /// A thing that we can project into, and that has a layout.
 pub trait Projectable<'tcx, Prov: Provenance>: Sized + std::fmt::Debug {
     /// Get the layout.
@@ -53,12 +62,12 @@ pub trait Projectable<'tcx, Prov: Provenance>: Sized + std::fmt::Debug {
     fn offset_with_meta<'mir, M: Machine<'mir, 'tcx, Provenance = Prov>>(
         &self,
         offset: Size,
+        mode: OffsetMode,
         meta: MemPlaceMeta<Prov>,
         layout: TyAndLayout<'tcx>,
         ecx: &InterpCx<'mir, 'tcx, M>,
     ) -> InterpResult<'tcx, Self>;
 
-    #[inline]
     fn offset<'mir, M: Machine<'mir, 'tcx, Provenance = Prov>>(
         &self,
         offset: Size,
@@ -66,10 +75,9 @@ pub trait Projectable<'tcx, Prov: Provenance>: Sized + std::fmt::Debug {
         ecx: &InterpCx<'mir, 'tcx, M>,
     ) -> InterpResult<'tcx, Self> {
         assert!(layout.is_sized());
-        self.offset_with_meta(offset, MemPlaceMeta::None, layout, ecx)
+        self.offset_with_meta(offset, OffsetMode::Inbounds, MemPlaceMeta::None, layout, ecx)
     }
 
-    #[inline]
     fn transmute<'mir, M: Machine<'mir, 'tcx, Provenance = Prov>>(
         &self,
         layout: TyAndLayout<'tcx>,
@@ -77,7 +85,7 @@ pub trait Projectable<'tcx, Prov: Provenance>: Sized + std::fmt::Debug {
     ) -> InterpResult<'tcx, Self> {
         assert!(self.layout().is_sized() && layout.is_sized());
         assert_eq!(self.layout().size, layout.size);
-        self.offset_with_meta(Size::ZERO, MemPlaceMeta::None, layout, ecx)
+        self.offset_with_meta(Size::ZERO, OffsetMode::Wrapping, MemPlaceMeta::None, layout, ecx)
     }
 
     /// Convert this to an `OpTy`. This might be an irreversible transformation, but is useful for
@@ -104,7 +112,17 @@ impl<'tcx, 'a, Prov: Provenance, P: Projectable<'tcx, Prov>> ArrayIterator<'tcx,
         ecx: &InterpCx<'mir, 'tcx, M>,
     ) -> InterpResult<'tcx, Option<(u64, P)>> {
         let Some(idx) = self.range.next() else { return Ok(None) };
-        Ok(Some((idx, self.base.offset(self.stride * idx, self.field_layout, ecx)?)))
+        // We use `Wrapping` here since the offset has already been checked when the iterator was created.
+        Ok(Some((
+            idx,
+            self.base.offset_with_meta(
+                self.stride * idx,
+                OffsetMode::Wrapping,
+                MemPlaceMeta::None,
+                self.field_layout,
+                ecx,
+            )?,
+        )))
     }
 }
 
@@ -131,26 +149,37 @@ where
             "`field` projection called on a slice -- call `index` projection instead"
         );
         let offset = base.layout().fields.offset(field);
+        // Computing the layout does normalization, so we get a normalized type out of this
+        // even if the field type is non-normalized (possible e.g. via associated types).
         let field_layout = base.layout().field(self, field);
 
         // Offset may need adjustment for unsized fields.
         let (meta, offset) = if field_layout.is_unsized() {
-            if base.layout().is_sized() {
-                // An unsized field of a sized type? Sure...
-                // But const-prop actually feeds us such nonsense MIR! (see test `const_prop/issue-86351.rs`)
-                throw_inval!(ConstPropNonsense);
-            }
+            assert!(!base.layout().is_sized());
             let base_meta = base.meta();
             // Re-use parent metadata to determine dynamic field layout.
             // With custom DSTS, this *will* execute user-defined code, but the same
             // happens at run-time so that's okay.
             match self.size_and_align_of(&base_meta, &field_layout)? {
-                Some((_, align)) => (base_meta, offset.align_to(align)),
-                None => {
-                    // For unsized types with an extern type tail we perform no adjustments.
-                    // NOTE: keep this in sync with `PlaceRef::project_field` in the codegen backend.
-                    assert!(matches!(base_meta, MemPlaceMeta::None));
+                Some((_, align)) => {
+                    // For packed types, we need to cap alignment.
+                    let align = if let ty::Adt(def, _) = base.layout().ty.kind()
+                        && let Some(packed) = def.repr().pack
+                    {
+                        align.min(packed)
+                    } else {
+                        align
+                    };
+                    (base_meta, offset.align_to(align))
+                }
+                None if offset == Size::ZERO => {
+                    // If the offset is 0, then rounding it up to alignment wouldn't change anything,
+                    // so we can do this even for types where we cannot determine the alignment.
                     (base_meta, offset)
+                }
+                None => {
+                    // We don't know the alignment of this field, so we cannot adjust.
+                    throw_unsup_format!("`extern type` does not have a known offset")
                 }
             }
         } else {
@@ -159,7 +188,7 @@ where
             (MemPlaceMeta::None, offset)
         };
 
-        base.offset_with_meta(offset, meta, field_layout, self)
+        base.offset_with_meta(offset, OffsetMode::Inbounds, meta, field_layout, self)
     }
 
     /// Downcasting to an enum variant.
@@ -174,11 +203,9 @@ where
         // see https://github.com/rust-lang/rust/issues/93688#issuecomment-1032929496.)
         // So we just "offset" by 0.
         let layout = base.layout().for_variant(self, variant);
-        if layout.abi.is_uninhabited() {
-            // `read_discriminant` should have excluded uninhabited variants... but ConstProp calls
-            // us on dead code.
-            throw_inval!(ConstPropNonsense)
-        }
+        // This variant may in fact be uninhabited.
+        // See <https://github.com/rust-lang/rust/issues/120337>.
+
         // This cannot be `transmute` as variants *can* have a smaller size than the entire enum.
         base.offset(Size::ZERO, layout, self)
     }
@@ -238,16 +265,20 @@ where
     }
 
     /// Iterates over all fields of an array. Much more efficient than doing the
-    /// same by repeatedly calling `operand_index`.
+    /// same by repeatedly calling `project_index`.
     pub fn project_array_fields<'a, P: Projectable<'tcx, M::Provenance>>(
         &self,
         base: &'a P,
     ) -> InterpResult<'tcx, ArrayIterator<'tcx, 'a, M::Provenance, P>> {
         let abi::FieldsShape::Array { stride, .. } = base.layout().fields else {
-            span_bug!(self.cur_span(), "operand_array_fields: expected an array layout");
+            span_bug!(self.cur_span(), "project_array_fields: expected an array layout");
         };
         let len = base.len(self)?;
         let field_layout = base.layout().field(self, 0);
+        // Ensure that all the offsets are in-bounds once, up-front.
+        debug!("project_array_fields: {base:?} {len}");
+        base.offset(len * stride, self.layout_of(self.tcx.types.unit).unwrap(), self)?;
+        // Create the iterator.
         Ok(ArrayIterator { base, range: 0..len, stride, field_layout, _phantom: PhantomData })
     }
 
@@ -305,7 +336,7 @@ where
         };
         let layout = self.layout_of(ty)?;
 
-        base.offset_with_meta(from_offset, meta, layout, self)
+        base.offset_with_meta(from_offset, OffsetMode::Inbounds, meta, layout, self)
     }
 
     /// Applying a general projection
@@ -319,12 +350,14 @@ where
             OpaqueCast(ty) => {
                 span_bug!(self.cur_span(), "OpaqueCast({ty}) encountered after borrowck")
             }
+            // We don't want anything happening here, this is here as a dummy.
+            Subtype(_) => base.transmute(base.layout(), self)?,
             Field(field, _) => self.project_field(base, field.index())?,
             Downcast(_, variant) => self.project_downcast(base, variant)?,
             Deref => self.deref_pointer(&base.to_op(self)?)?.into(),
             Index(local) => {
                 let layout = self.layout_of(self.tcx.types.usize)?;
-                let n = self.local_to_op(self.frame(), local, Some(layout))?;
+                let n = self.local_to_op(local, Some(layout))?;
                 let n = self.read_target_usize(&n)?;
                 self.project_index(base, n)?
             }

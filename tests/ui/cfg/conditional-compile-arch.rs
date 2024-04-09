@@ -1,5 +1,5 @@
-// run-pass
-// pretty-expanded FIXME #23616
+//@ run-pass
+//@ pretty-expanded FIXME #23616
 
 #[cfg(target_arch = "x86")]
 pub fn main() { }
@@ -26,9 +26,6 @@ pub fn main() { }
 pub fn main() { }
 
 #[cfg(target_arch = "s390x")]
-pub fn main() { }
-
-#[cfg(target_arch = "asmjs")]
 pub fn main() { }
 
 #[cfg(target_arch = "wasm32")]

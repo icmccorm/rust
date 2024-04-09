@@ -245,6 +245,30 @@ fn main() {
 }
 
 #[test]
+fn doctest_apply_demorgan_iterator() {
+    check_doc_test(
+        "apply_demorgan_iterator",
+        r#####"
+//- minicore: iterator
+fn main() {
+    let arr = [1, 2, 3];
+    if !arr.into_iter().$0any(|num| num == 4) {
+        println!("foo");
+    }
+}
+"#####,
+        r#####"
+fn main() {
+    let arr = [1, 2, 3];
+    if arr.into_iter().all(|num| num != 4) {
+        println!("foo");
+    }
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_auto_import() {
     check_doc_test(
         "auto_import",
@@ -275,6 +299,34 @@ fn some_function(x: i32$0) {}
         r#####"
 fn some_function(x: i32) {
     let _ = x;
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_bool_to_enum() {
+    check_doc_test(
+        "bool_to_enum",
+        r#####"
+fn main() {
+    let $0bool = true;
+
+    if bool {
+        println!("foo");
+    }
+}
+"#####,
+        r#####"
+#[derive(PartialEq, Eq)]
+enum Bool { True, False }
+
+fn main() {
+    let bool = Bool::True;
+
+    if bool == Bool::True {
+        println!("foo");
+    }
 }
 "#####,
     )
@@ -559,6 +611,33 @@ fn main() {
 }
 
 #[test]
+fn doctest_convert_tuple_return_type_to_struct() {
+    check_doc_test(
+        "convert_tuple_return_type_to_struct",
+        r#####"
+fn bar() {
+    let (a, b, c) = foo();
+}
+
+fn foo() -> ($0u32, u32, u32) {
+    (1, 2, 3)
+}
+"#####,
+        r#####"
+fn bar() {
+    let FooResult(a, b, c) = foo();
+}
+
+struct FooResult(u32, u32, u32);
+
+fn foo() -> FooResult {
+    FooResult(1, 2, 3)
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_convert_tuple_struct_to_named_struct() {
     check_doc_test(
         "convert_tuple_struct_to_named_struct",
@@ -638,6 +717,35 @@ fn main() {
         }
         foo();
     }
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_destructure_struct_binding() {
+    check_doc_test(
+        "destructure_struct_binding",
+        r#####"
+struct Foo {
+    bar: i32,
+    baz: i32,
+}
+fn main() {
+    let $0foo = Foo { bar: 1, baz: 2 };
+    let bar2 = foo.bar;
+    let baz2 = &foo.baz;
+}
+"#####,
+        r#####"
+struct Foo {
+    bar: i32,
+    baz: i32,
+}
+fn main() {
+    let Foo { bar, baz } = Foo { bar: 1, baz: 2 };
+    let bar2 = bar;
+    let baz2 = &baz;
 }
 "#####,
     )
@@ -825,6 +933,27 @@ fn main() {
 fn main() {
     let $0var_name = (1 + 2);
     var_name * 4;
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_fill_record_pattern_fields() {
+    check_doc_test(
+        "fill_record_pattern_fields",
+        r#####"
+struct Bar { y: Y, z: Z }
+
+fn foo(bar: Bar) {
+    let Bar { ..$0 } = bar;
+}
+"#####,
+        r#####"
+struct Bar { y: Y, z: Z }
+
+fn foo(bar: Bar) {
+    let Bar { y, z  } = bar;
 }
 "#####,
     )
@@ -1074,7 +1203,7 @@ impl SomeTrait for B {
     }
 
     fn method_(&mut self) -> bool {
-        <A as SomeTrait>::method_( &mut self.a )
+        <A as SomeTrait>::method_(&mut self.a)
     }
 }
 "#####,
@@ -1350,10 +1479,17 @@ fn doctest_generate_getter() {
     check_doc_test(
         "generate_getter",
         r#####"
-//- minicore: as_ref
+//- minicore: as_ref, deref
 pub struct String;
 impl AsRef<str> for String {
     fn as_ref(&self) -> &str {
+        ""
+    }
+}
+
+impl core::ops::Deref for String {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
         ""
     }
 }
@@ -1370,13 +1506,20 @@ impl AsRef<str> for String {
     }
 }
 
+impl core::ops::Deref for String {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        ""
+    }
+}
+
 struct Person {
     name: String,
 }
 
 impl Person {
     fn $0name(&self) -> &str {
-        self.name.as_ref()
+        &self.name
     }
 }
 "#####,
@@ -1420,9 +1563,7 @@ struct Ctx<T: Clone> {
     data: T,
 }
 
-impl<T: Clone> Ctx<T> {
-    $0
-}
+impl<T: Clone> Ctx<T> {$0}
 "#####,
     )
 }
@@ -1460,6 +1601,42 @@ impl MyStruct {
 }
 
 #[test]
+fn doctest_generate_mut_trait_impl() {
+    check_doc_test(
+        "generate_mut_trait_impl",
+        r#####"
+//- minicore: index
+pub enum Axis { X = 0, Y = 1, Z = 2 }
+
+impl<T> core::ops::Index$0<Axis> for [T; 3] {
+    type Output = T;
+
+    fn index(&self, index: Axis) -> &Self::Output {
+        &self[index as usize]
+    }
+}
+"#####,
+        r#####"
+pub enum Axis { X = 0, Y = 1, Z = 2 }
+
+$0impl<T> core::ops::IndexMut<Axis> for [T; 3] {
+    fn index_mut(&mut self, index: Axis) -> &mut Self::Output {
+        &self[index as usize]
+    }
+}
+
+impl<T> core::ops::Index<Axis> for [T; 3] {
+    type Output = T;
+
+    fn index(&self, index: Axis) -> &Self::Output {
+        &self[index as usize]
+    }
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_generate_new() {
     check_doc_test(
         "generate_new",
@@ -1474,7 +1651,9 @@ struct Ctx<T: Clone> {
 }
 
 impl<T: Clone> Ctx<T> {
-    fn $0new(data: T) -> Self { Self { data } }
+    fn $0new(data: T) -> Self {
+        Self { data }
+    }
 }
 "#####,
     )
@@ -1536,7 +1715,7 @@ macro_rules! const_maker {
     };
 }
 
-trait ${0:TraitName}<const N: usize> {
+trait ${0:NewTrait}<const N: usize> {
     // Used as an associated constant.
     const CONST_ASSOC: usize = N * 4;
 
@@ -1545,7 +1724,7 @@ trait ${0:TraitName}<const N: usize> {
     const_maker! {i32, 7}
 }
 
-impl<const N: usize> ${0:TraitName}<N> for Foo<N> {
+impl<const N: usize> ${0:NewTrait}<N> for Foo<N> {
     // Used as an associated constant.
     const CONST_ASSOC: usize = N * 4;
 
@@ -1573,9 +1752,7 @@ struct Ctx<T: Clone> {
     data: T,
 }
 
-impl<T: Clone> $0 for Ctx<T> {
-
-}
+impl<T: Clone> ${0:_} for Ctx<T> {}
 "#####,
     )
 }
@@ -1937,6 +2114,23 @@ fn handle(action: Action) {
 }
 
 #[test]
+fn doctest_merge_nested_if() {
+    check_doc_test(
+        "merge_nested_if",
+        r#####"
+fn main() {
+   i$0f x == 3 { if y == 4 { 1 } }
+}
+"#####,
+        r#####"
+fn main() {
+   if x == 3 && y == 4 { 1 }
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_move_arm_cond_to_match_guard() {
     check_doc_test(
         "move_arm_cond_to_match_guard",
@@ -2081,6 +2275,19 @@ $0fn t() {}$0
 "#####,
         r#####"
 fn t() {}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_normalize_import() {
+    check_doc_test(
+        "normalize_import",
+        r#####"
+use$0 std::{io, {fmt::Formatter}};
+"#####,
+        r#####"
+use std::{fmt::Formatter, io};
 "#####,
     )
 }
@@ -2480,6 +2687,25 @@ fn handle(action: Action) {
 }
 
 #[test]
+fn doctest_replace_is_some_with_if_let_some() {
+    check_doc_test(
+        "replace_is_some_with_if_let_some",
+        r#####"
+fn main() {
+    let x = Some(1);
+    if x.is_som$0e() {}
+}
+"#####,
+        r#####"
+fn main() {
+    let x = Some(1);
+    if let Some(${0:x}) = x {}
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_replace_let_with_if_let() {
     check_doc_test(
         "replace_let_with_if_let",
@@ -2850,6 +3076,8 @@ fn main() {
 mod std { pub mod ops { pub trait Add { fn add(self, _: Self) {} } impl Add for i32 {} } }
 "#####,
         r#####"
+use std::ops::Add;
+
 fn main() {
     1.add(2);
 }

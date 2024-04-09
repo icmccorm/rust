@@ -1,15 +1,12 @@
-use super::{AllocId, AllocRange, Pointer, Scalar};
+use super::{AllocId, AllocRange, ConstAllocation, Pointer, Scalar};
 
 use crate::error;
 use crate::mir::{ConstAlloc, ConstValue};
-use crate::query::TyCtxtAt;
 use crate::ty::{layout, tls, Ty, TyCtxt, ValTree};
 
+use rustc_ast_ir::Mutability;
 use rustc_data_structures::sync::Lock;
-use rustc_errors::{
-    struct_span_err, DiagnosticArgValue, DiagnosticBuilder, DiagnosticMessage, ErrorGuaranteed,
-    IntoDiagnosticArg,
-};
+use rustc_errors::{DiagArgName, DiagArgValue, DiagMessage, ErrorGuaranteed, IntoDiagArg};
 use rustc_macros::HashStable;
 use rustc_session::CtfeBacktrace;
 use rustc_span::{def_id::DefId, Span, DUMMY_SP};
@@ -43,26 +40,11 @@ impl ErrorHandled {
         }
     }
 
-    pub fn emit_err(&self, tcx: TyCtxt<'_>) -> ErrorGuaranteed {
-        match self {
-            &ErrorHandled::Reported(err, span) => {
-                if !err.is_tainted_by_errors && !span.is_dummy() {
-                    tcx.sess.emit_err(error::ErroneousConstant { span });
-                }
-                err.error
-            }
-            &ErrorHandled::TooGeneric(span) => tcx.sess.delay_span_bug(
-                span,
-                "encountered TooGeneric error when monomorphic data was expected",
-            ),
-        }
-    }
-
     pub fn emit_note(&self, tcx: TyCtxt<'_>) {
         match self {
             &ErrorHandled::Reported(err, span) => {
                 if !err.is_tainted_by_errors && !span.is_dummy() {
-                    tcx.sess.emit_note(error::ErroneousConstant { span });
+                    tcx.dcx().emit_note(error::ErroneousConstant { span });
                 }
             }
             &ErrorHandled::TooGeneric(_) => {}
@@ -100,19 +82,13 @@ impl Into<ErrorGuaranteed> for ReportedErrorInfo {
 TrivialTypeTraversalImpls! { ErrorHandled }
 
 pub type EvalToAllocationRawResult<'tcx> = Result<ConstAlloc<'tcx>, ErrorHandled>;
+pub type EvalStaticInitializerRawResult<'tcx> = Result<ConstAllocation<'tcx>, ErrorHandled>;
 pub type EvalToConstValueResult<'tcx> = Result<ConstValue<'tcx>, ErrorHandled>;
 /// `Ok(None)` indicates the constant was fine, but the valtree couldn't be constructed.
 /// This is needed in `thir::pattern::lower_inline_const`.
 pub type EvalToValTreeResult<'tcx> = Result<Option<ValTree<'tcx>>, ErrorHandled>;
 
-pub fn struct_error<'tcx>(
-    tcx: TyCtxtAt<'tcx>,
-    msg: &str,
-) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
-    struct_span_err!(tcx.sess, tcx.span, E0080, "{}", msg)
-}
-
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_pointer_width = "64"))]
 static_assert_size!(InterpErrorInfo<'_>, 8);
 
 /// Packages the kind of error we got from the const code interpreter
@@ -226,15 +202,11 @@ pub enum InvalidProgramInfo<'tcx> {
     /// (which unfortunately typeck does not reject).
     /// Not using `FnAbiError` as that contains a nested `LayoutError`.
     FnAbiAdjustForForeignAbi(call::AdjustForForeignAbiError),
-    /// We are runnning into a nonsense situation due to ConstProp violating our invariants.
-    ConstPropNonsense,
 }
 
 /// Details of why a pointer had to be in-bounds.
-#[derive(Debug, Copy, Clone, TyEncodable, TyDecodable, HashStable)]
+#[derive(Debug, Copy, Clone)]
 pub enum CheckInAllocMsg {
-    /// We are dereferencing a pointer (i.e., creating a place).
-    DerefTest,
     /// We are access memory.
     MemoryAccessTest,
     /// We are doing pointer arithmetic.
@@ -245,7 +217,16 @@ pub enum CheckInAllocMsg {
     InboundsTest,
 }
 
-#[derive(Debug, Copy, Clone, TyEncodable, TyDecodable, HashStable)]
+/// Details of which pointer is not aligned.
+#[derive(Debug, Copy, Clone)]
+pub enum CheckAlignMsg {
+    /// The accessed pointer did not have proper alignment.
+    AccessedPtr,
+    /// The access ocurred with a place that was based on a misaligned pointer.
+    BasedOn,
+}
+
+#[derive(Debug, Copy, Clone)]
 pub enum InvalidMetaKind {
     /// Size of a `[T]` is too big
     SliceTooBig,
@@ -253,9 +234,9 @@ pub enum InvalidMetaKind {
     TooBig,
 }
 
-impl IntoDiagnosticArg for InvalidMetaKind {
-    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
-        DiagnosticArgValue::Str(Cow::Borrowed(match self {
+impl IntoDiagArg for InvalidMetaKind {
+    fn into_diag_arg(self) -> DiagArgValue {
+        DiagArgValue::Str(Cow::Borrowed(match self {
             InvalidMetaKind::SliceTooBig => "slice_too_big",
             InvalidMetaKind::TooBig => "too_big",
         }))
@@ -278,20 +259,27 @@ pub struct ScalarSizeMismatch {
     pub data_size: u64,
 }
 
-macro_rules! impl_into_diagnostic_arg_through_debug {
+/// Information about a misaligned pointer.
+#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
+pub struct Misalignment {
+    pub has: Align,
+    pub required: Align,
+}
+
+macro_rules! impl_into_diag_arg_through_debug {
     ($($ty:ty),*$(,)?) => {$(
-        impl IntoDiagnosticArg for $ty {
-            fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
-                DiagnosticArgValue::Str(Cow::Owned(format!("{self:?}")))
+        impl IntoDiagArg for $ty {
+            fn into_diag_arg(self) -> DiagArgValue {
+                DiagArgValue::Str(Cow::Owned(format!("{self:?}")))
             }
         }
     )*}
 }
 
 // These types have nice `Debug` output so we can just use them in diagnostics.
-impl_into_diagnostic_arg_through_debug! {
+impl_into_diag_arg_through_debug! {
     AllocId,
-    Pointer,
+    Pointer<AllocId>,
     AllocRange,
 }
 
@@ -324,7 +312,7 @@ pub enum UndefinedBehaviorInfo<'tcx> {
     /// Invalid metadata in a wide pointer
     InvalidMeta(InvalidMetaKind),
     /// Reading a C string that does not end within its allocation.
-    UnterminatedCString(Pointer),
+    UnterminatedCString(Pointer<AllocId>),
     /// Using a pointer after it got freed.
     PointerUseAfterFree(AllocId, CheckInAllocMsg),
     /// Used a pointer outside the bounds it is valid for.
@@ -339,7 +327,7 @@ pub enum UndefinedBehaviorInfo<'tcx> {
     /// Using an integer as a pointer in the wrong way.
     DanglingIntPointer(u64, CheckInAllocMsg),
     /// Used a pointer with bad alignment.
-    AlignmentCheckFailed { required: Align, has: Align },
+    AlignmentCheckFailed(Misalignment, CheckAlignMsg),
     /// Writing to read-only memory.
     WriteToReadOnly(AllocId),
     /// Trying to access the data behind a function pointer.
@@ -351,11 +339,11 @@ pub enum UndefinedBehaviorInfo<'tcx> {
     /// Using a non-character `u32` as character.
     InvalidChar(u32),
     /// The tag of an enum does not encode an actual discriminant.
-    InvalidTag(Scalar),
+    InvalidTag(Scalar<AllocId>),
     /// Using a pointer-not-to-a-function as function pointer.
-    InvalidFunctionPointer(Pointer),
+    InvalidFunctionPointer(Pointer<AllocId>),
     /// Using a pointer-not-to-a-vtable as vtable pointer.
-    InvalidVTablePointer(Pointer),
+    InvalidVTablePointer(Pointer<AllocId>),
     /// Using a string that is not valid UTF-8,
     InvalidStr(std::str::Utf8Error),
     /// Using uninitialized data where it is not allowed.
@@ -368,6 +356,8 @@ pub enum UndefinedBehaviorInfo<'tcx> {
     UninhabitedEnumVariantWritten(VariantIdx),
     /// An uninhabited enum variant is projected.
     UninhabitedEnumVariantRead(VariantIdx),
+    /// Trying to set discriminant to the niched variant, but the value does not match.
+    InvalidNichedEnumVariantWritten { enum_ty: Ty<'tcx> },
     /// ABI-incompatible argument types.
     AbiMismatchArgument { caller_ty: Ty<'tcx>, callee_ty: Ty<'tcx> },
     /// ABI-incompatible return types.
@@ -376,15 +366,15 @@ pub enum UndefinedBehaviorInfo<'tcx> {
 
 #[derive(Debug, Clone, Copy)]
 pub enum PointerKind {
-    Ref,
+    Ref(Mutability),
     Box,
 }
 
-impl IntoDiagnosticArg for PointerKind {
-    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
-        DiagnosticArgValue::Str(
+impl IntoDiagArg for PointerKind {
+    fn into_diag_arg(self) -> DiagArgValue {
+        DiagArgValue::Str(
             match self {
-                Self::Ref => "ref",
+                Self::Ref(_) => "ref",
                 Self::Box => "box",
             }
             .into(),
@@ -417,7 +407,7 @@ impl From<PointerKind> for ExpectedKind {
     fn from(x: PointerKind) -> ExpectedKind {
         match x {
             PointerKind::Box => ExpectedKind::Box,
-            PointerKind::Ref => ExpectedKind::Reference,
+            PointerKind::Ref(_) => ExpectedKind::Reference,
         }
     }
 }
@@ -428,14 +418,15 @@ pub enum ValidationErrorKind<'tcx> {
     PartialPointer,
     PtrToUninhabited { ptr_kind: PointerKind, ty: Ty<'tcx> },
     PtrToStatic { ptr_kind: PointerKind },
-    PtrToMut { ptr_kind: PointerKind },
-    MutableRefInConst,
+    ConstRefToMutable,
+    ConstRefToExtern,
+    MutableRefToImmutable,
+    UnsafeCellInImmutable,
     NullFnPtr,
     NeverVal,
     NullablePtrOutOfRange { range: WrappingRange, max_value: u128 },
     PtrOutOfRange { range: WrappingRange, max_value: u128 },
     OutOfRange { value: String, range: WrappingRange, max_value: u128 },
-    UnsafeCell,
     UninhabitedVal { ty: Ty<'tcx> },
     InvalidEnumTag { value: String },
     UninhabitedEnumVariant,
@@ -478,7 +469,7 @@ pub enum UnsupportedOpInfo {
     /// Accessing thread local statics
     ThreadLocalStatic(DefId),
     /// Accessing an unsupported extern static.
-    ReadExternStatic(DefId),
+    ExternStatic(DefId),
 }
 
 /// Error information for when the program exhausted the resources granted to it
@@ -491,18 +482,17 @@ pub enum ResourceExhaustionInfo {
     MemoryExhausted,
     /// The address space (of the target) is full.
     AddressSpaceFull,
+    /// The compiler got an interrupt signal (a user ran out of patience).
+    Interrupted,
 }
 
 /// A trait for machine-specific errors (or other "machine stop" conditions).
 pub trait MachineStopType: Any + fmt::Debug + Send {
     /// The diagnostic message for this error
-    fn diagnostic_message(&self) -> DiagnosticMessage;
+    fn diagnostic_message(&self) -> DiagMessage;
     /// Add diagnostic arguments by passing name and value pairs to `adder`, which are passed to
     /// fluent for formatting the translated diagnostic message.
-    fn add_args(
-        self: Box<Self>,
-        adder: &mut dyn FnMut(Cow<'static, str>, DiagnosticArgValue<'static>),
-    );
+    fn add_args(self: Box<Self>, adder: &mut dyn FnMut(DiagArgName, DiagArgValue));
 }
 
 impl dyn MachineStopType {

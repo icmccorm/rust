@@ -1,5 +1,4 @@
-// compile-flags: -C opt-level=0 -Cpanic=abort
-// ignore-wasm32-bare compiled with panic=abort by default
+//@ compile-flags: -C opt-level=0 -Cpanic=abort
 
 #![crate_type = "lib"]
 

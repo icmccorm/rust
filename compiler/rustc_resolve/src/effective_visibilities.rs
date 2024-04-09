@@ -115,7 +115,7 @@ impl<'r, 'a, 'tcx> EffectiveVisibilitiesVisitor<'r, 'a, 'tcx> {
     /// Update effective visibilities of bindings in the given module,
     /// including their whole reexport chains.
     fn set_bindings_effective_visibilities(&mut self, module_id: LocalDefId) {
-        assert!(self.r.module_map.contains_key(&&module_id.to_def_id()));
+        assert!(self.r.module_map.contains_key(&module_id.to_def_id()));
         let module = self.r.get_module(module_id.to_def_id()).unwrap();
         let resolutions = self.r.resolutions(module);
 
@@ -147,7 +147,8 @@ impl<'r, 'a, 'tcx> EffectiveVisibilitiesVisitor<'r, 'a, 'tcx> {
                     warn_ambiguity |= nested_binding.warn_ambiguity;
                 }
                 if !is_ambiguity(binding, warn_ambiguity)
-                    && let Some(def_id) = binding.res().opt_def_id().and_then(|id| id.as_local()) {
+                    && let Some(def_id) = binding.res().opt_def_id().and_then(|id| id.as_local())
+                {
                     self.update_def(def_id, binding.vis.expect_local(), parent_id);
                 }
             }
@@ -185,7 +186,7 @@ impl<'r, 'a, 'tcx> EffectiveVisibilitiesVisitor<'r, 'a, 'tcx> {
     ) -> Option<Option<Visibility>> {
         match parent_id {
             ParentId::Def(def_id) => (nominal_vis != self.current_private_vis
-                && self.r.visibilities[&def_id] != self.current_private_vis)
+                && self.r.tcx.local_visibility(def_id) != self.current_private_vis)
                 .then_some(Some(self.current_private_vis)),
             ParentId::Import(_) => Some(None),
         }
@@ -221,7 +222,7 @@ impl<'r, 'a, 'tcx> EffectiveVisibilitiesVisitor<'r, 'a, 'tcx> {
     }
 
     fn update_field(&mut self, def_id: LocalDefId, parent_id: LocalDefId) {
-        self.update_def(def_id, self.r.visibilities[&def_id], ParentId::Def(parent_id));
+        self.update_def(def_id, self.r.tcx.local_visibility(def_id), ParentId::Def(parent_id));
     }
 }
 
@@ -276,7 +277,8 @@ impl<'r, 'ast, 'tcx> Visitor<'ast> for EffectiveVisibilitiesVisitor<'ast, 'r, 't
             | ast::ItemKind::TraitAlias(..)
             | ast::ItemKind::MacroDef(..)
             | ast::ItemKind::ForeignMod(..)
-            | ast::ItemKind::Fn(..) => return,
+            | ast::ItemKind::Fn(..)
+            | ast::ItemKind::Delegation(..) => return,
         }
     }
 }

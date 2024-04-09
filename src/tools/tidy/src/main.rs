@@ -100,8 +100,11 @@ fn main() {
 
         // Checks over tests.
         check!(tests_placement, &root_path);
+        check!(tests_revision_unpaired_stdout_stderr, &tests_path);
         check!(debug_artifacts, &tests_path);
-        check!(ui_tests, &tests_path);
+        check!(ui_tests, &root_path, bless);
+        // FIXME(jieyouxu): remove this check once all run-make tests are ported over to rmake.rs.
+        check!(run_make_tests, &tests_path, &src_path, bless);
         check!(mir_opt_tests, &tests_path, bless);
         check!(rustdoc_gui_tests, &tests_path);
         check!(rustdoc_css_themes, &librustdoc_path);
@@ -109,6 +112,7 @@ fn main() {
         // Checks that only make sense for the compiler.
         check!(error_codes, &root_path, &[&compiler_path, &librustdoc_path], verbose);
         check!(fluent_alphabetical, &compiler_path, bless);
+        check!(target_policy, &root_path);
 
         // Checks that only make sense for the std libs.
         check!(pal, &library_path);
@@ -132,6 +136,7 @@ fn main() {
         check!(edition, &library_path);
 
         check!(alphabetical, &src_path);
+        check!(alphabetical, &tests_path);
         check!(alphabetical, &compiler_path);
         check!(alphabetical, &library_path);
 

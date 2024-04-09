@@ -1,5 +1,5 @@
 // Ignore everything except x86 and x86_64
-// Any additional target are added to CI should be ignored here
+// Any new targets that are added to CI should be ignored here.
 // (We cannot use `cfg`-based tricks here since the `target-feature` flags below only work on x86.)
 //@ignore-target-aarch64
 //@ignore-target-arm
@@ -10,7 +10,7 @@
 //@compile-flags: -C target-feature=+avx512f,+avx512vl,+avx512bitalg,+avx512vpopcntdq
 
 #![feature(avx512_target_feature)]
-#![feature(stdsimd)]
+#![feature(stdarch_x86_avx512)]
 
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;

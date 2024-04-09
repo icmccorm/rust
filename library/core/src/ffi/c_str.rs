@@ -1,12 +1,23 @@
+//! [`CStr`] and its related types.
+
 use crate::cmp::Ordering;
 use crate::error::Error;
 use crate::ffi::c_char;
 use crate::fmt;
 use crate::intrinsics;
+use crate::iter::FusedIterator;
+use crate::marker::PhantomData;
 use crate::ops;
+use crate::ptr::addr_of;
+use crate::ptr::NonNull;
 use crate::slice;
 use crate::slice::memchr;
 use crate::str;
+
+// FIXME: because this is doc(inline)d, we *have* to use intra-doc links because the actual link
+//   depends on where the item is being documented. however, since this is libcore, we can't
+//   actually reference libstd or liballoc in intra-doc links. so, the best we can do is remove the
+//   links to `CString` and `String` for now until a solution is developed
 
 /// Representation of a borrowed C string.
 ///
@@ -14,9 +25,9 @@ use crate::str;
 /// array of bytes. It can be constructed safely from a <code>&[[u8]]</code>
 /// slice, or unsafely from a raw `*const c_char`. It can then be
 /// converted to a Rust <code>&[str]</code> by performing UTF-8 validation, or
-/// into an owned [`CString`].
+/// into an owned `CString`.
 ///
-/// `&CStr` is to [`CString`] as <code>&[str]</code> is to [`String`]: the former
+/// `&CStr` is to `CString` as <code>&[str]</code> is to `String`: the former
 /// in each pair are borrowed references; the latter are owned
 /// strings.
 ///
@@ -24,9 +35,6 @@ use crate::str;
 /// notwithstanding) and is not recommended to be placed in the signatures of FFI functions.
 /// Instead, safe wrappers of FFI functions may leverage the unsafe [`CStr::from_ptr`] constructor
 /// to provide a safe interface to other consumers.
-///
-/// [`CString`]: ../../std/ffi/struct.CString.html
-/// [`String`]: ../../std/string/struct.String.html
 ///
 /// # Examples
 ///
@@ -88,6 +96,7 @@ use crate::str;
 // want `repr(transparent)` but we don't want it to show up in rustdoc, so we hide it under
 // `cfg(doc)`. This is an ad-hoc implementation of attribute privacy.
 #[cfg_attr(not(doc), repr(transparent))]
+#[allow(clippy::derived_hash_with_manual_eq)]
 pub struct CStr {
     // FIXME: this should not be represented with a DST slice but rather with
     //        just a raw `c_char` along with some form of marker to make
@@ -123,10 +132,13 @@ enum FromBytesWithNulErrorKind {
     NotNulTerminated,
 }
 
+// FIXME: const stability attributes should not be required here, I think
 impl FromBytesWithNulError {
+    #[rustc_const_stable(feature = "const_cstr_methods", since = "1.72.0")]
     const fn interior_nul(pos: usize) -> FromBytesWithNulError {
         FromBytesWithNulError { kind: FromBytesWithNulErrorKind::InteriorNul(pos) }
     }
+    #[rustc_const_stable(feature = "const_cstr_methods", since = "1.72.0")]
     const fn not_nul_terminated() -> FromBytesWithNulError {
         FromBytesWithNulError { kind: FromBytesWithNulErrorKind::NotNulTerminated }
     }
@@ -205,7 +217,7 @@ impl CStr {
     /// * The memory pointed to by `ptr` must contain a valid nul terminator at the
     ///   end of the string.
     ///
-    /// * `ptr` must be [valid] for reads of bytes up to and including the null terminator.
+    /// * `ptr` must be [valid] for reads of bytes up to and including the nul terminator.
     ///   This means in particular:
     ///
     ///     * The entire memory range of this `CStr` must be contained within a single allocated object!
@@ -415,7 +427,7 @@ impl CStr {
             let mut i = bytes.len().saturating_sub(1);
             assert!(!bytes.is_empty() && bytes[i] == 0, "input was not nul-terminated");
 
-            // Ending null byte exists, skip to the rest.
+            // Ending nul byte exists, skip to the rest.
             while i != 0 {
                 i -= 1;
                 let byte = bytes[i];
@@ -426,10 +438,7 @@ impl CStr {
             unsafe { &*(bytes as *const [u8] as *const CStr) }
         }
 
-        // SAFETY: The const and runtime versions have identical behavior
-        // unless the safety contract of `from_bytes_with_nul_unchecked` is
-        // violated, which is UB.
-        unsafe { intrinsics::const_eval_select((bytes,), const_impl, rt_impl) }
+        intrinsics::const_eval_select((bytes,), const_impl, rt_impl)
     }
 
     /// Returns the inner pointer to this C string.
@@ -487,9 +496,16 @@ impl CStr {
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_stable(feature = "const_str_as_ptr", since = "1.32.0")]
-    #[cfg_attr(not(bootstrap), rustc_never_returns_null_ptr)]
+    #[rustc_never_returns_null_ptr]
     pub const fn as_ptr(&self) -> *const c_char {
         self.inner.as_ptr()
+    }
+
+    /// We could eventually expose this publicly, if we wanted.
+    #[inline]
+    #[must_use]
+    const fn as_non_null_ptr(&self) -> NonNull<c_char> {
+        NonNull::from(&self.inner).as_non_null_ptr()
     }
 
     /// Returns the length of `self`. Like C's `strlen`, this does not include the nul terminator.
@@ -602,7 +618,27 @@ impl CStr {
     pub const fn to_bytes_with_nul(&self) -> &[u8] {
         // SAFETY: Transmuting a slice of `c_char`s to a slice of `u8`s
         // is safe on all supported targets.
-        unsafe { &*(&self.inner as *const [c_char] as *const [u8]) }
+        unsafe { &*(addr_of!(self.inner) as *const [u8]) }
+    }
+
+    /// Iterates over the bytes in this C string.
+    ///
+    /// The returned iterator will **not** contain the trailing nul terminator
+    /// that this C string has.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(cstr_bytes)]
+    /// use std::ffi::CStr;
+    ///
+    /// let cstr = CStr::from_bytes_with_nul(b"foo\0").expect("CStr::from_bytes_with_nul failed");
+    /// assert!(cstr.bytes().eq(*b"foo"));
+    /// ```
+    #[inline]
+    #[unstable(feature = "cstr_bytes", issue = "112115")]
+    pub fn bytes(&self) -> Bytes<'_> {
+        Bytes::new(self)
     }
 
     /// Yields a <code>&[str]</code> slice if the `CStr` contains valid UTF-8.
@@ -717,6 +753,66 @@ const unsafe fn const_strlen(ptr: *const c_char) -> usize {
         unsafe { strlen(s) }
     }
 
-    // SAFETY: the two functions always provide equivalent functionality
-    unsafe { intrinsics::const_eval_select((ptr,), strlen_ct, strlen_rt) }
+    intrinsics::const_eval_select((ptr,), strlen_ct, strlen_rt)
 }
+
+/// An iterator over the bytes of a [`CStr`], without the nul terminator.
+///
+/// This struct is created by the [`bytes`] method on [`CStr`].
+/// See its documentation for more.
+///
+/// [`bytes`]: CStr::bytes
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+#[unstable(feature = "cstr_bytes", issue = "112115")]
+#[derive(Clone, Debug)]
+pub struct Bytes<'a> {
+    // since we know the string is nul-terminated, we only need one pointer
+    ptr: NonNull<u8>,
+    phantom: PhantomData<&'a u8>,
+}
+impl<'a> Bytes<'a> {
+    #[inline]
+    fn new(s: &'a CStr) -> Self {
+        Self { ptr: s.as_non_null_ptr().cast(), phantom: PhantomData }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        // SAFETY: We uphold that the pointer is always valid to dereference
+        // by starting with a valid C string and then never incrementing beyond
+        // the nul terminator.
+        unsafe { self.ptr.read() == 0 }
+    }
+}
+
+#[unstable(feature = "cstr_bytes", issue = "112115")]
+impl Iterator for Bytes<'_> {
+    type Item = u8;
+
+    #[inline]
+    fn next(&mut self) -> Option<u8> {
+        // SAFETY: We only choose a pointer from a valid C string, which must
+        // be non-null and contain at least one value. Since we always stop at
+        // the nul terminator, which is guaranteed to exist, we can assume that
+        // the pointer is non-null and valid. This lets us safely dereference
+        // it and assume that adding 1 will create a new, non-null, valid
+        // pointer.
+        unsafe {
+            let ret = self.ptr.read();
+            if ret == 0 {
+                None
+            } else {
+                self.ptr = self.ptr.offset(1);
+                Some(ret)
+            }
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.is_empty() { (0, Some(0)) } else { (1, None) }
+    }
+}
+
+#[unstable(feature = "cstr_bytes", issue = "112115")]
+impl FusedIterator for Bytes<'_> {}

@@ -2,8 +2,7 @@ use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::numeric_literal::NumericLiteral;
 use clippy_utils::source::snippet_opt;
 use clippy_utils::visitors::{for_each_expr, Visitable};
-use clippy_utils::{get_parent_expr, get_parent_node, is_hir_ty_cfg_dependant, is_ty_alias, path_to_local};
-use if_chain::if_chain;
+use clippy_utils::{get_parent_expr, is_hir_ty_cfg_dependant, is_ty_alias, path_to_local};
 use rustc_ast::{LitFloatType, LitIntType, LitKind};
 use rustc_errors::Applicability;
 use rustc_hir::def::{DefKind, Res};
@@ -25,40 +24,40 @@ pub(super) fn check<'tcx>(
 ) -> bool {
     let cast_str = snippet_opt(cx, cast_expr.span).unwrap_or_default();
 
-    if_chain! {
-        if let ty::RawPtr(..) = cast_from.kind();
+    if let ty::RawPtr(..) = cast_from.kind()
         // check both mutability and type are the same
-        if cast_from.kind() == cast_to.kind();
-        if let ExprKind::Cast(_, cast_to_hir) = expr.kind;
+        && cast_from.kind() == cast_to.kind()
+        && let ExprKind::Cast(_, cast_to_hir) = expr.kind
         // Ignore casts to e.g. type aliases and infer types
         // - p as pointer_alias
         // - p as _
-        if let TyKind::Ptr(to_pointee) = cast_to_hir.kind;
-        then {
-            match to_pointee.ty.kind {
-                // Ignore casts to pointers that are aliases or cfg dependant, e.g.
-                // - p as *const std::ffi::c_char (alias)
-                // - p as *const std::os::raw::c_char (cfg dependant)
-                TyKind::Path(qpath) => {
-                    if is_ty_alias(&qpath) || is_hir_ty_cfg_dependant(cx, to_pointee.ty) {
-                        return false;
-                    }
-                },
-                // Ignore `p as *const _`
-                TyKind::Infer => return false,
-                _ => {},
-            }
-
-            span_lint_and_sugg(
-                cx,
-                UNNECESSARY_CAST,
-                expr.span,
-                &format!("casting raw pointers to the same type and constness is unnecessary (`{cast_from}` -> `{cast_to}`)"),
-                "try",
-                cast_str.clone(),
-                Applicability::MaybeIncorrect,
-            );
+        && let TyKind::Ptr(to_pointee) = cast_to_hir.kind
+    {
+        match to_pointee.ty.kind {
+            // Ignore casts to pointers that are aliases or cfg dependant, e.g.
+            // - p as *const std::ffi::c_char (alias)
+            // - p as *const std::os::raw::c_char (cfg dependant)
+            TyKind::Path(qpath) => {
+                if is_ty_alias(&qpath) || is_hir_ty_cfg_dependant(cx, to_pointee.ty) {
+                    return false;
+                }
+            },
+            // Ignore `p as *const _`
+            TyKind::Infer => return false,
+            _ => {},
         }
+
+        span_lint_and_sugg(
+            cx,
+            UNNECESSARY_CAST,
+            expr.span,
+            format!(
+                "casting raw pointers to the same type and constness is unnecessary (`{cast_from}` -> `{cast_to}`)"
+            ),
+            "try",
+            cast_str.clone(),
+            Applicability::MaybeIncorrect,
+        );
     }
 
     // skip cast of local that is a type alias
@@ -66,8 +65,8 @@ pub(super) fn check<'tcx>(
         && let ExprKind::Path(qpath) = inner.kind
         && let QPath::Resolved(None, Path { res, .. }) = qpath
         && let Res::Local(hir_id) = res
-        && let parent = cx.tcx.hir().get_parent(*hir_id)
-        && let Node::Local(local) = parent
+        && let parent = cx.tcx.parent_hir_node(*hir_id)
+        && let Node::LetStmt(local) = parent
     {
         if let Some(ty) = local.ty
             && let TyKind::Path(qpath) = ty.kind
@@ -86,36 +85,37 @@ pub(super) fn check<'tcx>(
     }
 
     // skip cast to non-primitive type
-    if_chain! {
-        if let ExprKind::Cast(_, cast_to) = expr.kind;
-        if let TyKind::Path(QPath::Resolved(_, path)) = &cast_to.kind;
-        if let Res::PrimTy(_) = path.res;
-        then {}
-        else {
-            return false;
-        }
+    if let ExprKind::Cast(_, cast_to) = expr.kind
+        && let TyKind::Path(QPath::Resolved(_, path)) = &cast_to.kind
+        && let Res::PrimTy(_) = path.res
+    {
+    } else {
+        return false;
     }
 
     // skip cast of fn call that returns type alias
-    if let ExprKind::Cast(inner, ..) = expr.kind && is_cast_from_ty_alias(cx, inner, cast_from) {
+    if let ExprKind::Cast(inner, ..) = expr.kind
+        && is_cast_from_ty_alias(cx, inner, cast_from)
+    {
         return false;
     }
 
     if let Some(lit) = get_numeric_literal(cast_expr) {
         let literal_str = &cast_str;
 
-        if_chain! {
-            if let LitKind::Int(n, _) = lit.node;
-            if let Some(src) = snippet_opt(cx, cast_expr.span);
-            if cast_to.is_floating_point();
-            if let Some(num_lit) = NumericLiteral::from_lit_kind(&src, &lit.node);
-            let from_nbits = 128 - n.leading_zeros();
-            let to_nbits = fp_ty_mantissa_nbits(cast_to);
-            if from_nbits != 0 && to_nbits != 0 && from_nbits <= to_nbits && num_lit.is_decimal();
-            then {
-                lint_unnecessary_cast(cx, expr, num_lit.integer, cast_from, cast_to);
-                return true
-            }
+        if let LitKind::Int(n, _) = lit.node
+            && let Some(src) = snippet_opt(cx, cast_expr.span)
+            && cast_to.is_floating_point()
+            && let Some(num_lit) = NumericLiteral::from_lit_kind(&src, &lit.node)
+            && let from_nbits = 128 - n.get().leading_zeros()
+            && let to_nbits = fp_ty_mantissa_nbits(cast_to)
+            && from_nbits != 0
+            && to_nbits != 0
+            && from_nbits <= to_nbits
+            && num_lit.is_decimal()
+        {
+            lint_unnecessary_cast(cx, expr, num_lit.integer, cast_from, cast_to);
+            return true;
         }
 
         match lit.node {
@@ -144,21 +144,31 @@ pub(super) fn check<'tcx>(
 
     if cast_from.kind() == cast_to.kind() && !in_external_macro(cx.sess(), expr.span) {
         if let Some(id) = path_to_local(cast_expr)
-            && let Some(span) = cx.tcx.hir().opt_span(id)
-            && span.ctxt() != cast_expr.span.ctxt()
+            && !cx.tcx.hir().span(id).eq_ctxt(cast_expr.span)
         {
             // Binding context is different than the identifiers context.
             // Weird macro wizardry could be involved here.
             return false;
         }
 
+        // If the whole cast expression is a unary expression (`(*x as T)`) or an addressof
+        // expression (`(&x as T)`), then not surrounding the suggestion into a block risks us
+        // changing the precedence of operators if the cast expression is followed by an operation
+        // with higher precedence than the unary operator (`(*x as T).foo()` would become
+        // `*x.foo()`, which changes what the `*` applies on).
+        // The same is true if the expression encompassing the cast expression is a unary
+        // expression or an addressof expression.
+        let needs_block = matches!(cast_expr.kind, ExprKind::Unary(..) | ExprKind::AddrOf(..))
+            || get_parent_expr(cx, expr)
+                .map_or(false, |e| matches!(e.kind, ExprKind::Unary(..) | ExprKind::AddrOf(..)));
+
         span_lint_and_sugg(
             cx,
             UNNECESSARY_CAST,
             expr.span,
-            &format!("casting to the same type is unnecessary (`{cast_from}` -> `{cast_to}`)"),
+            format!("casting to the same type is unnecessary (`{cast_from}` -> `{cast_to}`)"),
             "try",
-            if get_parent_expr(cx, expr).map_or(false, |e| matches!(e.kind, ExprKind::AddrOf(..))) {
+            if needs_block {
                 format!("{{ {cast_str} }}")
             } else {
                 cast_str
@@ -189,18 +199,17 @@ fn lint_unnecessary_cast(
     let sugg = if let Some(parent_expr) = get_parent_expr(cx, expr)
         && let ExprKind::MethodCall(..) = parent_expr.kind
         && literal_str.starts_with('-')
-        {
-            format!("({literal_str}_{cast_to})")
-
-        } else {
-            format!("{literal_str}_{cast_to}")
+    {
+        format!("({literal_str}_{cast_to})")
+    } else {
+        format!("{literal_str}_{cast_to}")
     };
 
     span_lint_and_sugg(
         cx,
         UNNECESSARY_CAST,
         expr.span,
-        &format!("casting {literal_kind_name} literal to `{cast_to}` is unnecessary"),
+        format!("casting {literal_kind_name} literal to `{cast_to}` is unnecessary"),
         "try",
         sugg,
         Applicability::MachineApplicable,
@@ -266,10 +275,11 @@ fn is_cast_from_ty_alias<'tcx>(cx: &LateContext<'tcx>, expr: impl Visitable<'tcx
                 }
             // Local usage
             } else if let Res::Local(hir_id) = res
-                && let Some(parent) = get_parent_node(cx.tcx, hir_id)
-                && let Node::Local(l) = parent
+                && let Node::LetStmt(l) = cx.tcx.parent_hir_node(hir_id)
             {
-                if let Some(e) = l.init && is_cast_from_ty_alias(cx, e, cast_from) {
+                if let Some(e) = l.init
+                    && is_cast_from_ty_alias(cx, e, cast_from)
+                {
                     return ControlFlow::Break::<()>(());
                 }
 

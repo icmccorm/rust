@@ -1,7 +1,7 @@
 //! Helper code for character escaping.
 
 use crate::ascii;
-use crate::num::NonZeroUsize;
+use crate::num::NonZero;
 use crate::ops::Range;
 
 const HEX_DIGITS: [ascii::Char; 16] = *b"0123456789abcdef".as_ascii().unwrap();
@@ -21,12 +21,16 @@ pub(crate) fn escape_ascii_into(output: &mut [ascii::Char; 4], byte: u8) -> Rang
         b'\\' => backslash(ascii::Char::ReverseSolidus),
         b'\'' => backslash(ascii::Char::Apostrophe),
         b'\"' => backslash(ascii::Char::QuotationMark),
-        _ => if let Some(a) = byte.as_ascii() && !byte.is_ascii_control() {
-            ([a, ascii::Char::Null, ascii::Char::Null, ascii::Char::Null], 1)
-        } else {
-            let hi = HEX_DIGITS[usize::from(byte >> 4)];
-            let lo = HEX_DIGITS[usize::from(byte & 0xf)];
-            ([ascii::Char::ReverseSolidus, ascii::Char::SmallX, hi, lo], 4)
+        _ => {
+            if let Some(a) = byte.as_ascii()
+                && !byte.is_ascii_control()
+            {
+                ([a, ascii::Char::Null, ascii::Char::Null, ascii::Char::Null], 1)
+            } else {
+                let hi = HEX_DIGITS[usize::from(byte >> 4)];
+                let lo = HEX_DIGITS[usize::from(byte & 0xf)];
+                ([ascii::Char::ReverseSolidus, ascii::Char::SmallX, hi, lo], 4)
+            }
         }
     };
     *output = data;
@@ -102,11 +106,11 @@ impl<const N: usize> EscapeIterInner<N> {
         self.alive.next_back().map(|i| self.data[usize::from(i)].to_u8())
     }
 
-    pub fn advance_by(&mut self, n: usize) -> Result<(), NonZeroUsize> {
+    pub fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
         self.alive.advance_by(n)
     }
 
-    pub fn advance_back_by(&mut self, n: usize) -> Result<(), NonZeroUsize> {
+    pub fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
         self.alive.advance_back_by(n)
     }
 }

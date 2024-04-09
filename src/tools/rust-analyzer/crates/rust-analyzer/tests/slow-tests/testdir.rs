@@ -1,16 +1,25 @@
 use std::{
     fs, io,
-    path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use paths::{Utf8Path, Utf8PathBuf};
+
 pub(crate) struct TestDir {
-    path: PathBuf,
+    path: Utf8PathBuf,
     keep: bool,
 }
 
 impl TestDir {
     pub(crate) fn new() -> TestDir {
+        TestDir::new_dir(false)
+    }
+
+    pub(crate) fn new_symlink() -> TestDir {
+        TestDir::new_dir(true)
+    }
+
+    fn new_dir(symlink: bool) -> TestDir {
         let temp_dir = std::env::temp_dir();
         // On MacOS builders on GitHub actions, the temp dir is a symlink, and
         // that causes problems down the line. Specifically:
@@ -33,16 +42,33 @@ impl TestDir {
                 continue;
             }
             fs::create_dir_all(&path).unwrap();
-            return TestDir { path, keep: false };
+
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            if symlink {
+                let symlink_path = base.join(format!("{pid}_{cnt}_symlink"));
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                std::os::unix::fs::symlink(path, &symlink_path).unwrap();
+
+                #[cfg(target_os = "windows")]
+                std::os::windows::fs::symlink_dir(path, &symlink_path).unwrap();
+
+                return TestDir {
+                    path: Utf8PathBuf::from_path_buf(symlink_path).unwrap(),
+                    keep: false,
+                };
+            }
+
+            return TestDir { path: Utf8PathBuf::from_path_buf(path).unwrap(), keep: false };
         }
         panic!("Failed to create a temporary directory")
     }
+
     #[allow(unused)]
     pub(crate) fn keep(mut self) -> TestDir {
         self.keep = true;
         self
     }
-    pub(crate) fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Utf8Path {
         &self.path
     }
 }
@@ -52,19 +78,32 @@ impl Drop for TestDir {
         if self.keep {
             return;
         }
+
+        let filetype = fs::symlink_metadata(&self.path).unwrap().file_type();
+        let actual_path = filetype.is_symlink().then(|| fs::read_link(&self.path).unwrap());
+
+        if let Some(actual_path) = actual_path {
+            remove_dir_all(Utf8Path::from_path(&actual_path).unwrap()).unwrap_or_else(|err| {
+                panic!(
+                    "failed to remove temporary link to directory {}: {err}",
+                    actual_path.display()
+                )
+            })
+        }
+
         remove_dir_all(&self.path).unwrap_or_else(|err| {
-            panic!("failed to remove temporary directory {}: {err}", self.path.display())
-        })
+            panic!("failed to remove temporary directory {}: {err}", self.path)
+        });
     }
 }
 
 #[cfg(not(windows))]
-fn remove_dir_all(path: &Path) -> io::Result<()> {
+fn remove_dir_all(path: &Utf8Path) -> io::Result<()> {
     fs::remove_dir_all(path)
 }
 
 #[cfg(windows)]
-fn remove_dir_all(path: &Path) -> io::Result<()> {
+fn remove_dir_all(path: &Utf8Path) -> io::Result<()> {
     for _ in 0..99 {
         if fs::remove_dir_all(path).is_ok() {
             return Ok(());

@@ -1,5 +1,5 @@
 #![warn(clippy::transmute_ptr_to_ptr)]
-#![allow(clippy::borrow_as_ptr)]
+#![allow(clippy::borrow_as_ptr, clippy::missing_transmute_annotations)]
 
 // Make sure we can modify lifetimes, which is one of the recommended uses
 // of transmute
@@ -35,13 +35,16 @@ fn transmute_ptr_to_ptr() {
         // ref-ref transmutes; bad
         let _: &f32 = std::mem::transmute(&1u32);
         //~^ ERROR: transmute from a reference to a reference
-        let _: &f64 = std::mem::transmute(&1f32);
+        let _: &f32 = std::mem::transmute(&1f64);
         //~^ ERROR: transmute from a reference to a reference
         //:^ this test is here because both f32 and f64 are the same TypeVariant, but they are not
         // the same type
         let _: &mut f32 = std::mem::transmute(&mut 1u32);
         //~^ ERROR: transmute from a reference to a reference
         let _: &GenericParam<f32> = std::mem::transmute(&GenericParam { t: 1u32 });
+        //~^ ERROR: transmute from a reference to a reference
+        let u64_ref: &u64 = &0u64;
+        let u8_ref: &u8 = unsafe { std::mem::transmute(u64_ref) };
         //~^ ERROR: transmute from a reference to a reference
     }
 

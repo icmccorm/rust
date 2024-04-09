@@ -1,4 +1,3 @@
-use std::iter::ExactSizeIterator;
 use std::ops::Deref;
 
 use rustc_ast::ast::{self, FnRetTy, Mutability, Term};
@@ -301,7 +300,7 @@ where
     let output = match *output {
         FnRetTy::Ty(ref ty) => {
             let type_str = ty.rewrite(context, ty_shape)?;
-            format!(" -> {}", type_str)
+            format!(" -> {type_str}")
         }
         FnRetTy::Default(..) => String::new(),
     };
@@ -373,7 +372,7 @@ where
         || !context.use_block_indent()
         || is_inputs_empty
     {
-        format!("({})", list_str)
+        format!("({list_str})")
     } else {
         format!(
             "({}{}{})",
@@ -383,7 +382,7 @@ where
         )
     };
     if output.is_empty() || last_line_width(&args) + first_line_width(&output) <= shape.width {
-        Some(format!("{}{}", args, output))
+        Some(format!("{args}{output}"))
     } else {
         Some(format!(
             "{}\n{}{}",
@@ -426,12 +425,12 @@ impl Rewrite for ast::WherePredicate {
             }) => {
                 let type_str = bounded_ty.rewrite(context, shape)?;
                 let colon = type_bound_colon(context).trim_end();
-                let lhs = if let Some(lifetime_str) =
-                    rewrite_lifetime_param(context, shape, bound_generic_params)
+                let lhs = if let Some(binder_str) =
+                    rewrite_bound_params(context, shape, bound_generic_params)
                 {
-                    format!("for<{}> {}{}", lifetime_str, type_str, colon)
+                    format!("for<{binder_str}> {type_str}{colon}")
                 } else {
-                    format!("{}{}", type_str, colon)
+                    format!("{type_str}{colon}")
                 };
 
                 rewrite_assign_rhs(context, lhs, bounds, &RhsAssignKind::Bounds, shape)?
@@ -538,28 +537,30 @@ impl Rewrite for ast::Lifetime {
 impl Rewrite for ast::GenericBound {
     fn rewrite(&self, context: &RewriteContext<'_>, shape: Shape) -> Option<String> {
         match *self {
-            ast::GenericBound::Trait(ref poly_trait_ref, trait_bound_modifier) => {
+            ast::GenericBound::Trait(
+                ref poly_trait_ref,
+                ast::TraitBoundModifiers {
+                    constness,
+                    asyncness,
+                    polarity,
+                },
+            ) => {
                 let snippet = context.snippet(self.span());
                 let has_paren = snippet.starts_with('(') && snippet.ends_with(')');
-                let rewrite = match trait_bound_modifier {
-                    ast::TraitBoundModifier::None => poly_trait_ref.rewrite(context, shape),
-                    ast::TraitBoundModifier::Maybe => poly_trait_ref
-                        .rewrite(context, shape.offset_left(1)?)
-                        .map(|s| format!("?{}", s)),
-                    ast::TraitBoundModifier::MaybeConst => poly_trait_ref
-                        .rewrite(context, shape.offset_left(7)?)
-                        .map(|s| format!("~const {}", s)),
-                    ast::TraitBoundModifier::MaybeConstMaybe => poly_trait_ref
-                        .rewrite(context, shape.offset_left(8)?)
-                        .map(|s| format!("~const ?{}", s)),
-                    ast::TraitBoundModifier::Negative => poly_trait_ref
-                        .rewrite(context, shape.offset_left(1)?)
-                        .map(|s| format!("!{}", s)),
-                    ast::TraitBoundModifier::MaybeConstNegative => poly_trait_ref
-                        .rewrite(context, shape.offset_left(8)?)
-                        .map(|s| format!("~const !{}", s)),
-                };
-                rewrite.map(|s| if has_paren { format!("({})", s) } else { s })
+                let mut constness = constness.as_str().to_string();
+                if !constness.is_empty() {
+                    constness.push(' ');
+                }
+                let mut asyncness = asyncness.as_str().to_string();
+                if !asyncness.is_empty() {
+                    asyncness.push(' ');
+                }
+                let polarity = polarity.as_str();
+                let shape = shape.offset_left(constness.len() + polarity.len())?;
+                poly_trait_ref
+                    .rewrite(context, shape)
+                    .map(|s| format!("{constness}{asyncness}{polarity}{s}"))
+                    .map(|s| if has_paren { format!("({})", s) } else { s })
             }
             ast::GenericBound::Outlives(ref lifetime) => lifetime.rewrite(context, shape),
         }
@@ -657,8 +658,7 @@ impl Rewrite for ast::GenericParam {
 
 impl Rewrite for ast::PolyTraitRef {
     fn rewrite(&self, context: &RewriteContext<'_>, shape: Shape) -> Option<String> {
-        if let Some(lifetime_str) =
-            rewrite_lifetime_param(context, shape, &self.bound_generic_params)
+        if let Some(lifetime_str) = rewrite_bound_params(context, shape, &self.bound_generic_params)
         {
             // 6 is "for<> ".len()
             let extra_offset = lifetime_str.len() + 6;
@@ -666,7 +666,7 @@ impl Rewrite for ast::PolyTraitRef {
                 .trait_ref
                 .rewrite(context, shape.offset_left(extra_offset)?)?;
 
-            Some(format!("for<{}> {}", lifetime_str, path_str))
+            Some(format!("for<{lifetime_str}> {path_str}"))
         } else {
             self.trait_ref.rewrite(context, shape)
         }
@@ -684,9 +684,11 @@ impl Rewrite for ast::Ty {
         match self.kind {
             ast::TyKind::TraitObject(ref bounds, tobj_syntax) => {
                 // we have to consider 'dyn' keyword is used or not!!!
-                let is_dyn = tobj_syntax == ast::TraitObjectSyntax::Dyn;
-                // 4 is length of 'dyn '
-                let shape = if is_dyn { shape.offset_left(4)? } else { shape };
+                let (shape, prefix) = match tobj_syntax {
+                    ast::TraitObjectSyntax::Dyn => (shape.offset_left(4)?, "dyn "),
+                    ast::TraitObjectSyntax::DynStar => (shape.offset_left(5)?, "dyn* "),
+                    ast::TraitObjectSyntax::None => (shape, ""),
+                };
                 let mut res = bounds.rewrite(context, shape)?;
                 // We may have falsely removed a trailing `+` inside macro call.
                 if context.inside_macro() && bounds.len() == 1 {
@@ -694,11 +696,7 @@ impl Rewrite for ast::Ty {
                         res.push('+');
                     }
                 }
-                if is_dyn {
-                    Some(format!("dyn {}", res))
-                } else {
-                    Some(res)
-                }
+                Some(format!("{prefix}{res}"))
             }
             ast::TyKind::Ptr(ref mt) => {
                 let prefix = match mt.mutbl {
@@ -794,7 +792,7 @@ impl Rewrite for ast::Ty {
                 if let Some(sh) = shape.sub_width(2) {
                     if let Some(ref s) = ty.rewrite(context, sh) {
                         if !s.contains('\n') {
-                            return Some(format!("({})", s));
+                            return Some(format!("({s})"));
                         }
                     }
                 }
@@ -819,8 +817,8 @@ impl Rewrite for ast::Ty {
             ast::TyKind::Tup(ref items) => {
                 rewrite_tuple(context, items.iter(), self.span, shape, items.len() == 1)
             }
-            ast::TyKind::AnonStruct(_) => Some(context.snippet(self.span).to_owned()),
-            ast::TyKind::AnonUnion(_) => Some(context.snippet(self.span).to_owned()),
+            ast::TyKind::AnonStruct(..) => Some(context.snippet(self.span).to_owned()),
+            ast::TyKind::AnonUnion(..) => Some(context.snippet(self.span).to_owned()),
             ast::TyKind::Path(ref q_self, ref path) => {
                 rewrite_path(context, PathContext::Type, q_self, path, shape)
             }
@@ -861,7 +859,7 @@ impl Rewrite for ast::Ty {
                 })
             }
             ast::TyKind::CVarArgs => Some("...".to_owned()),
-            ast::TyKind::Err => Some(context.snippet(self.span).to_owned()),
+            ast::TyKind::Dummy | ast::TyKind::Err(_) => Some(context.snippet(self.span).to_owned()),
             ast::TyKind::Typeof(ref anon_const) => rewrite_call(
                 context,
                 "typeof",
@@ -883,8 +881,7 @@ fn rewrite_bare_fn(
 
     let mut result = String::with_capacity(128);
 
-    if let Some(ref lifetime_str) = rewrite_lifetime_param(context, shape, &bare_fn.generic_params)
-    {
+    if let Some(ref lifetime_str) = rewrite_bound_params(context, shape, &bare_fn.generic_params) {
         result.push_str("for<");
         // 6 = "for<> ".len(), 4 = "for<".
         // This doesn't work out so nicely for multiline situation with lots of
@@ -898,7 +895,6 @@ fn rewrite_bare_fn(
     result.push_str(&format_extern(
         bare_fn.ext,
         context.config.force_explicit_abi(),
-        false,
     ));
 
     result.push_str("fn");
@@ -1124,16 +1120,15 @@ pub(crate) fn can_be_overflowed_type(
     }
 }
 
-/// Returns `None` if there is no `LifetimeDef` in the given generic parameters.
-pub(crate) fn rewrite_lifetime_param(
+/// Returns `None` if there is no `GenericParam` in the list
+pub(crate) fn rewrite_bound_params(
     context: &RewriteContext<'_>,
     shape: Shape,
     generic_params: &[ast::GenericParam],
 ) -> Option<String> {
     let result = generic_params
         .iter()
-        .filter(|p| matches!(p.kind, ast::GenericParamKind::Lifetime))
-        .map(|lt| lt.rewrite(context, shape))
+        .map(|param| param.rewrite(context, shape))
         .collect::<Option<Vec<_>>>()?
         .join(", ");
     if result.is_empty() {

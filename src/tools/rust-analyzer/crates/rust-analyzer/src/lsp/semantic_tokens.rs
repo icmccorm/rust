@@ -85,6 +85,7 @@ define_semantic_token_types![
         (LIFETIME, "lifetime"),
         (LOGICAL, "logical") => OPERATOR,
         (MACRO_BANG, "macroBang") => MACRO,
+        (PROC_MACRO, "procMacro") => MACRO,
         (PARENTHESIS, "parenthesis"),
         (PUNCTUATION, "punctuation"),
         (SELF_KEYWORD, "selfKeyword") => KEYWORD,
@@ -126,13 +127,14 @@ macro_rules! define_semantic_token_modifiers {
 
 define_semantic_token_modifiers![
     standard {
+        ASYNC,
         DOCUMENTATION,
         DECLARATION,
         STATIC,
         DEFAULT_LIBRARY,
     }
     custom {
-        (ASYNC, "async"),
+        (ASSOCIATED, "associated"),
         (ATTRIBUTE_MODIFIER, "attribute"),
         (CALLABLE, "callable"),
         (CONSTANT, "constant"),
@@ -143,6 +145,7 @@ define_semantic_token_modifiers![
         (INTRA_DOC_LINK, "intraDocLink"),
         (LIBRARY, "library"),
         (MACRO_MODIFIER, "macro"),
+        (PROC_MACRO_MODIFIER, "proc_macro"),
         (MUTABLE, "mutable"),
         (PUBLIC, "public"),
         (REFERENCE, "reference"),
@@ -157,7 +160,7 @@ pub(crate) struct ModifierSet(pub(crate) u32);
 impl ModifierSet {
     pub(crate) fn standard_fallback(&mut self) {
         // Remove all non standard modifiers
-        self.0 = self.0 & !(!0u32 << LAST_STANDARD_MOD)
+        self.0 &= !(!0u32 << LAST_STANDARD_MOD)
     }
 }
 

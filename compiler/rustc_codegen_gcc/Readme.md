@@ -1,6 +1,7 @@
 # WIP libgccjit codegen backend for rust
 
 [![Chat on IRC](https://img.shields.io/badge/irc.libera.chat-%23rustc__codegen__gcc-blue.svg)](https://web.libera.chat/#rustc_codegen_gcc)
+[![Chat on Matrix](https://img.shields.io/badge/matrix.org-%23rustc__codegen__gcc-blue.svg)](https://matrix.to/#/#rustc_codegen_gcc:matrix.org)
 
 This is a GCC codegen for rustc, which means it can be loaded by the existing rustc frontend, but benefits from GCC: more architectures are supported and GCC's optimizations are used.
 
@@ -14,9 +15,19 @@ A secondary goal is to check if using the gcc backend will provide any run-time 
 ## Building
 
 **This requires a patched libgccjit in order to work.
-The patches in [this repository](https://github.com/antoyo/libgccjit-patches) need to be applied.
-(Those patches should work when applied on master, but in case it doesn't work, they are known to work when applied on 079c23cfe079f203d5df83fea8e92a60c7d7e878.)
-You can also use my [fork of gcc](https://github.com/antoyo/gcc) which already includes these patches.**
+You need to use my [fork of gcc](https://github.com/antoyo/gcc) which already includes these patches.**
+
+```bash
+$ cp config.example.toml config.toml
+```
+
+If don't need to test GCC patches you wrote in our GCC fork, then the default configuration should
+be all you need. You can update the `rustc_codegen_gcc` without worrying about GCC.
+
+### Building with your own GCC version
+
+If you wrote a patch for GCC and want to test it without this backend, you will need
+to do a few more things.
 
 To build it (most of these instructions come from [here](https://gcc.gnu.org/onlinedocs/jit/internals/index.html), so don't hesitate to take a look there if you encounter an issue):
 
@@ -50,50 +61,67 @@ $ make check-jit
 $ make check-jit RUNTESTFLAGS="-v -v -v jit.exp=jit.dg/test-asm.cc"
 ```
 
-**Put the path to your custom build of libgccjit in the file `gcc_path`.**
+**Put the path to your custom build of libgccjit in the file `config.toml`.**
+
+You now need to set the `gcc-path` value in `config.toml` with the result of this command:
 
 ```bash
-$ dirname $(readlink -f `find . -name libgccjit.so`) > gcc_path
+$ dirname $(readlink -f `find . -name libgccjit.so`)
 ```
 
-You also need to set RUST_COMPILER_RT_ROOT:
+and to comment the `download-gccjit` setting:
 
-```bash
-$ git clone https://github.com/llvm/llvm-project llvm --depth 1 --single-branch
-$ export RUST_COMPILER_RT_ROOT="$PWD/llvm/compiler-rt"
+```toml
+gcc-path = "[MY PATH]"
+# download-gccjit = true
 ```
 
 Then you can run commands like this:
 
 ```bash
-$ ./prepare.sh # download and patch sysroot src and install hyperfine for benchmarking
-$ LIBRARY_PATH=$(cat gcc_path) LD_LIBRARY_PATH=$(cat gcc_path) ./build.sh --release
+$ ./y.sh prepare # download and patch sysroot src and install hyperfine for benchmarking
+$ ./y.sh build --release
 ```
 
 To run the tests:
 
 ```bash
-$ ./test.sh --release
+$ ./y.sh test --release
 ```
 
 ## Usage
 
-`$cg_gccjit_dir` is the directory you cloned this repo into in the following instructions.
+`$CG_GCCJIT_DIR` is the directory you cloned this repo into in the following instructions:
+
+```bash
+export CG_GCCJIT_DIR=[the full path to rustc_codegen_gcc]
+```
 
 ### Cargo
 
 ```bash
-$ CHANNEL="release" $cg_gccjit_dir/cargo.sh run
+$ CHANNEL="release" $CG_GCCJIT_DIR/y.sh cargo run
 ```
 
-If you compiled cg_gccjit in debug mode (aka you didn't pass `--release` to `./test.sh`) you should use `CHANNEL="debug"` instead or omit `CHANNEL="release"` completely.
+If you compiled cg_gccjit in debug mode (aka you didn't pass `--release` to `./y.sh test`) you should use `CHANNEL="debug"` instead or omit `CHANNEL="release"` completely.
+
+### LTO
+
+To use LTO, you need to set the variable `FAT_LTO=1` and `EMBED_LTO_BITCODE=1` in addition to setting `lto = "fat"` in the `Cargo.toml`.
+Don't set `FAT_LTO` when compiling the sysroot, though: only set `EMBED_LTO_BITCODE=1`.
+
+Failing to set `EMBED_LTO_BITCODE` will give you the following error:
+
+```
+error: failed to copy bitcode to object file: No such file or directory (os error 2)
+```
 
 ### Rustc
 
 > You should prefer using the Cargo method.
 
 ```bash
-$ rustc +$(cat $cg_gccjit_dir/rust-toolchain) -Cpanic=abort -Zcodegen-backend=$cg_gccjit_dir/target/release/librustc_codegen_gcc.so --sysroot $cg_gccjit_dir/build_sysroot/sysroot my_crate.rs
+$ LIBRARY_PATH="[gcc-path value]" LD_LIBRARY_PATH="[gcc-path value]" rustc +$(cat $CG_GCCJIT_DIR/rust-toolchain | grep 'channel' | cut -d '=' -f 2 | sed 's/"//g' | sed 's/ //g') -Cpanic=abort -Zcodegen-backend=$CG_GCCJIT_DIR/target/release/librustc_codegen_gcc.so --sysroot $CG_GCCJIT_DIR/build_sysroot/sysroot my_crate.rs
 ```
 
 ## Env vars
@@ -105,138 +133,25 @@ $ rustc +$(cat $cg_gccjit_dir/rust-toolchain) -Cpanic=abort -Zcodegen-backend=$c
     object files when their content should have been changed by a change to cg_gccjit.</dd>
     <dt>CG_GCCJIT_DISPLAY_CG_TIME</dt>
     <dd>Display the time it took to perform codegen for a crate</dd>
+    <dt>CG_RUSTFLAGS</dt>
+    <dd>Send additional flags to rustc. Can be used to build the sysroot without unwinding by setting `CG_RUSTFLAGS=-Cpanic=abort`.</dd>
+    <dt>CG_GCCJIT_DUMP_TO_FILE</dt>
+    <dd>Dump a C-like representation to /tmp/gccjit_dumps and enable debug info in order to debug this C-like representation.</dd>
 </dl>
 
-## Debugging
+## Extra documentation
 
-Sometimes, libgccjit will crash and output an error like this:
+More specific documentation is available in the [`doc`](./doc) folder:
 
-```
-during RTL pass: expand
-libgccjit.so: error: in expmed_mode_index, at expmed.h:249
-0x7f0da2e61a35 expmed_mode_index
-	../../../gcc/gcc/expmed.h:249
-0x7f0da2e61aa4 expmed_op_cost_ptr
-	../../../gcc/gcc/expmed.h:271
-0x7f0da2e620dc sdiv_cost_ptr
-	../../../gcc/gcc/expmed.h:540
-0x7f0da2e62129 sdiv_cost
-	../../../gcc/gcc/expmed.h:558
-0x7f0da2e73c12 expand_divmod(int, tree_code, machine_mode, rtx_def*, rtx_def*, rtx_def*, int)
-	../../../gcc/gcc/expmed.c:4335
-0x7f0da2ea1423 expand_expr_real_2(separate_ops*, rtx_def*, machine_mode, expand_modifier)
-	../../../gcc/gcc/expr.c:9240
-0x7f0da2cd1a1e expand_gimple_stmt_1
-	../../../gcc/gcc/cfgexpand.c:3796
-0x7f0da2cd1c30 expand_gimple_stmt
-	../../../gcc/gcc/cfgexpand.c:3857
-0x7f0da2cd90a9 expand_gimple_basic_block
-	../../../gcc/gcc/cfgexpand.c:5898
-0x7f0da2cdade8 execute
-	../../../gcc/gcc/cfgexpand.c:6582
-```
+ * [Common errors](./doc/errors.md)
+ * [Debugging GCC LTO](./doc/debugging-gcc-lto.md)
+ * [Debugging libgccjit](./doc/debugging-libgccjit.md)
+ * [Git subtree sync](./doc/subtree.md)
+ * [List of useful commands](./doc/tips.md)
+ * [Send a patch to GCC](./doc/sending-gcc-patch.md)
 
-To see the code which causes this error, call the following function:
+## Licensing
 
-```c
-gcc_jit_context_dump_to_file(ctxt, "/tmp/output.c", 1 /* update_locations */)
-```
+While this crate is licensed under a dual Apache/MIT license, it links to `libgccjit` which is under the GPLv3+ and thus, the resulting toolchain (rustc + GCC codegen) will need to be released under the GPL license.
 
-This will create a C-like file and add the locations into the IR pointing to this C file.
-Then, rerun the program and it will output the location in the second line:
-
-```
-libgccjit.so: /tmp/something.c:61322:0: error: in expmed_mode_index, at expmed.h:249
-```
-
-Or add a breakpoint to `add_error` in gdb and print the line number using:
-
-```
-p loc->m_line
-p loc->m_filename->m_buffer
-```
-
-To print a debug representation of a tree:
-
-```c
-debug_tree(expr);
-```
-
-(defined in print-tree.h)
-
-To print a debug reprensentation of a gimple struct:
-
-```c
-debug_gimple_stmt(gimple_struct)
-```
-
-To get the `rustc` command to run in `gdb`, add the `--verbose` flag to `cargo build`.
-
-To have the correct file paths in `gdb` instead of `/usr/src/debug/gcc/libstdc++-v3/libsupc++/eh_personality.cc`:
-
-Maybe by calling the following at the beginning of gdb:
-
-```
-set substitute-path /usr/src/debug/gcc /path/to/gcc-repo/gcc
-```
-
-TODO(antoyo): but that's not what I remember I was doing.
-
-### How to use a custom-build rustc
-
- * Build the stage2 compiler (`rustup toolchain link debug-current build/x86_64-unknown-linux-gnu/stage2`).
- * Clean and rebuild the codegen with `debug-current` in the file `rust-toolchain`.
-
-### How to install a forked git-subtree
-
-Using git-subtree with `rustc` requires a patched git to make it work.
-The PR that is needed is [here](https://github.com/gitgitgadget/git/pull/493).
-Use the following instructions to install it:
-
-```bash
-git clone git@github.com:tqc/git.git
-cd git
-git checkout tqc/subtree
-make
-make install
-cd contrib/subtree
-make
-cp git-subtree ~/bin
-```
-
-Then, do a sync with this command:
-
-```bash
-PATH="$HOME/bin:$PATH" ~/bin/git-subtree push -P compiler/rustc_codegen_gcc/ ../rustc_codegen_gcc/ sync_branch_name
-cd ../rustc_codegen_gcc
-git checkout master
-git pull
-git checkout sync_branch_name
-git merge master
-```
-
-TODO: write a script that does the above.
-
-https://rust-lang.zulipchat.com/#narrow/stream/301329-t-devtools/topic/subtree.20madness/near/258877725
-
-### How to use [mem-trace](https://github.com/antoyo/mem-trace)
-
-`rustc` needs to be built without `jemalloc` so that `mem-trace` can overload `malloc` since `jemalloc` is linked statically, so a `LD_PRELOAD`-ed library won't a chance to intercept the calls to `malloc`.
-
-### How to build a cross-compiling libgccjit
-
-#### Building libgccjit
-
- * Follow these instructions: https://preshing.com/20141119/how-to-build-a-gcc-cross-compiler/ with the following changes:
- * Configure gcc with `../gcc/configure --enable-host-shared --disable-multilib --enable-languages=c,jit,c++ --disable-bootstrap --enable-checking=release --prefix=/opt/m68k-gcc/ --target=m68k-linux --without-headers`.
- * Some shells, like fish, don't define the environment variable `$MACHTYPE`.
- * Add `CFLAGS="-Wno-error=attributes -g -O2"` at the end of the configure command for building glibc (`CFLAGS="-Wno-error=attributes -Wno-error=array-parameter -Wno-error=stringop-overflow -Wno-error=array-bounds -g -O2"` for glibc 2.31, which is useful for Debian).
-
-#### Configuring rustc_codegen_gcc
-
- * Set `TARGET_TRIPLE="m68k-unknown-linux-gnu"` in config.sh.
- * Since rustc doesn't support this architecture yet, set it back to `TARGET_TRIPLE="mips-unknown-linux-gnu"` (or another target having the same attributes). Alternatively, create a [target specification file](https://book.avr-rust.com/005.1-the-target-specification-json-file.html) (note that the `arch` specified in this file must be supported by the rust compiler).
- * Set `linker='-Clinker=m68k-linux-gcc'`.
- * Set the path to the cross-compiling libgccjit in `gcc_path`.
- * Comment the line: `context.add_command_line_option("-masm=intel");` in src/base.rs.
- * (might not be necessary) Disable the compilation of libstd.so (and possibly libcore.so?).
+However, programs compiled with `rustc_codegen_gcc` do not need to be released under a GPL license.

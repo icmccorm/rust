@@ -1,6 +1,5 @@
-// run-pass
-// compile-flags:-C debuginfo=2
-// ignore-asmjs wasm2js does not support source maps yet
+//@ run-pass
+//@ compile-flags:-C debuginfo=2
 
 fn foo() -> impl Copy {
     foo

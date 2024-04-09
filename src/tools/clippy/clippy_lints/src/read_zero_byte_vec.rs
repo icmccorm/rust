@@ -1,13 +1,15 @@
-use clippy_utils::diagnostics::{span_lint, span_lint_and_sugg};
+use clippy_utils::diagnostics::{span_lint_hir, span_lint_hir_and_then};
+use clippy_utils::get_enclosing_block;
 use clippy_utils::higher::{get_vec_init_kind, VecInitKind};
 use clippy_utils::source::snippet;
-use clippy_utils::visitors::for_each_expr;
-use core::ops::ControlFlow;
-use hir::{Expr, ExprKind, Local, PatKind, PathSegment, QPath, StmtKind};
+
+use hir::{Expr, ExprKind, HirId, LetStmt, PatKind, PathSegment, QPath, StmtKind};
 use rustc_errors::Applicability;
 use rustc_hir as hir;
+use rustc_hir::def::Res;
+use rustc_hir::intravisit::{walk_expr, Visitor};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -24,7 +26,7 @@ declare_clippy_lint! {
     /// a zero-byte read would allocate a `Vec` for it.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// use std::io;
     /// fn foo<F: io::Read>(mut f: F) {
     ///     let mut data = Vec::with_capacity(100);
@@ -32,7 +34,7 @@ declare_clippy_lint! {
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// use std::io;
     /// fn foo<F: io::Read>(mut f: F) {
     ///     let mut data = Vec::with_capacity(100);
@@ -42,92 +44,133 @@ declare_clippy_lint! {
     /// ```
     #[clippy::version = "1.63.0"]
     pub READ_ZERO_BYTE_VEC,
-    correctness,
+    nursery,
     "checks for reads into a zero-length `Vec`"
 }
 declare_lint_pass!(ReadZeroByteVec => [READ_ZERO_BYTE_VEC]);
 
 impl<'tcx> LateLintPass<'tcx> for ReadZeroByteVec {
     fn check_block(&mut self, cx: &LateContext<'tcx>, block: &hir::Block<'tcx>) {
-        for (idx, stmt) in block.stmts.iter().enumerate() {
-            if !stmt.span.from_expansion()
-                // matches `let v = Vec::new();`
-                && let StmtKind::Local(local) = stmt.kind
-                && let Local { pat, init: Some(init), .. } = local
-                && let PatKind::Binding(_, _, ident, _) = pat.kind
+        for stmt in block.stmts {
+            if stmt.span.from_expansion() {
+                return;
+            }
+
+            if let StmtKind::Let(local) = stmt.kind
+                && let LetStmt {
+                    pat, init: Some(init), ..
+                } = local
+                && let PatKind::Binding(_, id, ident, _) = pat.kind
                 && let Some(vec_init_kind) = get_vec_init_kind(cx, init)
             {
-                let visitor = |expr: &Expr<'_>| {
-                    if let ExprKind::MethodCall(path, _, [arg], _) = expr.kind
-                        && let PathSegment { ident: read_or_read_exact, .. } = *path
-                        && matches!(read_or_read_exact.as_str(), "read" | "read_exact")
-                        && let ExprKind::AddrOf(_, hir::Mutability::Mut, inner) = arg.kind
-                        && let ExprKind::Path(QPath::Resolved(None, inner_path)) = inner.kind
-                        && let [inner_seg] = inner_path.segments
-                        && ident.name == inner_seg.ident.name
-                    {
-                        ControlFlow::Break(())
-                    } else {
-                        ControlFlow::Continue(())
-                    }
+                let mut visitor = ReadVecVisitor {
+                    local_id: id,
+                    read_zero_expr: None,
+                    has_resize: false,
                 };
 
-                let (read_found, next_stmt_span) =
-                if let Some(next_stmt) = block.stmts.get(idx + 1) {
-                    // case { .. stmt; stmt; .. }
-                    (for_each_expr(next_stmt, visitor).is_some(), next_stmt.span)
-                } else if let Some(e) = block.expr {
-                    // case { .. stmt; expr }
-                    (for_each_expr(e, visitor).is_some(), e.span)
-                } else {
-                    return
+                let Some(enclosing_block) = get_enclosing_block(cx, id) else {
+                    return;
                 };
+                visitor.visit_block(enclosing_block);
 
-                if read_found && !next_stmt_span.from_expansion() {
+                if let Some(expr) = visitor.read_zero_expr {
                     let applicability = Applicability::MaybeIncorrect;
                     match vec_init_kind {
-                        VecInitKind::WithConstCapacity(len) => {
-                            span_lint_and_sugg(
-                                cx,
-                                READ_ZERO_BYTE_VEC,
-                                next_stmt_span,
-                                "reading zero byte data to `Vec`",
-                                "try",
-                                format!("{}.resize({len}, 0); {}",
-                                    ident.as_str(),
-                                    snippet(cx, next_stmt_span, "..")
-                                ),
-                                applicability,
-                            );
-                        }
+                        VecInitKind::WithConstCapacity(len) => span_lint_hir_and_then(
+                            cx,
+                            READ_ZERO_BYTE_VEC,
+                            expr.hir_id,
+                            expr.span,
+                            "reading zero byte data to `Vec`",
+                            |diag| {
+                                diag.span_suggestion(
+                                    expr.span,
+                                    "try",
+                                    format!("{}.resize({len}, 0); {}", ident.as_str(), snippet(cx, expr.span, "..")),
+                                    applicability,
+                                );
+                            },
+                        ),
                         VecInitKind::WithExprCapacity(hir_id) => {
                             let e = cx.tcx.hir().expect_expr(hir_id);
-                            span_lint_and_sugg(
+                            span_lint_hir_and_then(
                                 cx,
                                 READ_ZERO_BYTE_VEC,
-                                next_stmt_span,
+                                expr.hir_id,
+                                expr.span,
                                 "reading zero byte data to `Vec`",
-                                "try",
-                                format!("{}.resize({}, 0); {}",
-                                    ident.as_str(),
-                                    snippet(cx, e.span, ".."),
-                                    snippet(cx, next_stmt_span, "..")
-                                ),
-                                applicability,
+                                |diag| {
+                                    diag.span_suggestion(
+                                        expr.span,
+                                        "try",
+                                        format!(
+                                            "{}.resize({}, 0); {}",
+                                            ident.as_str(),
+                                            snippet(cx, e.span, ".."),
+                                            snippet(cx, expr.span, "..")
+                                        ),
+                                        applicability,
+                                    );
+                                },
                             );
-                        }
+                        },
                         _ => {
-                            span_lint(
+                            span_lint_hir(
                                 cx,
                                 READ_ZERO_BYTE_VEC,
-                                next_stmt_span,
+                                expr.hir_id,
+                                expr.span,
                                 "reading zero byte data to `Vec`",
                             );
-
-                        }
+                        },
                     }
                 }
             }
+        }
+    }
+}
+
+struct ReadVecVisitor<'tcx> {
+    local_id: HirId,
+    read_zero_expr: Option<&'tcx Expr<'tcx>>,
+    has_resize: bool,
+}
+
+impl<'tcx> Visitor<'tcx> for ReadVecVisitor<'tcx> {
+    fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+        if let ExprKind::MethodCall(path, receiver, args, _) = e.kind {
+            let PathSegment { ident, .. } = *path;
+
+            match ident.as_str() {
+                "read" | "read_exact" => {
+                    let [arg] = args else { return };
+                    if let ExprKind::AddrOf(_, hir::Mutability::Mut, inner) = arg.kind
+                        && let ExprKind::Path(QPath::Resolved(None, inner_path)) = inner.kind
+                        && let [inner_seg] = inner_path.segments
+                        && let Res::Local(res_id) = inner_seg.res
+                        && self.local_id == res_id
+                    {
+                        self.read_zero_expr = Some(e);
+                        return;
+                    }
+                },
+                "resize" => {
+                    // If the Vec is resized, then it's a valid read
+                    if let ExprKind::Path(QPath::Resolved(_, inner_path)) = receiver.kind
+                        && let Res::Local(res_id) = inner_path.res
+                        && self.local_id == res_id
+                    {
+                        self.has_resize = true;
+                        return;
+                    }
+                },
+                _ => {},
+            }
+        }
+
+        if !self.has_resize && self.read_zero_expr.is_none() {
+            walk_expr(self, e);
         }
     }
 }

@@ -16,8 +16,15 @@ expand_attributes_wrong_form =
 expand_cannot_be_name_of_macro =
     `{$trait_ident}` cannot be a name of {$macro_type} macro
 
+expand_collapse_debuginfo_illegal =
+    illegal value for attribute #[collapse_debuginfo(no|external|yes)]
+
 expand_count_repetition_misplaced =
     `count` can not be placed inside the inner-most repetition
+
+expand_custom_attribute_panicked =
+    custom attribute panicked
+    .help = message: {$message}
 
 expand_duplicate_matcher_binding = duplicate matcher binding
     .label = duplicate binding
@@ -25,6 +32,9 @@ expand_duplicate_matcher_binding = duplicate matcher binding
 
 expand_expected_comma_in_list =
     expected token: `,`
+
+expand_expected_paren_or_brace =
+    expected `(` or `{"{"}`, found `{$token}`
 
 expand_explain_doc_comment_inner =
     inner doc comments expand to `#![doc = "..."]`, which is what this macro attempted to match
@@ -34,9 +44,6 @@ expand_explain_doc_comment_outer =
 
 expand_expr_repeat_no_syntax_vars =
     attempted to repeat an expression containing no syntax variables matched as repeating at this depth
-
-expand_feature_included_in_edition =
-    the feature `{$feature}` is included in the Rust {$edition} edition
 
 expand_feature_not_allowed =
     the feature `{$name}` is not in the list of allowed features
@@ -61,6 +68,11 @@ expand_invalid_cfg_multiple_predicates = multiple `cfg` predicates are specified
 expand_invalid_cfg_no_parens = `cfg` is not followed by parentheses
 expand_invalid_cfg_no_predicate = `cfg` predicate is not specified
 expand_invalid_cfg_predicate_literal = `cfg` predicate key cannot be a literal
+
+expand_invalid_fragment_specifier =
+    invalid fragment specifier `{$fragment}`
+    .help = {$help}
+
 expand_macro_body_stability =
     macros cannot have body stability attributes
     .label = invalid body stability attribute
@@ -70,6 +82,8 @@ expand_macro_const_stability =
     macros cannot have const stability attributes
     .label = invalid const stability attribute
     .label2 = const stability attribute affects this macro
+
+expand_macro_expands_to_match_arm = macros cannot expand to match arms
 
 expand_malformed_feature_attribute =
     malformed `feature` attribute input
@@ -86,6 +100,7 @@ expand_module_circular =
 expand_module_file_not_found =
     file not found for module `{$name}`
     .help = to create the module `{$name}`, create file "{$default_path}" or "{$secondary_path}"
+    .note = if there is a `mod {$name}` elsewhere in the crate already, import it with `use crate::...` instead
 
 expand_module_in_block =
     cannot declare a non-inline module inside a block unless it has a path attribute
@@ -106,6 +121,10 @@ expand_only_one_argument =
 
 expand_only_one_word =
     must only be one word
+
+expand_proc_macro_derive_panicked =
+    proc-macro derive panicked
+    .help = message: {$message}
 
 expand_proc_macro_derive_tokens =
     proc-macro derive produced unparsable tokens

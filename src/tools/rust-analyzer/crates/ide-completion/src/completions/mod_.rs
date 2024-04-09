@@ -2,7 +2,7 @@
 
 use std::iter;
 
-use hir::{Module, ModuleSource};
+use hir::{HirFileIdExt, Module};
 use ide_db::{
     base_db::{SourceDatabaseExt, VfsPath},
     FxHashSet, RootDatabase, SymbolKind,
@@ -21,7 +21,7 @@ pub(crate) fn complete_mod(
         return None;
     }
 
-    let _p = profile::span("completion::complete_mod");
+    let _p = tracing::span!(tracing::Level::INFO, "completion::complete_mod").entered();
 
     let mut current_module = ctx.module;
     // For `mod $0`, `ctx.module` is its parent, but for `mod f$0`, it's `mod f` itself, but we're
@@ -57,7 +57,7 @@ pub(crate) fn complete_mod(
         .collect::<FxHashSet<_>>();
 
     let module_declaration_file =
-        current_module.declaration_source(ctx.db).map(|module_declaration_source_file| {
+        current_module.declaration_source_range(ctx.db).map(|module_declaration_source_file| {
             module_declaration_source_file.file_id.original_file(ctx.db)
         });
 
@@ -148,9 +148,7 @@ fn module_chain_to_containing_module_file(
 ) -> Vec<Module> {
     let mut path =
         iter::successors(Some(current_module), |current_module| current_module.parent(db))
-            .take_while(|current_module| {
-                matches!(current_module.definition_source(db).value, ModuleSource::Module(_))
-            })
+            .take_while(|current_module| current_module.is_inline(db))
             .collect::<Vec<_>>();
     path.reverse();
     path

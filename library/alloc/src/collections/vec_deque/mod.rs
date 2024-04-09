@@ -485,18 +485,18 @@ impl<T, A: Allocator> VecDeque<T, A> {
         // H := head
         // L := last element (`self.to_physical_idx(self.len - 1)`)
         //
-        //    H           L
-        //   [o o o o o o o . ]
-        //    H           L
-        // A [o o o o o o o . . . . . . . . . ]
+        //    H             L
+        //   [o o o o o o o o ]
+        //    H             L
+        // A [o o o o o o o o . . . . . . . . ]
         //        L H
         //   [o o o o o o o o ]
-        //          H           L
-        // B [. . . o o o o o o o . . . . . . ]
+        //          H             L
+        // B [. . . o o o o o o o o . . . . . ]
         //              L H
         //   [o o o o o o o o ]
-        //            L                   H
-        // C [o o o o o . . . . . . . . . o o ]
+        //              L                 H
+        // C [o o o o o o . . . . . . . . o o ]
 
         // can't use is_contiguous() because the capacity is already updated.
         if self.head <= old_capacity - self.len {
@@ -558,6 +558,30 @@ impl<T> VecDeque<T> {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> VecDeque<T> {
         Self::with_capacity_in(capacity, Global)
+    }
+
+    /// Creates an empty deque with space for at least `capacity` elements.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the capacity exceeds `isize::MAX` _bytes_,
+    /// or if the allocator reports allocation failure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #![feature(try_with_capacity)]
+    /// # #[allow(unused)]
+    /// # fn example() -> Result<(), std::collections::TryReserveError> {
+    /// use std::collections::VecDeque;
+    ///
+    /// let deque: VecDeque<u32> = VecDeque::try_with_capacity(10)?;
+    /// # Ok(()) }
+    /// ```
+    #[inline]
+    #[unstable(feature = "try_with_capacity", issue = "91913")]
+    pub fn try_with_capacity(capacity: usize) -> Result<VecDeque<T>, TryReserveError> {
+        Ok(VecDeque { head: 0, len: 0, buf: RawVec::try_with_capacity_in(capacity, Global)? })
     }
 }
 
@@ -1209,6 +1233,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(deque.len(), 1);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("length", "size")]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -1491,6 +1516,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(d.front(), Some(&1));
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("first")]
     pub fn front(&self) -> Option<&T> {
         self.get(0)
     }
@@ -1535,6 +1561,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(d.back(), Some(&2));
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("last")]
     pub fn back(&self) -> Option<&T> {
         self.get(self.len.wrapping_sub(1))
     }
@@ -1654,6 +1681,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(3, *buf.back().unwrap());
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("push", "put", "append")]
     pub fn push_back(&mut self, value: T) {
         if self.is_full() {
             self.grow();
@@ -1813,6 +1841,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(buf, [1, 3]);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("delete", "take")]
     pub fn remove(&mut self, index: usize) -> Option<T> {
         if self.len <= index {
             return None;
@@ -2058,7 +2087,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
         // buffer without it being full emerge
         debug_assert!(self.is_full());
         let old_cap = self.capacity();
-        self.buf.reserve_for_push(old_cap);
+        self.buf.grow_one();
         unsafe {
             self.handle_capacity_increase(old_cap);
         }
@@ -2435,8 +2464,10 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// let mut deque: VecDeque<_> = [0, 1, 1, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55].into();
     /// let num = 42;
-    /// let idx = deque.partition_point(|&x| x < num);
-    /// // The above is equivalent to `let idx = deque.binary_search(&num).unwrap_or_else(|x| x);`
+    /// let idx = deque.partition_point(|&x| x <= num);
+    /// // If `num` is unique, `s.partition_point(|&x| x < num)` (with `<`) is equivalent to
+    /// // `s.binary_search(&num).unwrap_or_else(|x| x)`, but using `<=` may allow `insert`
+    /// // to shift less elements.
     /// deque.insert(idx, num);
     /// assert_eq!(deque, &[0, 1, 1, 1, 1, 2, 3, 5, 8, 13, 21, 34, 42, 55]);
     /// ```

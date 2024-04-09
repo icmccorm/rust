@@ -11,7 +11,7 @@ use field_offset::FieldOffset;
 use measureme::StringId;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync::AtomicU64;
-use rustc_hir::def::DefKind;
+use rustc_data_structures::sync::WorkerLocal;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::hir_id::OwnerId;
 use rustc_query_system::dep_graph::DepNodeIndex;
@@ -53,7 +53,7 @@ pub struct DynamicQuery<'tcx, C: QueryCache> {
         fn(tcx: TyCtxt<'tcx>, key: &C::Key, index: SerializedDepNodeIndex) -> bool,
     pub hash_result: HashResult<C::Value>,
     pub value_from_cycle_error:
-        fn(tcx: TyCtxt<'tcx>, cycle: &[QueryInfo], guar: ErrorGuaranteed) -> C::Value,
+        fn(tcx: TyCtxt<'tcx>, cycle_error: &CycleError, guar: ErrorGuaranteed) -> C::Value,
     pub format_value: fn(&C::Value) -> String,
 }
 
@@ -71,7 +71,7 @@ pub struct QuerySystemFns<'tcx> {
 
 pub struct QuerySystem<'tcx> {
     pub states: QueryStates<'tcx>,
-    pub arenas: QueryArenas<'tcx>,
+    pub arenas: WorkerLocal<QueryArenas<'tcx>>,
     pub caches: QueryCaches<'tcx>,
     pub dynamic_queries: DynamicQueries<'tcx>,
 
@@ -173,6 +173,47 @@ pub fn query_ensure<'tcx, Cache>(
     }
 }
 
+#[inline]
+pub fn query_ensure_error_guaranteed<'tcx, Cache, T>(
+    tcx: TyCtxt<'tcx>,
+    execute_query: fn(TyCtxt<'tcx>, Span, Cache::Key, QueryMode) -> Option<Cache::Value>,
+    query_cache: &Cache,
+    key: Cache::Key,
+    check_cache: bool,
+) -> Result<(), ErrorGuaranteed>
+where
+    Cache: QueryCache<Value = super::erase::Erase<Result<T, ErrorGuaranteed>>>,
+    Result<T, ErrorGuaranteed>: EraseType,
+{
+    let key = key.into_query_param();
+    if let Some(res) = try_get_cached(tcx, query_cache, &key) {
+        super::erase::restore(res).map(drop)
+    } else {
+        execute_query(tcx, DUMMY_SP, key, QueryMode::Ensure { check_cache })
+            .map(super::erase::restore)
+            .map(|res| res.map(drop))
+            // Either we actually executed the query, which means we got a full `Result`,
+            // or we can just assume the query succeeded, because it was green in the
+            // incremental cache. If it is green, that means that the previous compilation
+            // that wrote to the incremental cache compiles successfully. That is only
+            // possible if the cache entry was `Ok(())`, so we emit that here, without
+            // actually encoding the `Result` in the cache or loading it from there.
+            .unwrap_or(Ok(()))
+    }
+}
+
+macro_rules! query_ensure {
+    ([]$($args:tt)*) => {
+        query_ensure($($args)*)
+    };
+    ([(ensure_forwards_result_if_red) $($rest:tt)*]$($args:tt)*) => {
+        query_ensure_error_guaranteed($($args)*).map(|_| ())
+    };
+    ([$other:tt $($modifiers:tt)*]$($args:tt)*) => {
+        query_ensure!([$($modifiers)*]$($args)*)
+    };
+}
+
 macro_rules! query_helper_param_ty {
     (DefId) => { impl IntoQueryParam<DefId> };
     (LocalDefId) => { impl IntoQueryParam<LocalDefId> };
@@ -217,6 +258,18 @@ macro_rules! separate_provide_extern_decl {
     };
     ([$other:tt $($modifiers:tt)*][$($args:tt)*]) => {
         separate_provide_extern_decl!([$($modifiers)*][$($args)*])
+    };
+}
+
+macro_rules! ensure_result {
+    ([][$ty:ty]) => {
+        ()
+    };
+    ([(ensure_forwards_result_if_red) $($rest:tt)*][$ty:ty]) => {
+        Result<(), ErrorGuaranteed>
+    };
+    ([$other:tt $($modifiers:tt)*][$($args:tt)*]) => {
+        ensure_result!([$($modifiers)*][$($args)*])
     };
 }
 
@@ -283,12 +336,10 @@ macro_rules! define_callbacks {
                     ))
                 }
 
-                pub type Storage<'tcx> = <
-                    <$($K)* as keys::Key>::CacheSelector as CacheSelector<'tcx, Erase<$V>>
-                >::Cache;
+                pub type Storage<'tcx> = <$($K)* as keys::Key>::Cache<Erase<$V>>;
 
                 // Ensure that keys grow no larger than 64 bytes
-                #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+                #[cfg(all(any(target_arch = "x86_64", target_arch="aarch64"), target_pointer_width = "64"))]
                 const _: () = {
                     if mem::size_of::<Key<'static>>() > 64 {
                         panic!("{}", concat!(
@@ -302,7 +353,7 @@ macro_rules! define_callbacks {
                 };
 
                 // Ensure that values grow no larger than 64 bytes
-                #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+                #[cfg(all(any(target_arch = "x86_64", target_arch="aarch64"), target_pointer_width = "64"))]
                 const _: () = {
                     if mem::size_of::<Value<'static>>() > 64 {
                         panic!("{}", concat!(
@@ -319,7 +370,7 @@ macro_rules! define_callbacks {
 
         pub struct QueryArenas<'tcx> {
             $($(#[$attr])* pub $name: query_if_arena!([$($modifiers)*]
-                (WorkerLocal<TypedArena<<$V as Deref>::Target>>)
+                (TypedArena<<$V as Deref>::Target>)
                 ()
             ),)*
         }
@@ -328,7 +379,7 @@ macro_rules! define_callbacks {
             fn default() -> Self {
                 Self {
                     $($name: query_if_arena!([$($modifiers)*]
-                        (WorkerLocal::new(|_| Default::default()))
+                        (Default::default())
                         ()
                     ),)*
                 }
@@ -343,14 +394,15 @@ macro_rules! define_callbacks {
         impl<'tcx> TyCtxtEnsure<'tcx> {
             $($(#[$attr])*
             #[inline(always)]
-            pub fn $name(self, key: query_helper_param_ty!($($K)*)) {
-                query_ensure(
+            pub fn $name(self, key: query_helper_param_ty!($($K)*)) -> ensure_result!([$($modifiers)*][$V]) {
+                query_ensure!(
+                    [$($modifiers)*]
                     self.tcx,
                     self.tcx.query_system.fns.engine.$name,
                     &self.tcx.query_system.caches.$name,
                     key.into_query_param(),
                     false,
-                );
+                )
             })*
         }
 
@@ -499,7 +551,7 @@ macro_rules! define_feedable {
                                 // We have an inconsistency. This can happen if one of the two
                                 // results is tainted by errors. In this case, delay a bug to
                                 // ensure compilation is doomed, and keep the `old` value.
-                                tcx.sess.delay_span_bug(DUMMY_SP, format!(
+                                tcx.dcx().delayed_bug(format!(
                                     "Trying to feed an already recorded value for query {} key={key:?}:\n\
                                     old value: {old:?}\nnew value: {value:?}",
                                     stringify!($name),
@@ -615,21 +667,7 @@ mod sealed {
 
 pub use sealed::IntoQueryParam;
 
-impl<'tcx> TyCtxt<'tcx> {
-    pub fn def_kind(self, def_id: impl IntoQueryParam<DefId>) -> DefKind {
-        let def_id = def_id.into_query_param();
-        self.opt_def_kind(def_id)
-            .unwrap_or_else(|| bug!("def_kind: unsupported node: {:?}", def_id))
-    }
-}
-
-impl<'tcx> TyCtxtAt<'tcx> {
-    pub fn def_kind(self, def_id: impl IntoQueryParam<DefId>) -> DefKind {
-        let def_id = def_id.into_query_param();
-        self.opt_def_kind(def_id)
-            .unwrap_or_else(|| bug!("def_kind: unsupported node: {:?}", def_id))
-    }
-}
+use super::erase::EraseType;
 
 #[derive(Copy, Clone, Debug, HashStable)]
 pub struct CyclePlaceholder(pub ErrorGuaranteed);

@@ -522,7 +522,7 @@ fn test() -> u64 {
         expect![[r#"
             37..86 '{     ... a.1 }': u64
             47..48 'a': S
-            51..52 'S': S(i32, u64) -> S
+            51..52 'S': extern "rust-call" S(i32, u64) -> S
             51..58 'S(4, 6)': S
             53..54 '4': i32
             56..57 '6': u64
@@ -548,7 +548,7 @@ fn test() -> u64 {
         expect![[r#"
             43..108 '{     ...0(2) }': u64
             53..54 'a': S
-            57..58 'S': S(fn(u32) -> u64) -> S
+            57..58 'S': extern "rust-call" S(fn(u32) -> u64) -> S
             57..74 'S(|i| ...s u64)': S
             59..73 '|i| 2*i as u64': impl Fn(u32) -> u64
             60..61 'i': u32
@@ -1026,7 +1026,7 @@ fn test(x: impl Trait<u64>, y: &impl Trait<u32>) {
             201..202 'x': impl Trait<u64>
             208..209 'y': &impl Trait<u32>
             219..220 'z': S<u16>
-            223..224 'S': S<u16>(u16) -> S<u16>
+            223..224 'S': extern "rust-call" S<u16>(u16) -> S<u16>
             223..227 'S(1)': S<u16>
             225..226 '1': u16
             233..236 'bar': fn bar(S<u16>)
@@ -1232,6 +1232,87 @@ fn test(x: impl Trait<u64>, y: &impl Trait<u64>) {
 }
 
 #[test]
+fn argument_impl_trait_with_projection() {
+    check_infer(
+        r#"
+trait X {
+    type Item;
+}
+
+impl<T> X for [T; 2] {
+    type Item = T;
+}
+
+trait Y {}
+
+impl<T> Y for T {}
+
+enum R<T, U> {
+    A(T),
+    B(U),
+}
+
+fn foo<T>(x: impl X<Item = R<impl Y, T>>) -> T { loop {} }
+
+fn bar() {
+    let a = foo([R::A(()), R::B(7)]);
+}
+"#,
+        expect![[r#"
+            153..154 'x': impl X<Item = R<impl Y + ?Sized, T>> + ?Sized
+            190..201 '{ loop {} }': T
+            192..199 'loop {}': !
+            197..199 '{}': ()
+            212..253 '{     ...)]); }': ()
+            222..223 'a': i32
+            226..229 'foo': fn foo<i32>([R<(), i32>; 2]) -> i32
+            226..250 'foo([R...B(7)])': i32
+            230..249 '[R::A(...:B(7)]': [R<(), i32>; 2]
+            231..235 'R::A': extern "rust-call" A<(), i32>(()) -> R<(), i32>
+            231..239 'R::A(())': R<(), i32>
+            236..238 '()': ()
+            241..245 'R::B': extern "rust-call" B<(), i32>(i32) -> R<(), i32>
+            241..248 'R::B(7)': R<(), i32>
+            246..247 '7': i32
+        "#]],
+    );
+}
+
+#[test]
+fn argument_assoc_impl_trait() {
+    check_infer(
+        r#"
+trait Outer {
+    type Item;
+}
+
+trait Inner { }
+
+fn foo<T: Outer<Item = impl Inner>>(baz: T) {
+}
+
+impl Outer for usize {
+    type Item = usize;
+}
+
+impl Inner for usize {}
+
+fn main() {
+    foo(2);
+}
+"#,
+        expect![[r#"
+            85..88 'baz': T
+            93..96 '{ }': ()
+            182..197 '{     foo(2); }': ()
+            188..191 'foo': fn foo<usize>(usize)
+            188..194 'foo(2)': ()
+            192..193 '2': usize
+        "#]],
+    );
+}
+
+#[test]
 fn simple_return_pos_impl_trait() {
     cov_mark::check!(lower_rpit);
     check_infer(
@@ -1333,13 +1414,13 @@ fn foo<const C: u8, T>() -> (impl FnOnce(&str, T), impl Trait<u8>) {
 }
 "#,
         expect![[r#"
-            134..165 '{     ...(C)) }': (impl Fn(&str, T), Bar<u8>)
-            140..163 '(|inpu...ar(C))': (impl Fn(&str, T), Bar<u8>)
-            141..154 '|input, t| {}': impl Fn(&str, T)
+            134..165 '{     ...(C)) }': (impl FnOnce(&str, T), Bar<u8>)
+            140..163 '(|inpu...ar(C))': (impl FnOnce(&str, T), Bar<u8>)
+            141..154 '|input, t| {}': impl FnOnce(&str, T)
             142..147 'input': &str
             149..150 't': T
             152..154 '{}': ()
-            156..159 'Bar': Bar<u8>(u8) -> Bar<u8>
+            156..159 'Bar': extern "rust-call" Bar<u8>(u8) -> Bar<u8>
             156..162 'Bar(C)': Bar<u8>
             160..161 'C': u8
         "#]],
@@ -1958,25 +2039,25 @@ fn test() {
             118..120 '{}': ()
             136..255 '{     ... 1); }': ()
             146..147 'x': Option<u32>
-            150..162 'Option::Some': Some<u32>(u32) -> Option<u32>
+            150..162 'Option::Some': extern "rust-call" Some<u32>(u32) -> Option<u32>
             150..168 'Option...(1u32)': Option<u32>
             163..167 '1u32': u32
             174..175 'x': Option<u32>
             174..190 'x.map(...v + 1)': Option<u32>
-            180..189 '|v| v + 1': impl Fn(u32) -> u32
+            180..189 '|v| v + 1': impl FnOnce(u32) -> u32
             181..182 'v': u32
             184..185 'v': u32
             184..189 'v + 1': u32
             188..189 '1': u32
             196..197 'x': Option<u32>
             196..212 'x.map(... 1u64)': Option<u64>
-            202..211 '|_v| 1u64': impl Fn(u32) -> u64
+            202..211 '|_v| 1u64': impl FnOnce(u32) -> u64
             203..205 '_v': u32
             207..211 '1u64': u64
             222..223 'y': Option<i64>
             239..240 'x': Option<u32>
             239..252 'x.map(|_v| 1)': Option<i64>
-            245..251 '|_v| 1': impl Fn(u32) -> i64
+            245..251 '|_v| 1': impl FnOnce(u32) -> i64
             246..248 '_v': u32
             250..251 '1': i64
         "#]],
@@ -2062,17 +2143,17 @@ fn test() {
             312..314 '{}': ()
             330..489 '{     ... S); }': ()
             340..342 'x1': u64
-            345..349 'foo1': fn foo1<S, u64, impl Fn(S) -> u64>(S, impl Fn(S) -> u64) -> u64
+            345..349 'foo1': fn foo1<S, u64, impl FnOnce(S) -> u64>(S, impl FnOnce(S) -> u64) -> u64
             345..368 'foo1(S...hod())': u64
             350..351 'S': S
-            353..367 '|s| s.method()': impl Fn(S) -> u64
+            353..367 '|s| s.method()': impl FnOnce(S) -> u64
             354..355 's': S
             357..358 's': S
             357..367 's.method()': u64
             378..380 'x2': u64
-            383..387 'foo2': fn foo2<S, u64, impl Fn(S) -> u64>(impl Fn(S) -> u64, S) -> u64
+            383..387 'foo2': fn foo2<S, u64, impl FnOnce(S) -> u64>(impl FnOnce(S) -> u64, S) -> u64
             383..406 'foo2(|...(), S)': u64
-            388..402 '|s| s.method()': impl Fn(S) -> u64
+            388..402 '|s| s.method()': impl FnOnce(S) -> u64
             389..390 's': S
             392..393 's': S
             392..402 's.method()': u64
@@ -2081,14 +2162,14 @@ fn test() {
             421..422 'S': S
             421..446 'S.foo1...hod())': u64
             428..429 'S': S
-            431..445 '|s| s.method()': impl Fn(S) -> u64
+            431..445 '|s| s.method()': impl FnOnce(S) -> u64
             432..433 's': S
             435..436 's': S
             435..445 's.method()': u64
             456..458 'x4': u64
             461..462 'S': S
             461..486 'S.foo2...(), S)': u64
-            468..482 '|s| s.method()': impl Fn(S) -> u64
+            468..482 '|s| s.method()': impl FnOnce(S) -> u64
             469..470 's': S
             472..473 's': S
             472..482 's.method()': u64
@@ -2514,7 +2595,7 @@ fn test() -> impl Trait<i32> {
             178..180 '{}': ()
             213..309 '{     ...t()) }': S<i32>
             223..225 's1': S<u32>
-            228..229 'S': S<u32>(u32) -> S<u32>
+            228..229 'S': extern "rust-call" S<u32>(u32) -> S<u32>
             228..240 'S(default())': S<u32>
             230..237 'default': fn default<u32>() -> u32
             230..239 'default()': u32
@@ -2524,11 +2605,11 @@ fn test() -> impl Trait<i32> {
             263..264 'x': i32
             272..275 'bar': fn bar<i32>(S<i32>) -> i32
             272..289 'bar(S(...lt()))': i32
-            276..277 'S': S<i32>(i32) -> S<i32>
+            276..277 'S': extern "rust-call" S<i32>(i32) -> S<i32>
             276..288 'S(default())': S<i32>
             278..285 'default': fn default<i32>() -> i32
             278..287 'default()': i32
-            295..296 'S': S<i32>(i32) -> S<i32>
+            295..296 'S': extern "rust-call" S<i32>(i32) -> S<i32>
             295..307 'S(default())': S<i32>
             297..304 'default': fn default<i32>() -> i32
             297..306 'default()': i32
@@ -2562,9 +2643,9 @@ fn main() {
             72..74 '_v': F
             117..120 '{ }': ()
             132..163 '{     ... }); }': ()
-            138..148 'f::<(), _>': fn f<(), impl Fn(&())>(impl Fn(&()))
+            138..148 'f::<(), _>': fn f<(), impl FnOnce(&())>(impl FnOnce(&()))
             138..160 'f::<()... z; })': ()
-            149..159 '|z| { z; }': impl Fn(&())
+            149..159 '|z| { z; }': impl FnOnce(&())
             150..151 'z': &()
             153..159 '{ z; }': ()
             155..156 'z': &()
@@ -2595,6 +2676,34 @@ fn test<T: Trait>() {
 } //^^^^^^^ u32
 "#,
     );
+}
+
+#[test]
+fn associated_type_in_type_bound() {
+    check_types(
+        r#"
+//- minicore: deref
+fn fb(f: Foo<&u8>) {
+    f.foobar();
+  //^^^^^^^^^^ u8
+}
+trait Bar {
+    fn bar(&self) -> u8;
+}
+impl Bar for u8 {
+    fn bar(&self) -> u8 { *self }
+}
+
+struct Foo<F> {
+    foo: F,
+}
+impl<F: core::ops::Deref<Target = impl Bar>> Foo<F> {
+    fn foobar(&self) -> u8 {
+        self.foo.deref().bar()
+    }
+}
+"#,
+    )
 }
 
 #[test]
@@ -2721,22 +2830,22 @@ fn main() {
             983..998 'Vec::<i32>::new': fn new<i32>() -> Vec<i32>
             983..1000 'Vec::<...:new()': Vec<i32>
             983..1012 'Vec::<...iter()': IntoIter<i32>
-            983..1075 'Vec::<...one })': FilterMap<IntoIter<i32>, impl Fn(i32) -> Option<u32>>
+            983..1075 'Vec::<...one })': FilterMap<IntoIter<i32>, impl FnMut(i32) -> Option<u32>>
             983..1101 'Vec::<... y; })': ()
-            1029..1074 '|x| if...None }': impl Fn(i32) -> Option<u32>
+            1029..1074 '|x| if...None }': impl FnMut(i32) -> Option<u32>
             1030..1031 'x': i32
             1033..1074 'if x >...None }': Option<u32>
             1036..1037 'x': i32
             1036..1041 'x > 0': bool
             1040..1041 '0': i32
             1042..1060 '{ Some...u32) }': Option<u32>
-            1044..1048 'Some': Some<u32>(u32) -> Option<u32>
+            1044..1048 'Some': extern "rust-call" Some<u32>(u32) -> Option<u32>
             1044..1058 'Some(x as u32)': Option<u32>
             1049..1050 'x': i32
             1049..1057 'x as u32': u32
             1066..1074 '{ None }': Option<u32>
             1068..1072 'None': Option<u32>
-            1090..1100 '|y| { y; }': impl Fn(u32)
+            1090..1100 '|y| { y; }': impl FnMut(u32)
             1091..1092 'y': u32
             1094..1100 '{ y; }': ()
             1096..1097 'y': u32
@@ -2866,9 +2975,9 @@ fn test() {
             175..185 'foo.test()': bool
             191..194 'bar': fn bar<{unknown}>({unknown}) -> {unknown}
             191..201 'bar.test()': bool
-            207..213 'Struct': Struct(usize) -> Struct
+            207..213 'Struct': extern "rust-call" Struct(usize) -> Struct
             207..220 'Struct.test()': bool
-            226..239 'Enum::Variant': Variant(usize) -> Enum
+            226..239 'Enum::Variant': extern "rust-call" Variant(usize) -> Enum
             226..246 'Enum::...test()': bool
         "#]],
     );
@@ -3073,8 +3182,8 @@ fn foo() {
             232..236 'None': Option<i32>
             246..247 'f': Box<dyn FnOnce(&Option<i32>)>
             281..310 'Box { ... {}) }': Box<dyn FnOnce(&Option<i32>)>
-            294..308 '&mut (|ps| {})': &mut impl Fn(&Option<i32>)
-            300..307 '|ps| {}': impl Fn(&Option<i32>)
+            294..308 '&mut (|ps| {})': &mut impl FnOnce(&Option<i32>)
+            300..307 '|ps| {}': impl FnOnce(&Option<i32>)
             301..303 'ps': &Option<i32>
             305..307 '{}': ()
             316..317 'f': Box<dyn FnOnce(&Option<i32>)>
@@ -3396,7 +3505,7 @@ fn bin_op_with_rhs_is_self_for_assoc_bound() {
         fn repro<T>(t: T) -> bool
 where
     T: Request,
-    T::Output: Convertable,
+    T::Output: Convertible,
 {
     let a = execute(&t).convert();
     let b = execute(&t).convert();
@@ -3411,7 +3520,7 @@ where
 {
     <T as Request>::output()
 }
-trait Convertable {
+trait Convertible {
     type TraitSelf: PartialEq<Self::TraitSelf>;
     type AssocAsDefaultSelf: PartialEq;
     fn convert(self) -> Self::AssocAsDefaultSelf;
@@ -3447,12 +3556,12 @@ fn main(){
             95..99 'self': Wrapper
             101..104 'rhs': u32
             122..150 '{     ...     }': Wrapper
-            132..139 'Wrapper': Wrapper(u32) -> Wrapper
+            132..139 'Wrapper': extern "rust-call" Wrapper(u32) -> Wrapper
             132..144 'Wrapper(rhs)': Wrapper
             140..143 'rhs': u32
             162..248 '{     ...um;  }': ()
             172..179 'wrapped': Wrapper
-            182..189 'Wrapper': Wrapper(u32) -> Wrapper
+            182..189 'Wrapper': extern "rust-call" Wrapper(u32) -> Wrapper
             182..193 'Wrapper(10)': Wrapper
             190..192 '10': u32
             203..206 'num': u32
@@ -4439,42 +4548,219 @@ fn test(v: S<i32>) {
 fn associated_type_in_argument() {
     check(
         r#"
-    trait A {
-        fn m(&self) -> i32;
-    }
+trait A {
+    fn m(&self) -> i32;
+}
 
-    fn x<T: B>(k: &<T as B>::Ty) {
-        k.m();
-    }
+fn x<T: B>(k: &<T as B>::Ty) {
+    k.m();
+}
 
-    struct X;
-    struct Y;
+struct X;
+struct Y;
 
-    impl A for X {
-        fn m(&self) -> i32 {
-            8
-        }
+impl A for X {
+    fn m(&self) -> i32 {
+        8
     }
+}
 
-    impl A for Y {
-        fn m(&self) -> i32 {
-            32
-        }
+impl A for Y {
+    fn m(&self) -> i32 {
+        32
     }
+}
 
-    trait B {
-        type Ty: A;
-    }
+trait B {
+    type Ty: A;
+}
 
-    impl B for u16 {
-        type Ty = X;
-    }
+impl B for u16 {
+    type Ty = X;
+}
 
-    fn ttt() {
-        let inp = Y;
-        x::<u16>(&inp);
-               //^^^^ expected &X, got &Y
+fn ttt() {
+    let inp = Y;
+    x::<u16>(&inp);
+           //^^^^ expected &X, got &Y
+}
+"#,
+    );
+}
+
+#[test]
+fn infer_borrow() {
+    check_types(
+        r#"
+//- minicore: index
+pub struct SomeMap<K>;
+
+pub trait Borrow<Borrowed: ?Sized> {
+    fn borrow(&self) -> &Borrowed;
+}
+
+impl<T: ?Sized> Borrow<T> for T {
+    fn borrow(&self) -> &T {
+        self
     }
-    "#,
+}
+
+impl<T: ?Sized> Borrow<T> for &T {
+    fn borrow(&self) -> &T {
+        &**self
+    }
+}
+
+impl<K, KB: Borrow<K>> core::ops::Index<KB> for SomeMap<K> {
+    type Output = ();
+
+    fn index(&self, _: KB) -> &() {
+        &()
+    }
+}
+
+impl<K> core::ops::IndexMut<K> for SomeMap<K> {
+    fn index_mut(&mut self, _: K) -> &mut () {
+        &mut ()
+    }
+}
+
+fn foo() {
+    let mut map = SomeMap;
+    map["a"] = ();
+    map;
+  //^^^ SomeMap<&str>
+}
+"#,
+    );
+}
+
+#[test]
+fn auto_trait_bound() {
+    check_types(
+        r#"
+//- minicore: sized
+auto trait Send {}
+impl<T> !Send for *const T {}
+
+struct Yes;
+trait IsSend { const IS_SEND: Yes; }
+impl<T: Send> IsSend for T { const IS_SEND: Yes = Yes; }
+
+struct Struct<T>(T);
+enum Enum<T> { A, B(T) }
+union Union<T> { t: T }
+
+#[lang = "phantom_data"]
+struct PhantomData<T: ?Sized>;
+
+fn f<T: Send, U>() {
+    T::IS_SEND;
+  //^^^^^^^^^^Yes
+    U::IS_SEND;
+  //^^^^^^^^^^{unknown}
+    <*const T>::IS_SEND;
+  //^^^^^^^^^^^^^^^^^^^{unknown}
+    Struct::<T>::IS_SEND;
+  //^^^^^^^^^^^^^^^^^^^^Yes
+    Struct::<U>::IS_SEND;
+  //^^^^^^^^^^^^^^^^^^^^Yes
+    Struct::<*const T>::IS_SEND;
+  //^^^^^^^^^^^^^^^^^^^^^^^^^^^Yes
+    Enum::<T>::IS_SEND;
+  //^^^^^^^^^^^^^^^^^^Yes
+    Enum::<U>::IS_SEND;
+  //^^^^^^^^^^^^^^^^^^Yes
+    Enum::<*const T>::IS_SEND;
+  //^^^^^^^^^^^^^^^^^^^^^^^^^Yes
+    Union::<T>::IS_SEND;
+  //^^^^^^^^^^^^^^^^^^^Yes
+    Union::<U>::IS_SEND;
+  //^^^^^^^^^^^^^^^^^^^Yes
+    Union::<*const T>::IS_SEND;
+  //^^^^^^^^^^^^^^^^^^^^^^^^^^Yes
+    PhantomData::<T>::IS_SEND;
+  //^^^^^^^^^^^^^^^^^^^^^^^^^Yes
+    PhantomData::<U>::IS_SEND;
+  //^^^^^^^^^^^^^^^^^^^^^^^^^{unknown}
+    PhantomData::<*const T>::IS_SEND;
+  //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^{unknown}
+}
+"#,
+    );
+}
+
+#[test]
+fn associated_type_impl_trait() {
+    check_types(
+        r#"
+trait Foo {}
+struct S1;
+impl Foo for S1 {}
+
+trait Bar {
+    type Item;
+    fn bar(&self) -> Self::Item;
+}
+struct S2;
+impl Bar for S2 {
+    type Item = impl Foo;
+    fn bar(&self) -> Self::Item {
+        S1
+    }
+}
+
+fn test() {
+    let x = S2.bar();
+      //^ impl Foo + ?Sized
+}
+        "#,
+    );
+}
+
+#[test]
+fn associated_type_impl_traits_complex() {
+    check_types(
+        r#"
+struct Unary<T>(T);
+struct Binary<T, U>(T, U);
+
+trait Foo {}
+struct S1;
+impl Foo for S1 {}
+
+trait Bar {
+    type Item;
+    fn bar(&self) -> Unary<Self::Item>;
+}
+struct S2;
+impl Bar for S2 {
+    type Item = Unary<impl Foo>;
+    fn bar(&self) -> Unary<<Self as Bar>::Item> {
+        Unary(Unary(S1))
+    }
+}
+
+trait Baz {
+    type Target1;
+    type Target2;
+    fn baz(&self) -> Binary<Self::Target1, Self::Target2>;
+}
+struct S3;
+impl Baz for S3 {
+    type Target1 = impl Foo;
+    type Target2 = Unary<impl Bar>;
+    fn baz(&self) -> Binary<Self::Target1, Self::Target2> {
+        Binary(S1, Unary(S2))
+    }
+}
+
+fn test() {
+    let x = S3.baz();
+      //^ Binary<impl Foo + ?Sized, Unary<impl Bar + ?Sized>>
+    let y = x.1.0.bar();
+      //^ Unary<Bar::Item<impl Bar + ?Sized>>
+}
+        "#,
     );
 }

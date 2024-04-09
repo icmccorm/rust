@@ -1,6 +1,6 @@
 // Tests that trait bounds on specializing trait impls must be `~const` if the
 // same bound is present on the default impl and is `~const` there.
-// check-pass
+//@ check-pass
 // FIXME(effects) ^ should error
 
 #![feature(const_trait_impl)]
@@ -18,11 +18,7 @@ trait Bar {
     fn bar();
 }
 
-// bgr360: I was only able to exercise the code path that raises the
-// "missing ~const qualifier" error by making this base impl non-const, even
-// though that doesn't really make sense to do. As seen below, if the base impl
-// is made const, rustc fails earlier with an overlapping impl failure.
-impl<T> Bar for T
+impl<T> const Bar for T
 where
     T: ~const Foo,
 {

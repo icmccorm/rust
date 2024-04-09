@@ -1,4 +1,4 @@
-use crate::clean::auto_trait::AutoTraitFinder;
+use crate::clean::auto_trait::synthesize_auto_trait_impls;
 use crate::clean::blanket_impl::BlanketImplFinder;
 use crate::clean::render_macro_matchers::render_macro_matcher;
 use crate::clean::{
@@ -16,8 +16,10 @@ use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId, LOCAL_CRATE};
 use rustc_metadata::rendered_const;
 use rustc_middle::mir;
+use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::{self, GenericArgKind, GenericArgsRef, TyCtxt};
 use rustc_span::symbol::{kw, sym, Symbol};
+use std::assert_matches::debug_assert_matches;
 use std::fmt::Write as _;
 use std::mem;
 use std::sync::LazyLock as Lazy;
@@ -74,52 +76,138 @@ pub(crate) fn krate(cx: &mut DocContext<'_>) -> Crate {
     Crate { module, external_traits: cx.external_traits.clone() }
 }
 
-pub(crate) fn ty_args_to_args<'tcx>(
+pub(crate) fn clean_middle_generic_args<'tcx>(
     cx: &mut DocContext<'tcx>,
     args: ty::Binder<'tcx, &'tcx [ty::GenericArg<'tcx>]>,
-    has_self: bool,
-    container: Option<DefId>,
+    mut has_self: bool,
+    owner: DefId,
 ) -> Vec<GenericArg> {
-    let mut skip_first = has_self;
-    let mut ret_val =
-        Vec::with_capacity(args.skip_binder().len().saturating_sub(if skip_first { 1 } else { 0 }));
+    let (args, bound_vars) = (args.skip_binder(), args.bound_vars());
+    if args.is_empty() {
+        // Fast path which avoids executing the query `generics_of`.
+        return Vec::new();
+    }
 
-    ret_val.extend(args.iter().enumerate().filter_map(|(index, kind)| {
-        match kind.skip_binder().unpack() {
+    // If the container is a trait object type, the arguments won't contain the self type but the
+    // generics of the corresponding trait will. In such a case, prepend a dummy self type in order
+    // to align the arguments and parameters for the iteration below and to enable us to correctly
+    // instantiate the generic parameter default later.
+    let generics = cx.tcx.generics_of(owner);
+    let args = if !has_self && generics.parent.is_none() && generics.has_self {
+        has_self = true;
+        [cx.tcx.types.trait_object_dummy_self.into()]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>()
+            .into()
+    } else {
+        std::borrow::Cow::from(args)
+    };
+
+    let mut elision_has_failed_once_before = false;
+    let clean_arg = |(index, &arg): (usize, &ty::GenericArg<'tcx>)| {
+        // Elide the self type.
+        if has_self && index == 0 {
+            return None;
+        }
+
+        // Elide internal host effect args.
+        let param = generics.param_at(index, cx.tcx);
+        if param.is_host_effect() {
+            return None;
+        }
+
+        let arg = ty::Binder::bind_with_vars(arg, bound_vars);
+
+        // Elide arguments that coincide with their default.
+        if !elision_has_failed_once_before && let Some(default) = param.default_value(cx.tcx) {
+            let default = default.instantiate(cx.tcx, args.as_ref());
+            if can_elide_generic_arg(arg, arg.rebind(default)) {
+                return None;
+            }
+            elision_has_failed_once_before = true;
+        }
+
+        match arg.skip_binder().unpack() {
             GenericArgKind::Lifetime(lt) => {
                 Some(GenericArg::Lifetime(clean_middle_region(lt).unwrap_or(Lifetime::elided())))
             }
-            GenericArgKind::Type(_) if skip_first => {
-                skip_first = false;
-                None
-            }
             GenericArgKind::Type(ty) => Some(GenericArg::Type(clean_middle_ty(
-                kind.rebind(ty),
+                arg.rebind(ty),
                 cx,
                 None,
-                container.map(|container| crate::clean::ContainerTy::Regular {
-                    ty: container,
-                    args,
-                    has_self,
+                Some(crate::clean::ContainerTy::Regular {
+                    ty: owner,
+                    args: arg.rebind(args.as_ref()),
                     arg: index,
                 }),
             ))),
             GenericArgKind::Const(ct) => {
-                Some(GenericArg::Const(Box::new(clean_middle_const(kind.rebind(ct), cx))))
+                Some(GenericArg::Const(Box::new(clean_middle_const(arg.rebind(ct), cx))))
             }
         }
-    }));
-    ret_val
+    };
+
+    let offset = if has_self { 1 } else { 0 };
+    let mut clean_args = Vec::with_capacity(args.len().saturating_sub(offset));
+    clean_args.extend(args.iter().enumerate().rev().filter_map(clean_arg));
+    clean_args.reverse();
+    clean_args
 }
 
-fn external_generic_args<'tcx>(
+/// Check if the generic argument `actual` coincides with the `default` and can therefore be elided.
+///
+/// This uses a very conservative approach for performance and correctness reasons, meaning for
+/// several classes of terms it claims that they cannot be elided even if they theoretically could.
+/// This is absolutely fine since it mostly concerns edge cases.
+fn can_elide_generic_arg<'tcx>(
+    actual: ty::Binder<'tcx, ty::GenericArg<'tcx>>,
+    default: ty::Binder<'tcx, ty::GenericArg<'tcx>>,
+) -> bool {
+    debug_assert_matches!(
+        (actual.skip_binder().unpack(), default.skip_binder().unpack()),
+        (ty::GenericArgKind::Lifetime(_), ty::GenericArgKind::Lifetime(_))
+            | (ty::GenericArgKind::Type(_), ty::GenericArgKind::Type(_))
+            | (ty::GenericArgKind::Const(_), ty::GenericArgKind::Const(_))
+    );
+
+    // In practice, we shouldn't have any inference variables at this point.
+    // However to be safe, we bail out if we do happen to stumble upon them.
+    if actual.has_infer() || default.has_infer() {
+        return false;
+    }
+
+    // Since we don't properly keep track of bound variables in rustdoc (yet), we don't attempt to
+    // make any sense out of escaping bound variables. We simply don't have enough context and it
+    // would be incorrect to try to do so anyway.
+    if actual.has_escaping_bound_vars() || default.has_escaping_bound_vars() {
+        return false;
+    }
+
+    // Theoretically we could now check if either term contains (non-escaping) late-bound regions or
+    // projections, relate the two using an `InferCtxt` and check if the resulting obligations hold.
+    // Having projections means that the terms can potentially be further normalized thereby possibly
+    // revealing that they are equal after all. Regarding late-bound regions, they could to be
+    // liberated allowing us to consider more types to be equal by ignoring the names of binders
+    // (e.g., `for<'a> TYPE<'a>` and `for<'b> TYPE<'b>`).
+    //
+    // However, we are mostly interested in “reeliding” generic args, i.e., eliding generic args that
+    // were originally elided by the user and later filled in by the compiler contrary to eliding
+    // arbitrary generic arguments if they happen to semantically coincide with the default (of course,
+    // we cannot possibly distinguish these two cases). Therefore and for performance reasons, it
+    // suffices to only perform a syntactic / structural check by comparing the memory addresses of
+    // the interned arguments.
+    actual.skip_binder() == default.skip_binder()
+}
+
+fn clean_middle_generic_args_with_bindings<'tcx>(
     cx: &mut DocContext<'tcx>,
     did: DefId,
     has_self: bool,
     bindings: ThinVec<TypeBinding>,
     ty_args: ty::Binder<'tcx, GenericArgsRef<'tcx>>,
 ) -> GenericArgs {
-    let args = ty_args_to_args(cx, ty_args.map_bound(|args| &args[..]), has_self, Some(did));
+    let args = clean_middle_generic_args(cx, ty_args.map_bound(|args| &args[..]), has_self, did);
 
     if cx.tcx.fn_trait_kind_from_def_id(did).is_some() {
         let ty = ty_args
@@ -145,7 +233,7 @@ fn external_generic_args<'tcx>(
     }
 }
 
-pub(super) fn external_path<'tcx>(
+pub(super) fn clean_middle_path<'tcx>(
     cx: &mut DocContext<'tcx>,
     did: DefId,
     has_self: bool,
@@ -158,18 +246,9 @@ pub(super) fn external_path<'tcx>(
         res: Res::Def(def_kind, did),
         segments: thin_vec![PathSegment {
             name,
-            args: external_generic_args(cx, did, has_self, bindings, args),
+            args: clean_middle_generic_args_with_bindings(cx, did, has_self, bindings, args),
         }],
     }
-}
-
-/// Remove the generic arguments from a path.
-pub(crate) fn strip_path_generics(mut path: Path) -> Path {
-    for ps in path.segments.iter_mut() {
-        ps.args = GenericArgs::AngleBracketed { args: Default::default(), bindings: ThinVec::new() }
-    }
-
-    path
 }
 
 pub(crate) fn qpath_to_string(p: &hir::QPath<'_>) -> String {
@@ -207,12 +286,16 @@ pub(crate) fn build_deref_target_impls(
         if let Some(prim) = target.primitive_type() {
             let _prof_timer = tcx.sess.prof.generic_activity("build_primitive_inherent_impls");
             for did in prim.impls(tcx).filter(|did| !did.is_local()) {
-                inline::build_impl(cx, did, None, ret);
+                cx.with_param_env(did, |cx| {
+                    inline::build_impl(cx, did, None, ret);
+                });
             }
         } else if let Type::Path { path } = target {
             let did = path.def_id();
             if !did.is_local() {
-                inline::build_impls(cx, did, None, ret);
+                cx.with_param_env(did, |cx| {
+                    inline::build_impls(cx, did, None, ret);
+                });
             }
         }
     }
@@ -223,7 +306,10 @@ pub(crate) fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
     debug!("trying to get a name from pattern: {p:?}");
 
     Symbol::intern(&match p.kind {
-        PatKind::Wild | PatKind::Struct(..) => return kw::Underscore,
+        // FIXME(never_patterns): does this make sense?
+        PatKind::Wild | PatKind::Err(_) | PatKind::Never | PatKind::Struct(..) => {
+            return kw::Underscore;
+        }
         PatKind::Binding(_, _, ident, _) => return ident.name,
         PatKind::TupleStruct(ref p, ..) | PatKind::Path(ref p) => qpath_to_string(p),
         PatKind::Or(pats) => {
@@ -234,6 +320,7 @@ pub(crate) fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
             elts.iter().map(|p| name_from_pat(p).to_string()).collect::<Vec<String>>().join(", ")
         ),
         PatKind::Box(p) => return name_from_pat(&*p),
+        PatKind::Deref(p) => format!("deref!({})", name_from_pat(&*p)),
         PatKind::Ref(p, _) => return name_from_pat(&*p),
         PatKind::Lit(..) => {
             warn!(
@@ -275,7 +362,8 @@ pub(crate) fn print_const(cx: &DocContext<'_>, n: ty::Const<'_>) -> String {
 pub(crate) fn print_evaluated_const(
     tcx: TyCtxt<'_>,
     def_id: DefId,
-    underscores_and_type: bool,
+    with_underscores: bool,
+    with_type: bool,
 ) -> Option<String> {
     tcx.const_eval_poly(def_id).ok().and_then(|val| {
         let ty = tcx.type_of(def_id).instantiate_identity();
@@ -284,7 +372,7 @@ pub(crate) fn print_evaluated_const(
             (mir::ConstValue::Scalar(_), &ty::Adt(_, _)) => None,
             (mir::ConstValue::Scalar(_), _) => {
                 let const_ = mir::Const::from_value(val, ty);
-                Some(print_const_with_custom_print_scalar(tcx, const_, underscores_and_type))
+                Some(print_const_with_custom_print_scalar(tcx, const_, with_underscores, with_type))
             }
             _ => None,
         }
@@ -320,45 +408,50 @@ fn format_integer_with_underscore_sep(num: &str) -> String {
 fn print_const_with_custom_print_scalar<'tcx>(
     tcx: TyCtxt<'tcx>,
     ct: mir::Const<'tcx>,
-    underscores_and_type: bool,
+    with_underscores: bool,
+    with_type: bool,
 ) -> String {
     // Use a slightly different format for integer types which always shows the actual value.
     // For all other types, fallback to the original `pretty_print_const`.
     match (ct, ct.ty().kind()) {
         (mir::Const::Val(mir::ConstValue::Scalar(int), _), ty::Uint(ui)) => {
-            if underscores_and_type {
-                format!("{}{}", format_integer_with_underscore_sep(&int.to_string()), ui.name_str())
+            let mut output = if with_underscores {
+                format_integer_with_underscore_sep(&int.to_string())
             } else {
                 int.to_string()
+            };
+            if with_type {
+                output += ui.name_str();
             }
+            output
         }
         (mir::Const::Val(mir::ConstValue::Scalar(int), _), ty::Int(i)) => {
             let ty = ct.ty();
             let size = tcx.layout_of(ty::ParamEnv::empty().and(ty)).unwrap().size;
             let data = int.assert_bits(size);
             let sign_extended_data = size.sign_extend(data) as i128;
-            if underscores_and_type {
-                format!(
-                    "{}{}",
-                    format_integer_with_underscore_sep(&sign_extended_data.to_string()),
-                    i.name_str()
-                )
+            let mut output = if with_underscores {
+                format_integer_with_underscore_sep(&sign_extended_data.to_string())
             } else {
                 sign_extended_data.to_string()
+            };
+            if with_type {
+                output += i.name_str();
             }
+            output
         }
         _ => ct.to_string(),
     }
 }
 
 pub(crate) fn is_literal_expr(tcx: TyCtxt<'_>, hir_id: hir::HirId) -> bool {
-    if let hir::Node::Expr(expr) = tcx.hir().get(hir_id) {
+    if let hir::Node::Expr(expr) = tcx.hir_node(hir_id) {
         if let hir::ExprKind::Lit(_) = &expr.kind {
             return true;
         }
 
-        if let hir::ExprKind::Unary(hir::UnOp::Neg, expr) = &expr.kind &&
-            let hir::ExprKind::Lit(_) = &expr.kind
+        if let hir::ExprKind::Unary(hir::UnOp::Neg, expr) = &expr.kind
+            && let hir::ExprKind::Lit(_) = &expr.kind
         {
             return true;
         }
@@ -384,6 +477,7 @@ pub(crate) fn resolve_type(cx: &mut DocContext<'_>, path: Path) -> Type {
     }
 }
 
+// FIXME(fmease): Update the `get_*` terminology to the `synthesize_` one.
 pub(crate) fn get_auto_trait_and_blanket_impls(
     cx: &mut DocContext<'_>,
     item_def_id: DefId,
@@ -391,8 +485,8 @@ pub(crate) fn get_auto_trait_and_blanket_impls(
     let auto_impls = cx
         .sess()
         .prof
-        .generic_activity("get_auto_trait_impls")
-        .run(|| AutoTraitFinder::new(cx).get_auto_trait_impls(item_def_id));
+        .generic_activity("synthesize_auto_trait_impls")
+        .run(|| synthesize_auto_trait_impls(cx, item_def_id));
     let blanket_impls = cx
         .sess()
         .prof
@@ -425,7 +519,7 @@ pub(crate) fn register_res(cx: &mut DocContext<'_>, res: Res) -> DefId {
             | Mod
             | ForeignTy
             | Const
-            | Static(_)
+            | Static { .. }
             | Macro(..)
             | TraitAlias),
             did,
@@ -487,9 +581,8 @@ pub(crate) fn find_nearest_parent_module(tcx: TyCtxt<'_>, def_id: DefId) -> Opti
 /// This function exists because it runs on `hir::Attributes` whereas the other is a
 /// `clean::Attributes` method.
 pub(crate) fn has_doc_flag(tcx: TyCtxt<'_>, did: DefId, flag: Symbol) -> bool {
-    tcx.get_attrs(did, sym::doc).any(|attr| {
-        attr.meta_item_list().map_or(false, |l| rustc_attr::list_contains_name(&l, flag))
-    })
+    tcx.get_attrs(did, sym::doc)
+        .any(|attr| attr.meta_item_list().is_some_and(|l| rustc_attr::list_contains_name(&l, flag)))
 }
 
 /// A link to `doc.rust-lang.org` that includes the channel name. Use this instead of manual links
@@ -498,7 +591,7 @@ pub(crate) fn has_doc_flag(tcx: TyCtxt<'_>, did: DefId, flag: Symbol) -> bool {
 /// Set by `bootstrap::Builder::doc_rust_lang_org_channel` in order to keep tests passing on beta/stable.
 pub(crate) const DOC_RUST_LANG_ORG_CHANNEL: &str = env!("DOC_RUST_LANG_ORG_CHANNEL");
 pub(crate) static DOC_CHANNEL: Lazy<&'static str> =
-    Lazy::new(|| DOC_RUST_LANG_ORG_CHANNEL.rsplit("/").filter(|c| !c.is_empty()).next().unwrap());
+    Lazy::new(|| DOC_RUST_LANG_ORG_CHANNEL.rsplit('/').find(|c| !c.is_empty()).unwrap());
 
 /// Render a sequence of macro arms in a format suitable for displaying to the user
 /// as part of an item declaration.
@@ -525,6 +618,7 @@ pub(super) fn display_macro_source(
     def: &ast::MacroDef,
     def_id: DefId,
     vis: ty::Visibility<DefId>,
+    is_doc_hidden: bool,
 ) -> String {
     // Extract the spans of all matchers. They represent the "interface" of the macro.
     let matchers = def.body.tokens.chunks(4).map(|arm| &arm[0]);
@@ -535,7 +629,7 @@ pub(super) fn display_macro_source(
         if matchers.len() <= 1 {
             format!(
                 "{vis}macro {name}{matchers} {{\n    ...\n}}",
-                vis = visibility_to_src_with_space(Some(vis), cx.tcx, def_id),
+                vis = visibility_to_src_with_space(Some(vis), cx.tcx, def_id, is_doc_hidden),
                 matchers = matchers
                     .map(|matcher| render_macro_matcher(cx.tcx, matcher))
                     .collect::<String>(),
@@ -543,7 +637,7 @@ pub(super) fn display_macro_source(
         } else {
             format!(
                 "{vis}macro {name} {{\n{arms}}}",
-                vis = visibility_to_src_with_space(Some(vis), cx.tcx, def_id),
+                vis = visibility_to_src_with_space(Some(vis), cx.tcx, def_id, is_doc_hidden),
                 arms = render_macro_arms(cx.tcx, matchers, ","),
             )
         }
@@ -555,20 +649,19 @@ pub(crate) fn inherits_doc_hidden(
     mut def_id: LocalDefId,
     stop_at: Option<LocalDefId>,
 ) -> bool {
-    let hir = tcx.hir();
     while let Some(id) = tcx.opt_local_parent(def_id) {
-        if let Some(stop_at) = stop_at && id == stop_at {
+        if let Some(stop_at) = stop_at
+            && id == stop_at
+        {
             return false;
         }
         def_id = id;
         if tcx.is_doc_hidden(def_id.to_def_id()) {
             return true;
-        } else if let Some(node) = hir.find_by_def_id(def_id) &&
-            matches!(
-                node,
-                hir::Node::Item(hir::Item { kind: hir::ItemKind::Impl(_), .. }),
-            )
-        {
+        } else if matches!(
+            tcx.hir_node_by_def_id(def_id),
+            hir::Node::Item(hir::Item { kind: hir::ItemKind::Impl(_), .. })
+        ) {
             // `impl` blocks stand a bit on their own: unless they have `#[doc(hidden)]` directly
             // on them, they don't inherit it from the parent context.
             return false;

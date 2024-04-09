@@ -12,6 +12,7 @@
 //! bounds by special casing scenarios such as these. Fun!
 
 use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::unord::UnordSet;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty;
 use thin_vec::ThinVec;
@@ -21,7 +22,7 @@ use crate::clean::GenericArgs as PP;
 use crate::clean::WherePredicate as WP;
 use crate::core::DocContext;
 
-pub(crate) fn where_clauses(cx: &DocContext<'_>, clauses: Vec<WP>) -> ThinVec<WP> {
+pub(crate) fn where_clauses(cx: &DocContext<'_>, clauses: ThinVec<WP>) -> ThinVec<WP> {
     // First, partition the where clause into its separate components.
     //
     // We use `FxIndexMap` so that the insertion order is preserved to prevent messing up to
@@ -40,18 +41,18 @@ pub(crate) fn where_clauses(cx: &DocContext<'_>, clauses: Vec<WP>) -> ThinVec<WP
             WP::RegionPredicate { lifetime, bounds } => {
                 lifetimes.push((lifetime, bounds));
             }
-            WP::EqPredicate { lhs, rhs, bound_params } => equalities.push((lhs, rhs, bound_params)),
+            WP::EqPredicate { lhs, rhs } => equalities.push((lhs, rhs)),
         }
     }
 
     // Look for equality predicates on associated types that can be merged into
     // general bound predicates.
-    equalities.retain(|(lhs, rhs, bound_params)| {
+    equalities.retain(|(lhs, rhs)| {
         let Some((ty, trait_did, name)) = lhs.projection() else {
             return true;
         };
         let Some((bounds, _)) = tybounds.get_mut(ty) else { return true };
-        merge_bounds(cx, bounds, bound_params.clone(), trait_did, name, rhs)
+        merge_bounds(cx, bounds, trait_did, name, rhs)
     });
 
     // And finally, let's reassemble everything
@@ -64,18 +65,13 @@ pub(crate) fn where_clauses(cx: &DocContext<'_>, clauses: Vec<WP>) -> ThinVec<WP
         bounds,
         bound_params,
     }));
-    clauses.extend(equalities.into_iter().map(|(lhs, rhs, bound_params)| WP::EqPredicate {
-        lhs,
-        rhs,
-        bound_params,
-    }));
+    clauses.extend(equalities.into_iter().map(|(lhs, rhs)| WP::EqPredicate { lhs, rhs }));
     clauses
 }
 
 pub(crate) fn merge_bounds(
     cx: &clean::DocContext<'_>,
     bounds: &mut Vec<clean::GenericBound>,
-    mut bound_params: Vec<clean::GenericParamDef>,
     trait_did: DefId,
     assoc: clean::PathSegment,
     rhs: &clean::Term,
@@ -92,12 +88,6 @@ pub(crate) fn merge_bounds(
             return false;
         }
         let last = trait_ref.trait_.segments.last_mut().expect("segments were empty");
-
-        trait_ref.generic_params.append(&mut bound_params);
-        // Sort parameters (likely) originating from a hashset alphabetically to
-        // produce predictable output (and to allow for full deduplication).
-        trait_ref.generic_params.sort_unstable_by(|p, q| p.name.as_str().cmp(q.name.as_str()));
-        trait_ref.generic_params.dedup_by_key(|p| p.name);
 
         match last.args {
             PP::AngleBracketed { ref mut bindings, .. } => {
@@ -139,6 +129,48 @@ fn trait_is_same_or_supertrait(cx: &DocContext<'_>, child: DefId, trait_: DefId)
         .any(|did| trait_is_same_or_supertrait(cx, did, trait_))
 }
 
+pub(crate) fn sized_bounds(cx: &mut DocContext<'_>, generics: &mut clean::Generics) {
+    let mut sized_params = UnordSet::new();
+
+    // In the surface language, all type parameters except `Self` have an
+    // implicit `Sized` bound unless removed with `?Sized`.
+    // However, in the list of where-predicates below, `Sized` appears like a
+    // normal bound: It's either present (the type is sized) or
+    // absent (the type might be unsized) but never *maybe* (i.e. `?Sized`).
+    //
+    // This is unsuitable for rendering.
+    // Thus, as a first step remove all `Sized` bounds that should be implicit.
+    //
+    // Note that associated types also have an implicit `Sized` bound but we
+    // don't actually know the set of associated types right here so that
+    // should be handled when cleaning associated types.
+    generics.where_predicates.retain(|pred| {
+        if let WP::BoundPredicate { ty: clean::Generic(param), bounds, .. } = pred
+            && *param != rustc_span::symbol::kw::SelfUpper
+            && bounds.iter().any(|b| b.is_sized_bound(cx))
+        {
+            sized_params.insert(*param);
+            false
+        } else {
+            true
+        }
+    });
+
+    // As a final step, go through the type parameters again and insert a
+    // `?Sized` bound for each one we didn't find to be `Sized`.
+    for param in &generics.params {
+        if let clean::GenericParamDefKind::Type { .. } = param.kind
+            && !sized_params.contains(&param.name)
+        {
+            generics.where_predicates.push(WP::BoundPredicate {
+                ty: clean::Type::Generic(param.name),
+                bounds: vec![clean::GenericBound::maybe_sized(cx)],
+                bound_params: Vec::new(),
+            })
+        }
+    }
+}
+
 /// Move bounds that are (likely) directly attached to generic parameters from the where-clause to
 /// the respective parameter.
 ///
@@ -156,8 +188,9 @@ pub(crate) fn move_bounds_to_generic_parameters(generics: &mut clean::Generics) 
                 ..
             }) = generics.params.iter_mut().find(|param| &param.name == arg)
         {
-            param_bounds.append(bounds);
-        } else if let WherePredicate::RegionPredicate { lifetime: Lifetime(arg), bounds } = &mut pred
+            param_bounds.extend(bounds.drain(..));
+        } else if let WherePredicate::RegionPredicate { lifetime: Lifetime(arg), bounds } =
+            &mut pred
             && let Some(GenericParamDef {
                 kind: GenericParamDefKind::Lifetime { outlives: param_bounds },
                 ..

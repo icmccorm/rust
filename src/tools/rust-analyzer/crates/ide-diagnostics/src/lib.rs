@@ -23,7 +23,7 @@
 //! There are also a couple of ad-hoc diagnostics implemented directly here, we
 //! don't yet have a great pattern for how to do them properly.
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![warn(rust_2018_idioms, unused_lifetimes)]
 
 mod handlers {
     pub(crate) mod break_outside_of_loop;
@@ -41,33 +41,41 @@ mod handlers {
     pub(crate) mod moved_out_of_ref;
     pub(crate) mod mutability_errors;
     pub(crate) mod no_such_field;
+    pub(crate) mod non_exhaustive_let;
     pub(crate) mod private_assoc_item;
     pub(crate) mod private_field;
+    pub(crate) mod remove_trailing_return;
+    pub(crate) mod remove_unnecessary_else;
     pub(crate) mod replace_filter_map_next_with_find_map;
-    pub(crate) mod typed_hole;
+    pub(crate) mod trait_impl_incorrect_safety;
+    pub(crate) mod trait_impl_missing_assoc_item;
+    pub(crate) mod trait_impl_orphan;
+    pub(crate) mod trait_impl_redundant_assoc_item;
     pub(crate) mod type_mismatch;
+    pub(crate) mod typed_hole;
+    pub(crate) mod undeclared_label;
     pub(crate) mod unimplemented_builtin_macro;
+    pub(crate) mod unreachable_label;
+    pub(crate) mod unresolved_assoc_item;
     pub(crate) mod unresolved_extern_crate;
     pub(crate) mod unresolved_field;
-    pub(crate) mod unresolved_method;
+    pub(crate) mod unresolved_ident;
     pub(crate) mod unresolved_import;
     pub(crate) mod unresolved_macro_call;
+    pub(crate) mod unresolved_method;
     pub(crate) mod unresolved_module;
     pub(crate) mod unresolved_proc_macro;
-    pub(crate) mod undeclared_label;
-    pub(crate) mod unreachable_label;
+    pub(crate) mod unused_variables;
 
     // The handlers below are unusual, the implement the diagnostics as well.
     pub(crate) mod field_shorthand;
-    pub(crate) mod useless_braces;
-    pub(crate) mod unlinked_file;
     pub(crate) mod json_is_not_rust;
+    pub(crate) mod unlinked_file;
+    pub(crate) mod useless_braces;
 }
 
 #[cfg(test)]
 mod tests;
-
-use std::collections::HashMap;
 
 use hir::{diagnostics::AnyDiagnostic, InFile, Semantics};
 use ide_db::{
@@ -83,13 +91,12 @@ use ide_db::{
 use once_cell::sync::Lazy;
 use stdx::never;
 use syntax::{
-    algo::find_node_at_range,
     ast::{self, AstNode},
-    SyntaxNode, SyntaxNodePtr, TextRange,
+    AstPtr, SyntaxNode, SyntaxNodePtr, TextRange,
 };
 
 // FIXME: Make this an enum
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DiagnosticCode {
     RustcHardError(&'static str),
     RustcLint(&'static str),
@@ -129,17 +136,17 @@ impl DiagnosticCode {
 pub struct Diagnostic {
     pub code: DiagnosticCode,
     pub message: String,
-    pub range: TextRange,
+    pub range: FileRange,
     pub severity: Severity,
     pub unused: bool,
     pub experimental: bool,
     pub fixes: Option<Vec<Assist>>,
     // The node that will be affected by `#[allow]` and similar attributes.
-    pub main_node: Option<InFile<SyntaxNode>>,
+    pub main_node: Option<InFile<SyntaxNodePtr>>,
 }
 
 impl Diagnostic {
-    fn new(code: DiagnosticCode, message: impl Into<String>, range: TextRange) -> Diagnostic {
+    fn new(code: DiagnosticCode, message: impl Into<String>, range: FileRange) -> Diagnostic {
         let message = message.into();
         Diagnostic {
             code,
@@ -167,9 +174,8 @@ impl Diagnostic {
         message: impl Into<String>,
         node: InFile<SyntaxNodePtr>,
     ) -> Diagnostic {
-        let file_id = node.file_id;
-        Diagnostic::new(code, message, ctx.sema.diagnostics_display_range(node.clone()).range)
-            .with_main_node(node.map(|x| x.to_node(&ctx.sema.parse_or_expand(file_id))))
+        Diagnostic::new(code, message, ctx.sema.diagnostics_display_range(node))
+            .with_main_node(node)
     }
 
     fn experimental(mut self) -> Diagnostic {
@@ -177,7 +183,7 @@ impl Diagnostic {
         self
     }
 
-    fn with_main_node(mut self, main_node: InFile<SyntaxNode>) -> Diagnostic {
+    fn with_main_node(mut self, main_node: InFile<SyntaxNodePtr>) -> Diagnostic {
         self.main_node = Some(main_node);
         self
     }
@@ -193,7 +199,7 @@ impl Diagnostic {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Severity {
     Error,
     Warning,
@@ -221,9 +227,11 @@ pub struct DiagnosticsConfig {
     pub disable_experimental: bool,
     pub disabled: FxHashSet<String>,
     pub expr_fill_default: ExprFillDefaultMode,
+    pub style_lints: bool,
     // FIXME: We may want to include a whole `AssistConfig` here
     pub insert_use: InsertUseConfig,
     pub prefer_no_std: bool,
+    pub prefer_prelude: bool,
 }
 
 impl DiagnosticsConfig {
@@ -238,6 +246,7 @@ impl DiagnosticsConfig {
             disable_experimental: Default::default(),
             disabled: Default::default(),
             expr_fill_default: Default::default(),
+            style_lints: true,
             insert_use: InsertUseConfig {
                 granularity: ImportGranularity::Preserve,
                 enforce_granularity: false,
@@ -246,6 +255,7 @@ impl DiagnosticsConfig {
                 skip_glob_imports: false,
             },
             prefer_no_std: false,
+            prefer_prelude: true,
         }
     }
 }
@@ -261,7 +271,7 @@ impl DiagnosticsContext<'_> {
         &self,
         node: &InFile<SyntaxNodePtr>,
         precise_location: Option<TextRange>,
-    ) -> TextRange {
+    ) -> FileRange {
         let sema = &self.sema;
         (|| {
             let precise_location = precise_location?;
@@ -273,28 +283,29 @@ impl DiagnosticsContext<'_> {
                 }
             }
         })()
-        .unwrap_or_else(|| sema.diagnostics_display_range(node.clone()))
-        .range
+        .unwrap_or_else(|| sema.diagnostics_display_range(*node))
     }
 }
 
+/// Request diagnostics for the given [`FileId`]. The produced diagnostics may point to other files
+/// due to macros.
 pub fn diagnostics(
     db: &RootDatabase,
     config: &DiagnosticsConfig,
     resolve: &AssistResolveStrategy,
     file_id: FileId,
 ) -> Vec<Diagnostic> {
-    let _p = profile::span("diagnostics");
+    let _p = tracing::span!(tracing::Level::INFO, "diagnostics").entered();
     let sema = Semantics::new(db);
     let parse = db.parse(file_id);
     let mut res = Vec::new();
 
     // [#34344] Only take first 128 errors to prevent slowing down editor/ide, the number 128 is chosen arbitrarily.
-    res.extend(parse.errors().iter().take(128).map(|err| {
+    res.extend(parse.errors().into_iter().take(128).map(|err| {
         Diagnostic::new(
             DiagnosticCode::RustcHardError("syntax-error"),
             format!("Syntax Error: {err}"),
-            err.range(),
+            FileRange { file_id, range: err.range() },
         )
     }));
 
@@ -306,7 +317,7 @@ pub fn diagnostics(
         handlers::json_is_not_rust::json_in_items(&sema, &mut res, file_id, &node, config);
     }
 
-    let module = sema.to_module_def(file_id);
+    let module = sema.file_to_module_def(file_id);
 
     let ctx = DiagnosticsContext { config, sema, resolve };
     if module.is_none() {
@@ -315,11 +326,10 @@ pub fn diagnostics(
 
     let mut diags = Vec::new();
     if let Some(m) = module {
-        m.diagnostics(db, &mut diags);
+        m.diagnostics(db, &mut diags, config.style_lints);
     }
 
     for diag in diags {
-        #[rustfmt::skip]
         let d = match diag {
             AnyDiagnostic::ExpectedFunction(d) => handlers::expected_function::expected_function(&ctx, &d),
             AnyDiagnostic::InactiveCode(d) => match handlers::inactive_code::inactive_code(&ctx, &d) {
@@ -350,32 +360,66 @@ pub fn diagnostics(
             AnyDiagnostic::MissingMatchArms(d) => handlers::missing_match_arms::missing_match_arms(&ctx, &d),
             AnyDiagnostic::MissingUnsafe(d) => handlers::missing_unsafe::missing_unsafe(&ctx, &d),
             AnyDiagnostic::MovedOutOfRef(d) => handlers::moved_out_of_ref::moved_out_of_ref(&ctx, &d),
-            AnyDiagnostic::NeedMut(d) => handlers::mutability_errors::need_mut(&ctx, &d),
+            AnyDiagnostic::NeedMut(d) => match handlers::mutability_errors::need_mut(&ctx, &d) {
+                Some(it) => it,
+                None => continue,
+            },
+            AnyDiagnostic::NonExhaustiveLet(d) => handlers::non_exhaustive_let::non_exhaustive_let(&ctx, &d),
             AnyDiagnostic::NoSuchField(d) => handlers::no_such_field::no_such_field(&ctx, &d),
             AnyDiagnostic::PrivateAssocItem(d) => handlers::private_assoc_item::private_assoc_item(&ctx, &d),
             AnyDiagnostic::PrivateField(d) => handlers::private_field::private_field(&ctx, &d),
             AnyDiagnostic::ReplaceFilterMapNextWithFindMap(d) => handlers::replace_filter_map_next_with_find_map::replace_filter_map_next_with_find_map(&ctx, &d),
+            AnyDiagnostic::TraitImplIncorrectSafety(d) => handlers::trait_impl_incorrect_safety::trait_impl_incorrect_safety(&ctx, &d),
+            AnyDiagnostic::TraitImplMissingAssocItems(d) => handlers::trait_impl_missing_assoc_item::trait_impl_missing_assoc_item(&ctx, &d),
+            AnyDiagnostic::TraitImplRedundantAssocItems(d) => handlers::trait_impl_redundant_assoc_item::trait_impl_redundant_assoc_item(&ctx, &d),
+            AnyDiagnostic::TraitImplOrphan(d) => handlers::trait_impl_orphan::trait_impl_orphan(&ctx, &d),
             AnyDiagnostic::TypedHole(d) => handlers::typed_hole::typed_hole(&ctx, &d),
             AnyDiagnostic::TypeMismatch(d) => handlers::type_mismatch::type_mismatch(&ctx, &d),
             AnyDiagnostic::UndeclaredLabel(d) => handlers::undeclared_label::undeclared_label(&ctx, &d),
             AnyDiagnostic::UnimplementedBuiltinMacro(d) => handlers::unimplemented_builtin_macro::unimplemented_builtin_macro(&ctx, &d),
-            AnyDiagnostic::UnreachableLabel(d) => handlers::unreachable_label:: unreachable_label(&ctx, &d),
+            AnyDiagnostic::UnreachableLabel(d) => handlers::unreachable_label::unreachable_label(&ctx, &d),
+            AnyDiagnostic::UnresolvedAssocItem(d) => handlers::unresolved_assoc_item::unresolved_assoc_item(&ctx, &d),
             AnyDiagnostic::UnresolvedExternCrate(d) => handlers::unresolved_extern_crate::unresolved_extern_crate(&ctx, &d),
             AnyDiagnostic::UnresolvedField(d) => handlers::unresolved_field::unresolved_field(&ctx, &d),
+            AnyDiagnostic::UnresolvedIdent(d) => handlers::unresolved_ident::unresolved_ident(&ctx, &d),
             AnyDiagnostic::UnresolvedImport(d) => handlers::unresolved_import::unresolved_import(&ctx, &d),
             AnyDiagnostic::UnresolvedMacroCall(d) => handlers::unresolved_macro_call::unresolved_macro_call(&ctx, &d),
             AnyDiagnostic::UnresolvedMethodCall(d) => handlers::unresolved_method::unresolved_method(&ctx, &d),
             AnyDiagnostic::UnresolvedModule(d) => handlers::unresolved_module::unresolved_module(&ctx, &d),
             AnyDiagnostic::UnresolvedProcMacro(d) => handlers::unresolved_proc_macro::unresolved_proc_macro(&ctx, &d, config.proc_macros_enabled, config.proc_attr_macros_enabled),
-            AnyDiagnostic::UnusedMut(d) => handlers::mutability_errors::unused_mut(&ctx, &d),
+            AnyDiagnostic::UnusedMut(d) => match handlers::mutability_errors::unused_mut(&ctx, &d) {
+                Some(it) => it,
+                None => continue,
+            },
+            AnyDiagnostic::UnusedVariable(d) => match handlers::unused_variables::unused_variables(&ctx, &d) {
+                Some(it) => it,
+                None => continue,
+            },
             AnyDiagnostic::BreakOutsideOfLoop(d) => handlers::break_outside_of_loop::break_outside_of_loop(&ctx, &d),
             AnyDiagnostic::MismatchedTupleStructPatArgCount(d) => handlers::mismatched_arg_count::mismatched_tuple_struct_pat_arg_count(&ctx, &d),
+            AnyDiagnostic::RemoveTrailingReturn(d) => match handlers::remove_trailing_return::remove_trailing_return(&ctx, &d) {
+                Some(it) => it,
+                None => continue,
+            },
+            AnyDiagnostic::RemoveUnnecessaryElse(d) => match handlers::remove_unnecessary_else::remove_unnecessary_else(&ctx, &d) {
+                Some(it) => it,
+                None => continue,
+            },
         };
         res.push(d)
     }
 
-    let mut diagnostics_of_range =
-        res.iter_mut().filter_map(|x| Some((x.main_node.clone()?, x))).collect::<FxHashMap<_, _>>();
+    let mut diagnostics_of_range = res
+        .iter_mut()
+        .filter_map(|it| {
+            Some((
+                it.main_node.map(|ptr| {
+                    ptr.map(|node| node.to_node(&ctx.sema.parse_or_expand(ptr.file_id)))
+                })?,
+                it,
+            ))
+        })
+        .collect::<FxHashMap<_, _>>();
 
     let mut rustc_stack: FxHashMap<String, Vec<Severity>> = FxHashMap::default();
     let mut clippy_stack: FxHashMap<String, Vec<Severity>> = FxHashMap::default();
@@ -399,18 +443,18 @@ pub fn diagnostics(
 
 // `__RA_EVERY_LINT` is a fake lint group to allow every lint in proc macros
 
-static RUSTC_LINT_GROUPS_DICT: Lazy<HashMap<&str, Vec<&str>>> =
+static RUSTC_LINT_GROUPS_DICT: Lazy<FxHashMap<&str, Vec<&str>>> =
     Lazy::new(|| build_group_dict(DEFAULT_LINT_GROUPS, &["warnings", "__RA_EVERY_LINT"], ""));
 
-static CLIPPY_LINT_GROUPS_DICT: Lazy<HashMap<&str, Vec<&str>>> =
+static CLIPPY_LINT_GROUPS_DICT: Lazy<FxHashMap<&str, Vec<&str>>> =
     Lazy::new(|| build_group_dict(CLIPPY_LINT_GROUPS, &["__RA_EVERY_LINT"], "clippy::"));
 
 fn build_group_dict(
     lint_group: &'static [LintGroup],
     all_groups: &'static [&'static str],
     prefix: &'static str,
-) -> HashMap<&'static str, Vec<&'static str>> {
-    let mut r: HashMap<&str, Vec<&str>> = HashMap::new();
+) -> FxHashMap<&'static str, Vec<&'static str>> {
+    let mut r: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
     for g in lint_group {
         for child in g.children {
             r.entry(child.strip_prefix(prefix).unwrap())
@@ -433,8 +477,8 @@ fn handle_lint_attributes(
     diagnostics_of_range: &mut FxHashMap<InFile<SyntaxNode>, &mut Diagnostic>,
 ) {
     let file_id = sema.hir_file_for(root);
-    let mut preorder = root.preorder();
-    while let Some(ev) = preorder.next() {
+    let preorder = root.preorder();
+    for ev in preorder {
         match ev {
             syntax::WalkEvent::Enter(node) => {
                 for attr in node.children().filter_map(ast::Attr::cast) {
@@ -547,7 +591,7 @@ fn unresolved_fix(id: &'static str, label: &str, target: TextRange) -> Assist {
     assert!(!id.contains(' '));
     Assist {
         id: AssistId(id, AssistKind::QuickFix),
-        label: Label::new(label.to_string()),
+        label: Label::new(label.to_owned()),
         group: None,
         target,
         source_change: None,
@@ -557,14 +601,12 @@ fn unresolved_fix(id: &'static str, label: &str, target: TextRange) -> Assist {
 
 fn adjusted_display_range<N: AstNode>(
     ctx: &DiagnosticsContext<'_>,
-    diag_ptr: InFile<SyntaxNodePtr>,
+    diag_ptr: InFile<AstPtr<N>>,
     adj: &dyn Fn(N) -> Option<TextRange>,
-) -> TextRange {
-    let FileRange { file_id, range } = ctx.sema.diagnostics_display_range(diag_ptr);
-
-    let source_file = ctx.sema.db.parse(file_id);
-    find_node_at_range::<N>(&source_file.syntax_node(), range)
-        .filter(|it| it.syntax().text_range() == range)
-        .and_then(adj)
-        .unwrap_or(range)
+) -> FileRange {
+    let source_file = ctx.sema.parse_or_expand(diag_ptr.file_id);
+    let node = diag_ptr.value.to_node(&source_file);
+    diag_ptr
+        .with_value(adj(node).unwrap_or_else(|| diag_ptr.value.text_range()))
+        .original_node_file_range_rooted(ctx.sema.db)
 }

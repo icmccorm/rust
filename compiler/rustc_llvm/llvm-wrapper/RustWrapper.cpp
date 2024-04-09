@@ -10,24 +10,27 @@
 #include "llvm/IR/IntrinsicsARM.h"
 #include "llvm/IR/LLVMRemarkStreamer.h"
 #include "llvm/IR/Mangler.h"
+#include "llvm/IR/Value.h"
 #include "llvm/Remarks/RemarkStreamer.h"
 #include "llvm/Remarks/RemarkSerializer.h"
 #include "llvm/Remarks/RemarkFormat.h"
 #include "llvm/Support/ToolOutputFile.h"
-#if LLVM_VERSION_GE(16, 0)
 #include "llvm/Support/ModRef.h"
-#endif
 #include "llvm/Object/Archive.h"
 #include "llvm/Object/COFFImportFile.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Pass.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Support/Signals.h"
-#if LLVM_VERSION_LT(16, 0)
-#include "llvm/ADT/Optional.h"
-#endif
 
 #include <iostream>
+
+// for raw `write` in the bad-alloc handler
+#ifdef _MSC_VER
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 //===----------------------------------------------------------------------===
 //
@@ -71,19 +74,45 @@ static LLVM_THREAD_LOCAL char *LastError;
 static void FatalErrorHandler(void *UserData,
                               const char* Reason,
                               bool GenCrashDiag) {
-  // Do the same thing that the default error handler does.
-  std::cerr << "LLVM ERROR: " << Reason << std::endl;
+  // Once upon a time we emitted "LLVM ERROR:" specifically to mimic LLVM. Then,
+  // we developed crater and other tools which only expose logs, not error codes.
+  // Use a more greppable prefix that will still match the "LLVM ERROR:" prefix.
+  std::cerr << "rustc-LLVM ERROR: " << Reason << std::endl;
 
   // Since this error handler exits the process, we have to run any cleanup that
   // LLVM would run after handling the error. This might change with an LLVM
   // upgrade.
+  //
+  // In practice, this will do nothing, because the only cleanup LLVM does is
+  // to remove all files that were registered with it via a frontend calling
+  // one of the `createOutputFile` family of functions in LLVM and passing true
+  // to RemoveFileOnSignal, something that rustc does not do. However, it would
+  // be... inadvisable to suddenly stop running these handlers, if LLVM gets
+  // "interesting" ideas in the future about what cleanup should be done.
+  // We might even find it useful for generating less artifacts.
   sys::RunInterruptHandlers();
 
   exit(101);
 }
 
-extern "C" void LLVMRustInstallFatalErrorHandler() {
+// Custom error handler for bad-alloc LLVM errors.
+//
+// It aborts the process without any further allocations, similar to LLVM's
+// default except that may be configured to `throw std::bad_alloc()` instead.
+static void BadAllocErrorHandler(void *UserData,
+                                 const char* Reason,
+                                 bool GenCrashDiag) {
+  const char *OOM = "rustc-LLVM ERROR: out of memory\n";
+  (void)!::write(2, OOM, strlen(OOM));
+  (void)!::write(2, Reason, strlen(Reason));
+  (void)!::write(2, "\n", 1);
+  abort();
+}
+
+extern "C" void LLVMRustInstallErrorHandlers() {
+  install_bad_alloc_error_handler(BadAllocErrorHandler);
   install_fatal_error_handler(FatalErrorHandler);
+  install_out_of_memory_new_handler();
 }
 
 extern "C" void LLVMRustDisableSystemDialogsOnCrash() {
@@ -114,7 +143,7 @@ extern "C" void LLVMRustSetNormalizedTarget(LLVMModuleRef M,
 
 extern "C" const char *LLVMRustPrintPassTimings(size_t *Len) {
   std::string buf;
-  raw_string_ostream SS(buf);
+  auto SS = raw_string_ostream(buf);
   TimerGroup::printAll(SS);
   SS.flush();
   *Len = buf.length();
@@ -125,7 +154,7 @@ extern "C" const char *LLVMRustPrintPassTimings(size_t *Len) {
 
 extern "C" const char *LLVMRustPrintStatistics(size_t *Len) {
   std::string buf;
-  raw_string_ostream SS(buf);
+  auto SS = raw_string_ostream(buf);
   llvm::PrintStatistics(SS);
   SS.flush();
   *Len = buf.length();
@@ -179,7 +208,7 @@ extern "C" LLVMValueRef LLVMRustGetOrInsertFunction(LLVMModuleRef M,
 extern "C" LLVMValueRef
 LLVMRustGetOrInsertGlobal(LLVMModuleRef M, const char *Name, size_t NameLen, LLVMTypeRef Ty) {
   Module *Mod = unwrap(M);
-  StringRef NameRef(Name, NameLen);
+  auto NameRef = StringRef(Name, NameLen);
 
   // We don't use Module::getOrInsertGlobal because that returns a Constant*,
   // which may either be the real GlobalVariable*, or a constant bitcast of it
@@ -255,8 +284,6 @@ static Attribute::AttrKind fromRust(LLVMRustAttribute Kind) {
     return Attribute::NonLazyBind;
   case OptimizeNone:
     return Attribute::OptimizeNone;
-  case ReturnsTwice:
-    return Attribute::ReturnsTwice;
   case ReadNone:
     return Attribute::ReadNone;
   case SanitizeHWAddress:
@@ -283,6 +310,8 @@ static Attribute::AttrKind fromRust(LLVMRustAttribute Kind) {
     return Attribute::AllocAlign;
   case SanitizeSafeStack:
     return Attribute::SafeStack;
+  case FnRetThunkExtern:
+    return Attribute::FnRetThunkExtern;
   }
   report_fatal_error("bad AttributeKind");
 }
@@ -290,7 +319,7 @@ static Attribute::AttrKind fromRust(LLVMRustAttribute Kind) {
 template<typename T> static inline void AddAttributes(T *t, unsigned Index,
                                                       LLVMAttributeRef *Attrs, size_t AttrsLen) {
   AttributeList PAL = t->getAttributes();
-  AttrBuilder B(t->getContext());
+  auto B = AttrBuilder(t->getContext());
   for (LLVMAttributeRef Attr : ArrayRef<LLVMAttributeRef>(Attrs, AttrsLen))
     B.addAttribute(unwrap(Attr));
   AttributeList PALNew = PAL.addAttributesAtIndex(t->getContext(), Index, B);
@@ -347,13 +376,7 @@ extern "C" LLVMAttributeRef LLVMRustCreateUWTableAttr(LLVMContextRef C, bool Asy
 }
 
 extern "C" LLVMAttributeRef LLVMRustCreateAllocSizeAttr(LLVMContextRef C, uint32_t ElementSizeArg) {
-  return wrap(Attribute::getWithAllocSizeArgs(*unwrap(C), ElementSizeArg,
-#if LLVM_VERSION_LT(16, 0)
-                                              None
-#else
-                                              std::nullopt
-#endif
-                                              ));
+  return wrap(Attribute::getWithAllocSizeArgs(*unwrap(C), ElementSizeArg, std::nullopt));
 }
 
 // These values **must** match ffi::AllocKindFlags.
@@ -416,7 +439,6 @@ enum class LLVMRustMemoryEffects {
 
 extern "C" LLVMAttributeRef LLVMRustCreateMemoryEffectsAttr(LLVMContextRef C,
                                                             LLVMRustMemoryEffects Effects) {
-#if LLVM_VERSION_GE(16, 0)
   switch (Effects) {
     case LLVMRustMemoryEffects::None:
       return wrap(Attribute::getWithMemoryEffects(*unwrap(C), MemoryEffects::none()));
@@ -428,26 +450,51 @@ extern "C" LLVMAttributeRef LLVMRustCreateMemoryEffectsAttr(LLVMContextRef C,
     default:
       report_fatal_error("bad MemoryEffects.");
   }
-#else
-  switch (Effects) {
-    case LLVMRustMemoryEffects::None:
-      return wrap(Attribute::get(*unwrap(C), Attribute::ReadNone));
-    case LLVMRustMemoryEffects::ReadOnly:
-      return wrap(Attribute::get(*unwrap(C), Attribute::ReadOnly));
-    case LLVMRustMemoryEffects::InaccessibleMemOnly:
-      return wrap(Attribute::get(*unwrap(C), Attribute::InaccessibleMemOnly));
-    default:
-      report_fatal_error("bad MemoryEffects.");
-  }
-#endif
 }
 
-// Enable a fast-math flag
+// Enable all fast-math flags, including those which will cause floating-point operations
+// to return poison for some well-defined inputs. This function can only be used to build
+// unsafe Rust intrinsics. That unsafety does permit additional optimizations, but at the
+// time of writing, their value is not well-understood relative to those enabled by
+// LLVMRustSetAlgebraicMath.
 //
 // https://llvm.org/docs/LangRef.html#fast-math-flags
 extern "C" void LLVMRustSetFastMath(LLVMValueRef V) {
   if (auto I = dyn_cast<Instruction>(unwrap<Value>(V))) {
     I->setFast(true);
+  }
+}
+
+// Enable fast-math flags which permit algebraic transformations that are not allowed by
+// IEEE floating point. For example:
+// a + (b + c) = (a + b) + c
+// and
+// a / b = a * (1 / b)
+// Note that this does NOT enable any flags which can cause a floating-point operation on
+// well-defined inputs to return poison, and therefore this function can be used to build
+// safe Rust intrinsics (such as fadd_algebraic).
+//
+// https://llvm.org/docs/LangRef.html#fast-math-flags
+extern "C" void LLVMRustSetAlgebraicMath(LLVMValueRef V) {
+  if (auto I = dyn_cast<Instruction>(unwrap<Value>(V))) {
+    I->setHasAllowReassoc(true);
+    I->setHasAllowContract(true);
+    I->setHasAllowReciprocal(true);
+    I->setHasNoSignedZeros(true);
+  }
+}
+
+// Enable the reassoc fast-math flag, allowing transformations that pretend
+// floating-point addition and multiplication are associative.
+//
+// Note that this does NOT enable any flags which can cause a floating-point operation on
+// well-defined inputs to return poison, and therefore this function can be used to build
+// safe Rust intrinsics (such as fadd_algebraic).
+//
+// https://llvm.org/docs/LangRef.html#fast-math-flags
+extern "C" void LLVMRustSetAllowReassoc(LLVMValueRef V) {
+  if (auto I = dyn_cast<Instruction>(unwrap<Value>(V))) {
+    I->setHasAllowReassoc(true);
   }
 }
 
@@ -719,6 +766,25 @@ static DICompileUnit::DebugEmissionKind fromRust(LLVMRustDebugEmissionKind Kind)
   }
 }
 
+enum class LLVMRustDebugNameTableKind {
+    Default,
+    GNU,
+    None,
+};
+
+static DICompileUnit::DebugNameTableKind fromRust(LLVMRustDebugNameTableKind Kind) {
+  switch (Kind) {
+  case LLVMRustDebugNameTableKind::Default:
+    return DICompileUnit::DebugNameTableKind::Default;
+  case LLVMRustDebugNameTableKind::GNU:
+    return DICompileUnit::DebugNameTableKind::GNU;
+  case LLVMRustDebugNameTableKind::None:
+    return DICompileUnit::DebugNameTableKind::None;
+  default:
+    report_fatal_error("bad DebugNameTableKind.");
+  }
+}
+
 enum class LLVMRustChecksumKind {
   None,
   MD5,
@@ -726,18 +792,10 @@ enum class LLVMRustChecksumKind {
   SHA256,
 };
 
-#if LLVM_VERSION_LT(16, 0)
-static Optional<DIFile::ChecksumKind> fromRust(LLVMRustChecksumKind Kind) {
-#else
 static std::optional<DIFile::ChecksumKind> fromRust(LLVMRustChecksumKind Kind) {
-#endif
   switch (Kind) {
   case LLVMRustChecksumKind::None:
-#if LLVM_VERSION_LT(16, 0)
-    return None;
-#else
     return std::nullopt;
-#endif
   case LLVMRustChecksumKind::MD5:
     return DIFile::ChecksumKind::CSK_MD5;
   case LLVMRustChecksumKind::SHA1:
@@ -795,13 +853,15 @@ extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateCompileUnit(
     const char *Flags, unsigned RuntimeVer,
     const char *SplitName, size_t SplitNameLen,
     LLVMRustDebugEmissionKind Kind,
-    uint64_t DWOId, bool SplitDebugInlining) {
+    uint64_t DWOId, bool SplitDebugInlining,
+    LLVMRustDebugNameTableKind TableKind) {
   auto *File = unwrapDI<DIFile>(FileRef);
 
   return wrap(Builder->createCompileUnit(Lang, File, StringRef(Producer, ProducerLen),
                                          isOptimized, Flags, RuntimeVer,
                                          StringRef(SplitName, SplitNameLen),
-                                         fromRust(Kind), DWOId, SplitDebugInlining));
+                                         fromRust(Kind), DWOId, SplitDebugInlining,
+                                         false, fromRust(TableKind)));
 }
 
 extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateFile(
@@ -810,17 +870,8 @@ extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateFile(
     const char *Directory, size_t DirectoryLen, LLVMRustChecksumKind CSKind,
     const char *Checksum, size_t ChecksumLen) {
 
-#if LLVM_VERSION_LT(16, 0)
-  Optional<DIFile::ChecksumKind> llvmCSKind = fromRust(CSKind);
-#else
   std::optional<DIFile::ChecksumKind> llvmCSKind = fromRust(CSKind);
-#endif
-
-#if LLVM_VERSION_LT(16, 0)
-  Optional<DIFile::ChecksumInfo<StringRef>> CSInfo{};
-#else
   std::optional<DIFile::ChecksumInfo<StringRef>> CSInfo{};
-#endif
   if (llvmCSKind)
     CSInfo.emplace(*llvmCSKind, StringRef{Checksum, ChecksumLen});
   return wrap(Builder->createFile(StringRef(Filename, FilenameLen),
@@ -983,6 +1034,9 @@ extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateStaticMemberType(
     unwrapDI<DIType>(Ty),
     fromRust(Flags),
     unwrap<llvm::ConstantInt>(val),
+#if LLVM_VERSION_GE(18, 0)
+    llvm::dwarf::DW_TAG_member,
+#endif
     AlignInBits
   ));
 }
@@ -1081,11 +1135,16 @@ extern "C" LLVMValueRef LLVMRustDIBuilderInsertDeclareAtEnd(
     LLVMRustDIBuilderRef Builder, LLVMValueRef V, LLVMMetadataRef VarInfo,
     uint64_t *AddrOps, unsigned AddrOpsCount, LLVMMetadataRef DL,
     LLVMBasicBlockRef InsertAtEnd) {
-  return wrap(Builder->insertDeclare(
+  auto Result = Builder->insertDeclare(
       unwrap(V), unwrap<DILocalVariable>(VarInfo),
       Builder->createExpression(llvm::ArrayRef<uint64_t>(AddrOps, AddrOpsCount)),
       DebugLoc(cast<MDNode>(unwrap(DL))),
-      unwrap(InsertAtEnd)));
+      unwrap(InsertAtEnd));
+#if LLVM_VERSION_GE(19, 0)
+  return wrap(Result.get<llvm::Instruction *>());
+#else
+  return wrap(Result);
+#endif
 }
 
 extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateEnumerator(
@@ -1105,7 +1164,11 @@ extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateEnumerationType(
       unwrapDI<DIDescriptor>(Scope), StringRef(Name, NameLen),
       unwrapDI<DIFile>(File), LineNumber,
       SizeInBits, AlignInBits, DINodeArray(unwrapDI<MDTuple>(Elements)),
-      unwrapDI<DIType>(ClassTy), "", IsScoped));
+      unwrapDI<DIType>(ClassTy),
+#if LLVM_VERSION_GE(18, 0)
+      /* RunTimeLang */ 0,
+#endif
+      "", IsScoped));
 }
 
 extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateUnionType(
@@ -1171,13 +1234,13 @@ extern "C" int64_t LLVMRustDIBuilderCreateOpLLVMFragment() {
 }
 
 extern "C" void LLVMRustWriteTypeToString(LLVMTypeRef Ty, RustStringRef Str) {
-  RawRustStringOstream OS(Str);
+  auto OS = RawRustStringOstream(Str);
   unwrap<llvm::Type>(Ty)->print(OS);
 }
 
 extern "C" void LLVMRustWriteValueToString(LLVMValueRef V,
                                            RustStringRef Str) {
-  RawRustStringOstream OS(Str);
+  auto OS = RawRustStringOstream(Str);
   if (!V) {
     OS << "(null)";
   } else {
@@ -1189,18 +1252,10 @@ extern "C" void LLVMRustWriteValueToString(LLVMValueRef V,
   }
 }
 
-// LLVMArrayType function does not support 64-bit ElementCount
-// FIXME: replace with LLVMArrayType2 when bumped minimal version to llvm-17
-// https://github.com/llvm/llvm-project/commit/35276f16e5a2cae0dfb49c0fbf874d4d2f177acc
-extern "C" LLVMTypeRef LLVMRustArrayType(LLVMTypeRef ElementTy,
-                                         uint64_t ElementCount) {
-  return wrap(ArrayType::get(unwrap(ElementTy), ElementCount));
-}
-
 DEFINE_SIMPLE_CONVERSION_FUNCTIONS(Twine, LLVMTwineRef)
 
 extern "C" void LLVMRustWriteTwineToString(LLVMTwineRef T, RustStringRef Str) {
-  RawRustStringOstream OS(Str);
+  auto OS = RawRustStringOstream(Str);
   unwrap(T)->print(OS);
 }
 
@@ -1212,11 +1267,11 @@ extern "C" void LLVMRustUnpackOptimizationDiagnostic(
   llvm::DiagnosticInfoOptimizationBase *Opt =
       static_cast<llvm::DiagnosticInfoOptimizationBase *>(unwrap(DI));
 
-  RawRustStringOstream PassNameOS(PassNameOut);
+  auto PassNameOS = RawRustStringOstream(PassNameOut);
   PassNameOS << Opt->getPassName();
   *FunctionOut = wrap(&Opt->getFunction());
 
-  RawRustStringOstream FilenameOS(FilenameOut);
+  auto FilenameOS = RawRustStringOstream(FilenameOut);
   DiagnosticLocation loc = Opt->getLocation();
   if (loc.isValid()) {
     *Line = loc.getLine();
@@ -1224,7 +1279,7 @@ extern "C" void LLVMRustUnpackOptimizationDiagnostic(
     FilenameOS << loc.getAbsolutePath();
   }
 
-  RawRustStringOstream MessageOS(MessageOut);
+  auto MessageOS = RawRustStringOstream(MessageOut);
   MessageOS << Opt->getMsg();
 }
 
@@ -1238,7 +1293,7 @@ enum class LLVMRustDiagnosticLevel {
 extern "C" void
 LLVMRustUnpackInlineAsmDiagnostic(LLVMDiagnosticInfoRef DI,
                                   LLVMRustDiagnosticLevel *LevelOut,
-                                  unsigned *CookieOut,
+                                  uint64_t *CookieOut,
                                   LLVMTwineRef *MessageOut) {
   // Undefined to call this not on an inline assembly diagnostic!
   llvm::DiagnosticInfoInlineAsm *IA =
@@ -1267,8 +1322,8 @@ LLVMRustUnpackInlineAsmDiagnostic(LLVMDiagnosticInfoRef DI,
 
 extern "C" void LLVMRustWriteDiagnosticInfoToString(LLVMDiagnosticInfoRef DI,
                                                     RustStringRef Str) {
-  RawRustStringOstream OS(Str);
-  DiagnosticPrinterRawOStream DP(OS);
+  auto OS = RawRustStringOstream(Str);
+  auto DP = DiagnosticPrinterRawOStream(OS);
   unwrap(DI)->print(DP);
 }
 
@@ -1382,7 +1437,7 @@ extern "C" LLVMTypeKind LLVMRustGetTypeKind(LLVMTypeRef Ty) {
   default:
     {
       std::string error;
-      llvm::raw_string_ostream stream(error);
+      auto stream = llvm::raw_string_ostream(error);
       stream << "Rust does not support the TypeID: " << unwrap(Ty)->getTypeID()
              << " for the type: " << *unwrap(Ty);
       stream.flush();
@@ -1408,7 +1463,7 @@ extern "C" bool LLVMRustUnpackSMDiagnostic(LLVMSMDiagnosticRef DRef,
                                            unsigned* RangesOut,
                                            size_t* NumRanges) {
   SMDiagnostic& D = *unwrap(DRef);
-  RawRustStringOstream MessageOS(MessageOut);
+  auto MessageOS = RawRustStringOstream(MessageOut);
   MessageOS << D.getMessage();
 
   switch (D.getKind()) {
@@ -1515,6 +1570,31 @@ LLVMRustBuildInvoke(LLVMBuilderRef B, LLVMTypeRef Ty, LLVMValueRef Fn,
                                       Name));
 }
 
+extern "C" LLVMValueRef
+LLVMRustBuildCallBr(LLVMBuilderRef B, LLVMTypeRef Ty, LLVMValueRef Fn,
+                    LLVMBasicBlockRef DefaultDest,
+                    LLVMBasicBlockRef *IndirectDests, unsigned NumIndirectDests,
+                    LLVMValueRef *Args, unsigned NumArgs,
+                    OperandBundleDef **OpBundles, unsigned NumOpBundles,
+                    const char *Name) {
+  Value *Callee = unwrap(Fn);
+  FunctionType *FTy = unwrap<FunctionType>(Ty);
+
+  // FIXME: Is there a way around this?
+  std::vector<BasicBlock*> IndirectDestsUnwrapped;
+  IndirectDestsUnwrapped.reserve(NumIndirectDests);
+  for (unsigned i = 0; i < NumIndirectDests; ++i) {
+    IndirectDestsUnwrapped.push_back(unwrap(IndirectDests[i]));
+  }
+
+  return wrap(unwrap(B)->CreateCallBr(
+      FTy, Callee, unwrap(DefaultDest),
+      ArrayRef<BasicBlock*>(IndirectDestsUnwrapped),
+      ArrayRef<Value*>(unwrap(Args), NumArgs),
+      ArrayRef<OperandBundleDef>(*OpBundles, NumOpBundles),
+      Name));
+}
+
 extern "C" void LLVMRustPositionBuilderAtStart(LLVMBuilderRef B,
                                                LLVMBasicBlockRef BB) {
   auto Point = unwrap(BB)->getFirstInsertionPt();
@@ -1523,7 +1603,7 @@ extern "C" void LLVMRustPositionBuilderAtStart(LLVMBuilderRef B,
 
 extern "C" void LLVMRustSetComdat(LLVMModuleRef M, LLVMValueRef V,
                                   const char *Name, size_t NameLen) {
-  Triple TargetTriple(unwrap(M)->getTargetTriple());
+  Triple TargetTriple = Triple(unwrap(M)->getTargetTriple());
   GlobalObject *GV = unwrap<GlobalObject>(V);
   if (TargetTriple.supportsCOMDAT()) {
     StringRef NameRef(Name, NameLen);
@@ -1687,7 +1767,7 @@ extern "C" LLVMRustModuleBuffer*
 LLVMRustModuleBufferCreate(LLVMModuleRef M) {
   auto Ret = std::make_unique<LLVMRustModuleBuffer>();
   {
-    raw_string_ostream OS(Ret->data);
+    auto OS = raw_string_ostream(Ret->data);
     WriteBitcodeToFile(*unwrap(M), OS);
   }
   return Ret.release();
@@ -1717,8 +1797,8 @@ LLVMRustModuleCost(LLVMModuleRef M) {
 extern "C" void
 LLVMRustModuleInstructionStats(LLVMModuleRef M, RustStringRef Str)
 {
-  RawRustStringOstream OS(Str);
-  llvm::json::OStream JOS(OS);
+  auto OS = RawRustStringOstream(Str);
+  auto JOS = llvm::json::OStream(OS);
   auto Module = unwrap(M);
 
   JOS.object([&] {
@@ -1814,6 +1894,9 @@ extern "C" LLVMRustResult LLVMRustWriteImportLibrary(
       std::string{},    // ExtName
       std::string{},    // SymbolName
       std::string{},    // AliasTarget
+#if LLVM_VERSION_GE(19, 0)
+      std::string{},    // ExportAs
+#endif
       ordinal,          // Ordinal
       ordinal_present,  // Noname
       false,            // Data
@@ -1830,7 +1913,7 @@ extern "C" LLVMRustResult LLVMRustWriteImportLibrary(
     MinGW);
   if (Error) {
     std::string errorString;
-    llvm::raw_string_ostream stream(errorString);
+    auto stream = llvm::raw_string_ostream(errorString);
     stream << Error;
     stream.flush();
     LLVMRustSetLastError(errorString.c_str());
@@ -1909,7 +1992,11 @@ extern "C" void LLVMRustContextConfigureDiagnosticHandler(
         }
       }
       if (DiagnosticHandlerCallback) {
+#if LLVM_VERSION_GE(19, 0)
+        DiagnosticHandlerCallback(&DI, DiagnosticHandlerContext);
+#else
         DiagnosticHandlerCallback(DI, DiagnosticHandlerContext);
+#endif
         return true;
       }
       return false;
@@ -2014,7 +2101,7 @@ extern "C" void LLVMRustContextConfigureDiagnosticHandler(
 }
 
 extern "C" void LLVMRustGetMangledName(LLVMValueRef V, RustStringRef Str) {
-  RawRustStringOstream OS(Str);
+  auto OS = RawRustStringOstream(Str);
   GlobalValue *GV = unwrap<GlobalValue>(V);
   Mangler().getNameWithPrefix(OS, GV, true);
 }
@@ -2046,17 +2133,26 @@ extern "C" bool LLVMRustIsNonGVFunctionPointerTy(LLVMValueRef V) {
 }
 
 extern "C" bool LLVMRustLLVMHasZlibCompressionForDebugSymbols() {
-#if LLVM_VERSION_GE(16, 0)
   return llvm::compression::zlib::isAvailable();
-#else
-  return false;
-#endif
 }
 
 extern "C" bool LLVMRustLLVMHasZstdCompressionForDebugSymbols() {
-#if LLVM_VERSION_GE(16, 0)
   return llvm::compression::zstd::isAvailable();
-#else
-  return false;
-#endif
 }
+
+// Operations on composite constants.
+// These are clones of LLVM api functions that will become available in future releases.
+// They can be removed once Rust's minimum supported LLVM version supports them.
+// See https://github.com/rust-lang/rust/issues/121868
+// See https://llvm.org/doxygen/group__LLVMCCoreValueConstantComposite.html
+
+// FIXME: Remove when Rust's minimum supported LLVM version reaches 19.
+// https://github.com/llvm/llvm-project/commit/e1405e4f71c899420ebf8262d5e9745598419df8
+#if LLVM_VERSION_LT(19, 0)
+extern "C" LLVMValueRef LLVMConstStringInContext2(LLVMContextRef C,
+                                                  const char *Str,
+                                                  size_t Length,
+                                                  bool DontNullTerminate) {
+  return wrap(ConstantDataArray::getString(*unwrap(C), StringRef(Str, Length), !DontNullTerminate));
+}
+#endif

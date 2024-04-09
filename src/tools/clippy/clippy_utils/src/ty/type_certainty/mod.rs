@@ -38,7 +38,7 @@ fn expr_type_certainty(cx: &LateContext<'_>, expr: &Expr<'_>) -> Certainty {
 
         ExprKind::Call(callee, args) => {
             let lhs = expr_type_certainty(cx, callee);
-            let rhs = if type_is_inferrable_from_arguments(cx, expr) {
+            let rhs = if type_is_inferable_from_arguments(cx, expr) {
                 meet(args.iter().map(|arg| expr_type_certainty(cx, arg)))
             } else {
                 Certainty::Uncertain
@@ -57,7 +57,7 @@ fn expr_type_certainty(cx: &LateContext<'_>, expr: &Expr<'_>) -> Certainty {
                 receiver_type_certainty = receiver_type_certainty.with_def_id(self_ty_def_id);
             };
             let lhs = path_segment_certainty(cx, receiver_type_certainty, method, false);
-            let rhs = if type_is_inferrable_from_arguments(cx, expr) {
+            let rhs = if type_is_inferable_from_arguments(cx, expr) {
                 meet(
                     std::iter::once(receiver_type_certainty).chain(args.iter().map(|arg| expr_type_certainty(cx, arg))),
                 )
@@ -170,19 +170,18 @@ fn qpath_certainty(cx: &LateContext<'_>, qpath: &QPath<'_>, resolves_to_type: bo
             path_segment_certainty(cx, type_certainty(cx, ty), path_segment, resolves_to_type)
         },
 
-        QPath::LangItem(lang_item, _, _) => {
-            cx.tcx
-                .lang_items()
-                .get(*lang_item)
-                .map_or(Certainty::Uncertain, |def_id| {
-                    let generics = cx.tcx.generics_of(def_id);
-                    if generics.parent_count == 0 && generics.params.is_empty() {
-                        Certainty::Certain(if resolves_to_type { Some(def_id) } else { None })
-                    } else {
-                        Certainty::Uncertain
-                    }
-                })
-        },
+        QPath::LangItem(lang_item, ..) => cx
+            .tcx
+            .lang_items()
+            .get(*lang_item)
+            .map_or(Certainty::Uncertain, |def_id| {
+                let generics = cx.tcx.generics_of(def_id);
+                if generics.parent_count == 0 && generics.params.is_empty() {
+                    Certainty::Certain(if resolves_to_type { Some(def_id) } else { None })
+                } else {
+                    Certainty::Uncertain
+                }
+            }),
     };
     debug_assert!(resolves_to_type || certainty.to_def_id().is_none());
     certainty
@@ -238,12 +237,12 @@ fn path_segment_certainty(
         },
 
         // `get_parent` because `hir_id` refers to a `Pat`, and we're interested in the node containing the `Pat`.
-        Res::Local(hir_id) => match cx.tcx.hir().get_parent(hir_id) {
+        Res::Local(hir_id) => match cx.tcx.parent_hir_node(hir_id) {
             // An argument's type is always certain.
             Node::Param(..) => Certainty::Certain(None),
             // A local's type is certain if its type annotation is certain or it has an initializer whose
             // type is certain.
-            Node::Local(local) => {
+            Node::LetStmt(local) => {
                 let lhs = local.ty.map_or(Certainty::Uncertain, |ty| type_certainty(cx, ty));
                 let rhs = local
                     .init
@@ -267,7 +266,9 @@ fn path_segment_certainty(
 /// For at least some `QPath::TypeRelative`, the path segment's `res` can be `Res::Err`.
 /// `update_res` tries to fix the resolution when `parent_certainty` is `Certain(Some(..))`.
 fn update_res(cx: &LateContext<'_>, parent_certainty: Certainty, path_segment: &PathSegment<'_>) -> Option<Res> {
-    if path_segment.res == Res::Err && let Some(def_id) = parent_certainty.to_def_id() {
+    if path_segment.res == Res::Err
+        && let Some(def_id) = parent_certainty.to_def_id()
+    {
         let mut def_path = cx.get_def_path(def_id);
         def_path.push(path_segment.ident.name);
         let reses = def_path_res(cx, &def_path.iter().map(Symbol::as_str).collect::<Vec<_>>());
@@ -278,7 +279,7 @@ fn update_res(cx: &LateContext<'_>, parent_certainty: Certainty, path_segment: &
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn type_is_inferrable_from_arguments(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+fn type_is_inferable_from_arguments(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     let Some(callee_def_id) = (match expr.kind {
         ExprKind::Call(callee, _) => {
             let callee_ty = cx.typeck_results().expr_ty(callee);

@@ -12,8 +12,7 @@ use rustc_errors::Applicability;
 use rustc_hir::def_id::DefIdSet;
 use rustc_hir::{intravisit, BinOpKind, Block, Expr, ExprKind, HirId, HirIdSet, Stmt, StmtKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::query::Key;
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_session::impl_lint_pass;
 use rustc_span::hygiene::walk_chain;
 use rustc_span::source_map::SourceMap;
 use rustc_span::{BytePos, Span, Symbol};
@@ -117,7 +116,7 @@ declare_clippy_lint! {
     /// ```
     #[clippy::version = "pre 1.29.0"]
     pub IF_SAME_THEN_ELSE,
-    correctness,
+    style,
     "`if` with the same `then` and `else` blocks"
 }
 
@@ -350,7 +349,7 @@ impl BlockEq {
 
 /// If the statement is a local, checks if the bound names match the expected list of names.
 fn eq_binding_names(s: &Stmt<'_>, names: &[(HirId, Symbol)]) -> bool {
-    if let StmtKind::Local(l) = s.kind {
+    if let StmtKind::Let(l) = s.kind {
         let mut i = 0usize;
         let mut res = true;
         l.pat.each_binding_or_first(&mut |_, _, _, name| {
@@ -390,7 +389,7 @@ fn eq_stmts(
     eq: &mut HirEqInterExpr<'_, '_, '_>,
     moved_bindings: &mut Vec<(HirId, Symbol)>,
 ) -> bool {
-    (if let StmtKind::Local(l) = stmt.kind {
+    (if let StmtKind::Let(l) = stmt.kind {
         let old_count = moved_bindings.len();
         l.pat.each_binding_or_first(&mut |_, id, _, name| {
             moved_bindings.push((id, name.name));
@@ -433,7 +432,7 @@ fn scan_block_for_eq<'tcx>(
         .iter()
         .enumerate()
         .find(|&(i, stmt)| {
-            if let StmtKind::Local(l) = stmt.kind
+            if let StmtKind::Let(l) = stmt.kind
                 && needs_ordered_drop(cx, cx.typeck_results().node_type(l.hir_id))
             {
                 local_needs_ordered_drop = true;
@@ -510,9 +509,10 @@ fn scan_block_for_eq<'tcx>(
                 // Clear out all locals seen at the end so far. None of them can be moved.
                 let stmts = &blocks[0].stmts;
                 for stmt in &stmts[stmts.len() - init..=stmts.len() - offset] {
-                    if let StmtKind::Local(l) = stmt.kind {
+                    if let StmtKind::Let(l) = stmt.kind {
                         l.pat.each_binding_or_first(&mut |_, id, _, _| {
-                            eq.locals.remove(&id);
+                            // FIXME(rust/#120456) - is `swap_remove` correct?
+                            eq.locals.swap_remove(&id);
                         });
                     }
                 }
@@ -574,7 +574,7 @@ fn method_caller_is_mutable(cx: &LateContext<'_>, caller_expr: &Expr<'_>, ignore
     let caller_ty = cx.typeck_results().expr_ty(caller_expr);
     // Check if given type has inner mutability and was not set to ignored by the configuration
     let is_inner_mut_ty = is_interior_mut_ty(cx, caller_ty)
-        && !matches!(caller_ty.ty_adt_id(), Some(adt_id) if ignored_ty_ids.contains(&adt_id));
+        && !matches!(caller_ty.ty_adt_def(), Some(adt) if ignored_ty_ids.contains(&adt.did()));
 
     is_inner_mut_ty
         || caller_ty.is_mutable_ptr()

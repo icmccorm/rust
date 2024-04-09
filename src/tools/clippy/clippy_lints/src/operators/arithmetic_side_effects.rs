@@ -1,15 +1,15 @@
 use super::ARITHMETIC_SIDE_EFFECTS;
 use clippy_utils::consts::{constant, constant_simple, Constant};
 use clippy_utils::diagnostics::span_lint;
-use clippy_utils::ty::type_diagnostic_name;
+use clippy_utils::ty::is_type_diagnostic_item;
 use clippy_utils::{expr_or_init, is_from_proc_macro, is_lint_allowed, peel_hir_expr_refs, peel_hir_expr_unary};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::ty::Ty;
+use rustc_middle::ty::{self, Ty};
 use rustc_session::impl_lint_pass;
-use rustc_span::source_map::{Span, Spanned};
+use rustc_span::source_map::Spanned;
 use rustc_span::symbol::sym;
-use rustc_span::Symbol;
+use rustc_span::{Span, Symbol};
 use {rustc_ast as ast, rustc_hir as hir};
 
 const HARD_CODED_ALLOWED_BINARY: &[[&str; 2]] = &[["f32", "f32"], ["f64", "f64"], ["std::string::String", "str"]];
@@ -71,7 +71,7 @@ impl ArithmeticSideEffects {
                 rhs_has_allowed_ty || rhs_from_specific.contains("*")
             }
         {
-           true
+            true
         } else if let Some(rhs_from_glob) = self.allowed_binary.get("*") {
             rhs_from_glob.contains(rhs_ty_string_elem)
         } else {
@@ -88,37 +88,44 @@ impl ArithmeticSideEffects {
     }
 
     /// Verifies built-in types that have specific allowed operations
-    fn has_specific_allowed_type_and_operation(
-        cx: &LateContext<'_>,
-        lhs_ty: Ty<'_>,
+    fn has_specific_allowed_type_and_operation<'tcx>(
+        cx: &LateContext<'tcx>,
+        lhs_ty: Ty<'tcx>,
         op: &Spanned<hir::BinOpKind>,
-        rhs_ty: Ty<'_>,
+        rhs_ty: Ty<'tcx>,
     ) -> bool {
         let is_div_or_rem = matches!(op.node, hir::BinOpKind::Div | hir::BinOpKind::Rem);
-        let is_non_zero_u = |symbol: Option<Symbol>| {
-            matches!(
-                symbol,
-                Some(
-                    sym::NonZeroU128
-                        | sym::NonZeroU16
-                        | sym::NonZeroU32
-                        | sym::NonZeroU64
-                        | sym::NonZeroU8
-                        | sym::NonZeroUsize
-                )
-            )
+        let is_non_zero_u = |cx: &LateContext<'tcx>, ty: Ty<'tcx>| {
+            let tcx = cx.tcx;
+
+            let ty::Adt(adt, substs) = ty.kind() else { return false };
+
+            if !tcx.is_diagnostic_item(sym::NonZero, adt.did()) {
+                return false;
+            };
+
+            let int_type = substs.type_at(0);
+            let unsigned_int_types = [
+                tcx.types.u8,
+                tcx.types.u16,
+                tcx.types.u32,
+                tcx.types.u64,
+                tcx.types.u128,
+                tcx.types.usize,
+            ];
+
+            unsigned_int_types.contains(&int_type)
         };
         let is_sat_or_wrap = |ty: Ty<'_>| {
-            let is_sat = type_diagnostic_name(cx, ty) == Some(sym::Saturating);
-            let is_wrap = type_diagnostic_name(cx, ty) == Some(sym::Wrapping);
-            is_sat || is_wrap
+            is_type_diagnostic_item(cx, ty, sym::Saturating) || is_type_diagnostic_item(cx, ty, sym::Wrapping)
         };
 
-        // If the RHS is NonZeroU*, then division or module by zero will never occur
-        if is_non_zero_u(type_diagnostic_name(cx, rhs_ty)) && is_div_or_rem {
+        // If the RHS is `NonZero<u*>`, then division or module by zero will never occur.
+        if is_non_zero_u(cx, rhs_ty) && is_div_or_rem {
             return true;
         }
-        // `Saturation` and `Wrapping` can overflow if the RHS is zero in a division or module
+
+        // `Saturation` and `Wrapping` can overflow if the RHS is zero in a division or module.
         if is_sat_or_wrap(lhs_ty) {
             return !is_div_or_rem;
         }
@@ -132,7 +139,11 @@ impl ArithmeticSideEffects {
     }
 
     // Common entry-point to avoid code duplication.
-    fn issue_lint(&mut self, cx: &LateContext<'_>, expr: &hir::Expr<'_>) {
+    fn issue_lint<'tcx>(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'_>) {
+        if is_from_proc_macro(cx, expr) {
+            return;
+        }
+
         let msg = "arithmetic operation that can potentially result in unexpected side-effects";
         span_lint(cx, ARITHMETIC_SIDE_EFFECTS, expr.span, msg);
         self.expr_span = Some(expr.span);
@@ -144,8 +155,10 @@ impl ArithmeticSideEffects {
     /// like `i32::MAX` or constant references like `N` from `const N: i32 = 1;`,
     fn literal_integer(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<u128> {
         let actual = peel_hir_expr_unary(expr).0;
-        if let hir::ExprKind::Lit(lit) = actual.kind && let ast::LitKind::Int(n, _) = lit.node {
-            return Some(n)
+        if let hir::ExprKind::Lit(lit) = actual.kind
+            && let ast::LitKind::Int(n, _) = lit.node
+        {
+            return Some(n.get());
         }
         if let Some(Constant::Int(n)) = constant(cx, cx.typeck_results(), expr) {
             return Some(n);
@@ -158,10 +171,10 @@ impl ArithmeticSideEffects {
     fn manage_bin_ops<'tcx>(
         &mut self,
         cx: &LateContext<'tcx>,
-        expr: &hir::Expr<'tcx>,
+        expr: &'tcx hir::Expr<'_>,
         op: &Spanned<hir::BinOpKind>,
-        lhs: &hir::Expr<'tcx>,
-        rhs: &hir::Expr<'tcx>,
+        lhs: &'tcx hir::Expr<'_>,
+        rhs: &'tcx hir::Expr<'_>,
     ) {
         if constant_simple(cx, cx.typeck_results(), expr).is_some() {
             return;
@@ -234,10 +247,10 @@ impl ArithmeticSideEffects {
     /// provided input.
     fn manage_method_call<'tcx>(
         &mut self,
-        args: &[hir::Expr<'tcx>],
+        args: &'tcx [hir::Expr<'_>],
         cx: &LateContext<'tcx>,
-        ps: &hir::PathSegment<'tcx>,
-        receiver: &hir::Expr<'tcx>,
+        ps: &'tcx hir::PathSegment<'_>,
+        receiver: &'tcx hir::Expr<'_>,
     ) {
         let Some(arg) = args.first() else {
             return;
@@ -262,8 +275,8 @@ impl ArithmeticSideEffects {
     fn manage_unary_ops<'tcx>(
         &mut self,
         cx: &LateContext<'tcx>,
-        expr: &hir::Expr<'tcx>,
-        un_expr: &hir::Expr<'tcx>,
+        expr: &'tcx hir::Expr<'_>,
+        un_expr: &'tcx hir::Expr<'_>,
         un_op: hir::UnOp,
     ) {
         let hir::UnOp::Neg = un_op else {
@@ -285,14 +298,13 @@ impl ArithmeticSideEffects {
 
     fn should_skip_expr<'tcx>(&mut self, cx: &LateContext<'tcx>, expr: &hir::Expr<'tcx>) -> bool {
         is_lint_allowed(cx, ARITHMETIC_SIDE_EFFECTS, expr.hir_id)
-            || is_from_proc_macro(cx, expr)
             || self.expr_span.is_some()
             || self.const_span.map_or(false, |sp| sp.contains(expr.span))
     }
 }
 
 impl<'tcx> LateLintPass<'tcx> for ArithmeticSideEffects {
-    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &hir::Expr<'tcx>) {
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
         if self.should_skip_expr(cx, expr) {
             return;
         }
@@ -317,7 +329,9 @@ impl<'tcx> LateLintPass<'tcx> for ArithmeticSideEffects {
         let body_owner_kind = cx.tcx.hir().body_owner_kind(body_owner_def_id);
         if let hir::BodyOwnerKind::Const { .. } | hir::BodyOwnerKind::Static(_) = body_owner_kind {
             let body_span = cx.tcx.hir().span_with_body(body_owner);
-            if let Some(span) = self.const_span && span.contains(body_span) {
+            if let Some(span) = self.const_span
+                && span.contains(body_span)
+            {
                 return;
             }
             self.const_span = Some(body_span);
@@ -327,7 +341,9 @@ impl<'tcx> LateLintPass<'tcx> for ArithmeticSideEffects {
     fn check_body_post(&mut self, cx: &LateContext<'_>, body: &hir::Body<'_>) {
         let body_owner = cx.tcx.hir().body_owner(body.id());
         let body_span = cx.tcx.hir().span(body_owner);
-        if let Some(span) = self.const_span && span.contains(body_span) {
+        if let Some(span) = self.const_span
+            && span.contains(body_span)
+        {
             return;
         }
         self.const_span = None;

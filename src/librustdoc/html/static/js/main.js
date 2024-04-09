@@ -1,5 +1,5 @@
 // Local js definitions:
-/* global addClass, getSettingValue, hasClass, searchState */
+/* global addClass, getSettingValue, hasClass, searchState, updateLocalStorage */
 /* global onEach, onEachLazy, removeClass, getVar */
 
 "use strict";
@@ -25,19 +25,9 @@ function showMain() {
     removeClass(document.getElementById(MAIN_ID), "hidden");
 }
 
-function elemIsInParent(elem, parent) {
-    while (elem && elem !== document.body) {
-        if (elem === parent) {
-            return true;
-        }
-        elem = elem.parentElement;
-    }
-    return false;
-}
-
 function blurHandler(event, parentElem, hideCallback) {
-    if (!elemIsInParent(document.activeElement, parentElem) &&
-        !elemIsInParent(event.relatedTarget, parentElem)
+    if (!parentElem.contains(document.activeElement) &&
+        !parentElem.contains(event.relatedTarget)
     ) {
         hideCallback();
     }
@@ -51,9 +41,14 @@ function setMobileTopbar() {
     // but with the current code it's hard to get the right information in the right place.
     const mobileTopbar = document.querySelector(".mobile-topbar");
     const locationTitle = document.querySelector(".sidebar h2.location");
-    if (mobileTopbar && locationTitle) {
+    if (mobileTopbar) {
         const mobileTitle = document.createElement("h2");
-        mobileTitle.innerHTML = locationTitle.innerHTML;
+        mobileTitle.className = "location";
+        if (hasClass(document.querySelector(".rustdoc"), "crate")) {
+            mobileTitle.innerHTML = `Crate <a href="#">${window.currentCrate}</a>`;
+        } else if (locationTitle) {
+            mobileTitle.innerHTML = locationTitle.innerHTML;
+        }
         mobileTopbar.appendChild(mobileTitle);
     }
 }
@@ -190,9 +185,12 @@ function preLoadCss(cssUrl) {
 (function() {
     const isHelpPage = window.location.pathname.endsWith("/help.html");
 
-    function loadScript(url) {
+    function loadScript(url, errorCallback) {
         const script = document.createElement("script");
         script.src = url;
+        if (errorCallback !== undefined) {
+            script.onerror = errorCallback;
+        }
         document.head.append(script);
     }
 
@@ -284,7 +282,8 @@ function preLoadCss(cssUrl) {
             const params = {};
             window.location.search.substring(1).split("&").
                 map(s => {
-                    const pair = s.split("=");
+                    // https://github.com/rust-lang/rust/issues/119219
+                    const pair = s.split("=").map(x => x.replace(/\+/g, " "));
                     params[decodeURIComponent(pair[0])] =
                         typeof pair[1] === "undefined" ? null : decodeURIComponent(pair[1]);
                 });
@@ -296,11 +295,16 @@ function preLoadCss(cssUrl) {
                 return;
             }
             let searchLoaded = false;
+            // If you're browsing the nightly docs, the page might need to be refreshed for the
+            // search to work because the hash of the JS scripts might have changed.
+            function sendSearchForm() {
+                document.getElementsByClassName("search-form")[0].submit();
+            }
             function loadSearch() {
                 if (!searchLoaded) {
                     searchLoaded = true;
-                    loadScript(getVar("static-root-path") + getVar("search-js"));
-                    loadScript(resourcePath("search-index", ".js"));
+                    loadScript(getVar("static-root-path") + getVar("search-js"), sendSearchForm);
+                    loadScript(resourcePath("search-index", ".js"), sendSearchForm);
                 }
             }
 
@@ -324,6 +328,30 @@ function preLoadCss(cssUrl) {
             const search = searchState.outputElement();
             search.innerHTML = "<h3 class=\"search-loading\">" + searchState.loadingText + "</h3>";
             searchState.showResults(search);
+        },
+        descShards: new Map(),
+        loadDesc: async function({descShard, descIndex}) {
+            if (descShard.promise === null) {
+                descShard.promise = new Promise((resolve, reject) => {
+                    // The `resolve` callback is stored in the `descShard`
+                    // object, which is itself stored in `this.descShards` map.
+                    // It is called in `loadedDescShard` by the
+                    // search.desc script.
+                    descShard.resolve = resolve;
+                    const ds = descShard;
+                    const fname = `${ds.crate}-desc-${ds.shard}-`;
+                    const url = resourcePath(
+                        `search.desc/${descShard.crate}/${fname}`,
+                        ".js",
+                    );
+                    loadScript(url, reject);
+                });
+            }
+            const list = await descShard.promise;
+            return list[descIndex];
+        },
+        loadedDescShard: function(crate, shard, data) {
+            this.descShards.get(crate)[shard].resolve(data.split("\n"));
         },
     };
 
@@ -352,6 +380,34 @@ function preLoadCss(cssUrl) {
             savedHash = pageId;
             if (pageId !== "") {
                 expandSection(pageId);
+            }
+        }
+        if (savedHash.startsWith("impl-")) {
+            // impl-disambiguated links, used by the search engine
+            // format: impl-X[-for-Y]/method.WHATEVER
+            // turn this into method.WHATEVER[-NUMBER]
+            const splitAt = savedHash.indexOf("/");
+            if (splitAt !== -1) {
+                const implId = savedHash.slice(0, splitAt);
+                const assocId = savedHash.slice(splitAt + 1);
+                const implElem = document.getElementById(implId);
+                if (implElem && implElem.parentElement.tagName === "SUMMARY" &&
+                    implElem.parentElement.parentElement.tagName === "DETAILS") {
+                    onEachLazy(implElem.parentElement.parentElement.querySelectorAll(
+                        `[id^="${assocId}"]`),
+                        item => {
+                            const numbered = /([^-]+)-([0-9]+)/.exec(item.id);
+                            if (item.id === assocId || (numbered && numbered[1] === assocId)) {
+                                openParentDetails(item);
+                                item.scrollIntoView();
+                                // Let the section expand itself before trying to highlight
+                                setTimeout(() => {
+                                    window.location.replace("#" + item.id);
+                                }, 0);
+                            }
+                        },
+                    );
+                }
             }
         }
     }
@@ -452,19 +508,24 @@ function preLoadCss(cssUrl) {
                 return;
             }
 
+            const modpath = hasClass(document.querySelector(".rustdoc"), "mod") ? "../" : "";
+
             const h3 = document.createElement("h3");
-            h3.innerHTML = `<a href="index.html#${id}">${longty}</a>`;
+            h3.innerHTML = `<a href="${modpath}index.html#${id}">${longty}</a>`;
             const ul = document.createElement("ul");
             ul.className = "block " + shortty;
 
             for (const name of filtered) {
                 let path;
                 if (shortty === "mod") {
-                    path = name + "/index.html";
+                    path = `${modpath}${name}/index.html`;
                 } else {
-                    path = shortty + "." + name + ".html";
+                    path = `${modpath}${shortty}.${name}.html`;
                 }
-                const current_page = document.location.href.split("/").pop();
+                let current_page = document.location.href.toString();
+                if (current_page.endsWith("/")) {
+                    current_page += "index.html";
+                }
                 const link = document.createElement("a");
                 link.href = path;
                 if (path === current_page) {
@@ -480,23 +541,38 @@ function preLoadCss(cssUrl) {
         }
 
         if (sidebar) {
+            // keep this synchronized with ItemSection::ALL in html/render/mod.rs
+            // Re-exports aren't shown here, because they don't have child pages
+            //block("reexport", "reexports", "Re-exports");
             block("primitive", "primitives", "Primitive Types");
             block("mod", "modules", "Modules");
             block("macro", "macros", "Macros");
             block("struct", "structs", "Structs");
             block("enum", "enums", "Enums");
-            block("union", "unions", "Unions");
             block("constant", "constants", "Constants");
             block("static", "static", "Statics");
             block("trait", "traits", "Traits");
             block("fn", "functions", "Functions");
             block("type", "types", "Type Aliases");
+            block("union", "unions", "Unions");
+            // No point, because these items don't appear in modules
+            //block("impl", "impls", "Implementations");
+            //block("tymethod", "tymethods", "Type Methods");
+            //block("method", "methods", "Methods");
+            //block("structfield", "fields", "Fields");
+            //block("variant", "variants", "Variants");
+            //block("associatedtype", "associated-types", "Associated Types");
+            //block("associatedconstant", "associated-consts", "Associated Constants");
             block("foreigntype", "foreign-types", "Foreign Types");
             block("keyword", "keywords", "Keywords");
+            block("opaque", "opaque-types", "Opaque Types");
+            block("attr", "attributes", "Attribute Macros");
+            block("derive", "derives", "Derive Macros");
             block("traitalias", "trait-aliases", "Trait Aliases");
         }
     }
 
+    // <https://github.com/search?q=repo%3Arust-lang%2Frust+[RUSTDOCIMPL]+trait.impl&type=code>
     window.register_implementors = imp => {
         const implementors = document.getElementById("implementors-list");
         const synthetic_implementors = document.getElementById("synthetic-implementors-list");
@@ -533,7 +609,7 @@ function preLoadCss(cssUrl) {
         const script = document
             .querySelector("script[data-ignore-extern-crates]");
         const ignoreExternCrates = new Set(
-            (script ? script.getAttribute("data-ignore-extern-crates") : "").split(",")
+            (script ? script.getAttribute("data-ignore-extern-crates") : "").split(","),
         );
         for (const lib of libs) {
             if (lib === window.currentCrate || ignoreExternCrates.has(lib)) {
@@ -563,7 +639,7 @@ function preLoadCss(cssUrl) {
                 onEachLazy(code.getElementsByTagName("a"), elem => {
                     const href = elem.getAttribute("href");
 
-                    if (href && !/^(?:[a-z+]+:)?\/\//.test(href)) {
+                    if (href && !href.startsWith("#") && !/^(?:[a-z+]+:)?\/\//.test(href)) {
                         elem.setAttribute("href", window.rootPath + href);
                     }
                 });
@@ -587,6 +663,216 @@ function preLoadCss(cssUrl) {
         window.register_implementors(window.pending_implementors);
     }
 
+    /**
+     * <https://github.com/search?q=repo%3Arust-lang%2Frust+[RUSTDOCIMPL]+type.impl&type=code>
+     *
+     * [RUSTDOCIMPL] type.impl
+     *
+     * This code inlines implementations into the type alias docs at runtime. It's done at
+     * runtime because some crates have many type aliases and many methods, and we don't want
+     * to generate *O*`(types*methods)` HTML text. The data inside is mostly HTML fragments,
+     * wrapped in JSON.
+     *
+     * - It only includes docs generated for the current crate. This function accepts an
+     *   object mapping crate names to the set of impls.
+     *
+     * - It filters down to the set of applicable impls. The Rust type checker is used to
+     *   tag each HTML blob with the set of type aliases that can actually use it, so the
+     *   JS only needs to consult the attached list of type aliases.
+     *
+     * - It renames the ID attributes, to avoid conflicting IDs in the resulting DOM.
+     *
+     * - It adds the necessary items to the sidebar. If it's an inherent impl, that means
+     *   adding methods, associated types, and associated constants. If it's a trait impl,
+     *   that means adding it to the trait impl sidebar list.
+     *
+     * - It adds the HTML block itself. If it's an inherent impl, it goes after the type
+     *   alias's own inherent impls. If it's a trait impl, it goes in the Trait
+     *   Implementations section.
+     *
+     * - After processing all of the impls, it sorts the sidebar items by name.
+     *
+     * @param {{[cratename: string]: Array<Array<string|0>>}} impl
+     */
+    window.register_type_impls = imp => {
+        if (!imp || !imp[window.currentCrate]) {
+            return;
+        }
+        window.pending_type_impls = null;
+        const idMap = new Map();
+
+        let implementations = document.getElementById("implementations-list");
+        let trait_implementations = document.getElementById("trait-implementations-list");
+        let trait_implementations_header = document.getElementById("trait-implementations");
+
+        // We want to include the current type alias's impls, and no others.
+        const script = document.querySelector("script[data-self-path]");
+        const selfPath = script ? script.getAttribute("data-self-path") : null;
+
+        // These sidebar blocks need filled in, too.
+        const mainContent = document.querySelector("#main-content");
+        const sidebarSection = document.querySelector(".sidebar section");
+        let methods = document.querySelector(".sidebar .block.method");
+        let associatedTypes = document.querySelector(".sidebar .block.associatedtype");
+        let associatedConstants = document.querySelector(".sidebar .block.associatedconstant");
+        let sidebarTraitList = document.querySelector(".sidebar .block.trait-implementation");
+
+        for (const impList of imp[window.currentCrate]) {
+            const types = impList.slice(2);
+            const text = impList[0];
+            const isTrait = impList[1] !== 0;
+            const traitName = impList[1];
+            if (types.indexOf(selfPath) === -1) {
+                continue;
+            }
+            let outputList = isTrait ? trait_implementations : implementations;
+            if (outputList === null) {
+                const outputListName = isTrait ? "Trait Implementations" : "Implementations";
+                const outputListId = isTrait ?
+                    "trait-implementations-list" :
+                    "implementations-list";
+                const outputListHeaderId = isTrait ? "trait-implementations" : "implementations";
+                const outputListHeader = document.createElement("h2");
+                outputListHeader.id = outputListHeaderId;
+                outputListHeader.innerText = outputListName;
+                outputList = document.createElement("div");
+                outputList.id = outputListId;
+                if (isTrait) {
+                    const link = document.createElement("a");
+                    link.href = `#${outputListHeaderId}`;
+                    link.innerText = "Trait Implementations";
+                    const h = document.createElement("h3");
+                    h.appendChild(link);
+                    trait_implementations = outputList;
+                    trait_implementations_header = outputListHeader;
+                    sidebarSection.appendChild(h);
+                    sidebarTraitList = document.createElement("ul");
+                    sidebarTraitList.className = "block trait-implementation";
+                    sidebarSection.appendChild(sidebarTraitList);
+                    mainContent.appendChild(outputListHeader);
+                    mainContent.appendChild(outputList);
+                } else {
+                    implementations = outputList;
+                    if (trait_implementations) {
+                        mainContent.insertBefore(outputListHeader, trait_implementations_header);
+                        mainContent.insertBefore(outputList, trait_implementations_header);
+                    } else {
+                        const mainContent = document.querySelector("#main-content");
+                        mainContent.appendChild(outputListHeader);
+                        mainContent.appendChild(outputList);
+                    }
+                }
+            }
+            const template = document.createElement("template");
+            template.innerHTML = text;
+
+            onEachLazy(template.content.querySelectorAll("a"), elem => {
+                const href = elem.getAttribute("href");
+
+                if (href && !href.startsWith("#") && !/^(?:[a-z+]+:)?\/\//.test(href)) {
+                    elem.setAttribute("href", window.rootPath + href);
+                }
+            });
+            onEachLazy(template.content.querySelectorAll("[id]"), el => {
+                let i = 0;
+                if (idMap.has(el.id)) {
+                    i = idMap.get(el.id);
+                } else if (document.getElementById(el.id)) {
+                    i = 1;
+                    while (document.getElementById(`${el.id}-${2 * i}`)) {
+                        i = 2 * i;
+                    }
+                    while (document.getElementById(`${el.id}-${i}`)) {
+                        i += 1;
+                    }
+                }
+                if (i !== 0) {
+                    const oldHref = `#${el.id}`;
+                    const newHref = `#${el.id}-${i}`;
+                    el.id = `${el.id}-${i}`;
+                    onEachLazy(template.content.querySelectorAll("a[href]"), link => {
+                        if (link.getAttribute("href") === oldHref) {
+                            link.href = newHref;
+                        }
+                    });
+                }
+                idMap.set(el.id, i + 1);
+            });
+            const templateAssocItems = template.content.querySelectorAll("section.tymethod, " +
+                "section.method, section.associatedtype, section.associatedconstant");
+            if (isTrait) {
+                const li = document.createElement("li");
+                const a = document.createElement("a");
+                a.href = `#${template.content.querySelector(".impl").id}`;
+                a.textContent = traitName;
+                li.appendChild(a);
+                sidebarTraitList.append(li);
+            } else {
+                onEachLazy(templateAssocItems, item => {
+                    let block = hasClass(item, "associatedtype") ? associatedTypes : (
+                        hasClass(item, "associatedconstant") ? associatedConstants : (
+                        methods));
+                    if (!block) {
+                        const blockTitle = hasClass(item, "associatedtype") ? "Associated Types" : (
+                            hasClass(item, "associatedconstant") ? "Associated Constants" : (
+                            "Methods"));
+                        const blockClass = hasClass(item, "associatedtype") ? "associatedtype" : (
+                            hasClass(item, "associatedconstant") ? "associatedconstant" : (
+                            "method"));
+                        const blockHeader = document.createElement("h3");
+                        const blockLink = document.createElement("a");
+                        blockLink.href = "#implementations";
+                        blockLink.innerText = blockTitle;
+                        blockHeader.appendChild(blockLink);
+                        block = document.createElement("ul");
+                        block.className = `block ${blockClass}`;
+                        const insertionReference = methods || sidebarTraitList;
+                        if (insertionReference) {
+                            const insertionReferenceH = insertionReference.previousElementSibling;
+                            sidebarSection.insertBefore(blockHeader, insertionReferenceH);
+                            sidebarSection.insertBefore(block, insertionReferenceH);
+                        } else {
+                            sidebarSection.appendChild(blockHeader);
+                            sidebarSection.appendChild(block);
+                        }
+                        if (hasClass(item, "associatedtype")) {
+                            associatedTypes = block;
+                        } else if (hasClass(item, "associatedconstant")) {
+                            associatedConstants = block;
+                        } else {
+                            methods = block;
+                        }
+                    }
+                    const li = document.createElement("li");
+                    const a = document.createElement("a");
+                    a.innerText = item.id.split("-")[0].split(".")[1];
+                    a.href = `#${item.id}`;
+                    li.appendChild(a);
+                    block.appendChild(li);
+                });
+            }
+            outputList.appendChild(template.content);
+        }
+
+        for (const list of [methods, associatedTypes, associatedConstants, sidebarTraitList]) {
+            if (!list) {
+                continue;
+            }
+            const newChildren = Array.prototype.slice.call(list.children);
+            newChildren.sort((a, b) => {
+                const aI = a.innerText;
+                const bI = b.innerText;
+                return aI < bI ? -1 :
+                    aI > bI ? 1 :
+                    0;
+            });
+            list.replaceChildren(...newChildren);
+        }
+    };
+    if (window.pending_type_impls) {
+        window.register_type_impls(window.pending_type_impls);
+    }
+
     function addSidebarCrates() {
         if (!window.ALL_CRATES) {
             return;
@@ -604,12 +890,12 @@ function preLoadCss(cssUrl) {
         for (const crate of window.ALL_CRATES) {
             const link = document.createElement("a");
             link.href = window.rootPath + crate + "/index.html";
-            if (window.rootPath !== "./" && crate === window.currentCrate) {
-                link.className = "current";
-            }
             link.textContent = crate;
 
             const li = document.createElement("li");
+            if (window.rootPath !== "./" && crate === window.currentCrate) {
+                li.className = "current";
+            }
             li.appendChild(link);
             ul.appendChild(li);
         }
@@ -836,7 +1122,7 @@ function preLoadCss(cssUrl) {
         } else {
             wrapper.style.setProperty(
                 "--popover-arrow-offset",
-                (wrapperPos.right - pos.right + 4) + "px"
+                (wrapperPos.right - pos.right + 4) + "px",
             );
         }
         wrapper.style.visibility = "";
@@ -855,7 +1141,7 @@ function preLoadCss(cssUrl) {
             if (ev.pointerType !== "mouse") {
                 return;
             }
-            if (!e.TOOLTIP_FORCE_VISIBLE && !elemIsInParent(ev.relatedTarget, e)) {
+            if (!e.TOOLTIP_FORCE_VISIBLE && !e.contains(ev.relatedTarget)) {
                 // See "Tooltip pointer leave gesture" below.
                 setTooltipHoverTimeout(e, false);
                 addClass(wrapper, "fade-out");
@@ -915,10 +1201,10 @@ function preLoadCss(cssUrl) {
 
     function tooltipBlurHandler(event) {
         if (window.CURRENT_TOOLTIP_ELEMENT &&
-            !elemIsInParent(document.activeElement, window.CURRENT_TOOLTIP_ELEMENT) &&
-            !elemIsInParent(event.relatedTarget, window.CURRENT_TOOLTIP_ELEMENT) &&
-            !elemIsInParent(document.activeElement, window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE) &&
-            !elemIsInParent(event.relatedTarget, window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE)
+            !window.CURRENT_TOOLTIP_ELEMENT.contains(document.activeElement) &&
+            !window.CURRENT_TOOLTIP_ELEMENT.contains(event.relatedTarget) &&
+            !window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE.contains(document.activeElement) &&
+            !window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE.contains(event.relatedTarget)
         ) {
             // Work around a difference in the focus behaviour between Firefox, Chrome, and Safari.
             // When I click the button on an already-opened tooltip popover, Safari
@@ -985,8 +1271,8 @@ function preLoadCss(cssUrl) {
             if (ev.pointerType !== "mouse") {
                 return;
             }
-            if (!e.TOOLTIP_FORCE_VISIBLE &&
-                !elemIsInParent(ev.relatedTarget, window.CURRENT_TOOLTIP_ELEMENT)) {
+            if (!e.TOOLTIP_FORCE_VISIBLE && window.CURRENT_TOOLTIP_ELEMENT &&
+                !window.CURRENT_TOOLTIP_ELEMENT.contains(ev.relatedTarget)) {
                 // Tooltip pointer leave gesture:
                 //
                 // Designing a good hover microinteraction is a matter of guessing user
@@ -1065,8 +1351,7 @@ function preLoadCss(cssUrl) {
 
         const infos = [
             `For a full list of all search features, take a look <a \
-href="https://doc.rust-lang.org/${channel}/rustdoc/how-to-read-rustdoc.html\
-#the-search-interface">here</a>.`,
+href="https://doc.rust-lang.org/${channel}/rustdoc/read-documentation/search.html">here</a>.`,
             "Prefix searches with a type followed by a colon (e.g., <code>fn:</code>) to \
              restrict the search to a given item kind.",
             "Accepted kinds are: <code>fn</code>, <code>mod</code>, <code>struct</code>, \
@@ -1221,6 +1506,268 @@ href="https://doc.rust-lang.org/${channel}/rustdoc/how-to-read-rustdoc.html\
     searchState.setup();
 }());
 
+// Hide, show, and resize the sidebar
+//
+// The body class and CSS variable are initially set up in storage.js,
+// but in this file, we implement:
+//
+//   * the show sidebar button, which appears if the sidebar is hidden
+//     and, by clicking on it, will bring it back
+//   * the sidebar resize handle, which appears only on large viewports
+//     with a [fine precision pointer] to allow the user to change
+//     the size of the sidebar
+//
+// [fine precision pointer]: https://developer.mozilla.org/en-US/docs/Web/CSS/@media/pointer
+(function() {
+    // 100 is the size of the logo
+    // don't let the sidebar get smaller than that, or it'll get squished
+    const SIDEBAR_MIN = 100;
+    // Don't let the sidebar get bigger than this
+    const SIDEBAR_MAX = 500;
+    // Don't let the body (including the gutter) get smaller than this
+    //
+    // WARNING: RUSTDOC_MOBILE_BREAKPOINT MEDIA QUERY
+    // Acceptable values for BODY_MIN are constrained by the mobile breakpoint
+    // (which is the minimum size of the whole page where the sidebar exists)
+    // and the default sidebar width:
+    //
+    //     BODY_MIN <= RUSTDOC_MOBILE_BREAKPOINT - DEFAULT_SIDEBAR_WIDTH
+    //
+    // At the time of this writing, the DEFAULT_SIDEBAR_WIDTH on src pages is
+    // 300px, and the RUSTDOC_MOBILE_BREAKPOINT is 700px, so BODY_MIN must be
+    // at most 400px. Otherwise, it would start out at the default size, then
+    // grabbing the resize handle would suddenly cause it to jank to
+    // its contraint-generated maximum.
+    const RUSTDOC_MOBILE_BREAKPOINT = 700;
+    const BODY_MIN = 400;
+    // At half-way past the minimum size, vanish the sidebar entirely
+    const SIDEBAR_VANISH_THRESHOLD = SIDEBAR_MIN / 2;
+
+    // Toolbar button to show the sidebar.
+    //
+    // On small, "mobile-sized" viewports, it's not persistent and it
+    // can only be activated by going into Settings and hiding the nav bar.
+    // On larger, "desktop-sized" viewports (though that includes many
+    // tablets), it's fixed-position, appears in the left side margin,
+    // and it can be activated by resizing the sidebar into nothing.
+    const sidebarButton = document.getElementById("sidebar-button");
+    if (sidebarButton) {
+        sidebarButton.addEventListener("click", e => {
+            removeClass(document.documentElement, "hide-sidebar");
+            updateLocalStorage("hide-sidebar", "false");
+            if (document.querySelector(".rustdoc.src")) {
+                window.rustdocToggleSrcSidebar();
+            }
+            e.preventDefault();
+        });
+    }
+
+    // Pointer capture.
+    //
+    // Resizing is a single-pointer gesture. Any secondary pointer is ignored
+    let currentPointerId = null;
+
+    // "Desired" sidebar size.
+    //
+    // This is stashed here for window resizing. If the sidebar gets
+    // shrunk to maintain BODY_MIN, and then the user grows the window again,
+    // it gets the sidebar to restore its size.
+    let desiredSidebarSize = null;
+
+    // Sidebar resize debouncer.
+    //
+    // The sidebar itself is resized instantly, but the body HTML can be too
+    // big for that, causing reflow jank. To reduce this, we queue up a separate
+    // animation frame and throttle it.
+    let pendingSidebarResizingFrame = false;
+
+    // If this page has no sidebar at all, bail out.
+    const resizer = document.querySelector(".sidebar-resizer");
+    const sidebar = document.querySelector(".sidebar");
+    if (!resizer || !sidebar) {
+        return;
+    }
+
+    // src page and docs page use different variables, because the contents of
+    // the sidebar are so different that it's reasonable to thing the user
+    // would want them to have different sizes
+    const isSrcPage = hasClass(document.body, "src");
+
+    // Call this function to hide the sidebar when using the resize handle
+    //
+    // This function also nulls out the sidebar width CSS variable and setting,
+    // causing it to return to its default. This does not happen if you do it
+    // from settings.js, which uses a separate function. It's done here because
+    // the minimum sidebar size is rather uncomfortable, and it must pass
+    // through that size when using the shrink-to-nothing gesture.
+    function hideSidebar() {
+        if (isSrcPage) {
+            window.rustdocCloseSourceSidebar();
+            updateLocalStorage("src-sidebar-width", null);
+            // [RUSTDOCIMPL] CSS variable fast path
+            //
+            // The sidebar width variable is attached to the <html> element by
+            // storage.js, because the sidebar and resizer don't exist yet.
+            // But the resize code, in `resize()`, sets the property on the
+            // sidebar and resizer elements (which are the only elements that
+            // use the variable) to avoid recalculating CSS on the entire
+            // document on every frame.
+            //
+            // So, to clear it, we need to clear all three.
+            document.documentElement.style.removeProperty("--src-sidebar-width");
+            sidebar.style.removeProperty("--src-sidebar-width");
+            resizer.style.removeProperty("--src-sidebar-width");
+        } else {
+            addClass(document.documentElement, "hide-sidebar");
+            updateLocalStorage("hide-sidebar", "true");
+            updateLocalStorage("desktop-sidebar-width", null);
+            document.documentElement.style.removeProperty("--desktop-sidebar-width");
+            sidebar.style.removeProperty("--desktop-sidebar-width");
+            resizer.style.removeProperty("--desktop-sidebar-width");
+        }
+    }
+
+    // Call this function to show the sidebar from the resize handle.
+    // On docs pages, this can only happen if the user has grabbed the resize
+    // handle, shrunk the sidebar down to nothing, and then pulls back into
+    // the visible range without releasing it. You can, however, grab the
+    // resize handle on a source page with the sidebar closed, because it
+    // remains visible all the time on there.
+    function showSidebar() {
+        if (isSrcPage) {
+            window.rustdocShowSourceSidebar();
+        } else {
+            removeClass(document.documentElement, "hide-sidebar");
+            updateLocalStorage("hide-sidebar", "false");
+        }
+    }
+
+    /**
+     * Call this to set the correct CSS variable and setting.
+     * This function doesn't enforce size constraints. Do that before calling it!
+     *
+     * @param {number} size - CSS px width of the sidebar.
+     */
+    function changeSidebarSize(size) {
+        if (isSrcPage) {
+            updateLocalStorage("src-sidebar-width", size);
+            // [RUSTDOCIMPL] CSS variable fast path
+            //
+            // While this property is set on the HTML element at load time,
+            // because the sidebar isn't actually loaded yet,
+            // we scope this update to the sidebar to avoid hitting a slow
+            // path in WebKit.
+            sidebar.style.setProperty("--src-sidebar-width", size + "px");
+            resizer.style.setProperty("--src-sidebar-width", size + "px");
+        } else {
+            updateLocalStorage("desktop-sidebar-width", size);
+            sidebar.style.setProperty("--desktop-sidebar-width", size + "px");
+            resizer.style.setProperty("--desktop-sidebar-width", size + "px");
+        }
+    }
+
+    // Check if the sidebar is hidden. Since src pages and doc pages have
+    // different settings, this function has to check that.
+    function isSidebarHidden() {
+        return isSrcPage ?
+            !hasClass(document.documentElement, "src-sidebar-expanded") :
+            hasClass(document.documentElement, "hide-sidebar");
+    }
+
+    // Respond to the resize handle event.
+    // This function enforces size constraints, and implements the
+    // shrink-to-nothing gesture based on thresholds defined above.
+    function resize(e) {
+        if (currentPointerId === null || currentPointerId !== e.pointerId) {
+            return;
+        }
+        e.preventDefault();
+        const pos = e.clientX - 3;
+        if (pos < SIDEBAR_VANISH_THRESHOLD) {
+            hideSidebar();
+        } else if (pos >= SIDEBAR_MIN) {
+            if (isSidebarHidden()) {
+                showSidebar();
+            }
+            // don't let the sidebar get wider than SIDEBAR_MAX, or the body narrower
+            // than BODY_MIN
+            const constrainedPos = Math.min(pos, window.innerWidth - BODY_MIN, SIDEBAR_MAX);
+            changeSidebarSize(constrainedPos);
+            desiredSidebarSize = constrainedPos;
+            if (pendingSidebarResizingFrame !== false) {
+                clearTimeout(pendingSidebarResizingFrame);
+            }
+            pendingSidebarResizingFrame = setTimeout(() => {
+                if (currentPointerId === null || pendingSidebarResizingFrame === false) {
+                    return;
+                }
+                pendingSidebarResizingFrame = false;
+                document.documentElement.style.setProperty(
+                    "--resizing-sidebar-width",
+                    desiredSidebarSize + "px",
+                );
+            }, 100);
+        }
+    }
+    // Respond to the window resize event.
+    window.addEventListener("resize", () => {
+        if (window.innerWidth < RUSTDOC_MOBILE_BREAKPOINT) {
+            return;
+        }
+        stopResize();
+        if (desiredSidebarSize >= (window.innerWidth - BODY_MIN)) {
+            changeSidebarSize(window.innerWidth - BODY_MIN);
+        } else if (desiredSidebarSize !== null && desiredSidebarSize > SIDEBAR_MIN) {
+            changeSidebarSize(desiredSidebarSize);
+        }
+    });
+    function stopResize(e) {
+        if (currentPointerId === null) {
+            return;
+        }
+        if (e) {
+            e.preventDefault();
+        }
+        desiredSidebarSize = sidebar.getBoundingClientRect().width;
+        removeClass(resizer, "active");
+        window.removeEventListener("pointermove", resize, false);
+        window.removeEventListener("pointerup", stopResize, false);
+        removeClass(document.documentElement, "sidebar-resizing");
+        document.documentElement.style.removeProperty( "--resizing-sidebar-width");
+        if (resizer.releasePointerCapture) {
+            resizer.releasePointerCapture(currentPointerId);
+            currentPointerId = null;
+        }
+    }
+    function initResize(e) {
+        if (currentPointerId !== null || e.altKey || e.ctrlKey || e.metaKey || e.button !== 0) {
+            return;
+        }
+        if (resizer.setPointerCapture) {
+            resizer.setPointerCapture(e.pointerId);
+            if (!resizer.hasPointerCapture(e.pointerId)) {
+                // unable to capture pointer; something else has it
+                // on iOS, this usually means you long-clicked a link instead
+                resizer.releasePointerCapture(e.pointerId);
+                return;
+            }
+            currentPointerId = e.pointerId;
+        }
+        window.hideAllModals(false);
+        e.preventDefault();
+        window.addEventListener("pointermove", resize, false);
+        window.addEventListener("pointercancel", stopResize, false);
+        window.addEventListener("pointerup", stopResize, false);
+        addClass(resizer, "active");
+        addClass(document.documentElement, "sidebar-resizing");
+        const pos = e.clientX - sidebar.offsetLeft - 3;
+        document.documentElement.style.setProperty( "--resizing-sidebar-width", pos + "px");
+        desiredSidebarSize = null;
+    }
+    resizer.addEventListener("pointerdown", initResize, false);
+}());
+
+// This section handles the copy button that appears next to the path breadcrumbs
 (function() {
     let reset_button_timeout = null;
 

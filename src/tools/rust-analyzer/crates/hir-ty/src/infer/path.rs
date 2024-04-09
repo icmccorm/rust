@@ -4,22 +4,22 @@ use chalk_ir::cast::Cast;
 use hir_def::{
     path::{Path, PathSegment},
     resolver::{ResolveValueResult, TypeNs, ValueNs},
-    AdtId, AssocItemId, EnumVariantId, GenericDefId, ItemContainerId, Lookup,
+    AdtId, AssocItemId, GenericDefId, ItemContainerId, Lookup,
 };
 use hir_expand::name::Name;
 use stdx::never;
 
 use crate::{
     builder::ParamKind,
-    consteval,
+    consteval, error_lifetime,
     method_resolution::{self, VisibleFromModule},
     to_chalk_trait_id,
     utils::generics,
-    InferenceDiagnostic, Interner, Substitution, TraitRefExt, Ty, TyBuilder, TyExt, TyKind,
-    ValueTyDefId,
+    InferenceDiagnostic, Interner, Substitution, TraitRef, TraitRefExt, Ty, TyBuilder, TyExt,
+    TyKind, ValueTyDefId,
 };
 
-use super::{ExprOrPatId, InferenceContext, TraitRef};
+use super::{ExprOrPatId, InferenceContext};
 
 impl InferenceContext<'_> {
     pub(super) fn infer_path(&mut self, path: &Path, id: ExprOrPatId) -> Option<Ty> {
@@ -34,39 +34,13 @@ impl InferenceContext<'_> {
 
         self.add_required_obligations_for_value_path(generic_def, &substs);
 
-        let ty = self.db.value_ty(value_def).substitute(Interner, &substs);
+        let ty = self.db.value_ty(value_def)?.substitute(Interner, &substs);
         let ty = self.normalize_associated_types_in(ty);
         Some(ty)
     }
 
     fn resolve_value_path(&mut self, path: &Path, id: ExprOrPatId) -> Option<ValuePathResolution> {
-        let (value, self_subst) = if let Some(type_ref) = path.type_anchor() {
-            let last = path.segments().last()?;
-
-            // Don't use `self.make_ty()` here as we need `orig_ns`.
-            let ctx =
-                crate::lower::TyLoweringContext::new(self.db, &self.resolver, self.owner.into());
-            let (ty, orig_ns) = ctx.lower_ty_ext(type_ref);
-            let ty = self.table.insert_type_vars(ty);
-            let ty = self.table.normalize_associated_types_in(ty);
-
-            let remaining_segments_for_ty = path.segments().take(path.segments().len() - 1);
-            let (ty, _) = ctx.lower_ty_relative_path(ty, orig_ns, remaining_segments_for_ty);
-            let ty = self.table.insert_type_vars(ty);
-            let ty = self.table.normalize_associated_types_in(ty);
-            self.resolve_ty_assoc_item(ty, last.name, id).map(|(it, substs)| (it, Some(substs)))?
-        } else {
-            // FIXME: report error, unresolved first path segment
-            let value_or_partial =
-                self.resolver.resolve_path_in_value_ns(self.db.upcast(), path)?;
-
-            match value_or_partial {
-                ResolveValueResult::ValueNs(it, _) => (it, None),
-                ResolveValueResult::Partial(def, remaining_index, _) => self
-                    .resolve_assoc_item(def, path, remaining_index, id)
-                    .map(|(it, substs)| (it, Some(substs)))?,
-            }
-        };
+        let (value, self_subst) = self.resolve_value_path_inner(path, id)?;
 
         let value_def = match value {
             ValueNs::LocalBinding(pat) => match self.result.type_of_binding.get(pat) {
@@ -124,7 +98,7 @@ impl InferenceContext<'_> {
         let Some(generic_def) = value_def.to_generic_def_id() else {
             // `value_def` is the kind of item that can never be generic (i.e. statics, at least
             // currently). We can just skip the binders to get its type.
-            let (ty, binders) = self.db.value_ty(value_def).into_value_and_skipped_binders();
+            let (ty, binders) = self.db.value_ty(value_def)?.into_value_and_skipped_binders();
             stdx::always!(
                 parent_substs.is_none() && binders.is_empty(Interner),
                 "non-empty binders for non-generic def",
@@ -137,11 +111,47 @@ impl InferenceContext<'_> {
                 it.next().unwrap_or_else(|| match x {
                     ParamKind::Type => self.result.standard_types.unknown.clone().cast(Interner),
                     ParamKind::Const(ty) => consteval::unknown_const_as_generic(ty.clone()),
+                    ParamKind::Lifetime => error_lifetime().cast(Interner),
                 })
             })
             .build();
 
         Some(ValuePathResolution::GenericDef(value_def, generic_def, substs))
+    }
+
+    pub(super) fn resolve_value_path_inner(
+        &mut self,
+        path: &Path,
+        id: ExprOrPatId,
+    ) -> Option<(ValueNs, Option<chalk_ir::Substitution<Interner>>)> {
+        let (value, self_subst) = if let Some(type_ref) = path.type_anchor() {
+            let last = path.segments().last()?;
+
+            // Don't use `self.make_ty()` here as we need `orig_ns`.
+            let ctx =
+                crate::lower::TyLoweringContext::new(self.db, &self.resolver, self.owner.into());
+            let (ty, orig_ns) = ctx.lower_ty_ext(type_ref);
+            let ty = self.table.insert_type_vars(ty);
+            let ty = self.table.normalize_associated_types_in(ty);
+
+            let remaining_segments_for_ty = path.segments().take(path.segments().len() - 1);
+            let (ty, _) = ctx.lower_ty_relative_path(ty, orig_ns, remaining_segments_for_ty);
+            let ty = self.table.insert_type_vars(ty);
+            let ty = self.table.normalize_associated_types_in(ty);
+            self.resolve_ty_assoc_item(ty, last.name, id).map(|(it, substs)| (it, Some(substs)))?
+        } else {
+            // FIXME: report error, unresolved first path segment
+            let value_or_partial =
+                self.resolver.resolve_path_in_value_ns(self.db.upcast(), path)?;
+
+            match value_or_partial {
+                ResolveValueResult::ValueNs(it, _) => (it, None),
+                ResolveValueResult::Partial(def, remaining_index, _) => self
+                    .resolve_assoc_item(def, path, remaining_index, id)
+                    .map(|(it, substs)| (it, Some(substs)))?,
+            }
+        };
+        Some((value, self_subst))
     }
 
     fn add_required_obligations_for_value_path(&mut self, def: GenericDefId, subst: &Substitution) {
@@ -312,7 +322,7 @@ impl InferenceContext<'_> {
 
         let mut not_visible = None;
         let res = method_resolution::iterate_method_candidates(
-            &canonical_ty.value,
+            &canonical_ty,
             self.db,
             self.table.trait_env.clone(),
             self.get_traits_in_scope().as_ref().left_or_else(|&it| it),
@@ -331,6 +341,9 @@ impl InferenceContext<'_> {
             },
         );
         let res = res.or(not_visible);
+        if res.is_none() {
+            self.push_diagnostic(InferenceDiagnostic::UnresolvedAssocItem { id });
+        }
         let (item, visible) = res?;
 
         let (def, container) = match item {
@@ -377,19 +390,19 @@ impl InferenceContext<'_> {
         name: &Name,
         id: ExprOrPatId,
     ) -> Option<(ValueNs, Substitution)> {
-        let ty = self.resolve_ty_shallow(&ty);
+        let ty = self.resolve_ty_shallow(ty);
         let (enum_id, subst) = match ty.as_adt() {
             Some((AdtId::EnumId(e), subst)) => (e, subst),
             _ => return None,
         };
         let enum_data = self.db.enum_data(enum_id);
-        let local_id = enum_data.variant(name)?;
-        let variant = EnumVariantId { parent: enum_id, local_id };
+        let variant = enum_data.variant(name)?;
         self.write_variant_resolution(id, variant.into());
         Some((ValueNs::EnumVariantId(variant), subst.clone()))
     }
 }
 
+#[derive(Debug)]
 enum ValuePathResolution {
     // It's awkward to wrap a single ID in two enums, but we need both and this saves fallible
     // conversion between them + `unwrap()`.

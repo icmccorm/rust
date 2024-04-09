@@ -347,13 +347,14 @@ impl<'a, K: Ord, V, A: Allocator + Clone> VacantEntry<'a, K, V, A> {
     /// assert_eq!(map["poneyland"], 37);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("push", "put")]
     pub fn insert(mut self, value: V) -> &'a mut V {
         let out_ptr = match self.handle {
             None => {
                 // SAFETY: There is no tree yet so no reference to it exists.
                 let map = unsafe { self.dormant_map.awaken() };
                 let mut root = NodeRef::new_leaf(self.alloc.clone());
-                let val_ptr = root.borrow_mut().push(self.key, value) as *mut V;
+                let val_ptr = root.borrow_mut().push(self.key, value);
                 map.root = Some(root.forget_type());
                 map.length = 1;
                 val_ptr
@@ -524,6 +525,7 @@ impl<'a, K: Ord, V, A: Allocator + Clone> OccupiedEntry<'a, K, V, A> {
     /// assert_eq!(map["poneyland"], 15);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("push", "put")]
     pub fn insert(&mut self, value: V) -> V {
         mem::replace(self.get_mut(), value)
     }
@@ -546,6 +548,7 @@ impl<'a, K: Ord, V, A: Allocator + Clone> OccupiedEntry<'a, K, V, A> {
     /// // println!("{}", map["poneyland"]);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("delete", "take")]
     pub fn remove(self) -> V {
         self.remove_kv().1
     }

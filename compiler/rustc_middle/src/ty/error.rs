@@ -7,8 +7,7 @@ use rustc_hir::def_id::DefId;
 use rustc_span::symbol::Symbol;
 use rustc_target::spec::abi;
 use std::borrow::Cow;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TypeFoldable, TypeVisitable)]
@@ -33,7 +32,7 @@ impl<T> ExpectedFound<T> {
 pub enum TypeError<'tcx> {
     Mismatch,
     ConstnessMismatch(ExpectedFound<ty::BoundConstness>),
-    PolarityMismatch(ExpectedFound<ty::ImplPolarity>),
+    PolarityMismatch(ExpectedFound<ty::PredicatePolarity>),
     UnsafetyMismatch(ExpectedFound<hir::Unsafety>),
     AbiMismatch(ExpectedFound<abi::Abi>),
     Mutability,
@@ -236,13 +235,15 @@ impl<'tcx> Ty<'tcx> {
                 _ => "fn item".into(),
             },
             ty::FnPtr(_) => "fn pointer".into(),
-            ty::Dynamic(ref inner, ..) if let Some(principal) = inner.principal() => {
+            ty::Dynamic(inner, ..) if let Some(principal) = inner.principal() => {
                 format!("`dyn {}`", tcx.def_path_str(principal.def_id())).into()
             }
             ty::Dynamic(..) => "trait object".into(),
             ty::Closure(..) => "closure".into(),
-            ty::Generator(def_id, ..) => tcx.generator_kind(def_id).unwrap().descr().into(),
-            ty::GeneratorWitness(..) => "generator witness".into(),
+            ty::Coroutine(def_id, ..) => {
+                format!("{:#}", tcx.coroutine_kind(def_id).unwrap()).into()
+            }
+            ty::CoroutineWitness(..) => "coroutine witness".into(),
             ty::Infer(ty::TyVar(_)) => "inferred type".into(),
             ty::Infer(ty::IntVar(_)) => "integer".into(),
             ty::Infer(ty::FloatVar(_)) => "floating-point number".into(),
@@ -253,7 +254,13 @@ impl<'tcx> Ty<'tcx> {
             ty::Infer(ty::FreshFloatTy(_)) => "fresh floating-point type".into(),
             ty::Alias(ty::Projection | ty::Inherent, _) => "associated type".into(),
             ty::Param(p) => format!("type parameter `{p}`").into(),
-            ty::Alias(ty::Opaque, ..) => if tcx.ty_is_opaque_future(self) { "future".into() } else { "opaque type".into() },
+            ty::Alias(ty::Opaque, ..) => {
+                if tcx.ty_is_opaque_future(self) {
+                    "future".into()
+                } else {
+                    "opaque type".into()
+                }
+            }
             ty::Error(_) => "type error".into(),
             _ => {
                 let width = tcx.sess.diagnostic_width();
@@ -274,12 +281,12 @@ impl<'tcx> Ty<'tcx> {
             | ty::Float(_)
             | ty::Str
             | ty::Never => "type".into(),
-            ty::Tuple(ref tys) if tys.is_empty() => "unit type".into(),
+            ty::Tuple(tys) if tys.is_empty() => "unit type".into(),
             ty::Adt(def, _) => def.descr().into(),
             ty::Foreign(_) => "extern type".into(),
             ty::Array(..) => "array".into(),
             ty::Slice(_) => "slice".into(),
-            ty::RawPtr(_) => "raw pointer".into(),
+            ty::RawPtr(_, _) => "raw pointer".into(),
             ty::Ref(.., mutbl) => match mutbl {
                 hir::Mutability::Mut => "mutable reference",
                 _ => "reference",
@@ -292,9 +299,11 @@ impl<'tcx> Ty<'tcx> {
             },
             ty::FnPtr(_) => "fn pointer".into(),
             ty::Dynamic(..) => "trait object".into(),
-            ty::Closure(..) => "closure".into(),
-            ty::Generator(def_id, ..) => tcx.generator_kind(def_id).unwrap().descr().into(),
-            ty::GeneratorWitness(..) => "generator witness".into(),
+            ty::Closure(..) | ty::CoroutineClosure(..) => "closure".into(),
+            ty::Coroutine(def_id, ..) => {
+                format!("{:#}", tcx.coroutine_kind(def_id).unwrap()).into()
+            }
+            ty::CoroutineWitness(..) => "coroutine witness".into(),
             ty::Tuple(..) => "tuple".into(),
             ty::Placeholder(..) => "higher-ranked type".into(),
             ty::Bound(..) => "bound type variable".into(),
@@ -309,26 +318,25 @@ impl<'tcx> Ty<'tcx> {
 impl<'tcx> TyCtxt<'tcx> {
     pub fn ty_string_with_limit(self, ty: Ty<'tcx>, length_limit: usize) -> String {
         let mut type_limit = 50;
-        let regular = FmtPrinter::new(self, hir::def::Namespace::TypeNS)
-            .pretty_print_type(ty)
-            .expect("could not write to `String`")
-            .into_buffer();
+        let regular = FmtPrinter::print_string(self, hir::def::Namespace::TypeNS, |cx| {
+            cx.pretty_print_type(ty)
+        })
+        .expect("could not write to `String`");
         if regular.len() <= length_limit {
             return regular;
         }
         let mut short;
         loop {
             // Look for the longest properly trimmed path that still fits in length_limit.
-            short = with_forced_trimmed_paths!(
-                FmtPrinter::new_with_limit(
+            short = with_forced_trimmed_paths!({
+                let mut cx = FmtPrinter::new_with_limit(
                     self,
                     hir::def::Namespace::TypeNS,
                     rustc_session::Limit(type_limit),
-                )
-                .pretty_print_type(ty)
-                .expect("could not write to `String`")
-                .into_buffer()
-            );
+                );
+                cx.pretty_print_type(ty).expect("could not write to `String`");
+                cx.into_buffer()
+            });
             if short.len() <= length_limit || type_limit == 0 {
                 break;
             }
@@ -337,33 +345,35 @@ impl<'tcx> TyCtxt<'tcx> {
         short
     }
 
-    pub fn short_ty_string(self, ty: Ty<'tcx>) -> (String, Option<PathBuf>) {
-        let regular = FmtPrinter::new(self, hir::def::Namespace::TypeNS)
-            .pretty_print_type(ty)
-            .expect("could not write to `String`")
-            .into_buffer();
+    pub fn short_ty_string(self, ty: Ty<'tcx>, path: &mut Option<PathBuf>) -> String {
+        let regular = FmtPrinter::print_string(self, hir::def::Namespace::TypeNS, |cx| {
+            cx.pretty_print_type(ty)
+        })
+        .expect("could not write to `String`");
 
-        if !self.sess.opts.unstable_opts.write_long_types_to_disk {
-            return (regular, None);
+        if !self.sess.opts.unstable_opts.write_long_types_to_disk || self.sess.opts.verbose {
+            return regular;
         }
 
         let width = self.sess.diagnostic_width();
         let length_limit = width.saturating_sub(30);
         if regular.len() <= width {
-            return (regular, None);
+            return regular;
         }
         let short = self.ty_string_with_limit(ty, length_limit);
         if regular == short {
-            return (regular, None);
+            return regular;
         }
-        // Multiple types might be shortened in a single error, ensure we create a file for each.
+        // Ensure we create an unique file for the type passed in when we create a file.
         let mut s = DefaultHasher::new();
         ty.hash(&mut s);
         let hash = s.finish();
-        let path = self.output_filenames(()).temp_path_ext(&format!("long-type-{hash}.txt"), None);
-        match std::fs::write(&path, &regular) {
-            Ok(_) => (short, Some(path)),
-            Err(_) => (regular, None),
+        *path = Some(path.take().unwrap_or_else(|| {
+            self.output_filenames(()).temp_path_ext(&format!("long-type-{hash}.txt"), None)
+        }));
+        match std::fs::write(path.as_ref().unwrap(), &format!("{regular}\n")) {
+            Ok(_) => short,
+            Err(_) => regular,
         }
     }
 }

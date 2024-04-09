@@ -1,6 +1,4 @@
-// compile-flags: -O -Z merge-functions=disabled
-// no-system-llvm
-// ignore-debug (the extra assertions get in the way)
+//@ compile-flags: -O -Z merge-functions=disabled
 
 #![crate_type = "lib"]
 

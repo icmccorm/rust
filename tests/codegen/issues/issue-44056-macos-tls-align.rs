@@ -1,7 +1,6 @@
 //
-// only-macos
-// no-system-llvm
-// compile-flags: -O
+//@ only-macos
+//@ compile-flags: -O
 
 #![crate_type = "rlib"]
 #![feature(thread_local)]

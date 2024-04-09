@@ -2,7 +2,8 @@
 
 use crate::helpers::mod_path_to_ast;
 use either::Either;
-use hir::{AsAssocItem, HirDisplay, SemanticsScope};
+use hir::{AsAssocItem, HirDisplay, ModuleDef, SemanticsScope};
+use itertools::Itertools;
 use rustc_hash::FxHashMap;
 use syntax::{
     ast::{self, make, AstNode},
@@ -82,6 +83,34 @@ impl<'a> PathTransform<'a> {
         }
     }
 
+    pub fn impl_transformation(
+        target_scope: &'a SemanticsScope<'a>,
+        source_scope: &'a SemanticsScope<'a>,
+        impl_: hir::Impl,
+        generic_arg_list: ast::GenericArgList,
+    ) -> PathTransform<'a> {
+        PathTransform {
+            source_scope,
+            target_scope,
+            generic_def: Some(impl_.into()),
+            substs: get_type_args_from_arg_list(generic_arg_list).unwrap_or_default(),
+        }
+    }
+
+    pub fn adt_transformation(
+        target_scope: &'a SemanticsScope<'a>,
+        source_scope: &'a SemanticsScope<'a>,
+        adt: hir::Adt,
+        generic_arg_list: ast::GenericArgList,
+    ) -> PathTransform<'a> {
+        PathTransform {
+            source_scope,
+            target_scope,
+            generic_def: Some(adt.into()),
+            substs: get_type_args_from_arg_list(generic_arg_list).unwrap_or_default(),
+        }
+    }
+
     pub fn generic_transformation(
         target_scope: &'a SemanticsScope<'a>,
         source_scope: &'a SemanticsScope<'a>,
@@ -119,7 +148,7 @@ impl<'a> PathTransform<'a> {
         let mut defaulted_params: Vec<DefaultedParam> = Default::default();
         self.generic_def
             .into_iter()
-            .flat_map(|it| it.type_params(db))
+            .flat_map(|it| it.type_or_const_params(db))
             .skip(skip)
             // The actual list of trait type parameters may be longer than the one
             // used in the `impl` block due to trailing default type parameters.
@@ -131,7 +160,7 @@ impl<'a> PathTransform<'a> {
             .for_each(|(k, v)| match (k.split(db), v) {
                 (Either::Right(k), Some(TypeOrConst::Either(v))) => {
                     if let Some(ty) = v.ty() {
-                        type_substs.insert(k, ty.clone());
+                        type_substs.insert(k, ty);
                     }
                 }
                 (Either::Right(k), None) => {
@@ -183,6 +212,7 @@ impl<'a> PathTransform<'a> {
             lifetime_substs,
             target_module,
             source_scope: self.source_scope,
+            same_self_type: self.target_scope.has_same_self_type(self.source_scope),
         };
         ctx.transform_default_values(defaulted_params);
         ctx
@@ -195,13 +225,18 @@ struct Ctx<'a> {
     lifetime_substs: FxHashMap<LifetimeName, ast::Lifetime>,
     target_module: hir::Module,
     source_scope: &'a SemanticsScope<'a>,
+    same_self_type: bool,
 }
 
-fn postorder(item: &SyntaxNode) -> impl Iterator<Item = SyntaxNode> {
-    item.preorder().filter_map(|event| match event {
-        syntax::WalkEvent::Enter(_) => None,
-        syntax::WalkEvent::Leave(node) => Some(node),
-    })
+fn preorder_rev(item: &SyntaxNode) -> impl Iterator<Item = SyntaxNode> {
+    let x = item
+        .preorder()
+        .filter_map(|event| match event {
+            syntax::WalkEvent::Enter(node) => Some(node),
+            syntax::WalkEvent::Leave(_) => None,
+        })
+        .collect_vec();
+    x.into_iter().rev()
 }
 
 impl Ctx<'_> {
@@ -209,12 +244,12 @@ impl Ctx<'_> {
         // `transform_path` may update a node's parent and that would break the
         // tree traversal. Thus all paths in the tree are collected into a vec
         // so that such operation is safe.
-        let paths = postorder(item).filter_map(ast::Path::cast).collect::<Vec<_>>();
+        let paths = preorder_rev(item).filter_map(ast::Path::cast).collect::<Vec<_>>();
         for path in paths {
             self.transform_path(path);
         }
 
-        postorder(item).filter_map(ast::Lifetime::cast).for_each(|lifetime| {
+        preorder_rev(item).filter_map(ast::Lifetime::cast).for_each(|lifetime| {
             if let Some(subst) = self.lifetime_substs.get(&lifetime.syntax().text().to_string()) {
                 ted::replace(lifetime.syntax(), subst.clone_subtree().clone_for_update().syntax());
             }
@@ -233,7 +268,7 @@ impl Ctx<'_> {
             // `transform_path` may update a node's parent and that would break the
             // tree traversal. Thus all paths in the tree are collected into a vec
             // so that such operation is safe.
-            let paths = postorder(value).filter_map(ast::Path::cast).collect::<Vec<_>>();
+            let paths = preorder_rev(value).filter_map(ast::Path::cast).collect::<Vec<_>>();
             for path in paths {
                 self.transform_path(path);
             }
@@ -277,6 +312,7 @@ impl Ctx<'_> {
                                 self.source_scope.db.upcast(),
                                 hir::ModuleDef::Trait(trait_ref),
                                 false,
+                                true,
                             )?;
                             match make::ty_path(mod_path_to_ast(&found_path)) {
                                 ast::Type::PathType(path_ty) => Some(path_ty),
@@ -311,8 +347,12 @@ impl Ctx<'_> {
                     }
                 }
 
-                let found_path =
-                    self.target_module.find_use_path(self.source_scope.db.upcast(), def, false)?;
+                let found_path = self.target_module.find_use_path(
+                    self.source_scope.db.upcast(),
+                    def,
+                    false,
+                    true,
+                )?;
                 let res = mod_path_to_ast(&found_path).clone_for_update();
                 if let Some(args) = path.segment().and_then(|it| it.generic_arg_list()) {
                     if let Some(segment) = res.segment() {
@@ -327,8 +367,42 @@ impl Ctx<'_> {
                     ted::replace(path.syntax(), subst.clone_subtree().clone_for_update());
                 }
             }
+            hir::PathResolution::SelfType(imp) => {
+                // keep Self type if it does not need to be replaced
+                if self.same_self_type {
+                    return None;
+                }
+
+                let ty = imp.self_ty(self.source_scope.db);
+                let ty_str = &ty
+                    .display_source_code(
+                        self.source_scope.db,
+                        self.source_scope.module().into(),
+                        true,
+                    )
+                    .ok()?;
+                let ast_ty = make::ty(ty_str).clone_for_update();
+
+                if let Some(adt) = ty.as_adt() {
+                    if let ast::Type::PathType(path_ty) = &ast_ty {
+                        let found_path = self.target_module.find_use_path(
+                            self.source_scope.db.upcast(),
+                            ModuleDef::from(adt),
+                            false,
+                            true,
+                        )?;
+
+                        if let Some(qual) = mod_path_to_ast(&found_path).qualifier() {
+                            let res = make::path_concat(qual, path_ty.path()?).clone_for_update();
+                            ted::replace(path.syntax(), res.syntax());
+                            return Some(());
+                        }
+                    }
+                }
+
+                ted::replace(path.syntax(), ast_ty.syntax());
+            }
             hir::PathResolution::Local(_)
-            | hir::PathResolution::SelfType(_)
             | hir::PathResolution::Def(_)
             | hir::PathResolution::BuiltinAttr(_)
             | hir::PathResolution::ToolModule(_)

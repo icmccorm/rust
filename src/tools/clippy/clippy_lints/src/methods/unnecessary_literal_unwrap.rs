@@ -24,7 +24,6 @@ fn get_ty_from_args<'a>(args: Option<&'a [hir::GenericArg<'a>]>, index: usize) -
     }
 }
 
-#[expect(clippy::too_many_lines)]
 pub(super) fn check(
     cx: &LateContext<'_>,
     expr: &hir::Expr<'_>,
@@ -64,7 +63,7 @@ pub(super) fn check(
     let help_message = format!("used `{method}()` on `{constructor}` value");
     let suggestion_message = format!("remove the `{constructor}` and `{method}()`");
 
-    span_lint_and_then(cx, UNNECESSARY_LITERAL_UNWRAP, expr.span, &help_message, |diag| {
+    span_lint_and_then(cx, UNNECESSARY_LITERAL_UNWRAP, expr.span, help_message, |diag| {
         let suggestions = match (constructor, method, ty) {
             ("None", "unwrap", _) => Some(vec![(expr.span, "panic!()".to_string())]),
             ("None", "expect", _) => Some(vec![
@@ -77,12 +76,12 @@ pub(super) fn check(
                     (expr.span.with_lo(call_args[0].span.hi()), String::new()),
                 ];
                 // try to also remove the unsafe block if present
-                if let hir::Node::Block(block) = cx.tcx.hir().get_parent(expr.hir_id)
+                if let hir::Node::Block(block) = cx.tcx.parent_hir_node(expr.hir_id)
                     && let hir::BlockCheckMode::UnsafeBlock(hir::UnsafeSource::UserProvided) = block.rules
                 {
                     suggs.extend([
                         (block.span.shrink_to_lo().to(expr.span.shrink_to_lo()), String::new()),
-                        (expr.span.shrink_to_hi().to(block.span.shrink_to_hi()), String::new())
+                        (expr.span.shrink_to_hi().to(block.span.shrink_to_hi()), String::new()),
                     ]);
                 }
                 Some(suggs)
@@ -101,15 +100,11 @@ pub(super) fn check(
                 (expr.span.with_lo(args[0].span.hi()), String::new()),
             ]),
             ("None", "unwrap_or_else", _) => match args[0].kind {
-                hir::ExprKind::Closure(hir::Closure {
-                    fn_decl:
-                        hir::FnDecl {
-                            output: hir::FnRetTy::DefaultReturn(span) | hir::FnRetTy::Return(hir::Ty { span, .. }),
-                            ..
-                        },
-                    ..
-                }) => Some(vec![
-                    (expr.span.with_hi(span.hi()), String::new()),
+                hir::ExprKind::Closure(hir::Closure { body, .. }) => Some(vec![
+                    (
+                        expr.span.with_hi(cx.tcx.hir().body(*body).value.span.lo()),
+                        String::new(),
+                    ),
                     (expr.span.with_lo(args[0].span.hi()), String::new()),
                 ]),
                 _ => None,

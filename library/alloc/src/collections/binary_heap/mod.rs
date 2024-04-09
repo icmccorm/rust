@@ -145,9 +145,9 @@
 
 use core::alloc::Allocator;
 use core::fmt;
-use core::iter::{FusedIterator, InPlaceIterable, SourceIter, TrustedLen};
+use core::iter::{FusedIterator, InPlaceIterable, SourceIter, TrustedFused, TrustedLen};
 use core::mem::{self, swap, ManuallyDrop};
-use core::num::NonZeroUsize;
+use core::num::NonZero;
 use core::ops::{Deref, DerefMut};
 use core::ptr;
 
@@ -296,7 +296,7 @@ pub struct PeekMut<
     heap: &'a mut BinaryHeap<T, A>,
     // If a set_len + sift_down are required, this is Some. If a &mut T has not
     // yet been exposed to peek_mut()'s caller, it's None.
-    original_len: Option<NonZeroUsize>,
+    original_len: Option<NonZero<usize>>,
 }
 
 #[stable(feature = "collection_debug", since = "1.17.0")]
@@ -350,7 +350,7 @@ impl<T: Ord, A: Allocator> DerefMut for PeekMut<'_, T, A> {
             // the standard library as "leak amplification".
             unsafe {
                 // SAFETY: len > 1 so len != 0.
-                self.original_len = Some(NonZeroUsize::new_unchecked(len));
+                self.original_len = Some(NonZero::new_unchecked(len));
                 // SAFETY: len > 1 so all this does for now is leak elements,
                 // which is safe.
                 self.heap.data.set_len(1);
@@ -434,8 +434,9 @@ impl<T: Ord> BinaryHeap<T> {
     /// heap.push(4);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_const_unstable(feature = "const_binary_heap_constructor", issue = "112353")]
     #[must_use]
-    pub fn new() -> BinaryHeap<T> {
+    pub const fn new() -> BinaryHeap<T> {
         BinaryHeap { data: vec![] }
     }
 
@@ -477,8 +478,9 @@ impl<T: Ord, A: Allocator> BinaryHeap<T, A> {
     /// heap.push(4);
     /// ```
     #[unstable(feature = "allocator_api", issue = "32838")]
+    #[rustc_const_unstable(feature = "const_binary_heap_constructor", issue = "112353")]
     #[must_use]
-    pub fn new_in(alloc: A) -> BinaryHeap<T, A> {
+    pub const fn new_in(alloc: A) -> BinaryHeap<T, A> {
         BinaryHeap { data: Vec::new_in(alloc) }
     }
 
@@ -605,6 +607,7 @@ impl<T: Ord, A: Allocator> BinaryHeap<T, A> {
     /// occurs when capacity is exhausted and needs a resize. The resize cost
     /// has been amortized in the previous figures.
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("append", "put")]
     pub fn push(&mut self, item: T) {
         let old_len = self.len();
         self.data.push(item);
@@ -1262,6 +1265,7 @@ impl<T, A: Allocator> BinaryHeap<T, A> {
     /// ```
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("length", "size")]
     pub fn len(&self) -> usize {
         self.data.len()
     }
@@ -1540,6 +1544,10 @@ impl<T, A: Allocator> ExactSizeIterator for IntoIter<T, A> {
 #[stable(feature = "fused", since = "1.26.0")]
 impl<T, A: Allocator> FusedIterator for IntoIter<T, A> {}
 
+#[doc(hidden)]
+#[unstable(issue = "none", feature = "trusted_fused")]
+unsafe impl<T, A: Allocator> TrustedFused for IntoIter<T, A> {}
+
 #[stable(feature = "default_iters", since = "1.70.0")]
 impl<T> Default for IntoIter<T> {
     /// Creates an empty `binary_heap::IntoIter`.
@@ -1569,7 +1577,10 @@ unsafe impl<T, A: Allocator> SourceIter for IntoIter<T, A> {
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
 #[doc(hidden)]
-unsafe impl<I, A: Allocator> InPlaceIterable for IntoIter<I, A> {}
+unsafe impl<I, A: Allocator> InPlaceIterable for IntoIter<I, A> {
+    const EXPAND_BY: Option<NonZero<usize>> = NonZero::new(1);
+    const MERGE_BY: Option<NonZero<usize>> = NonZero::new(1);
+}
 
 unsafe impl<I> AsVecIntoIter for IntoIter<I> {
     type Item = I;

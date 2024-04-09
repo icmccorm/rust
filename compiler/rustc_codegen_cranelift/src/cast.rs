@@ -104,11 +104,7 @@ pub(crate) fn clif_int_or_float_cast(
                     &[from],
                 )[0];
                 // FIXME(bytecodealliance/wasmtime#6104) use bitcast instead of store to get from i64x2 to i128
-                let stack_slot = fx.bcx.create_sized_stack_slot(StackSlotData {
-                    kind: StackSlotKind::ExplicitSlot,
-                    size: 16,
-                });
-                let ret_ptr = Pointer::stack_slot(stack_slot);
+                let ret_ptr = fx.create_stack_slot(16, 16);
                 ret_ptr.store(fx, ret, MemFlags::trusted());
                 ret_ptr.load(fx, types::I128, MemFlags::trusted())
             } else {
@@ -129,8 +125,8 @@ pub(crate) fn clif_int_or_float_cast(
             let (min, max) = match (to_ty, to_signed) {
                 (types::I8, false) => (0, i64::from(u8::MAX)),
                 (types::I16, false) => (0, i64::from(u16::MAX)),
-                (types::I8, true) => (i64::from(i8::MIN), i64::from(i8::MAX)),
-                (types::I16, true) => (i64::from(i16::MIN), i64::from(i16::MAX)),
+                (types::I8, true) => (i64::from(i8::MIN as u32), i64::from(i8::MAX as u32)),
+                (types::I16, true) => (i64::from(i16::MIN as u32), i64::from(i16::MAX as u32)),
                 _ => unreachable!(),
             };
             let min_val = fx.bcx.ins().iconst(types::I32, min);

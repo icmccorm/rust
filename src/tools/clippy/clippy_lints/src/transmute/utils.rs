@@ -1,6 +1,6 @@
 use rustc_hir as hir;
 use rustc_hir::Expr;
-use rustc_hir_typeck::{cast, FnCtxt, Inherited};
+use rustc_hir_typeck::{cast, FnCtxt, TypeckRootCtxt};
 use rustc_lint::LateContext;
 use rustc_middle::ty::cast::CastKind;
 use rustc_middle::ty::Ty;
@@ -34,14 +34,8 @@ pub(super) fn check_cast<'tcx>(
     let hir_id = e.hir_id;
     let local_def_id = hir_id.owner.def_id;
 
-    let inherited = Inherited::new(cx.tcx, local_def_id);
-    let fn_ctxt = FnCtxt::new(&inherited, cx.param_env, local_def_id);
-
-    // If we already have errors, we can't be sure we can pointer cast.
-    assert!(
-        !fn_ctxt.errors_reported_since_creation(),
-        "Newly created FnCtxt contained errors"
-    );
+    let root_ctxt = TypeckRootCtxt::new(cx.tcx, local_def_id);
+    let fn_ctxt = FnCtxt::new(&root_ctxt, cx.param_env, local_def_id);
 
     if let Ok(check) = cast::CastCheck::new(
         &fn_ctxt,
@@ -53,17 +47,7 @@ pub(super) fn check_cast<'tcx>(
         DUMMY_SP,
         hir::Constness::NotConst,
     ) {
-        let res = check.do_check(&fn_ctxt);
-
-        // do_check's documentation says that it might return Ok and create
-        // errors in the fcx instead of returning Err in some cases. Those cases
-        // should be filtered out before getting here.
-        assert!(
-            !fn_ctxt.errors_reported_since_creation(),
-            "`fn_ctxt` contained errors after cast check!"
-        );
-
-        res.ok()
+        check.do_check(&fn_ctxt).ok()
     } else {
         None
     }

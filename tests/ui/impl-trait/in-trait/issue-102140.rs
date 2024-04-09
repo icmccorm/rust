@@ -1,6 +1,3 @@
-#![feature(return_position_impl_trait_in_trait)]
-#![allow(incomplete_features)]
-
 trait Marker {}
 impl Marker for u32 {}
 
@@ -22,7 +19,6 @@ impl dyn MyTrait {
     fn other(&self) -> impl Marker {
         MyTrait::foo(&self)
         //~^ ERROR the trait bound `&dyn MyTrait: MyTrait` is not satisfied
-        //~| ERROR the trait bound `&dyn MyTrait: MyTrait` is not satisfied
         //~| ERROR the trait bound `&dyn MyTrait: MyTrait` is not satisfied
     }
 }

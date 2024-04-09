@@ -2,7 +2,7 @@ error[E0277]: the trait bound `K: Hash` is not satisfied
   --> $DIR/bad-index-due-to-nested.rs:20:5
    |
 LL |     map[k]
-   |     ^^^ the trait `Hash` is not implemented for `K`
+   |     ^^^ the trait `Hash` is not implemented for `K`, which is required by `HashMap<_, _>: Index<&_>`
    |
 note: required for `HashMap<K, V>` to implement `Index<&K>`
   --> $DIR/bad-index-due-to-nested.rs:7:12
@@ -21,7 +21,7 @@ error[E0277]: the trait bound `V: Copy` is not satisfied
   --> $DIR/bad-index-due-to-nested.rs:20:5
    |
 LL |     map[k]
-   |     ^^^ the trait `Copy` is not implemented for `V`
+   |     ^^^ the trait `Copy` is not implemented for `V`, which is required by `HashMap<_, _>: Index<&_>`
    |
 note: required for `HashMap<K, V>` to implement `Index<&K>`
   --> $DIR/bad-index-due-to-nested.rs:7:12
@@ -40,12 +40,12 @@ error[E0308]: mismatched types
   --> $DIR/bad-index-due-to-nested.rs:20:9
    |
 LL | fn index<'a, K, V>(map: &'a HashMap<K, V>, k: K) -> &'a V {
-   |              - this type parameter
+   |              - found this type parameter
 LL |     map[k]
    |         ^ expected `&K`, found type parameter `K`
    |
-   = note:   expected reference `&K`
-           found type parameter `K`
+   = note:   expected reference `&_`
+           found type parameter `_`
 help: consider borrowing here
    |
 LL |     map[&k]
@@ -55,12 +55,12 @@ error[E0308]: mismatched types
   --> $DIR/bad-index-due-to-nested.rs:20:5
    |
 LL | fn index<'a, K, V>(map: &'a HashMap<K, V>, k: K) -> &'a V {
-   |                 - this type parameter               ----- expected `&'a V` because of return type
+   |                 - found this type parameter         ----- expected `&'a V` because of return type
 LL |     map[k]
    |     ^^^^^^ expected `&V`, found type parameter `V`
    |
-   = note:   expected reference `&'a V`
-           found type parameter `V`
+   = note:   expected reference `&'a _`
+           found type parameter `_`
 help: consider borrowing here
    |
 LL |     &map[k]

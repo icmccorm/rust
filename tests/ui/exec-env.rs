@@ -1,7 +1,7 @@
-// run-pass
-// exec-env:TEST_EXEC_ENV=22
-// ignore-emscripten FIXME: issue #31622
-// ignore-sgx unsupported
+//@ run-pass
+//@ exec-env:TEST_EXEC_ENV=22
+//@ ignore-wasm32 wasm runtimes aren't configured to inherit env vars yet
+//@ ignore-sgx unsupported
 
 use std::env;
 

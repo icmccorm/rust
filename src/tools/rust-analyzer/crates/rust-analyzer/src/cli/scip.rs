@@ -1,20 +1,15 @@
 //! SCIP generator
 
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-    time::Instant,
-};
+use std::{path::PathBuf, time::Instant};
 
 use ide::{
-    LineCol, MonikerDescriptorKind, StaticIndex, StaticIndexedFile, TextRange, TokenId,
-    TokenStaticData,
+    AnalysisHost, LineCol, MonikerDescriptorKind, MonikerResult, StaticIndex, StaticIndexedFile,
+    SymbolInformationKind, TextRange, TokenId,
 };
 use ide_db::LineIndexDatabase;
-use load_cargo::{load_workspace, LoadCargoConfig, ProcMacroServerChoice};
-use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace, RustLibSource};
+use load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
+use rustc_hash::{FxHashMap, FxHashSet};
 use scip::types as scip_types;
-use std::env;
 
 use crate::{
     cli::flags,
@@ -25,8 +20,6 @@ impl flags::Scip {
     pub fn run(self) -> anyhow::Result<()> {
         eprintln!("Generating SCIP start...");
         let now = Instant::now();
-        let mut cargo_config = CargoConfig::default();
-        cargo_config.sysroot = Some(RustLibSource::Discover);
 
         let no_progress = &|s| (eprintln!("rust-analyzer: Loading {s}"));
         let load_cargo_config = LoadCargoConfig {
@@ -34,14 +27,29 @@ impl flags::Scip {
             with_proc_macro_server: ProcMacroServerChoice::Sysroot,
             prefill_caches: true,
         };
-        let path = vfs::AbsPathBuf::assert(env::current_dir()?.join(&self.path));
-        let rootpath = path.normalize();
-        let manifest = ProjectManifest::discover_single(&path)?;
+        let root =
+            vfs::AbsPathBuf::assert_utf8(std::env::current_dir()?.join(&self.path)).normalize();
 
-        let workspace = ProjectWorkspace::load(manifest, &cargo_config, no_progress)?;
+        let mut config = crate::config::Config::new(
+            root.clone(),
+            lsp_types::ClientCapabilities::default(),
+            vec![],
+            None,
+        );
 
-        let (host, vfs, _) =
-            load_workspace(workspace, &cargo_config.extra_env, &load_cargo_config)?;
+        if let Some(p) = self.config_path {
+            let mut file = std::io::BufReader::new(std::fs::File::open(p)?);
+            let json = serde_json::from_reader(&mut file)?;
+            config.update(json)?;
+        }
+        let cargo_config = config.cargo();
+        let (db, vfs, _) = load_workspace_at(
+            root.as_path().as_ref(),
+            &cargo_config,
+            &load_cargo_config,
+            &no_progress,
+        )?;
+        let host = AnalysisHost::with_database(db);
         let db = host.raw_database();
         let analysis = host.analysis();
 
@@ -56,20 +64,16 @@ impl flags::Scip {
                 special_fields: Default::default(),
             })
             .into(),
-            project_root: format!(
-                "file://{}",
-                path.normalize()
-                    .as_os_str()
-                    .to_str()
-                    .ok_or(anyhow::format_err!("Unable to normalize project_root path"))?
-            ),
+            project_root: format!("file://{root}"),
             text_document_encoding: scip_types::TextEncoding::UTF8.into(),
             special_fields: Default::default(),
         };
         let mut documents = Vec::new();
 
-        let mut symbols_emitted: HashSet<TokenId> = HashSet::default();
-        let mut tokens_to_symbol: HashMap<TokenId, String> = HashMap::new();
+        let mut symbols_emitted: FxHashSet<TokenId> = FxHashSet::default();
+        let mut tokens_to_symbol: FxHashMap<TokenId, String> = FxHashMap::default();
+        let mut tokens_to_enclosing_symbol: FxHashMap<TokenId, Option<String>> =
+            FxHashMap::default();
 
         for StaticIndexedFile { file_id, tokens, .. } in si.files {
             let mut local_count = 0;
@@ -80,7 +84,7 @@ impl flags::Scip {
                 new_symbol
             };
 
-            let relative_path = match get_relative_filepath(&vfs, &rootpath, file_id) {
+            let relative_path = match get_relative_filepath(&vfs, &root, file_id) {
                 Some(relative_path) => relative_path,
                 None => continue,
             };
@@ -101,8 +105,22 @@ impl flags::Scip {
                 let symbol = tokens_to_symbol
                     .entry(id)
                     .or_insert_with(|| {
-                        let symbol = token_to_symbol(token).unwrap_or_else(&mut new_local_symbol);
+                        let symbol = token
+                            .moniker
+                            .as_ref()
+                            .map(moniker_to_symbol)
+                            .unwrap_or_else(&mut new_local_symbol);
                         scip::symbol::format_symbol(symbol)
+                    })
+                    .clone();
+                let enclosing_symbol = tokens_to_enclosing_symbol
+                    .entry(id)
+                    .or_insert_with(|| {
+                        token
+                            .enclosing_moniker
+                            .as_ref()
+                            .map(moniker_to_symbol)
+                            .map(scip::symbol::format_symbol)
                     })
                     .clone();
 
@@ -114,17 +132,30 @@ impl flags::Scip {
                     }
 
                     if symbols_emitted.insert(id) {
-                        let documentation = token
-                            .hover
-                            .as_ref()
-                            .map(|hover| hover.markup.as_str())
-                            .filter(|it| !it.is_empty())
-                            .map(|it| vec![it.to_owned()]);
+                        let documentation = match &token.documentation {
+                            Some(doc) => vec![doc.as_str().to_owned()],
+                            None => vec![],
+                        };
+
+                        let position_encoding =
+                            scip_types::PositionEncoding::UTF8CodeUnitOffsetFromLineStart.into();
+                        let signature_documentation =
+                            token.signature.clone().map(|text| scip_types::Document {
+                                relative_path: relative_path.clone(),
+                                language: "rust".to_owned(),
+                                text,
+                                position_encoding,
+                                ..Default::default()
+                            });
                         let symbol_info = scip_types::SymbolInformation {
                             symbol: symbol.clone(),
-                            documentation: documentation.unwrap_or_default(),
+                            documentation,
                             relationships: Vec::new(),
                             special_fields: Default::default(),
+                            kind: symbol_kind(token.kind).into(),
+                            display_name: token.display_name.clone().unwrap_or_default(),
+                            signature_documentation: signature_documentation.into(),
+                            enclosing_symbol: enclosing_symbol.unwrap_or_default(),
                         };
 
                         symbols.push(symbol_info)
@@ -139,6 +170,7 @@ impl flags::Scip {
                     syntax_kind: Default::default(),
                     diagnostics: Vec::new(),
                     special_fields: Default::default(),
+                    enclosing_range: Vec::new(),
                 });
             });
 
@@ -146,11 +178,15 @@ impl flags::Scip {
                 continue;
             }
 
+            let position_encoding =
+                scip_types::PositionEncoding::UTF8CodeUnitOffsetFromLineStart.into();
             documents.push(scip_types::Document {
                 relative_path,
-                language: "rust".to_string(),
+                language: "rust".to_owned(),
                 occurrences,
                 symbols,
+                text: String::new(),
+                position_encoding,
                 special_fields: Default::default(),
             });
         }
@@ -176,7 +212,7 @@ fn get_relative_filepath(
     rootpath: &vfs::AbsPathBuf,
     file_id: ide::FileId,
 ) -> Option<String> {
-    Some(vfs.file_path(file_id).as_path()?.strip_prefix(rootpath)?.as_ref().to_str()?.to_string())
+    Some(vfs.file_path(file_id).as_path()?.strip_prefix(rootpath)?.as_str().to_owned())
 }
 
 // SCIP Ranges have a (very large) optimization that ranges if they are on the same line
@@ -199,8 +235,8 @@ fn new_descriptor_str(
     suffix: scip_types::descriptor::Suffix,
 ) -> scip_types::Descriptor {
     scip_types::Descriptor {
-        name: name.to_string(),
-        disambiguator: "".to_string(),
+        name: name.to_owned(),
+        disambiguator: "".to_owned(),
         suffix: suffix.into(),
         special_fields: Default::default(),
     }
@@ -210,18 +246,40 @@ fn new_descriptor(name: &str, suffix: scip_types::descriptor::Suffix) -> scip_ty
     if name.contains('\'') {
         new_descriptor_str(&format!("`{name}`"), suffix)
     } else {
-        new_descriptor_str(&name, suffix)
+        new_descriptor_str(name, suffix)
     }
 }
 
-/// Loosely based on `def_to_moniker`
-///
-/// Only returns a Symbol when it's a non-local symbol.
-///     So if the visibility isn't outside of a document, then it will return None
-fn token_to_symbol(token: &TokenStaticData) -> Option<scip_types::Symbol> {
-    use scip_types::descriptor::Suffix::*;
+fn symbol_kind(kind: SymbolInformationKind) -> scip_types::symbol_information::Kind {
+    use scip_types::symbol_information::Kind as ScipKind;
+    match kind {
+        SymbolInformationKind::AssociatedType => ScipKind::AssociatedType,
+        SymbolInformationKind::Attribute => ScipKind::Attribute,
+        SymbolInformationKind::Constant => ScipKind::Constant,
+        SymbolInformationKind::Enum => ScipKind::Enum,
+        SymbolInformationKind::EnumMember => ScipKind::EnumMember,
+        SymbolInformationKind::Field => ScipKind::Field,
+        SymbolInformationKind::Function => ScipKind::Function,
+        SymbolInformationKind::Macro => ScipKind::Macro,
+        SymbolInformationKind::Method => ScipKind::Method,
+        SymbolInformationKind::Module => ScipKind::Module,
+        SymbolInformationKind::Parameter => ScipKind::Parameter,
+        SymbolInformationKind::SelfParameter => ScipKind::SelfParameter,
+        SymbolInformationKind::StaticMethod => ScipKind::StaticMethod,
+        SymbolInformationKind::StaticVariable => ScipKind::StaticVariable,
+        SymbolInformationKind::Struct => ScipKind::Struct,
+        SymbolInformationKind::Trait => ScipKind::Trait,
+        SymbolInformationKind::TraitMethod => ScipKind::TraitMethod,
+        SymbolInformationKind::Type => ScipKind::Type,
+        SymbolInformationKind::TypeAlias => ScipKind::TypeAlias,
+        SymbolInformationKind::TypeParameter => ScipKind::TypeParameter,
+        SymbolInformationKind::Union => ScipKind::Union,
+        SymbolInformationKind::Variable => ScipKind::Variable,
+    }
+}
 
-    let moniker = token.moniker.as_ref()?;
+fn moniker_to_symbol(moniker: &MonikerResult) -> scip_types::Symbol {
+    use scip_types::descriptor::Suffix::*;
 
     let package_name = moniker.package_information.name.clone();
     let version = moniker.package_information.version.clone();
@@ -246,26 +304,26 @@ fn token_to_symbol(token: &TokenStaticData) -> Option<scip_types::Symbol> {
         })
         .collect();
 
-    Some(scip_types::Symbol {
+    scip_types::Symbol {
         scheme: "rust-analyzer".into(),
         package: Some(scip_types::Package {
-            manager: "cargo".to_string(),
+            manager: "cargo".to_owned(),
             name: package_name,
-            version: version.unwrap_or_else(|| ".".to_string()),
+            version: version.unwrap_or_else(|| ".".to_owned()),
             special_fields: Default::default(),
         })
         .into(),
         descriptors,
         special_fields: Default::default(),
-    })
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use ide::{AnalysisHost, FilePosition, StaticIndex, TextSize};
-    use ide_db::base_db::fixture::ChangeFixture;
+    use ide::{FilePosition, TextSize};
     use scip::symbol::format_symbol;
+    use test_fixture::ChangeFixture;
 
     fn position(ra_fixture: &str) -> (AnalysisHost, FilePosition) {
         let mut host = AnalysisHost::default();
@@ -295,13 +353,13 @@ mod test {
             for &(range, id) in &file.tokens {
                 if range.contains(offset - TextSize::from(1)) {
                     let token = si.tokens.get(id).unwrap();
-                    found_symbol = token_to_symbol(token);
+                    found_symbol = token.moniker.as_ref().map(moniker_to_symbol);
                     break;
                 }
             }
         }
 
-        if expected == "" {
+        if expected.is_empty() {
             assert!(found_symbol.is_none(), "must have no symbols {found_symbol:?}");
             return;
         }
@@ -342,6 +400,21 @@ pub mod module {
 }
 "#,
             "rust-analyzer cargo foo 0.1.0 module/MyTrait#func().",
+        );
+    }
+
+    #[test]
+    fn symbol_for_trait_alias() {
+        check_symbol(
+            r#"
+//- /foo/lib.rs crate:foo@0.1.0,https://a.b/foo.git library
+#![feature(trait_alias)]
+pub mod module {
+    pub trait MyTrait {}
+    pub trait MyTraitAlias$0 = MyTrait;
+}
+"#,
+            "rust-analyzer cargo foo 0.1.0 module/MyTraitAlias#",
         );
     }
 
@@ -510,5 +583,34 @@ pub mod example_mod {
     "#,
             "rust-analyzer cargo main . foo/Bar#",
         );
+    }
+
+    #[test]
+    fn symbol_for_for_type_alias() {
+        check_symbol(
+            r#"
+    //- /lib.rs crate:main
+    pub type MyTypeAlias$0 = u8;
+    "#,
+            "rust-analyzer cargo main . MyTypeAlias#",
+        );
+    }
+
+    #[test]
+    fn documentation_matches_doc_comment() {
+        let s = "/// foo\nfn bar() {}";
+
+        let mut host = AnalysisHost::default();
+        let change_fixture = ChangeFixture::parse(s);
+        host.raw_database_mut().apply_change(change_fixture.change);
+
+        let analysis = host.analysis();
+        let si = StaticIndex::compute(&analysis);
+
+        let file = si.files.first().unwrap();
+        let (_, token_id) = file.tokens.first().unwrap();
+        let token = si.tokens.get(*token_id).unwrap();
+
+        assert_eq!(token.documentation.as_ref().map(|d| d.as_str()), Some("foo"));
     }
 }

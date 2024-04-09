@@ -3,7 +3,7 @@ use clippy_utils::diagnostics::span_lint_and_help;
 use clippy_utils::ty::is_copy;
 use rustc_lint::LateContext;
 use rustc_middle::ty::Ty;
-use rustc_span::source_map::Span;
+use rustc_span::Span;
 use std::fmt;
 
 use super::WRONG_SELF_CONVENTION;
@@ -137,7 +137,7 @@ pub(super) fn check<'tcx>(
                 cx,
                 WRONG_SELF_CONVENTION,
                 first_arg_span,
-                &format!(
+                format!(
                     "{suggestion} usually take {}",
                     &self_kinds
                         .iter()

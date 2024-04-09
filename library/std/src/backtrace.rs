@@ -93,10 +93,9 @@ use crate::env;
 use crate::ffi::c_void;
 use crate::fmt;
 use crate::panic::UnwindSafe;
-use crate::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use crate::sync::atomic::{AtomicU8, Ordering::Relaxed};
 use crate::sync::LazyLock;
-use crate::sys_common::backtrace::{lock, output_filename};
-use crate::vec::Vec;
+use crate::sys_common::backtrace::{lock, output_filename, set_image_base};
 
 /// A captured OS thread stack backtrace.
 ///
@@ -255,7 +254,7 @@ impl Backtrace {
         // Cache the result of reading the environment variables to make
         // backtrace captures speedy, because otherwise reading environment
         // variables every time can be somewhat slow.
-        static ENABLED: AtomicUsize = AtomicUsize::new(0);
+        static ENABLED: AtomicU8 = AtomicU8::new(0);
         match ENABLED.load(Relaxed) {
             0 => {}
             1 => return false,
@@ -268,7 +267,7 @@ impl Backtrace {
                 Err(_) => false,
             },
         };
-        ENABLED.store(enabled as usize + 1, Relaxed);
+        ENABLED.store(enabled as u8 + 1, Relaxed);
         enabled
     }
 
@@ -327,6 +326,7 @@ impl Backtrace {
         let _lock = lock();
         let mut frames = Vec::new();
         let mut actual_start = None;
+        set_image_base();
         unsafe {
             backtrace_rs::trace_unsynchronized(|frame| {
                 frames.push(BacktraceFrame {
@@ -467,7 +467,7 @@ impl RawFrame {
         match self {
             RawFrame::Actual(frame) => frame.ip(),
             #[cfg(test)]
-            RawFrame::Fake => crate::ptr::invalid_mut(1),
+            RawFrame::Fake => crate::ptr::without_provenance_mut(1),
         }
     }
 }

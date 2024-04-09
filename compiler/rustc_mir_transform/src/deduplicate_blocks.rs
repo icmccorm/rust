@@ -3,8 +3,6 @@
 
 use std::{collections::hash_map::Entry, hash::Hash, hash::Hasher, iter};
 
-use crate::MirPass;
-
 use rustc_data_structures::fx::FxHashMap;
 use rustc_middle::mir::visit::MutVisitor;
 use rustc_middle::mir::*;
@@ -27,7 +25,7 @@ impl<'tcx> MirPass<'tcx> for DeduplicateBlocks {
         if has_opts_to_apply {
             let mut opt_applier = OptApplier { tcx, duplicates };
             opt_applier.visit_body(body);
-            simplify_cfg(tcx, body);
+            simplify_cfg(body);
         }
     }
 }

@@ -3,7 +3,7 @@ use super::{GlobalCtxt, TyCtxt};
 use crate::dep_graph::TaskDepsRef;
 use crate::query::plumbing::QueryJobId;
 use rustc_data_structures::sync::{self, Lock};
-use rustc_errors::Diagnostic;
+use rustc_errors::DiagInner;
 #[cfg(not(parallel_compiler))]
 use std::cell::Cell;
 use std::mem;
@@ -26,7 +26,7 @@ pub struct ImplicitCtxt<'a, 'tcx> {
 
     /// Where to store diagnostics for the current query job, if any.
     /// This is updated by `JobOwner::start` in `ty::query::plumbing` when executing a query.
-    pub diagnostics: Option<&'a Lock<ThinVec<Diagnostic>>>,
+    pub diagnostics: Option<&'a Lock<ThinVec<DiagInner>>>,
 
     /// Used to prevent queries from calling too deeply.
     pub query_depth: usize,
@@ -85,6 +85,7 @@ where
 
 /// Allows access to the current `ImplicitCtxt` in a closure if one is available.
 #[inline]
+#[track_caller]
 pub fn with_context_opt<F, R>(f: F) -> R
 where
     F: for<'a, 'tcx> FnOnce(Option<&ImplicitCtxt<'a, 'tcx>>) -> R,
@@ -147,9 +148,13 @@ where
 /// Allows access to the `TyCtxt` in the current `ImplicitCtxt`.
 /// The closure is passed None if there is no `ImplicitCtxt` available.
 #[inline]
+#[track_caller]
 pub fn with_opt<F, R>(f: F) -> R
 where
     F: for<'tcx> FnOnce(Option<TyCtxt<'tcx>>) -> R,
 {
-    with_context_opt(|opt_context| f(opt_context.map(|context| context.tcx)))
+    with_context_opt(
+        #[track_caller]
+        |opt_context| f(opt_context.map(|context| context.tcx)),
+    )
 }

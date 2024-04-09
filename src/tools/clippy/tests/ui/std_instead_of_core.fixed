@@ -1,7 +1,12 @@
+//@aux-build:proc_macro_derive.rs
+
 #![warn(clippy::std_instead_of_core)]
 #![allow(unused_imports)]
 
 extern crate alloc;
+
+#[macro_use]
+extern crate proc_macro_derive;
 
 #[warn(clippy::std_instead_of_core)]
 fn std_instead_of_core() {
@@ -17,6 +22,14 @@ fn std_instead_of_core() {
     // Multiple imports
     use core::fmt::{Debug, Result};
     //~^ ERROR: used import from `std` instead of `core`
+
+    // Multiple imports multiline
+    #[rustfmt::skip]
+    use core::{
+        //~^ ERROR: used import from `std` instead of `core`
+        fmt::Write as _,
+        ptr::read_unaligned,
+    };
 
     // Function calls
     let ptr = core::ptr::null::<u32>();
@@ -53,6 +66,13 @@ fn std_instead_of_alloc() {
 fn alloc_instead_of_core() {
     use core::slice::from_ref;
     //~^ ERROR: used import from `alloc` instead of `core`
+}
+
+mod std_in_proc_macro_derive {
+    #[warn(clippy::alloc_instead_of_core)]
+    #[allow(unused)]
+    #[derive(ImplStructWithStdDisplay)]
+    struct B {}
 }
 
 fn main() {

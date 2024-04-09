@@ -8,14 +8,14 @@ use ide_db::{
     defs::Definition,
     imports::insert_use::remove_path_if_in_use_stmt,
     path_transform::PathTransform,
-    search::{FileReference, SearchScope},
+    search::{FileReference, FileReferenceNode, SearchScope},
     source_change::SourceChangeBuilder,
     syntax_helpers::{insert_whitespace_into_node::insert_ws_into, node_ext::expr_as_name_ref},
     RootDatabase,
 };
 use itertools::{izip, Itertools};
 use syntax::{
-    ast::{self, edit::IndentLevel, edit_in_place::Indent, HasArgList, PathExpr},
+    ast::{self, edit::IndentLevel, edit_in_place::Indent, HasArgList, Pat, PathExpr},
     ted, AstNode, NodeOrToken, SyntaxKind,
 };
 
@@ -107,6 +107,9 @@ pub(crate) fn inline_into_callers(acc: &mut Assists, ctx: &AssistContext<'_>) ->
                 let call_infos: Vec<_> = name_refs
                     .into_iter()
                     .filter_map(CallInfo::from_name_ref)
+                    // FIXME: do not handle callsites in macros' parameters, because
+                    // directly inlining into macros may cause errors.
+                    .filter(|call_info| !ctx.sema.hir_file_for(call_info.node.syntax()).is_macro())
                     .map(|call_info| {
                         let mut_node = builder.make_syntax_mut(call_info.node.syntax().clone());
                         (call_info, mut_node)
@@ -148,7 +151,7 @@ pub(super) fn split_refs_and_uses<T: ast::AstNode>(
 ) -> (Vec<T>, Vec<ast::Path>) {
     iter.into_iter()
         .filter_map(|file_ref| match file_ref.name {
-            ast::NameLike::NameRef(name_ref) => Some(name_ref),
+            FileReferenceNode::NameRef(name_ref) => Some(name_ref),
             _ => None,
         })
         .filter_map(|name_ref| match name_ref.syntax().ancestors().find_map(ast::UseTree::cast) {
@@ -203,7 +206,7 @@ pub(crate) fn inline_call(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<
     let fn_body = fn_source.value.body()?;
     let param_list = fn_source.value.param_list()?;
 
-    let FileRange { file_id, range } = fn_source.syntax().original_file_range(ctx.sema.db);
+    let FileRange { file_id, range } = fn_source.syntax().original_file_range_rooted(ctx.sema.db);
     if file_id == ctx.file_id() && range.contains(ctx.offset()) {
         cov_mark::hit!(inline_call_recursive);
         return None;
@@ -224,7 +227,6 @@ pub(crate) fn inline_call(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<
         syntax.text_range(),
         |builder| {
             let replacement = inline(&ctx.sema, file_id, function, &fn_body, &params, &call_info);
-
             builder.replace_ast(
                 match call_info.node {
                     ast::CallableExpr::Call(it) => ast::Expr::CallExpr(it),
@@ -279,7 +281,7 @@ fn get_fn_params(
 
     let mut params = Vec::new();
     if let Some(self_param) = param_list.self_param() {
-        // FIXME this should depend on the receiver as well as the self_param
+        // Keep `ref` and `mut` and transform them into `&` and `mut` later
         params.push((
             make::ident_pat(
                 self_param.amp_token().is_some(),
@@ -316,17 +318,6 @@ fn inline(
     } else {
         fn_body.clone_for_update()
     };
-    if let Some(imp) = body.syntax().ancestors().find_map(ast::Impl::cast) {
-        if !node.syntax().ancestors().any(|anc| &anc == imp.syntax()) {
-            if let Some(t) = imp.self_ty() {
-                body.syntax()
-                    .descendants_with_tokens()
-                    .filter_map(NodeOrToken::into_token)
-                    .filter(|tok| tok.kind() == SyntaxKind::SELF_TYPE_KW)
-                    .for_each(|tok| ted::replace(tok, t.syntax()));
-            }
-        }
-    }
     let usages_for_locals = |local| {
         Definition::Local(local)
             .usages(sema)
@@ -347,7 +338,7 @@ fn inline(
             match param.as_local(sema.db) {
                 Some(l) => usages_for_locals(l)
                     .map(|FileReference { name, range, .. }| match name {
-                        ast::NameLike::NameRef(_) => body
+                        FileReferenceNode::NameRef(_) => body
                             .syntax()
                             .covering_element(range)
                             .ancestors()
@@ -363,16 +354,43 @@ fn inline(
         .collect();
 
     if function.self_param(sema.db).is_some() {
-        let this = || make::name_ref("this").syntax().clone_for_update().first_token().unwrap();
+        let this = || {
+            make::name_ref("this")
+                .syntax()
+                .clone_for_update()
+                .first_token()
+                .expect("NameRef should have had a token.")
+        };
         if let Some(self_local) = params[0].2.as_local(sema.db) {
             usages_for_locals(self_local)
                 .filter_map(|FileReference { name, range, .. }| match name {
-                    ast::NameLike::NameRef(_) => Some(body.syntax().covering_element(range)),
+                    FileReferenceNode::NameRef(_) => Some(body.syntax().covering_element(range)),
                     _ => None,
                 })
-                .for_each(|it| {
-                    ted::replace(it, &this());
-                })
+                .for_each(|usage| {
+                    ted::replace(usage, &this());
+                });
+        }
+    }
+
+    // We should place the following code after last usage of `usages_for_locals`
+    // because `ted::replace` will change the offset in syntax tree, which makes
+    // `FileReference` incorrect
+    if let Some(imp) =
+        sema.ancestors_with_macros(fn_body.syntax().clone()).find_map(ast::Impl::cast)
+    {
+        if !node.syntax().ancestors().any(|anc| &anc == imp.syntax()) {
+            if let Some(t) = imp.self_ty() {
+                while let Some(self_tok) = body
+                    .syntax()
+                    .descendants_with_tokens()
+                    .filter_map(NodeOrToken::into_token)
+                    .find(|tok| tok.kind() == SyntaxKind::SELF_TYPE_KW)
+                {
+                    let replace_with = t.clone_subtree().syntax().clone_for_update();
+                    ted::replace(self_tok, replace_with);
+                }
+            }
         }
     }
 
@@ -394,16 +412,63 @@ fn inline(
     let mut let_stmts = Vec::new();
 
     // Inline parameter expressions or generate `let` statements depending on whether inlining works or not.
-    for ((pat, param_ty, _), usages, expr) in izip!(params, param_use_nodes, arguments) {
+    for ((pat, param_ty, param), usages, expr) in izip!(params, param_use_nodes, arguments) {
         // izip confuses RA due to our lack of hygiene info currently losing us type info causing incorrect errors
         let usages: &[ast::PathExpr] = &usages;
         let expr: &ast::Expr = expr;
 
         let mut insert_let_stmt = || {
-            let ty = sema.type_of_expr(expr).filter(TypeInfo::has_adjustment).and(param_ty.clone());
-            let_stmts.push(
-                make::let_stmt(pat.clone(), ty, Some(expr.clone())).clone_for_update().into(),
-            );
+            let param_ty = param_ty.clone().map(|param_ty| {
+                if sema.hir_file_for(param_ty.syntax()).is_macro() {
+                    ast::Type::cast(insert_ws_into(param_ty.syntax().clone())).unwrap_or(param_ty)
+                } else {
+                    param_ty
+                }
+            });
+
+            let ty = sema.type_of_expr(expr).filter(TypeInfo::has_adjustment).and(param_ty);
+
+            let is_self = param
+                .name(sema.db)
+                .and_then(|name| name.as_text())
+                .is_some_and(|name| name == "self");
+
+            if is_self {
+                let mut this_pat = make::ident_pat(false, false, make::name("this"));
+                let mut expr = expr.clone();
+                if let Pat::IdentPat(pat) = pat {
+                    match (pat.ref_token(), pat.mut_token()) {
+                        // self => let this = obj
+                        (None, None) => {}
+                        // mut self => let mut this = obj
+                        (None, Some(_)) => {
+                            this_pat = make::ident_pat(false, true, make::name("this"));
+                        }
+                        // &self => let this = &obj
+                        (Some(_), None) => {
+                            expr = make::expr_ref(expr, false);
+                        }
+                        // let foo = &mut X; &mut self => let this = &mut obj
+                        // let mut foo = X;  &mut self => let this = &mut *obj (reborrow)
+                        (Some(_), Some(_)) => {
+                            let should_reborrow = sema
+                                .type_of_expr(&expr)
+                                .map(|ty| ty.original.is_mutable_reference());
+                            expr = if let Some(true) = should_reborrow {
+                                make::expr_reborrow(expr)
+                            } else {
+                                make::expr_ref(expr, true)
+                            };
+                        }
+                    }
+                };
+                let_stmts
+                    .push(make::let_stmt(this_pat.into(), ty, Some(expr)).clone_for_update().into())
+            } else {
+                let_stmts.push(
+                    make::let_stmt(pat.clone(), ty, Some(expr.clone())).clone_for_update().into(),
+                );
+            }
         };
 
         // check if there is a local var in the function that conflicts with parameter
@@ -469,10 +534,10 @@ fn inline(
             body = make::block_expr(let_stmts, Some(body.into())).clone_for_update();
         }
     } else if let Some(stmt_list) = body.stmt_list() {
-        ted::insert_all(
-            ted::Position::after(stmt_list.l_curly_token().unwrap()),
-            let_stmts.into_iter().map(|stmt| stmt.syntax().clone().into()).collect(),
-        );
+        let position = stmt_list.l_curly_token().expect("L_CURLY for StatementList is missing.");
+        let_stmts.into_iter().rev().for_each(|let_stmt| {
+            ted::insert(ted::Position::after(position.clone()), let_stmt.syntax().clone());
+        });
     }
 
     let original_indentation = match node {
@@ -481,8 +546,12 @@ fn inline(
     };
     body.reindent_to(original_indentation);
 
+    let no_stmts = body.statements().next().is_none();
     match body.tail_expr() {
-        Some(expr) if !is_async_fn && body.statements().next().is_none() => expr,
+        Some(expr) if matches!(expr, ast::Expr::ClosureExpr(_)) && no_stmts => {
+            make::expr_paren(expr).clone_for_update()
+        }
+        Some(expr) if !is_async_fn && no_stmts => expr,
         _ => match node
             .syntax()
             .parent()
@@ -700,7 +769,7 @@ impl Foo {
 
 fn main() {
     let x = {
-        let ref this = Foo(3);
+        let this = &Foo(3);
         Foo(this.0 + 2)
     };
 }
@@ -736,7 +805,7 @@ impl Foo {
 
 fn main() {
     let x = {
-        let ref this = Foo(3);
+        let this = &Foo(3);
         Foo(this.0 + 2)
     };
 }
@@ -774,7 +843,7 @@ impl Foo {
 fn main() {
     let mut foo = Foo(3);
     {
-        let ref mut this = foo;
+        let this = &mut foo;
         this.0 = 0;
     };
 }
@@ -861,7 +930,7 @@ impl Foo {
     }
     fn bar(&self) {
         {
-            let ref this = self;
+            let this = &self;
             this;
             this;
         };
@@ -1281,8 +1350,8 @@ macro_rules! define_foo {
 define_foo!();
 fn bar() -> u32 {
     {
-      let x = 0;
-      x
+        let x = 0;
+        x
     }
 }
 "#,
@@ -1470,6 +1539,274 @@ fn main() {
             y + y + *z
         }
     });
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn inline_call_closure_body() {
+        check_assist(
+            inline_call,
+            r#"
+fn f() -> impl Fn() -> i32 {
+    || 2
+}
+
+fn main() {
+    let _ = $0f()();
+}
+"#,
+            r#"
+fn f() -> impl Fn() -> i32 {
+    || 2
+}
+
+fn main() {
+    let _ = (|| 2)();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn inline_call_with_multiple_self_types_eq() {
+        check_assist(
+            inline_call,
+            r#"
+#[derive(PartialEq, Eq)]
+enum Enum {
+    A,
+    B,
+}
+
+impl Enum {
+    fn a_or_b_eq(&self) -> bool {
+        self == &Self::A || self == &Self::B
+    }
+}
+
+fn a() -> bool {
+    Enum::A.$0a_or_b_eq()
+}
+"#,
+            r#"
+#[derive(PartialEq, Eq)]
+enum Enum {
+    A,
+    B,
+}
+
+impl Enum {
+    fn a_or_b_eq(&self) -> bool {
+        self == &Self::A || self == &Self::B
+    }
+}
+
+fn a() -> bool {
+    {
+        let this = &Enum::A;
+        this == &Enum::A || this == &Enum::B
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn inline_call_with_self_type_in_macros() {
+        check_assist(
+            inline_call,
+            r#"
+trait Trait<T1> {
+    fn f(a: T1) -> Self;
+}
+
+macro_rules! impl_from {
+    ($t: ty) => {
+        impl Trait<$t> for $t {
+            fn f(a: $t) -> Self {
+                a as Self
+            }
+        }
+    };
+}
+
+struct A {}
+
+impl_from!(A);
+
+fn main() {
+    let a: A = A{};
+    let b = <A as Trait<A>>::$0f(a);
+}
+"#,
+            r#"
+trait Trait<T1> {
+    fn f(a: T1) -> Self;
+}
+
+macro_rules! impl_from {
+    ($t: ty) => {
+        impl Trait<$t> for $t {
+            fn f(a: $t) -> Self {
+                a as Self
+            }
+        }
+    };
+}
+
+struct A {}
+
+impl_from!(A);
+
+fn main() {
+    let a: A = A{};
+    let b = {
+        let a = a;
+        a as A
+    };
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn method_by_reborrow() {
+        check_assist(
+            inline_call,
+            r#"
+pub struct Foo(usize);
+
+impl Foo {
+    fn add1(&mut self) {
+        self.0 += 1;
+    }
+}
+
+pub fn main() {
+    let f = &mut Foo(0);
+    f.add1$0();
+}
+"#,
+            r#"
+pub struct Foo(usize);
+
+impl Foo {
+    fn add1(&mut self) {
+        self.0 += 1;
+    }
+}
+
+pub fn main() {
+    let f = &mut Foo(0);
+    {
+        let this = &mut *f;
+        this.0 += 1;
+    };
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn method_by_mut() {
+        check_assist(
+            inline_call,
+            r#"
+pub struct Foo(usize);
+
+impl Foo {
+    fn add1(mut self) {
+        self.0 += 1;
+    }
+}
+
+pub fn main() {
+    let mut f = Foo(0);
+    f.add1$0();
+}
+"#,
+            r#"
+pub struct Foo(usize);
+
+impl Foo {
+    fn add1(mut self) {
+        self.0 += 1;
+    }
+}
+
+pub fn main() {
+    let mut f = Foo(0);
+    {
+        let mut this = f;
+        this.0 += 1;
+    };
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn inline_call_with_reference_in_macros() {
+        check_assist(
+            inline_call,
+            r#"
+fn _write_u64(s: &mut u64, x: u64) {
+    *s += x;
+}
+macro_rules! impl_write {
+    ($(($ty:ident, $meth:ident),)*) => {$(
+        fn _hash(inner_self_: &u64, state: &mut u64) {
+            $meth(state, *inner_self_)
+        }
+    )*}
+}
+impl_write! { (u64, _write_u64), }
+fn _hash2(self_: &u64, state: &mut u64) {
+    $0_hash(&self_, state);
+}
+"#,
+            r#"
+fn _write_u64(s: &mut u64, x: u64) {
+    *s += x;
+}
+macro_rules! impl_write {
+    ($(($ty:ident, $meth:ident),)*) => {$(
+        fn _hash(inner_self_: &u64, state: &mut u64) {
+            $meth(state, *inner_self_)
+        }
+    )*}
+}
+impl_write! { (u64, _write_u64), }
+fn _hash2(self_: &u64, state: &mut u64) {
+    {
+        let inner_self_: &u64 = &self_;
+        let state: &mut u64 = state;
+        _write_u64(state, *inner_self_)
+    };
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn inline_into_callers_in_macros_not_applicable() {
+        check_assist_not_applicable(
+            inline_into_callers,
+            r#"
+fn foo() -> u32 {
+    42
+}
+
+macro_rules! bar {
+    ($x:expr) => {
+      $x
+    };
+}
+
+fn f() {
+    bar!(foo$0());
 }
 "#,
         );

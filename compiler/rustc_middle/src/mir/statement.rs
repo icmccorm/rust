@@ -57,6 +57,7 @@ impl<V, T> ProjectionElem<V, T> {
             Self::Field(_, _)
             | Self::Index(_)
             | Self::OpaqueCast(_)
+            | Self::Subtype(_)
             | Self::ConstantIndex { .. }
             | Self::Subslice { .. }
             | Self::Downcast(_, _) => false,
@@ -70,6 +71,7 @@ impl<V, T> ProjectionElem<V, T> {
             Self::Deref | Self::Index(_) => false,
             Self::Field(_, _)
             | Self::OpaqueCast(_)
+            | Self::Subtype(_)
             | Self::ConstantIndex { .. }
             | Self::Subslice { .. }
             | Self::Downcast(_, _) => true,
@@ -95,6 +97,7 @@ impl<V, T> ProjectionElem<V, T> {
             | Self::Field(_, _) => true,
             Self::ConstantIndex { from_end: true, .. }
             | Self::Index(_)
+            | Self::Subtype(_)
             | Self::OpaqueCast(_)
             | Self::Subslice { .. } => false,
         }
@@ -156,7 +159,7 @@ impl<'tcx> Place<'tcx> {
 
     #[inline]
     pub fn as_ref(&self) -> PlaceRef<'tcx> {
-        PlaceRef { local: self.local, projection: &self.projection }
+        PlaceRef { local: self.local, projection: self.projection }
     }
 
     /// Iterate over the projections in evaluation order, i.e., the first element is the base with
@@ -378,7 +381,7 @@ impl<'tcx> Operand<'tcx> {
 impl<'tcx> ConstOperand<'tcx> {
     pub fn check_static_ptr(&self, tcx: TyCtxt<'_>) -> Option<DefId> {
         match self.const_.try_to_scalar() {
-            Some(Scalar::Ptr(ptr, _size)) => match tcx.global_alloc(ptr.provenance) {
+            Some(Scalar::Ptr(ptr, _size)) => match tcx.global_alloc(ptr.provenance.alloc_id()) {
                 GlobalAlloc::Static(def_id) => {
                     assert!(!tcx.is_thread_local_static(def_id));
                     Some(def_id)
@@ -406,7 +409,7 @@ impl<'tcx> Rvalue<'tcx> {
             // Pointer to int casts may be side-effects due to exposing the provenance.
             // While the model is undecided, we should be conservative. See
             // <https://www.ralfj.de/blog/2022/04/11/provenance-exposed.html>
-            Rvalue::Cast(CastKind::PointerExposeAddress, _, _) => false,
+            Rvalue::Cast(CastKind::PointerExposeProvenance, _, _) => false,
 
             Rvalue::Use(_)
             | Rvalue::CopyForDeref(_)
@@ -423,7 +426,7 @@ impl<'tcx> Rvalue<'tcx> {
                 | CastKind::FnPtrToPtr
                 | CastKind::PtrToPtr
                 | CastKind::PointerCoercion(_)
-                | CastKind::PointerFromExposedAddress
+                | CastKind::PointerWithExposedProvenance
                 | CastKind::DynStar
                 | CastKind::Transmute,
                 _,
@@ -443,7 +446,7 @@ impl<'tcx> Rvalue<'tcx> {
 impl BorrowKind {
     pub fn mutability(&self) -> Mutability {
         match *self {
-            BorrowKind::Shared | BorrowKind::Shallow => Mutability::Not,
+            BorrowKind::Shared | BorrowKind::Fake => Mutability::Not,
             BorrowKind::Mut { .. } => Mutability::Mut,
         }
     }
@@ -451,7 +454,7 @@ impl BorrowKind {
     pub fn allows_two_phase_borrow(&self) -> bool {
         match *self {
             BorrowKind::Shared
-            | BorrowKind::Shallow
+            | BorrowKind::Fake
             | BorrowKind::Mut { kind: MutBorrowKind::Default | MutBorrowKind::ClosureCapture } => {
                 false
             }

@@ -1,11 +1,10 @@
-// run-pass
+//@ run-pass
 
 // Ensure that provided items are inherited properly even when impls vary in
 // type parameters *and* rely on projections.
 
 #![feature(specialization)] //~ WARN the feature `specialization` is incomplete
 
-use std::convert::Into;
 
 trait Trait {
     fn to_u8(&self) -> u8;

@@ -146,7 +146,7 @@ impl<'tcx> Stack {
     /// Panics if any of the caching mechanisms have broken,
     /// - The StackCache indices don't refer to the parallel items,
     /// - There are no Unique items outside of first_unique..last_unique
-    #[cfg(all(feature = "stack-cache", debug_assertions))]
+    #[cfg(feature = "stack-cache-consistency-check")]
     fn verify_cache_consistency(&self) {
         // Only a full cache needs to be valid. Also see the comments in find_granting_cache
         // and set_unknown_bottom.
@@ -190,7 +190,7 @@ impl<'tcx> Stack {
         tag: ProvenanceExtra,
         exposed_tags: &FxHashSet<BorTag>,
     ) -> Result<Option<usize>, ()> {
-        #[cfg(all(feature = "stack-cache", debug_assertions))]
+        #[cfg(feature = "stack-cache-consistency-check")]
         self.verify_cache_consistency();
 
         let ProvenanceExtra::Concrete(tag) = tag else {
@@ -327,7 +327,7 @@ impl<'tcx> Stack {
         // This primes the cache for the next access, which is almost always the just-added tag.
         self.cache.add(new_idx, new);
 
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "stack-cache-consistency-check")]
         self.verify_cache_consistency();
     }
 
@@ -385,7 +385,7 @@ impl<'tcx> Stack {
             let upper = unique_range.end;
             for item in &mut self.borrows[lower..upper] {
                 if item.perm() == Permission::Unique {
-                    log::trace!("access: disabling item {:?}", item);
+                    trace!("access: disabling item {:?}", item);
                     visitor(*item)?;
                     item.set_permission(Permission::Disabled);
                     // Also update all copies of this item in the cache.
@@ -410,7 +410,7 @@ impl<'tcx> Stack {
             self.unique_range.end = self.unique_range.end.min(disable_start);
         }
 
-        #[cfg(all(feature = "stack-cache", debug_assertions))]
+        #[cfg(feature = "stack-cache-consistency-check")]
         self.verify_cache_consistency();
 
         Ok(())
@@ -465,7 +465,7 @@ impl<'tcx> Stack {
             self.unique_range = 0..0;
         }
 
-        #[cfg(all(feature = "stack-cache", debug_assertions))]
+        #[cfg(feature = "stack-cache-consistency-check")]
         self.verify_cache_consistency();
         Ok(())
     }

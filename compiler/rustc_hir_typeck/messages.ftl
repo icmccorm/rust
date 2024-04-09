@@ -86,18 +86,15 @@ hir_typeck_invalid_callee = expected function, found {$ty}
 hir_typeck_lossy_provenance_int2ptr =
     strict provenance disallows casting integer `{$expr_ty}` to pointer `{$cast_ty}`
     .suggestion = use `.with_addr()` to adjust a valid pointer in the same allocation, to this address
-    .help = if you can't comply with strict provenance and don't have a pointer with the correct provenance you can use `std::ptr::from_exposed_addr()` instead
+    .help = if you can't comply with strict provenance and don't have a pointer with the correct provenance you can use `std::ptr::with_exposed_provenance()` instead
 
 hir_typeck_lossy_provenance_ptr2int =
     under strict provenance it is considered bad style to cast pointer `{$expr_ty}` to integer `{$cast_ty}`
     .suggestion = use `.addr()` to obtain the address of a pointer
-    .help = if you can't comply with strict provenance and need to expose the pointer provenance you can use `.expose_addr()` instead
+    .help = if you can't comply with strict provenance and need to expose the pointer provenance you can use `.expose_provenance()` instead
 
 hir_typeck_method_call_on_unknown_raw_pointee =
     cannot call a method on a raw pointer with an unknown pointee type
-
-hir_typeck_missing_fn_lang_items = failed to find an overloaded call trait for closure call
-    .help = make sure the `fn`/`fn_mut`/`fn_once` lang items are defined and have correctly defined `call`/`call_mut`/`call_once` methods
 
 hir_typeck_missing_parentheses_in_range = can't call method `{$method_name}` on type `{$ty_str}`
 
@@ -106,9 +103,9 @@ hir_typeck_no_associated_item = no {$item_kind} named `{$item_name}` found for {
     *[other] {" "}in the current scope
 }
 
-hir_typeck_note_edition_guide = for more on editions, read https://doc.rust-lang.org/edition-guide
+hir_typeck_note_caller_chooses_ty_for_ty_param = the caller chooses a type for `{$ty_param_name}` which can be different from `{$found_ty}`
 
-hir_typeck_op_trait_generic_params = `{$method_name}` must not have any generic parameters
+hir_typeck_note_edition_guide = for more on editions, read https://doc.rust-lang.org/edition-guide
 
 hir_typeck_option_result_asref = use `{$def_path}::as_ref` to convert `{$expected_ty}` to `{$expr_ty}`
 hir_typeck_option_result_cloned = use `{$def_path}::cloned` to clone the value inside the `{$def_path}`
@@ -124,6 +121,10 @@ hir_typeck_return_stmt_outside_of_fn_body =
     {$statement_kind} statement outside of function body
     .encl_body_label = the {$statement_kind} is part of this body...
     .encl_fn_label = ...not the enclosing function body
+
+hir_typeck_rpit_box_return_expr = if you change the return type to expect trait objects, box the returned expressions
+
+hir_typeck_rpit_change_return_type = you could change the return type to be a boxed trait object
 
 hir_typeck_rustcall_incorrect_args =
     functions with the "rust-call" ABI must take a single non-self tuple argument
@@ -150,5 +151,5 @@ hir_typeck_union_pat_multiple_fields = union patterns should have exactly one fi
 hir_typeck_use_is_empty =
     consider using the `is_empty` method on `{$expr_ty}` to determine if it contains anything
 
-hir_typeck_yield_expr_outside_of_generator =
-    yield expression outside of generator literal
+hir_typeck_yield_expr_outside_of_coroutine =
+    yield expression outside of coroutine literal

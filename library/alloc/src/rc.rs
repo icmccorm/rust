@@ -252,6 +252,7 @@ use core::cell::Cell;
 use core::cmp::Ordering;
 use core::fmt;
 use core::hash::{Hash, Hasher};
+use core::hint;
 use core::intrinsics::abort;
 #[cfg(not(no_global_oom_handling))]
 use core::iter;
@@ -259,7 +260,7 @@ use core::marker::{PhantomData, Unsize};
 #[cfg(not(no_global_oom_handling))]
 use core::mem::size_of_val;
 use core::mem::{self, align_of_val_raw, forget, ManuallyDrop};
-use core::ops::{CoerceUnsized, Deref, DerefMut, DispatchFromDyn, Receiver};
+use core::ops::{CoerceUnsized, Deref, DerefMut, DerefPure, DispatchFromDyn, Receiver};
 use core::panic::{RefUnwindSafe, UnwindSafe};
 #[cfg(not(no_global_oom_handling))]
 use core::pin::Pin;
@@ -938,8 +939,26 @@ impl<T, A: Allocator> Rc<T, A> {
     /// it is guaranteed that exactly one of the calls returns the inner value.
     /// This means in particular that the inner value is not dropped.
     ///
-    /// This is equivalent to `Rc::try_unwrap(this).ok()`. (Note that these are not equivalent for
-    /// [`Arc`](crate::sync::Arc), due to race conditions that do not apply to `Rc`.)
+    /// [`Rc::try_unwrap`] is conceptually similar to `Rc::into_inner`.
+    /// And while they are meant for different use-cases, `Rc::into_inner(this)`
+    /// is in fact equivalent to <code>[Rc::try_unwrap]\(this).[ok][Result::ok]()</code>.
+    /// (Note that the same kind of equivalence does **not** hold true for
+    /// [`Arc`](crate::sync::Arc), due to race conditions that do not apply to `Rc`!)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::rc::Rc;
+    ///
+    /// let x = Rc::new(3);
+    /// assert_eq!(Rc::into_inner(x), Some(3));
+    ///
+    /// let x = Rc::new(4);
+    /// let y = Rc::clone(&x);
+    ///
+    /// assert_eq!(Rc::into_inner(y), None);
+    /// assert_eq!(Rc::into_inner(x), Some(4));
+    /// ```
     #[inline]
     #[stable(feature = "rc_into_inner", since = "1.70.0")]
     pub fn into_inner(this: Self) -> Option<T> {
@@ -1180,12 +1199,19 @@ impl<T: ?Sized> Rc<T> {
     /// Constructs an `Rc<T>` from a raw pointer.
     ///
     /// The raw pointer must have been previously returned by a call to
-    /// [`Rc<U>::into_raw`][into_raw] where `U` must have the same size
-    /// and alignment as `T`. This is trivially true if `U` is `T`.
-    /// Note that if `U` is not `T` but has the same size and alignment, this is
-    /// basically like transmuting references of different types. See
-    /// [`mem::transmute`][transmute] for more information on what
-    /// restrictions apply in this case.
+    /// [`Rc<U>::into_raw`][into_raw] with the following requirements:
+    ///
+    /// * If `U` is sized, it must have the same size and alignment as `T`. This
+    ///   is trivially true if `U` is `T`.
+    /// * If `U` is unsized, its data pointer must have the same size and
+    ///   alignment as `T`. This is trivially true if `Rc<U>` was constructed
+    ///   through `Rc<T>` and then converted to `Rc<U>` through an [unsized
+    ///   coercion].
+    ///
+    /// Note that if `U` or `U`'s data pointer is not `T` but has the same size
+    /// and alignment, this is basically like transmuting references of
+    /// different types. See [`mem::transmute`][transmute] for more information
+    /// on what restrictions apply in this case.
     ///
     /// The raw pointer must point to a block of memory allocated by the global allocator
     ///
@@ -1197,6 +1223,7 @@ impl<T: ?Sized> Rc<T> {
     ///
     /// [into_raw]: Rc::into_raw
     /// [transmute]: core::mem::transmute
+    /// [unsized coercion]: https://doc.rust-lang.org/reference/type-coercions.html#unsized-coercions
     ///
     /// # Examples
     ///
@@ -1215,6 +1242,20 @@ impl<T: ?Sized> Rc<T> {
     /// }
     ///
     /// // The memory was freed when `x` went out of scope above, so `x_ptr` is now dangling!
+    /// ```
+    ///
+    /// Convert a slice back into its original array:
+    ///
+    /// ```
+    /// use std::rc::Rc;
+    ///
+    /// let x: Rc<[u32]> = Rc::new([1, 2, 3]);
+    /// let x_ptr: *const [u32] = Rc::into_raw(x);
+    ///
+    /// unsafe {
+    ///     let x: Rc<[u32; 3]> = Rc::from_raw(x_ptr.cast::<[u32; 3]>());
+    ///     assert_eq!(&*x, &[1, 2, 3]);
+    /// }
     /// ```
     #[inline]
     #[stable(feature = "rc_raw", since = "1.17.0")]
@@ -1303,8 +1344,9 @@ impl<T: ?Sized, A: Allocator> Rc<T, A> {
     /// let x_ptr = Rc::into_raw(x);
     /// assert_eq!(unsafe { &*x_ptr }, "hello");
     /// ```
+    #[must_use = "losing the pointer will leak memory"]
     #[stable(feature = "rc_raw", since = "1.17.0")]
-    #[cfg_attr(not(bootstrap), rustc_never_returns_null_ptr)]
+    #[rustc_never_returns_null_ptr]
     pub fn into_raw(this: Self) -> *const T {
         let ptr = Self::as_ptr(&this);
         mem::forget(this);
@@ -1328,7 +1370,7 @@ impl<T: ?Sized, A: Allocator> Rc<T, A> {
     /// assert_eq!(unsafe { &*x_ptr }, "hello");
     /// ```
     #[stable(feature = "weak_into_raw", since = "1.45.0")]
-    #[cfg_attr(not(bootstrap), rustc_never_returns_null_ptr)]
+    #[rustc_never_returns_null_ptr]
     pub fn as_ptr(this: &Self) -> *const T {
         let ptr: *mut RcBox<T> = NonNull::as_ptr(this.ptr);
 
@@ -1340,13 +1382,20 @@ impl<T: ?Sized, A: Allocator> Rc<T, A> {
 
     /// Constructs an `Rc<T, A>` from a raw pointer in the provided allocator.
     ///
-    /// The raw pointer must have been previously returned by a call to
-    /// [`Rc<U, A>::into_raw`][into_raw] where `U` must have the same size
-    /// and alignment as `T`. This is trivially true if `U` is `T`.
-    /// Note that if `U` is not `T` but has the same size and alignment, this is
-    /// basically like transmuting references of different types. See
-    /// [`mem::transmute`] for more information on what
-    /// restrictions apply in this case.
+    /// The raw pointer must have been previously returned by a call to [`Rc<U,
+    /// A>::into_raw`][into_raw] with the following requirements:
+    ///
+    /// * If `U` is sized, it must have the same size and alignment as `T`. This
+    ///   is trivially true if `U` is `T`.
+    /// * If `U` is unsized, its data pointer must have the same size and
+    ///   alignment as `T`. This is trivially true if `Rc<U>` was constructed
+    ///   through `Rc<T>` and then converted to `Rc<U>` through an [unsized
+    ///   coercion].
+    ///
+    /// Note that if `U` or `U`'s data pointer is not `T` but has the same size
+    /// and alignment, this is basically like transmuting references of
+    /// different types. See [`mem::transmute`][transmute] for more information
+    /// on what restrictions apply in this case.
     ///
     /// The raw pointer must point to a block of memory allocated by `alloc`
     ///
@@ -1357,6 +1406,8 @@ impl<T: ?Sized, A: Allocator> Rc<T, A> {
     /// even if the returned `Rc<T>` is never accessed.
     ///
     /// [into_raw]: Rc::into_raw
+    /// [transmute]: core::mem::transmute
+    /// [unsized coercion]: https://doc.rust-lang.org/reference/type-coercions.html#unsized-coercions
     ///
     /// # Examples
     ///
@@ -1378,6 +1429,23 @@ impl<T: ?Sized, A: Allocator> Rc<T, A> {
     /// }
     ///
     /// // The memory was freed when `x` went out of scope above, so `x_ptr` is now dangling!
+    /// ```
+    ///
+    /// Convert a slice back into its original array:
+    ///
+    /// ```
+    /// #![feature(allocator_api)]
+    ///
+    /// use std::rc::Rc;
+    /// use std::alloc::System;
+    ///
+    /// let x: Rc<[u32], _> = Rc::new_in([1, 2, 3], System);
+    /// let x_ptr: *const [u32] = Rc::into_raw(x);
+    ///
+    /// unsafe {
+    ///     let x: Rc<[u32; 3], _> = Rc::from_raw_in(x_ptr.cast::<[u32; 3]>(), System);
+    ///     assert_eq!(&*x, &[1, 2, 3]);
+    /// }
     /// ```
     #[unstable(feature = "allocator_api", issue = "32838")]
     pub unsafe fn from_raw_in(ptr: *const T, alloc: A) -> Self {
@@ -1649,7 +1717,7 @@ impl<T: ?Sized, A: Allocator> Rc<T, A> {
     /// assert!(!Rc::ptr_eq(&five, &other_five));
     /// ```
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
-        this.ptr.as_ptr() as *const () == other.ptr.as_ptr() as *const ()
+        ptr::addr_eq(this.ptr.as_ptr(), other.ptr.as_ptr())
     }
 }
 
@@ -1748,7 +1816,6 @@ impl<T: Clone, A: Allocator + Clone> Rc<T, A> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(arc_unwrap_or_clone)]
     /// # use std::{ptr, rc::Rc};
     /// let inner = String::from("test");
     /// let ptr = inner.as_ptr();
@@ -1769,7 +1836,7 @@ impl<T: Clone, A: Allocator + Clone> Rc<T, A> {
     /// assert!(ptr::eq(ptr, inner.as_ptr()));
     /// ```
     #[inline]
-    #[unstable(feature = "arc_unwrap_or_clone", issue = "93610")]
+    #[stable(feature = "arc_unwrap_or_clone", since = "1.76.0")]
     pub fn unwrap_or_clone(this: Self) -> T {
         Rc::try_unwrap(this).unwrap_or_else(|rc| (*rc).clone())
     }
@@ -1886,10 +1953,10 @@ impl<T: ?Sized> Rc<T> {
         // Initialize the RcBox
         let inner = mem_to_rcbox(ptr.as_non_null_ptr().as_ptr());
         unsafe {
-            debug_assert_eq!(Layout::for_value(&*inner), layout);
+            debug_assert_eq!(Layout::for_value_raw(inner), layout);
 
-            ptr::write(&mut (*inner).strong, Cell::new(1));
-            ptr::write(&mut (*inner).weak, Cell::new(1));
+            ptr::addr_of_mut!((*inner).strong).write(Cell::new(1));
+            ptr::addr_of_mut!((*inner).weak).write(Cell::new(1));
         }
 
         Ok(inner)
@@ -1903,7 +1970,7 @@ impl<T: ?Sized, A: Allocator> Rc<T, A> {
         // Allocate for the `RcBox<T>` using the given value.
         unsafe {
             Rc::<T>::allocate_for_layout(
-                Layout::for_value(&*ptr),
+                Layout::for_value_raw(ptr),
                 |layout| alloc.allocate(layout),
                 |mem| mem.with_metadata_of(ptr as *const RcBox<T>),
             )
@@ -1918,14 +1985,14 @@ impl<T: ?Sized, A: Allocator> Rc<T, A> {
 
             // Copy value as bytes
             ptr::copy_nonoverlapping(
-                &*src as *const T as *const u8,
-                &mut (*ptr).value as *mut _ as *mut u8,
+                core::ptr::addr_of!(*src) as *const u8,
+                ptr::addr_of_mut!((*ptr).value) as *mut u8,
                 value_size,
             );
 
             // Free the allocation without dropping its contents
             let (bptr, alloc) = Box::into_raw_with_allocator(src);
-            let src = Box::from_raw(bptr as *mut mem::ManuallyDrop<T>);
+            let src = Box::from_raw_in(bptr as *mut mem::ManuallyDrop<T>, alloc.by_ref());
             drop(src);
 
             Self::from_ptr_in(ptr, alloc)
@@ -1953,7 +2020,11 @@ impl<T> Rc<[T]> {
     unsafe fn copy_from_slice(v: &[T]) -> Rc<[T]> {
         unsafe {
             let ptr = Self::allocate_for_slice(v.len());
-            ptr::copy_nonoverlapping(v.as_ptr(), &mut (*ptr).value as *mut [T] as *mut T, v.len());
+            ptr::copy_nonoverlapping(
+                v.as_ptr(),
+                ptr::addr_of_mut!((*ptr).value) as *mut T,
+                v.len(),
+            );
             Self::from_ptr(ptr)
         }
     }
@@ -1988,10 +2059,10 @@ impl<T> Rc<[T]> {
             let ptr = Self::allocate_for_slice(len);
 
             let mem = ptr as *mut _ as *mut u8;
-            let layout = Layout::for_value(&*ptr);
+            let layout = Layout::for_value_raw(ptr);
 
             // Pointer to first element
-            let elems = &mut (*ptr).value as *mut [T] as *mut T;
+            let elems = ptr::addr_of_mut!((*ptr).value) as *mut T;
 
             let mut guard = Guard { mem: NonNull::new_unchecked(mem), elems, layout, n_elems: 0 };
 
@@ -2023,6 +2094,7 @@ impl<T, A: Allocator> Rc<[T], A> {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 /// Specialization trait used for `From<&[T]>`.
 trait RcFromSlice<T> {
     fn from_slice(slice: &[T]) -> Self;
@@ -2053,6 +2125,9 @@ impl<T: ?Sized, A: Allocator> Deref for Rc<T, A> {
         &self.inner().value
     }
 }
+
+#[unstable(feature = "deref_pure_trait", issue = "87121")]
+unsafe impl<T: ?Sized, A: Allocator> DerefPure for Rc<T, A> {}
 
 #[unstable(feature = "receiver_trait", issue = "none")]
 impl<T: ?Sized> Receiver for Rc<T> {}
@@ -2096,7 +2171,8 @@ unsafe impl<#[may_dangle] T: ?Sized, A: Allocator> Drop for Rc<T, A> {
                 self.inner().dec_weak();
 
                 if self.inner().weak() == 0 {
-                    self.alloc.deallocate(self.ptr.cast(), Layout::for_value(self.ptr.as_ref()));
+                    self.alloc
+                        .deallocate(self.ptr.cast(), Layout::for_value_raw(self.ptr.as_ptr()));
                 }
             }
         }
@@ -2383,7 +2459,7 @@ impl<T: ?Sized + fmt::Debug, A: Allocator> fmt::Debug for Rc<T, A> {
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized, A: Allocator> fmt::Pointer for Rc<T, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Pointer::fmt(&(&**self as *const T), f)
+        fmt::Pointer::fmt(&core::ptr::addr_of!(**self), f)
     }
 }
 
@@ -2409,7 +2485,7 @@ impl<T> From<T> for Rc<T> {
 }
 
 #[cfg(not(no_global_oom_handling))]
-#[stable(feature = "shared_from_array", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "shared_from_array", since = "1.74.0")]
 impl<T, const N: usize> From<[T; N]> for Rc<[T]> {
     /// Converts a [`[T; N]`](prim@array) into an `Rc<[T]>`.
     ///
@@ -2524,7 +2600,7 @@ impl<T, A: Allocator> From<Vec<T, A>> for Rc<[T], A> {
             let (vec_ptr, len, cap, alloc) = v.into_raw_parts_with_alloc();
 
             let rc_ptr = Self::allocate_for_slice_in(len, &alloc);
-            ptr::copy_nonoverlapping(vec_ptr, &mut (*rc_ptr).value as *mut [T] as *mut T, len);
+            ptr::copy_nonoverlapping(vec_ptr, ptr::addr_of_mut!((*rc_ptr).value) as *mut T, len);
 
             // Create a `Vec<T, &A>` with length 0, to deallocate the buffer
             // without dropping its contents or the allocator
@@ -2701,6 +2777,7 @@ impl<T, I: iter::TrustedLen<Item = T>> ToRcSlice<T> for I {
 ///
 /// [`upgrade`]: Weak::upgrade
 #[stable(feature = "rc_weak", since = "1.4.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "RcWeak")]
 pub struct Weak<
     T: ?Sized,
     #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global,
@@ -2746,7 +2823,9 @@ impl<T> Weak<T> {
     #[must_use]
     pub const fn new() -> Weak<T> {
         Weak {
-            ptr: unsafe { NonNull::new_unchecked(ptr::invalid_mut::<RcBox<T>>(usize::MAX)) },
+            ptr: unsafe {
+                NonNull::new_unchecked(ptr::without_provenance_mut::<RcBox<T>>(usize::MAX))
+            },
             alloc: Global,
         }
     }
@@ -2771,13 +2850,15 @@ impl<T, A: Allocator> Weak<T, A> {
     #[unstable(feature = "allocator_api", issue = "32838")]
     pub fn new_in(alloc: A) -> Weak<T, A> {
         Weak {
-            ptr: unsafe { NonNull::new_unchecked(ptr::invalid_mut::<RcBox<T>>(usize::MAX)) },
+            ptr: unsafe {
+                NonNull::new_unchecked(ptr::without_provenance_mut::<RcBox<T>>(usize::MAX))
+            },
             alloc,
         }
     }
 }
 
-pub(crate) fn is_dangling<T: ?Sized>(ptr: *mut T) -> bool {
+pub(crate) fn is_dangling<T: ?Sized>(ptr: *const T) -> bool {
     (ptr.cast::<()>()).addr() == usize::MAX
 }
 
@@ -2908,7 +2989,7 @@ impl<T: ?Sized, A: Allocator> Weak<T, A> {
     ///
     /// [`from_raw`]: Weak::from_raw
     /// [`as_ptr`]: Weak::as_ptr
-    #[must_use = "`self` will be dropped if the result is not used"]
+    #[must_use = "losing the pointer will leak memory"]
     #[stable(feature = "weak_into_raw", since = "1.45.0")]
     pub fn into_raw(self) -> *const T {
         let result = self.as_ptr();
@@ -3002,7 +3083,7 @@ impl<T: ?Sized, A: Allocator> Weak<T, A> {
     pub unsafe fn from_raw_in(ptr: *const T, alloc: A) -> Self {
         // See Weak::as_ptr for context on how the input pointer is derived.
 
-        let ptr = if is_dangling(ptr as *mut T) {
+        let ptr = if is_dangling(ptr) {
             // This is a dangling Weak.
             ptr as *mut RcBox<T>
         } else {
@@ -3146,7 +3227,7 @@ impl<T: ?Sized, A: Allocator> Weak<T, A> {
     #[must_use]
     #[stable(feature = "weak_ptr_eq", since = "1.39.0")]
     pub fn ptr_eq(&self, other: &Self) -> bool {
-        ptr::eq(self.ptr.as_ptr() as *const (), other.ptr.as_ptr() as *const ())
+        ptr::addr_eq(self.ptr.as_ptr(), other.ptr.as_ptr())
     }
 }
 
@@ -3267,7 +3348,7 @@ trait RcInnerPtr {
         // SAFETY: The reference count will never be zero when this is
         // called.
         unsafe {
-            core::intrinsics::assume(strong != 0);
+            hint::assert_unchecked(strong != 0);
         }
 
         let strong = strong.wrapping_add(1);
@@ -3300,7 +3381,7 @@ trait RcInnerPtr {
         // SAFETY: The reference count will never be zero when this is
         // called.
         unsafe {
-            core::intrinsics::assume(weak != 0);
+            hint::assert_unchecked(weak != 0);
         }
 
         let weak = weak.wrapping_add(1);
@@ -3513,7 +3594,7 @@ unsafe impl<#[may_dangle] T> Drop for UniqueRc<T> {
             self.ptr.as_ref().dec_weak();
 
             if self.ptr.as_ref().weak() == 0 {
-                Global.deallocate(self.ptr.cast(), Layout::for_value(self.ptr.as_ref()));
+                Global.deallocate(self.ptr.cast(), Layout::for_value_raw(self.ptr.as_ptr()));
             }
         }
     }

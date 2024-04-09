@@ -1,9 +1,9 @@
-// run-pass
+//@ run-pass
 
 #![allow(unused_must_use)]
 #![allow(deprecated)]
-// ignore-emscripten no threads support
-// ignore-sgx no processes
+//@ ignore-wasm32 no processes or threads
+//@ ignore-sgx no processes
 
 use std::{env, fmt, process, sync, thread};
 

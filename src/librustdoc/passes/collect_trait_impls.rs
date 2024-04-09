@@ -22,7 +22,7 @@ pub(crate) fn collect_trait_impls(mut krate: Crate, cx: &mut DocContext<'_>) -> 
     let tcx = cx.tcx;
     // We need to check if there are errors before running this pass because it would crash when
     // we try to get auto and blanket implementations.
-    if tcx.sess.diagnostic().has_errors_or_lint_errors().is_some() {
+    if tcx.dcx().has_errors().is_some() {
         return krate;
     }
 
@@ -36,7 +36,7 @@ pub(crate) fn collect_trait_impls(mut krate: Crate, cx: &mut DocContext<'_>) -> 
     let prims: FxHashSet<PrimitiveType> = local_crate.primitives(tcx).iter().map(|p| p.1).collect();
 
     let crate_items = {
-        let mut coll = ItemCollector::new();
+        let mut coll = ItemAndAliasCollector::new(&cx.cache);
         cx.sess().time("collect_items_for_trait_impls", || coll.visit_crate(&krate));
         coll.items
     };
@@ -49,7 +49,9 @@ pub(crate) fn collect_trait_impls(mut krate: Crate, cx: &mut DocContext<'_>) -> 
         let _prof_timer = tcx.sess.prof.generic_activity("build_extern_trait_impls");
         for &cnum in tcx.crates(()) {
             for &impl_def_id in tcx.trait_impls_in_crate(cnum) {
-                inline::build_impl(cx, impl_def_id, None, &mut new_items_external);
+                cx.with_param_env(impl_def_id, |cx| {
+                    inline::build_impl(cx, impl_def_id, None, &mut new_items_external);
+                });
             }
         }
     }
@@ -74,7 +76,9 @@ pub(crate) fn collect_trait_impls(mut krate: Crate, cx: &mut DocContext<'_>) -> 
                 );
                 parent = tcx.opt_parent(did);
             }
-            inline::build_impl(cx, impl_def_id, Some((&attr_buf, None)), &mut new_items_local);
+            cx.with_param_env(impl_def_id, |cx| {
+                inline::build_impl(cx, impl_def_id, Some((&attr_buf, None)), &mut new_items_local);
+            });
             attr_buf.clear();
         }
     }
@@ -83,7 +87,9 @@ pub(crate) fn collect_trait_impls(mut krate: Crate, cx: &mut DocContext<'_>) -> 
         for def_id in PrimitiveType::all_impls(tcx) {
             // Try to inline primitive impls from other crates.
             if !def_id.is_local() {
-                inline::build_impl(cx, def_id, None, &mut new_items_external);
+                cx.with_param_env(def_id, |cx| {
+                    inline::build_impl(cx, def_id, None, &mut new_items_external);
+                });
             }
         }
         for (prim, did) in PrimitiveType::primitive_locations(tcx) {
@@ -109,9 +115,7 @@ pub(crate) fn collect_trait_impls(mut krate: Crate, cx: &mut DocContext<'_>) -> 
                     // form that is valid for use in type inference.
                     let ty = tcx.type_of(def_id).instantiate_identity();
                     match ty.kind() {
-                        ty::Slice(ty)
-                        | ty::Ref(_, ty, _)
-                        | ty::RawPtr(ty::TypeAndMut { ty, .. }) => {
+                        ty::Slice(ty) | ty::Ref(_, ty, _) | ty::RawPtr(ty, _) => {
                             matches!(ty.kind(), ty::Param(..))
                         }
                         ty::Tuple(tys) => tys.iter().all(|ty| matches!(ty.kind(), ty::Param(..))),
@@ -154,9 +158,9 @@ pub(crate) fn collect_trait_impls(mut krate: Crate, cx: &mut DocContext<'_>) -> 
 
     // scan through included items ahead of time to splice in Deref targets to the "valid" sets
     for it in new_items_external.iter().chain(new_items_local.iter()) {
-        if let ImplItem(box Impl { ref for_, ref trait_, ref items, .. }) = *it.kind &&
-            trait_.as_ref().map(|t| t.def_id()) == tcx.lang_items().deref_trait() &&
-            cleaner.keep_impl(for_, true)
+        if let ImplItem(box Impl { ref for_, ref trait_, ref items, .. }) = *it.kind
+            && trait_.as_ref().map(|t| t.def_id()) == tcx.lang_items().deref_trait()
+            && cleaner.keep_impl(for_, true)
         {
             let target = items
                 .iter()
@@ -198,7 +202,7 @@ pub(crate) fn collect_trait_impls(mut krate: Crate, cx: &mut DocContext<'_>) -> 
             cleaner.keep_impl(
                 for_,
                 trait_.as_ref().map(|t| t.def_id()) == tcx.lang_items().deref_trait(),
-            ) || trait_.as_ref().map_or(false, |t| cleaner.keep_impl_with_def_id(t.def_id().into()))
+            ) || trait_.as_ref().is_some_and(|t| cleaner.keep_impl_with_def_id(t.def_id().into()))
                 || kind.is_blanket()
         } else {
             true
@@ -235,20 +239,26 @@ impl<'a, 'tcx> DocVisitor for SyntheticImplCollector<'a, 'tcx> {
     }
 }
 
-#[derive(Default)]
-struct ItemCollector {
+struct ItemAndAliasCollector<'cache> {
     items: FxHashSet<ItemId>,
+    cache: &'cache Cache,
 }
 
-impl ItemCollector {
-    fn new() -> Self {
-        Self::default()
+impl<'cache> ItemAndAliasCollector<'cache> {
+    fn new(cache: &'cache Cache) -> Self {
+        ItemAndAliasCollector { items: FxHashSet::default(), cache }
     }
 }
 
-impl DocVisitor for ItemCollector {
+impl<'cache> DocVisitor for ItemAndAliasCollector<'cache> {
     fn visit_item(&mut self, i: &Item) {
         self.items.insert(i.item_id);
+
+        if let TypeAliasItem(alias) = &*i.kind
+            && let Some(did) = alias.type_.def_id(self.cache)
+        {
+            self.items.insert(ItemId::DefId(did));
+        }
 
         self.visit_item_recur(i)
     }

@@ -1,5 +1,4 @@
-// no-system-llvm
-// compile-flags: -O -C panic=abort
+//@ compile-flags: -O -C panic=abort
 #![crate_type = "lib"]
 
 fn search<T: Ord + Eq>(arr: &mut [T], a: &T) -> Result<usize, ()> {

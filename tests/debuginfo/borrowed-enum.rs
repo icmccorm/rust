@@ -1,8 +1,8 @@
 // Require a gdb or lldb that can read DW_TAG_variant_part.
-// min-gdb-version: 8.2
-// needs-rust-lldb
+//@ min-gdb-version: 8.2
+//@ needs-rust-lldb
 
-// compile-flags:-g
+//@ compile-flags:-g
 
 // === GDB TESTS ===================================================================================
 
@@ -22,11 +22,11 @@
 
 // lldb-command:run
 
-// lldb-command:print *the_a_ref
+// lldb-command:v *the_a_ref
 // lldbr-check:(borrowed_enum::ABC::TheA) *the_a_ref = TheA { TheA: 0, TheB: 8970181431921507452 }
-// lldb-command:print *the_b_ref
+// lldb-command:v *the_b_ref
 // lldbr-check:(borrowed_enum::ABC::TheB) *the_b_ref = { = 0 = 286331153 = 286331153 }
-// lldb-command:print *univariant_ref
+// lldb-command:v *univariant_ref
 // lldbr-check:(borrowed_enum::Univariant) *univariant_ref = { TheOnlyCase = { = 4820353753753434 } }
 
 #![allow(unused_variables)]

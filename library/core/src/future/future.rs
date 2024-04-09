@@ -1,6 +1,5 @@
 #![stable(feature = "futures_api", since = "1.36.0")]
 
-use crate::marker::Unpin;
 use crate::ops;
 use crate::pin::Pin;
 use crate::task::{Context, Poll};
@@ -29,10 +28,9 @@ use crate::task::{Context, Poll};
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 #[stable(feature = "futures_api", since = "1.36.0")]
 #[lang = "future_trait"]
-#[rustc_on_unimplemented(
+#[diagnostic::on_unimplemented(
     label = "`{Self}` is not a future",
-    message = "`{Self}` is not a future",
-    note = "{Self} must be a future or must implement `IntoFuture` to be awaited"
+    message = "`{Self}` is not a future"
 )]
 pub trait Future {
     /// The type of value produced on completion.

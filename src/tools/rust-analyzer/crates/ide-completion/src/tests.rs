@@ -12,8 +12,8 @@ mod attribute;
 mod expression;
 mod flyimport;
 mod fn_param;
-mod item_list;
 mod item;
+mod item_list;
 mod pattern;
 mod predicate;
 mod proc_macros;
@@ -26,12 +26,13 @@ mod visibility;
 use expect_test::Expect;
 use hir::PrefixKind;
 use ide_db::{
-    base_db::{fixture::ChangeFixture, FileLoader, FilePosition},
+    base_db::{FileLoader, FilePosition},
     imports::insert_use::{ImportGranularity, InsertUseConfig},
     RootDatabase, SnippetCap,
 };
 use itertools::Itertools;
 use stdx::{format_to, trim_indent};
+use test_fixture::ChangeFixture;
 use test_utils::assert_eq_text;
 
 use crate::{
@@ -64,9 +65,12 @@ pub(crate) const TEST_CONFIG: CompletionConfig = CompletionConfig {
     enable_imports_on_the_fly: true,
     enable_self_on_the_fly: true,
     enable_private_editable: false,
+    enable_term_search: true,
+    full_function_signatures: false,
     callable: Some(CallableSnippets::FillArguments),
     snippet_cap: SnippetCap::new(true),
     prefer_no_std: false,
+    prefer_prelude: true,
     insert_use: InsertUseConfig {
         granularity: ImportGranularity::Crate,
         prefix_kind: PrefixKind::Plain,
@@ -148,16 +152,29 @@ fn render_completion_list(completions: Vec<CompletionItem>) -> String {
     fn monospace_width(s: &str) -> usize {
         s.chars().count()
     }
-    let label_width =
-        completions.iter().map(|it| monospace_width(&it.label)).max().unwrap_or_default().min(22);
+    let label_width = completions
+        .iter()
+        .map(|it| {
+            monospace_width(&it.label)
+                + monospace_width(it.label_detail.as_deref().unwrap_or_default())
+        })
+        .max()
+        .unwrap_or_default()
+        .min(22);
     completions
         .into_iter()
         .map(|it| {
             let tag = it.kind.tag();
             let var_name = format!("{tag} {}", it.label);
             let mut buf = var_name;
+            if let Some(ref label_detail) = it.label_detail {
+                format_to!(buf, "{label_detail}");
+            }
             if let Some(detail) = it.detail {
-                let width = label_width.saturating_sub(monospace_width(&it.label));
+                let width = label_width.saturating_sub(
+                    monospace_width(&it.label)
+                        + monospace_width(&it.label_detail.unwrap_or_default()),
+                );
                 format_to!(buf, "{:width$} {}", "", detail, width = width);
             }
             if it.deprecated {
@@ -194,23 +211,14 @@ pub(crate) fn check_edit_with_config(
 
     let mut combined_edit = completion.text_edit.clone();
 
-    resolve_completion_edits(
-        &db,
-        &config,
-        position,
-        completion
-            .import_to_add
-            .iter()
-            .cloned()
-            .filter_map(|(import_path, import_name)| Some((import_path, import_name))),
-    )
-    .into_iter()
-    .flatten()
-    .for_each(|text_edit| {
-        combined_edit.union(text_edit).expect(
-            "Failed to apply completion resolve changes: change ranges overlap, but should not",
-        )
-    });
+    resolve_completion_edits(&db, &config, position, completion.import_to_add.iter().cloned())
+        .into_iter()
+        .flatten()
+        .for_each(|text_edit| {
+            combined_edit.union(text_edit).expect(
+                "Failed to apply completion resolve changes: change ranges overlap, but should not",
+            )
+        });
 
     combined_edit.apply(&mut actual);
     assert_eq_text!(&ra_fixture_after, &actual)

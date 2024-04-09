@@ -9,43 +9,49 @@
 
 // FIXME: spec the JSON output properly.
 
-use rustc_span::source_map::{FilePathMapping, SourceMap};
-use termcolor::{ColorSpec, WriteColor};
-
-use crate::emitter::{should_show_source_code, Emitter, HumanReadableErrorType};
+use crate::emitter::{
+    should_show_source_code, ColorConfig, Destination, Emitter, HumanEmitter,
+    HumanReadableErrorType,
+};
 use crate::registry::Registry;
 use crate::translation::{to_fluent_args, Translate};
-use crate::DiagnosticId;
 use crate::{
-    CodeSuggestion, FluentBundle, LazyFallbackBundle, MultiSpan, SpanLabel, SubDiagnostic,
-    TerminalUrl,
+    diagnostic::IsLint, CodeSuggestion, FluentBundle, LazyFallbackBundle, MultiSpan, SpanLabel,
+    Subdiag, TerminalUrl,
 };
-use rustc_lint_defs::Applicability;
-
+use derive_setters::Setters;
 use rustc_data_structures::sync::{IntoDynSyncSend, Lrc};
 use rustc_error_messages::FluentArgs;
+use rustc_lint_defs::Applicability;
 use rustc_span::hygiene::ExpnData;
+use rustc_span::source_map::SourceMap;
 use rustc_span::Span;
+use serde::Serialize;
 use std::error::Report;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::vec;
-
-use serde::Serialize;
+use termcolor::{ColorSpec, WriteColor};
 
 #[cfg(test)]
 mod tests;
 
+#[derive(Setters)]
 pub struct JsonEmitter {
+    #[setters(skip)]
     dst: IntoDynSyncSend<Box<dyn Write + Send>>,
     registry: Option<Registry>,
+    #[setters(skip)]
     sm: Lrc<SourceMap>,
     fluent_bundle: Option<Lrc<FluentBundle>>,
+    #[setters(skip)]
     fallback_bundle: LazyFallbackBundle,
+    #[setters(skip)]
     pretty: bool,
     ui_testing: bool,
     ignored_directories_in_source_blocks: Vec<String>,
+    #[setters(skip)]
     json_rendered: HumanReadableErrorType,
     diagnostic_width: Option<usize>,
     macro_backtrace: bool,
@@ -54,97 +60,48 @@ pub struct JsonEmitter {
 }
 
 impl JsonEmitter {
-    pub fn stderr(
-        registry: Option<Registry>,
-        source_map: Lrc<SourceMap>,
-        fluent_bundle: Option<Lrc<FluentBundle>>,
-        fallback_bundle: LazyFallbackBundle,
-        pretty: bool,
-        json_rendered: HumanReadableErrorType,
-        diagnostic_width: Option<usize>,
-        macro_backtrace: bool,
-        track_diagnostics: bool,
-        terminal_url: TerminalUrl,
-    ) -> JsonEmitter {
-        JsonEmitter {
-            dst: IntoDynSyncSend(Box::new(io::BufWriter::new(io::stderr()))),
-            registry,
-            sm: source_map,
-            fluent_bundle,
-            fallback_bundle,
-            pretty,
-            ui_testing: false,
-            ignored_directories_in_source_blocks: Vec::new(),
-            json_rendered,
-            diagnostic_width,
-            macro_backtrace,
-            track_diagnostics,
-            terminal_url,
-        }
-    }
-
-    pub fn basic(
-        pretty: bool,
-        json_rendered: HumanReadableErrorType,
-        fluent_bundle: Option<Lrc<FluentBundle>>,
-        fallback_bundle: LazyFallbackBundle,
-        diagnostic_width: Option<usize>,
-        macro_backtrace: bool,
-        track_diagnostics: bool,
-        terminal_url: TerminalUrl,
-    ) -> JsonEmitter {
-        let file_path_mapping = FilePathMapping::empty();
-        JsonEmitter::stderr(
-            None,
-            Lrc::new(SourceMap::new(file_path_mapping)),
-            fluent_bundle,
-            fallback_bundle,
-            pretty,
-            json_rendered,
-            diagnostic_width,
-            macro_backtrace,
-            track_diagnostics,
-            terminal_url,
-        )
-    }
-
     pub fn new(
         dst: Box<dyn Write + Send>,
-        registry: Option<Registry>,
-        source_map: Lrc<SourceMap>,
-        fluent_bundle: Option<Lrc<FluentBundle>>,
+        sm: Lrc<SourceMap>,
         fallback_bundle: LazyFallbackBundle,
         pretty: bool,
         json_rendered: HumanReadableErrorType,
-        diagnostic_width: Option<usize>,
-        macro_backtrace: bool,
-        track_diagnostics: bool,
-        terminal_url: TerminalUrl,
     ) -> JsonEmitter {
         JsonEmitter {
             dst: IntoDynSyncSend(dst),
-            registry,
-            sm: source_map,
-            fluent_bundle,
+            registry: None,
+            sm,
+            fluent_bundle: None,
             fallback_bundle,
             pretty,
             ui_testing: false,
             ignored_directories_in_source_blocks: Vec::new(),
             json_rendered,
-            diagnostic_width,
-            macro_backtrace,
-            track_diagnostics,
-            terminal_url,
+            diagnostic_width: None,
+            macro_backtrace: false,
+            track_diagnostics: false,
+            terminal_url: TerminalUrl::No,
         }
     }
 
-    pub fn ui_testing(self, ui_testing: bool) -> Self {
-        Self { ui_testing, ..self }
+    fn emit(&mut self, val: EmitTyped<'_>) -> io::Result<()> {
+        if self.pretty {
+            serde_json::to_writer_pretty(&mut *self.dst, &val)?
+        } else {
+            serde_json::to_writer(&mut *self.dst, &val)?
+        };
+        self.dst.write_all(b"\n")?;
+        self.dst.flush()
     }
+}
 
-    pub fn ignored_directories_in_source_blocks(self, value: Vec<String>) -> Self {
-        Self { ignored_directories_in_source_blocks: value, ..self }
-    }
+#[derive(Serialize)]
+#[serde(tag = "$message_type", rename_all = "snake_case")]
+enum EmitTyped<'a> {
+    Diagnostic(Diagnostic),
+    Artifact(ArtifactNotification<'a>),
+    FutureIncompat(FutureIncompatReport<'a>),
+    UnusedExtern(UnusedExterns<'a>),
 }
 
 impl Translate for JsonEmitter {
@@ -158,14 +115,9 @@ impl Translate for JsonEmitter {
 }
 
 impl Emitter for JsonEmitter {
-    fn emit_diagnostic(&mut self, diag: &crate::Diagnostic) {
+    fn emit_diagnostic(&mut self, diag: crate::DiagInner) {
         let data = Diagnostic::from_errors_diagnostic(diag, self);
-        let result = if self.pretty {
-            writeln!(&mut self.dst, "{}", serde_json::to_string_pretty(&data).unwrap())
-        } else {
-            writeln!(&mut self.dst, "{}", serde_json::to_string(&data).unwrap())
-        }
-        .and_then(|_| self.dst.flush());
+        let result = self.emit(EmitTyped::Diagnostic(data));
         if let Err(e) = result {
             panic!("failed to print diagnostics: {e:?}");
         }
@@ -173,34 +125,28 @@ impl Emitter for JsonEmitter {
 
     fn emit_artifact_notification(&mut self, path: &Path, artifact_type: &str) {
         let data = ArtifactNotification { artifact: path, emit: artifact_type };
-        let result = if self.pretty {
-            writeln!(&mut self.dst, "{}", serde_json::to_string_pretty(&data).unwrap())
-        } else {
-            writeln!(&mut self.dst, "{}", serde_json::to_string(&data).unwrap())
-        }
-        .and_then(|_| self.dst.flush());
+        let result = self.emit(EmitTyped::Artifact(data));
         if let Err(e) = result {
             panic!("failed to print notification: {e:?}");
         }
     }
 
-    fn emit_future_breakage_report(&mut self, diags: Vec<crate::Diagnostic>) {
-        let data: Vec<FutureBreakageItem> = diags
+    fn emit_future_breakage_report(&mut self, diags: Vec<crate::DiagInner>) {
+        let data: Vec<FutureBreakageItem<'_>> = diags
             .into_iter()
             .map(|mut diag| {
                 if diag.level == crate::Level::Allow {
-                    diag.level = crate::Level::Warning(None);
+                    diag.level = crate::Level::Warning;
                 }
-                FutureBreakageItem { diagnostic: Diagnostic::from_errors_diagnostic(&diag, self) }
+                FutureBreakageItem {
+                    diagnostic: EmitTyped::Diagnostic(Diagnostic::from_errors_diagnostic(
+                        diag, self,
+                    )),
+                }
             })
             .collect();
         let report = FutureIncompatReport { future_incompat_report: data };
-        let result = if self.pretty {
-            writeln!(&mut self.dst, "{}", serde_json::to_string_pretty(&report).unwrap())
-        } else {
-            writeln!(&mut self.dst, "{}", serde_json::to_string(&report).unwrap())
-        }
-        .and_then(|_| self.dst.flush());
+        let result = self.emit(EmitTyped::FutureIncompat(report));
         if let Err(e) = result {
             panic!("failed to print future breakage report: {e:?}");
         }
@@ -209,12 +155,7 @@ impl Emitter for JsonEmitter {
     fn emit_unused_externs(&mut self, lint_level: rustc_lint_defs::Level, unused_externs: &[&str]) {
         let lint_level = lint_level.as_str();
         let data = UnusedExterns { lint_level, unused_extern_names: unused_externs };
-        let result = if self.pretty {
-            writeln!(&mut self.dst, "{}", serde_json::to_string_pretty(&data).unwrap())
-        } else {
-            writeln!(&mut self.dst, "{}", serde_json::to_string(&data).unwrap())
-        }
-        .and_then(|_| self.dst.flush());
+        let result = self.emit(EmitTyped::UnusedExtern(data));
         if let Err(e) = result {
             panic!("failed to print unused externs: {e:?}");
         }
@@ -298,7 +239,8 @@ struct DiagnosticSpanMacroExpansion {
 
 #[derive(Serialize)]
 struct DiagnosticCode {
-    /// The code itself.
+    /// The error code (e.g. "E1234"), if the diagnostic has one. Or the lint
+    /// name, if it's a lint without an error code.
     code: String,
     /// An explanation for the code.
     explanation: Option<&'static str>,
@@ -313,13 +255,15 @@ struct ArtifactNotification<'a> {
 }
 
 #[derive(Serialize)]
-struct FutureBreakageItem {
-    diagnostic: Diagnostic,
+struct FutureBreakageItem<'a> {
+    // Always EmitTyped::Diagnostic, but we want to make sure it gets serialized
+    // with "$message_type".
+    diagnostic: EmitTyped<'a>,
 }
 
 #[derive(Serialize)]
-struct FutureIncompatReport {
-    future_incompat_report: Vec<FutureBreakageItem>,
+struct FutureIncompatReport<'a> {
+    future_incompat_report: Vec<FutureBreakageItem<'a>>,
 }
 
 // NOTE: Keep this in sync with the equivalent structs in rustdoc's
@@ -327,16 +271,17 @@ struct FutureIncompatReport {
 // We could unify this struct the one in rustdoc but they have different
 // ownership semantics, so doing so would create wasteful allocations.
 #[derive(Serialize)]
-struct UnusedExterns<'a, 'b, 'c> {
+struct UnusedExterns<'a> {
     /// The severity level of the unused dependencies lint
     lint_level: &'a str,
     /// List of unused externs by their names.
-    unused_extern_names: &'b [&'c str],
+    unused_extern_names: &'a [&'a str],
 }
 
 impl Diagnostic {
-    fn from_errors_diagnostic(diag: &crate::Diagnostic, je: &JsonEmitter) -> Diagnostic {
-        let args = to_fluent_args(diag.args());
+    /// Converts from `rustc_errors::DiagInner` to `Diagnostic`.
+    fn from_errors_diagnostic(diag: crate::DiagInner, je: &JsonEmitter) -> Diagnostic {
+        let args = to_fluent_args(diag.args.iter());
         let sugg = diag.suggestions.iter().flatten().map(|sugg| {
             let translated_message =
                 je.translate_message(&sugg.msg, &args).map_err(Report::new).unwrap();
@@ -377,10 +322,37 @@ impl Diagnostic {
                 Ok(())
             }
         }
+
+        let translated_message = je.translate_messages(&diag.messages, &args);
+
+        let code = if let Some(code) = diag.code {
+            Some(DiagnosticCode {
+                code: code.to_string(),
+                explanation: je.registry.as_ref().unwrap().try_find_description(code).ok(),
+            })
+        } else if let Some(IsLint { name, .. }) = &diag.is_lint {
+            Some(DiagnosticCode { code: name.to_string(), explanation: None })
+        } else {
+            None
+        };
+        let level = diag.level.to_str();
+        let spans = DiagnosticSpan::from_multispan(&diag.span, &args, je);
+        let children = diag
+            .children
+            .iter()
+            .map(|c| Diagnostic::from_sub_diagnostic(c, &args, je))
+            .chain(sugg)
+            .collect();
+
         let buf = BufWriter::default();
-        let output = buf.clone();
-        je.json_rendered
-            .new_emitter(Box::new(buf), je.fallback_bundle.clone())
+        let mut dst: Destination = Box::new(buf.clone());
+        let (short, color_config) = je.json_rendered.unzip();
+        match color_config {
+            ColorConfig::Always | ColorConfig::Auto => dst = Box::new(termcolor::Ansi::new(dst)),
+            ColorConfig::Never => {}
+        }
+        HumanEmitter::new(dst, je.fallback_bundle.clone())
+            .short_message(short)
             .sm(Some(je.sm.clone()))
             .fluent_bundle(je.fluent_bundle.clone())
             .diagnostic_width(je.diagnostic_width)
@@ -390,40 +362,30 @@ impl Diagnostic {
             .ui_testing(je.ui_testing)
             .ignored_directories_in_source_blocks(je.ignored_directories_in_source_blocks.clone())
             .emit_diagnostic(diag);
-        let output = Arc::try_unwrap(output.0).unwrap().into_inner().unwrap();
-        let output = String::from_utf8(output).unwrap();
+        let buf = Arc::try_unwrap(buf.0).unwrap().into_inner().unwrap();
+        let buf = String::from_utf8(buf).unwrap();
 
-        let translated_message = je.translate_messages(&diag.message, &args);
         Diagnostic {
             message: translated_message.to_string(),
-            code: DiagnosticCode::map_opt_string(diag.code.clone(), je),
-            level: diag.level.to_str(),
-            spans: DiagnosticSpan::from_multispan(&diag.span, &args, je),
-            children: diag
-                .children
-                .iter()
-                .map(|c| Diagnostic::from_sub_diagnostic(c, &args, je))
-                .chain(sugg)
-                .collect(),
-            rendered: Some(output),
+            code,
+            level,
+            spans,
+            children,
+            rendered: Some(buf),
         }
     }
 
     fn from_sub_diagnostic(
-        diag: &SubDiagnostic,
+        subdiag: &Subdiag,
         args: &FluentArgs<'_>,
         je: &JsonEmitter,
     ) -> Diagnostic {
-        let translated_message = je.translate_messages(&diag.message, args);
+        let translated_message = je.translate_messages(&subdiag.messages, args);
         Diagnostic {
             message: translated_message.to_string(),
             code: None,
-            level: diag.level.to_str(),
-            spans: diag
-                .render_span
-                .as_ref()
-                .map(|sp| DiagnosticSpan::from_multispan(sp, args, je))
-                .unwrap_or_else(|| DiagnosticSpan::from_multispan(&diag.span, args, je)),
+            level: subdiag.level.to_str(),
+            spans: DiagnosticSpan::from_multispan(&subdiag.span, args, je),
             children: vec![],
             rendered: None,
         }
@@ -466,7 +428,7 @@ impl DiagnosticSpan {
     }
 
     fn from_span_full(
-        span: Span,
+        mut span: Span,
         is_primary: bool,
         label: Option<String>,
         suggestion: Option<(&String, Applicability)>,
@@ -474,6 +436,16 @@ impl DiagnosticSpan {
         je: &JsonEmitter,
     ) -> DiagnosticSpan {
         let start = je.sm.lookup_char_pos(span.lo());
+        // If this goes from the start of a line to the end and the replacement
+        // is an empty string, increase the length to include the newline so we don't
+        // leave an empty line
+        if start.col.0 == 0
+            && suggestion.map_or(false, |(s, _)| s.is_empty())
+            && let Ok(after) = je.sm.span_to_next_source(span)
+            && after.starts_with('\n')
+        {
+            span = span.with_hi(span.hi() + rustc_span::BytePos(1));
+        }
         let end = je.sm.lookup_char_pos(span.hi());
         let backtrace_step = backtrace.next().map(|bt| {
             let call_site = Self::from_span_full(bt.call_site, false, None, None, backtrace, je);
@@ -589,20 +561,5 @@ impl DiagnosticSpanLine {
                     .collect()
             })
             .unwrap_or_else(|_| vec![])
-    }
-}
-
-impl DiagnosticCode {
-    fn map_opt_string(s: Option<DiagnosticId>, je: &JsonEmitter) -> Option<DiagnosticCode> {
-        s.map(|s| {
-            let s = match s {
-                DiagnosticId::Error(s) => s,
-                DiagnosticId::Lint { name, .. } => name,
-            };
-            let je_result =
-                je.registry.as_ref().map(|registry| registry.try_find_description(&s)).unwrap();
-
-            DiagnosticCode { code: s, explanation: je_result.ok() }
-        })
     }
 }

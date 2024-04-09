@@ -4,13 +4,12 @@ mod macros;
 mod mod_resolution;
 mod primitives;
 
-use base_db::{fixture::WithFixture, SourceDatabase};
+use base_db::SourceDatabase;
 use expect_test::{expect, Expect};
+use test_fixture::WithFixture;
 use triomphe::Arc;
 
-use crate::{db::DefDatabase, test_db::TestDB};
-
-use super::DefMap;
+use crate::{db::DefDatabase, nameres::DefMap, test_db::TestDB};
 
 fn compute_crate_def_map(ra_fixture: &str) -> Arc<DefMap> {
     let db = TestDB::with_files(ra_fixture);

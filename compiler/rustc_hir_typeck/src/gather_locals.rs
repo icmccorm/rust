@@ -29,7 +29,7 @@ impl<'a> DeclOrigin<'a> {
     }
 }
 
-/// A declaration is an abstraction of [hir::Local] and [hir::Let].
+/// A declaration is an abstraction of [hir::LetStmt] and [hir::LetExpr].
 ///
 /// It must have a hir_id, as this is how we connect gather_locals to the check functions.
 pub(super) struct Declaration<'a> {
@@ -41,16 +41,16 @@ pub(super) struct Declaration<'a> {
     pub origin: DeclOrigin<'a>,
 }
 
-impl<'a> From<&'a hir::Local<'a>> for Declaration<'a> {
-    fn from(local: &'a hir::Local<'a>) -> Self {
-        let hir::Local { hir_id, pat, ty, span, init, els, source: _ } = *local;
+impl<'a> From<&'a hir::LetStmt<'a>> for Declaration<'a> {
+    fn from(local: &'a hir::LetStmt<'a>) -> Self {
+        let hir::LetStmt { hir_id, pat, ty, span, init, els, source: _ } = *local;
         Declaration { hir_id, pat, ty, span, init, origin: DeclOrigin::LocalDecl { els } }
     }
 }
 
-impl<'a> From<&'a hir::Let<'a>> for Declaration<'a> {
-    fn from(let_expr: &'a hir::Let<'a>) -> Self {
-        let hir::Let { hir_id, pat, ty, span, init, is_recovered: _ } = *let_expr;
+impl<'a> From<(&'a hir::LetExpr<'a>, hir::HirId)> for Declaration<'a> {
+    fn from((let_expr, hir_id): (&'a hir::LetExpr<'a>, hir::HirId)) -> Self {
+        let hir::LetExpr { pat, ty, span, init, is_recovered: _ } = *let_expr;
         Declaration { hir_id, pat, ty, span, init: Some(init), origin: DeclOrigin::LetExpr }
     }
 }
@@ -60,7 +60,7 @@ pub(super) struct GatherLocalsVisitor<'a, 'tcx> {
     // parameters are special cases of patterns, but we want to handle them as
     // *distinct* cases. so track when we are hitting a pattern *within* an fn
     // parameter.
-    outermost_fn_param_pat: Option<Span>,
+    outermost_fn_param_pat: Option<(Span, hir::HirId)>,
 }
 
 impl<'a, 'tcx> GatherLocalsVisitor<'a, 'tcx> {
@@ -93,10 +93,9 @@ impl<'a, 'tcx> GatherLocalsVisitor<'a, 'tcx> {
     fn declare(&mut self, decl: Declaration<'tcx>) {
         let local_ty = match decl.ty {
             Some(ref ty) => {
-                let o_ty = self.fcx.to_ty(&ty);
+                let o_ty = self.fcx.lower_ty(ty);
 
-                let c_ty =
-                    self.fcx.inh.infcx.canonicalize_user_type_annotation(UserType::Ty(o_ty.raw));
+                let c_ty = self.fcx.infcx.canonicalize_user_type_annotation(UserType::Ty(o_ty.raw));
                 debug!("visit_local: ty.hir_id={:?} o_ty={:?} c_ty={:?}", ty.hir_id, o_ty, c_ty);
                 self.fcx
                     .typeck_results
@@ -120,18 +119,21 @@ impl<'a, 'tcx> GatherLocalsVisitor<'a, 'tcx> {
 
 impl<'a, 'tcx> Visitor<'tcx> for GatherLocalsVisitor<'a, 'tcx> {
     // Add explicitly-declared locals.
-    fn visit_local(&mut self, local: &'tcx hir::Local<'tcx>) {
+    fn visit_local(&mut self, local: &'tcx hir::LetStmt<'tcx>) {
         self.declare(local.into());
         intravisit::walk_local(self, local)
     }
 
-    fn visit_let_expr(&mut self, let_expr: &'tcx hir::Let<'tcx>) {
-        self.declare(let_expr.into());
-        intravisit::walk_let_expr(self, let_expr);
+    fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+        if let hir::ExprKind::Let(let_expr) = expr.kind {
+            self.declare((let_expr, expr.hir_id).into());
+        }
+        intravisit::walk_expr(self, expr)
     }
 
     fn visit_param(&mut self, param: &'tcx hir::Param<'tcx>) {
-        let old_outermost_fn_param_pat = self.outermost_fn_param_pat.replace(param.ty_span);
+        let old_outermost_fn_param_pat =
+            self.outermost_fn_param_pat.replace((param.ty_span, param.hir_id));
         intravisit::walk_param(self, param);
         self.outermost_fn_param_pat = old_outermost_fn_param_pat;
     }
@@ -141,7 +143,7 @@ impl<'a, 'tcx> Visitor<'tcx> for GatherLocalsVisitor<'a, 'tcx> {
         if let PatKind::Binding(_, _, ident, _) = p.kind {
             let var_ty = self.assign(p.span, p.hir_id, None);
 
-            if let Some(ty_span) = self.outermost_fn_param_pat {
+            if let Some((ty_span, hir_id)) = self.outermost_fn_param_pat {
                 if !self.fcx.tcx.features().unsized_fn_params {
                     self.fcx.require_type_is_sized(
                         var_ty,
@@ -150,11 +152,11 @@ impl<'a, 'tcx> Visitor<'tcx> for GatherLocalsVisitor<'a, 'tcx> {
                         // ascription, or if it's an implicit `self` parameter
                         traits::SizedArgumentType(
                             if ty_span == ident.span
-                                && self.fcx.tcx.is_closure(self.fcx.body_id.into())
+                                && self.fcx.tcx.is_closure_like(self.fcx.body_id.into())
                             {
                                 None
                             } else {
-                                Some(ty_span)
+                                Some(hir_id)
                             },
                         ),
                     );

@@ -21,9 +21,8 @@ pub(super) fn check<'tcx>(
         // lhs op= l op r
         if eq_expr_value(cx, lhs, l) {
             lint_misrefactored_assign_op(cx, expr, op, rhs, lhs, r);
-        }
-        // lhs op= l commutative_op r
-        if is_commutative(op) && eq_expr_value(cx, lhs, r) {
+        } else if is_commutative(op) && eq_expr_value(cx, lhs, r) {
+            // lhs op= l commutative_op r
             lint_misrefactored_assign_op(cx, expr, op, rhs, lhs, l);
         }
     }
@@ -46,7 +45,7 @@ fn lint_misrefactored_assign_op(
             if let (Some(snip_a), Some(snip_r)) = (snippet_opt(cx, assignee.span), snippet_opt(cx, rhs_other.span)) {
                 let a = &sugg::Sugg::hir(cx, assignee, "..");
                 let r = &sugg::Sugg::hir(cx, rhs, "..");
-                let long = format!("{snip_a} = {}", sugg::make_binop(op.into(), a, r));
+                let long = format!("{snip_a} = {}", sugg::make_binop(op, a, r));
                 diag.span_suggestion(
                     expr.span,
                     format!(

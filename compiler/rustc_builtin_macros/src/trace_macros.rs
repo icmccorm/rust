@@ -1,6 +1,6 @@
 use crate::errors;
 use rustc_ast::tokenstream::{TokenStream, TokenTree};
-use rustc_expand::base::{self, ExtCtxt};
+use rustc_expand::base::{DummyResult, ExpandResult, ExtCtxt, MacroExpanderResult};
 use rustc_span::symbol::kw;
 use rustc_span::Span;
 
@@ -8,7 +8,7 @@ pub fn expand_trace_macros(
     cx: &mut ExtCtxt<'_>,
     sp: Span,
     tt: TokenStream,
-) -> Box<dyn base::MacResult + 'static> {
+) -> MacroExpanderResult<'static> {
     let mut cursor = tt.trees();
     let mut err = false;
     let value = match &cursor.next() {
@@ -21,10 +21,10 @@ pub fn expand_trace_macros(
     };
     err |= cursor.next().is_some();
     if err {
-        cx.emit_err(errors::TraceMacros { span: sp });
+        cx.dcx().emit_err(errors::TraceMacros { span: sp });
     } else {
         cx.set_trace_macros(value);
     }
 
-    base::DummyResult::any_valid(sp)
+    ExpandResult::Ready(DummyResult::any_valid(sp))
 }

@@ -5,7 +5,7 @@ use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::Ty;
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -24,11 +24,11 @@ declare_clippy_lint! {
     /// - `Path` to anything else than a primitive type.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let foo: String = String::new();
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// let foo = String::new();
     /// ```
     #[clippy::version = "1.72.0"]
@@ -59,7 +59,7 @@ fn is_same_type<'tcx>(cx: &LateContext<'tcx>, ty_resolved_path: hir::def::Res, f
 
 fn func_hir_id_to_func_ty<'tcx>(cx: &LateContext<'tcx>, hir_id: hir::hir_id::HirId) -> Option<Ty<'tcx>> {
     if let Some((defkind, func_defid)) = cx.typeck_results().type_dependent_def(hir_id)
-        && defkind == hir::def::DefKind::AssocFn
+        && defkind == DefKind::AssocFn
         && let Some(init_ty) = cx.tcx.type_of(func_defid).no_bound_vars()
     {
         Some(init_ty)
@@ -131,7 +131,7 @@ fn extract_primty(ty_kind: &hir::TyKind<'_>) -> Option<hir::PrimTy> {
 }
 
 impl LateLintPass<'_> for RedundantTypeAnnotations {
-    fn check_local<'tcx>(&mut self, cx: &LateContext<'tcx>, local: &'tcx rustc_hir::Local<'tcx>) {
+    fn check_local<'tcx>(&mut self, cx: &LateContext<'tcx>, local: &'tcx rustc_hir::LetStmt<'tcx>) {
         if !is_lint_allowed(cx, REDUNDANT_TYPE_ANNOTATIONS, local.hir_id)
             // type annotation part
             && !local.span.from_expansion()
@@ -145,8 +145,8 @@ impl LateLintPass<'_> for RedundantTypeAnnotations {
                 hir::ExprKind::Call(init_call, _) => {
                     if let hir::TyKind::Path(ty_path) = &ty.kind
                         && let hir::QPath::Resolved(_, resolved_path_ty) = ty_path
-
-                        && is_redundant_in_func_call(cx, resolved_path_ty.res, init_call) {
+                        && is_redundant_in_func_call(cx, resolved_path_ty.res, init_call)
+                    {
                         span_lint(cx, REDUNDANT_TYPE_ANNOTATIONS, local.span, "redundant type annotation");
                     }
                 },
@@ -164,11 +164,11 @@ impl LateLintPass<'_> for RedundantTypeAnnotations {
                         && let hir::QPath::Resolved(_, resolved_path_ty) = ty_path
                         && let Some(func_ty) = func_hir_id_to_func_ty(cx, init.hir_id)
                         && let Some(return_type) = func_ty_to_return_type(cx, func_ty)
-                        && is_same_type(cx, resolved_path_ty.res, if is_ref {
-                            return_type.peel_refs()
-                        } else {
-                            return_type
-                        })
+                        && is_same_type(
+                            cx,
+                            resolved_path_ty.res,
+                            if is_ref { return_type.peel_refs() } else { return_type },
+                        )
                     {
                         span_lint(cx, REDUNDANT_TYPE_ANNOTATIONS, local.span, "redundant type annotation");
                     }
@@ -177,10 +177,8 @@ impl LateLintPass<'_> for RedundantTypeAnnotations {
                 hir::ExprKind::Path(init_path) => {
                     // TODO: check for non primty
                     if let Some(primty) = extract_primty(&ty.kind)
-
                         && let hir::QPath::TypeRelative(init_ty, _) = init_path
                         && let Some(primty_init) = extract_primty(&init_ty.kind)
-
                         && primty == primty_init
                     {
                         span_lint(cx, REDUNDANT_TYPE_ANNOTATIONS, local.span, "redundant type annotation");
@@ -190,7 +188,6 @@ impl LateLintPass<'_> for RedundantTypeAnnotations {
                     match init_lit.node {
                         // In these cases the annotation is redundant
                         LitKind::Str(..)
-                        | LitKind::ByteStr(..)
                         | LitKind::Byte(..)
                         | LitKind::Char(..)
                         | LitKind::Bool(..)
@@ -203,10 +200,20 @@ impl LateLintPass<'_> for RedundantTypeAnnotations {
                                 span_lint(cx, REDUNDANT_TYPE_ANNOTATIONS, local.span, "redundant type annotation");
                             }
                         },
-                        LitKind::Err => (),
+                        LitKind::Err(_) => (),
+                        LitKind::ByteStr(..) => {
+                            // We only lint if the type annotation is an array type (e.g. &[u8; 4]).
+                            // If instead it is a slice (e.g. &[u8]) it may not be redundant, so we
+                            // don't lint.
+                            if let hir::TyKind::Ref(_, mut_ty) = ty.kind
+                                && matches!(mut_ty.ty.kind, hir::TyKind::Array(..))
+                            {
+                                span_lint(cx, REDUNDANT_TYPE_ANNOTATIONS, local.span, "redundant type annotation");
+                            }
+                        },
                     }
-                }
-                _ => ()
+                },
+                _ => (),
             }
         };
     }

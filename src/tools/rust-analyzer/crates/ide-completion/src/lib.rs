@@ -1,6 +1,6 @@
 //! `completions` crate provides utilities for generating completions of user input.
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![warn(rust_2018_idioms, unused_lifetimes)]
 
 mod completions;
 mod config;
@@ -8,9 +8,9 @@ mod context;
 mod item;
 mod render;
 
+mod snippet;
 #[cfg(test)]
 mod tests;
-mod snippet;
 
 use ide_db::{
     base_db::FilePosition,
@@ -64,6 +64,7 @@ pub use crate::{
 // - `expr.ref` -> `&expr`
 // - `expr.refm` -> `&mut expr`
 // - `expr.let` -> `let $0 = expr;`
+// - `expr.lete` -> `let $1 = expr else { $0 };`
 // - `expr.letm` -> `let mut $0 = expr;`
 // - `expr.not` -> `!expr`
 // - `expr.dbg` -> `dbg!(expr)`
@@ -169,6 +170,28 @@ pub fn completions(
         return Some(completions.into());
     }
 
+    // when the user types a bare `_` (that is it does not belong to an identifier)
+    // the user might just wanted to type a `_` for type inference or pattern discarding
+    // so try to suppress completions in those cases
+    if trigger_character == Some('_') && ctx.original_token.kind() == syntax::SyntaxKind::UNDERSCORE
+    {
+        if let CompletionAnalysis::NameRef(NameRefContext {
+            kind:
+                NameRefKind::Path(
+                    path_ctx @ PathCompletionCtx {
+                        kind: PathKind::Type { .. } | PathKind::Pat { .. },
+                        ..
+                    },
+                ),
+            ..
+        }) = analysis
+        {
+            if path_ctx.is_trivial_path() {
+                return None;
+            }
+        }
+    }
+
     {
         let acc = &mut completions;
 
@@ -184,17 +207,19 @@ pub fn completions(
             CompletionAnalysis::String { original, expanded: Some(expanded) } => {
                 completions::extern_abi::complete_extern_abi(acc, ctx, expanded);
                 completions::format_string::format_string(acc, ctx, original, expanded);
-                completions::env_vars::complete_cargo_env_vars(acc, ctx, expanded);
+                completions::env_vars::complete_cargo_env_vars(acc, ctx, original, expanded);
             }
             CompletionAnalysis::UnexpandedAttrTT {
                 colon_prefix,
                 fake_attribute_under_caret: Some(attr),
+                extern_crate,
             } => {
                 completions::attribute::complete_known_attribute_input(
                     acc,
                     ctx,
                     colon_prefix,
                     attr,
+                    extern_crate.as_ref(),
                 );
             }
             CompletionAnalysis::UnexpandedAttrTT { .. } | CompletionAnalysis::String { .. } => (),
@@ -212,7 +237,7 @@ pub fn resolve_completion_edits(
     FilePosition { file_id, offset }: FilePosition,
     imports: impl IntoIterator<Item = (String, String)>,
 ) -> Option<Vec<TextEdit>> {
-    let _p = profile::span("resolve_completion_edits");
+    let _p = tracing::span!(tracing::Level::INFO, "resolve_completion_edits").entered();
     let sema = hir::Semantics::new(db);
 
     let original_file = sema.parse(file_id);
@@ -232,7 +257,6 @@ pub fn resolve_completion_edits(
             current_crate,
             NameToImport::exact_case_sensitive(imported_name),
             items_locator::AssocSearchMode::Include,
-            Some(items_locator::DEFAULT_QUERY_SEARCH_LIMIT.inner()),
         );
         let import = items_with_name
             .filter_map(|candidate| {
@@ -241,6 +265,7 @@ pub fn resolve_completion_edits(
                     candidate,
                     config.insert_use.prefix_kind,
                     config.prefer_no_std,
+                    config.prefer_prelude,
                 )
             })
             .find(|mod_path| mod_path.display(db).to_string() == full_import_path);

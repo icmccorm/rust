@@ -9,13 +9,16 @@ impl TraitWAssocConst for impl Demo { //~ ERROR E0404
 }
 
 fn foo<A: TraitWAssocConst<A=32>>() { //~ ERROR E0658
-    foo::<Demo>()(); //~ ERROR E0271
-    //~^ ERROR E0618
-    //~| ERROR E0277
+    foo::<Demo>()();
+    //~^ ERROR is not satisfied
+    //~| ERROR type mismatch
+    //~| ERROR expected function, found `()`
 }
 
-fn main<A: TraitWAssocConst<A=32>>() { //~ ERROR E0131
+fn main<A: TraitWAssocConst<A=32>>() {
     //~^ ERROR E0658
-    foo::<Demo>(); //~ ERROR E0277
-    //~^ ERROR E0271
+    //~| ERROR E0131
+    foo::<Demo>();
+    //~^ ERROR type mismatch
+    //~| ERROR is not satisfied
 }

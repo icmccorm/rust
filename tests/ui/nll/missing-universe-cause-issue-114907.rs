@@ -6,7 +6,7 @@
 // - a custom `Drop` is needed somewhere in the type that `accept` returns, to create universes
 //   during liveness and dropck outlives computation
 
-// check-fail
+//@ check-fail
 
 trait Role {
     type Inner;
@@ -31,8 +31,8 @@ fn accept<C: FnOnce(&())>(_: C) -> Handshake<HandshakeCallback<C>> {
 fn main() {
     let callback = |_| {};
     accept(callback);
-    //~^ ERROR mismatched types
-    //~| ERROR mismatched types
+    //~^ ERROR implementation of `FnOnce` is not general enough
+    //~| ERROR implementation of `FnOnce` is not general enough
     //~| ERROR implementation of `FnOnce` is not general enough
     //~| ERROR implementation of `FnOnce` is not general enough
     //~| ERROR higher-ranked subtype error

@@ -39,6 +39,9 @@ pub enum Alignment {
 #[stable(feature = "debug_builders", since = "1.2.0")]
 pub use self::builders::{DebugList, DebugMap, DebugSet, DebugStruct, DebugTuple};
 
+#[unstable(feature = "debug_closure_helpers", issue = "117729")]
+pub use self::builders::FormatterFn;
+
 /// The type returned by formatter methods.
 ///
 /// # Examples
@@ -198,14 +201,22 @@ pub trait Write {
         impl<W: Write + ?Sized> SpecWriteFmt for &mut W {
             #[inline]
             default fn spec_write_fmt(mut self, args: Arguments<'_>) -> Result {
-                write(&mut self, args)
+                if let Some(s) = args.as_statically_known_str() {
+                    self.write_str(s)
+                } else {
+                    write(&mut self, args)
+                }
             }
         }
 
         impl<W: Write> SpecWriteFmt for &mut W {
             #[inline]
             fn spec_write_fmt(self, args: Arguments<'_>) -> Result {
-                write(self, args)
+                if let Some(s) = args.as_statically_known_str() {
+                    self.write_str(s)
+                } else {
+                    write(self, args)
+                }
             }
         }
 
@@ -239,6 +250,7 @@ impl<W: Write + ?Sized> Write for &mut W {
 /// documentation of the methods defined on `Formatter` below.
 #[allow(missing_debug_implementations)]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_diagnostic_item = "Formatter"]
 pub struct Formatter<'a> {
     flags: u32,
     fill: char,
@@ -425,6 +437,14 @@ impl<'a> Arguments<'a> {
             ([s], []) => Some(s),
             _ => None,
         }
+    }
+
+    /// Same as [`Arguments::as_str`], but will only return `Some(s)` if it can be determined at compile time.
+    #[must_use]
+    #[inline]
+    fn as_statically_known_str(&self) -> Option<&'static str> {
+        let s = self.as_str();
+        if core::intrinsics::is_val_statically_known(s.is_some()) { s } else { None }
     }
 }
 
@@ -629,6 +649,23 @@ pub use macros::Debug;
 /// [tostring]: ../../std/string/trait.ToString.html
 /// [tostring_function]: ../../std/string/trait.ToString.html#tymethod.to_string
 ///
+/// # Internationalization
+///
+/// Because a type can only have one `Display` implementation, it is often preferable
+/// to only implement `Display` when there is a single most "obvious" way that
+/// values can be formatted as text. This could mean formatting according to the
+/// "invariant" culture and "undefined" locale, or it could mean that the type
+/// display is designed for a specific culture/locale, such as developer logs.
+///
+/// If not all values have a justifiably canonical textual format or if you want
+/// to support alternative formats not covered by the standard set of possible
+/// [formatting traits], the most flexible approach is display adapters: methods
+/// like [`str::escape_default`] or [`Path::display`] which create a wrapper
+/// implementing `Display` to output the specific display format.
+///
+/// [formatting traits]: ../../std/fmt/index.html#formatting-traits
+/// [`Path::display`]: ../../std/path/struct.Path.html#method.display
+///
 /// # Examples
 ///
 /// Implementing `Display` on a type:
@@ -791,8 +828,10 @@ pub trait Octal {
 /// assert_eq!(format!("l as binary is: {l:b}"), "l as binary is: 1101011");
 ///
 /// assert_eq!(
-///     format!("l as binary is: {l:#032b}"),
-///     "l as binary is: 0b000000000000000000000001101011"
+///     // Note that the `0b` prefix added by `#` is included in the total width, so we
+///     // need to add two to correctly display all 32 bits.
+///     format!("l as binary is: {l:#034b}"),
+///     "l as binary is: 0b00000000000000000000000001101011"
 /// );
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -1576,8 +1615,13 @@ impl<'a> Formatter<'a> {
     /// assert_eq!(format!("{:0>8}", Foo(2)), "Foo 2");
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[inline]
     pub fn write_fmt(&mut self, fmt: Arguments<'_>) -> Result {
-        write(self.buf, fmt)
+        if let Some(s) = fmt.as_statically_known_str() {
+            self.buf.write_str(s)
+        } else {
+            write(self.buf, fmt)
+        }
     }
 
     /// Flags for formatting
@@ -2266,8 +2310,13 @@ impl Write for Formatter<'_> {
         self.buf.write_char(c)
     }
 
+    #[inline]
     fn write_fmt(&mut self, args: Arguments<'_>) -> Result {
-        write(self.buf, args)
+        if let Some(s) = args.as_statically_known_str() {
+            self.buf.write_str(s)
+        } else {
+            write(self.buf, args)
+        }
     }
 }
 
@@ -2389,8 +2438,8 @@ impl Display for char {
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized> Pointer for *const T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        // Cast is needed here because `.expose_addr()` requires `T: Sized`.
-        pointer_fmt_inner((*self as *const ()).expose_addr(), f)
+        // Cast is needed here because `.expose_provenance()` requires `T: Sized`.
+        pointer_fmt_inner((*self as *const ()).expose_provenance(), f)
     }
 }
 

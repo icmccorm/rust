@@ -5,9 +5,10 @@ use rustc_ast as ast;
 use rustc_errors::Applicability;
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::lint::in_external_macro;
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 
 declare_clippy_lint! {
+    /// ### What it does
     /// Checks for usage of the `#[allow]` attribute and suggests replacing it with
     /// the `#[expect]` (See [RFC 2383](https://rust-lang.github.io/rfcs/2383-lint-reasons.html))
     ///
@@ -19,7 +20,6 @@ declare_clippy_lint! {
     /// (`#![allow]`) are usually used to enable or disable lints on a global scale.
     ///
     /// ### Why is this bad?
-    ///
     /// `#[expect]` attributes suppress the lint emission, but emit a warning, if
     /// the expectation is unfulfilled. This can be useful to be notified when the
     /// lint is no longer triggered.
@@ -52,24 +52,22 @@ declare_lint_pass!(AllowAttribute => [ALLOW_ATTRIBUTES]);
 impl LateLintPass<'_> for AllowAttribute {
     // Separate each crate's features.
     fn check_attribute<'cx>(&mut self, cx: &LateContext<'cx>, attr: &'cx Attribute) {
-        if_chain! {
-            if !in_external_macro(cx.sess(), attr.span);
-            if cx.tcx.features().lint_reasons;
-            if let AttrStyle::Outer = attr.style;
-            if let Some(ident) = attr.ident();
-            if ident.name == rustc_span::symbol::sym::allow;
-            if !is_from_proc_macro(cx, &attr);
-            then {
-                span_lint_and_sugg(
-                    cx,
-                    ALLOW_ATTRIBUTES,
-                    ident.span,
-                    "#[allow] attribute found",
-                    "replace it with",
-                    "expect".into(),
-                    Applicability::MachineApplicable,
-                );
-            }
+        if !in_external_macro(cx.sess(), attr.span)
+            && cx.tcx.features().lint_reasons
+            && let AttrStyle::Outer = attr.style
+            && let Some(ident) = attr.ident()
+            && ident.name == rustc_span::symbol::sym::allow
+            && !is_from_proc_macro(cx, &attr)
+        {
+            span_lint_and_sugg(
+                cx,
+                ALLOW_ATTRIBUTES,
+                ident.span,
+                "#[allow] attribute found",
+                "replace it with",
+                "expect".into(),
+                Applicability::MachineApplicable,
+            );
         }
     }
 }

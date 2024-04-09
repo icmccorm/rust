@@ -13,6 +13,8 @@ and [Blackberry QNX][BlackBerry].
 
 - Florian Bartels, `Florian.Bartels@elektrobit.com`, https://github.com/flba-eb
 - Tristan Roach, `TRoach@blackberry.com`, https://github.com/gh-tr
+- Jonathan Pallant `Jonathan.Pallant@ferrous-systems.com`, https://github.com/jonathanpallant
+- Jorge Aparicio `Jorge.Aparicio@ferrous-systems.com`, https://github.com/japaric
 
 ## Requirements
 
@@ -98,7 +100,7 @@ Example content:
 
 ```toml
 profile = "compiler"
-changelog-seen = 2
+change-id = 115898
 ```
 
 2. Compile the Rust toolchain for an `x86_64-unknown-linux-gnu` host (for both `aarch64` and `x86_64` targets)
@@ -121,10 +123,8 @@ export build_env='
 
 env $build_env \
     ./x.py build \
-        --target aarch64-unknown-nto-qnx710 \
-        --target x86_64-pc-nto-qnx710 \
-        --target x86_64-unknown-linux-gnu \
-        rustc library/core library/alloc
+        --target aarch64-unknown-nto-qnx710,x86_64-pc-nto-qnx710,x86_64-unknown-linux-gnu \
+        rustc library/core library/alloc library/std
 ```
 
 ## Running the Rust test suite

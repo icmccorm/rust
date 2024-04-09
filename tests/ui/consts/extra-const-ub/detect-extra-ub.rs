@@ -1,7 +1,7 @@
-// revisions: no_flag with_flag
-// [no_flag] check-pass
-// [with_flag] compile-flags: -Zextra-const-ub-checks
-#![feature(never_type, pointer_byte_offsets)]
+//@ revisions: no_flag with_flag
+//@ [no_flag] check-pass
+//@ [with_flag] compile-flags: -Zextra-const-ub-checks
+#![feature(never_type)]
 
 use std::mem::transmute;
 use std::ptr::addr_of;
@@ -87,5 +87,16 @@ const PARTIAL_POINTER: () = unsafe {
 // Regression tests for an ICE (related to <https://github.com/rust-lang/rust/issues/113988>).
 const VALID_ENUM1: E = { let e = E::A; e };
 const VALID_ENUM2: Result<&'static [u8], ()> = { let e = Err(()); e };
+
+// Htting the (non-integer) array code in validation with an immediate local.
+const VALID_ARRAY: [Option<i32>; 0] = { let e = [None; 0]; e };
+
+// Detecting oversized references.
+const OVERSIZED_REF: () = { unsafe {
+    let slice: *const [u8] = transmute((1usize, usize::MAX));
+    let _val = &*slice;
+    //[with_flag]~^ ERROR: evaluation of constant value failed
+    //[with_flag]~| slice is bigger than largest supported object
+} };
 
 fn main() {}

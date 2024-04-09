@@ -48,9 +48,6 @@ ENV \
     AR_x86_64_pc_solaris=x86_64-pc-solaris2.10-ar \
     CC_x86_64_pc_solaris=x86_64-pc-solaris2.10-gcc \
     CXX_x86_64_pc_solaris=x86_64-pc-solaris2.10-g++ \
-    AR_x86_64_sun_solaris=x86_64-sun-solaris2.10-ar \
-    CC_x86_64_sun_solaris=x86_64-sun-solaris2.10-gcc \
-    CXX_x86_64_sun_solaris=x86_64-sun-solaris2.10-g++ \
     CC_armv7_unknown_linux_gnueabi=arm-linux-gnueabi-gcc-9 \
     CXX_armv7_unknown_linux_gnueabi=arm-linux-gnueabi-g++-9 \
     AR_x86_64_fortanix_unknown_sgx=ar \
@@ -79,13 +76,11 @@ RUN env \
     rm -rf /build/*
 
 WORKDIR /tmp
-COPY host-x86_64/dist-various-2/shared.sh /tmp/
-COPY host-x86_64/dist-various-2/build-fuchsia-toolchain.sh /tmp/
+COPY scripts/shared.sh /tmp/
+COPY scripts/build-fuchsia-toolchain.sh /tmp/
 RUN /tmp/build-fuchsia-toolchain.sh
 COPY host-x86_64/dist-various-2/build-solaris-toolchain.sh /tmp/
 RUN /tmp/build-solaris-toolchain.sh x86_64  amd64   solaris-i386  pc
-# Build deprecated target 'x86_64-sun-solaris2.10' until removed
-RUN /tmp/build-solaris-toolchain.sh x86_64  amd64   solaris-i386  sun
 RUN /tmp/build-solaris-toolchain.sh sparcv9 sparcv9 solaris-sparc sun
 COPY host-x86_64/dist-various-2/build-x86_64-fortanix-unknown-sgx-toolchain.sh /tmp/
 RUN /tmp/build-x86_64-fortanix-unknown-sgx-toolchain.sh
@@ -117,10 +112,10 @@ ENV TARGETS=x86_64-unknown-fuchsia
 ENV TARGETS=$TARGETS,aarch64-unknown-fuchsia
 ENV TARGETS=$TARGETS,wasm32-unknown-unknown
 ENV TARGETS=$TARGETS,wasm32-wasi
-ENV TARGETS=$TARGETS,wasm32-wasi-preview1-threads
+ENV TARGETS=$TARGETS,wasm32-wasip1
+ENV TARGETS=$TARGETS,wasm32-wasip1-threads
 ENV TARGETS=$TARGETS,sparcv9-sun-solaris
 ENV TARGETS=$TARGETS,x86_64-pc-solaris
-ENV TARGETS=$TARGETS,x86_64-sun-solaris
 ENV TARGETS=$TARGETS,x86_64-unknown-linux-gnux32
 ENV TARGETS=$TARGETS,x86_64-fortanix-unknown-sgx
 ENV TARGETS=$TARGETS,nvptx64-nvidia-cuda
@@ -140,9 +135,10 @@ ENV TARGETS=$TARGETS,x86_64-unknown-uefi
 # Luckily one of the folders is /usr/local/include so symlink /usr/include/x86_64-linux-gnu/asm there
 RUN ln -s /usr/include/x86_64-linux-gnu/asm /usr/local/include/asm
 
-ENV RUST_CONFIGURE_ARGS --enable-extended --enable-lld --disable-docs \
-  --set target.wasm32-wasi.wasi-root=/wasm32-wasi \
-  --set target.wasm32-wasi-preview1-threads.wasi-root=/wasm32-wasi-preview1-threads \
+ENV RUST_CONFIGURE_ARGS --enable-extended --enable-lld --enable-llvm-bitcode-linker --disable-docs \
+  --set target.wasm32-wasi.wasi-root=/wasm32-wasip1 \
+  --set target.wasm32-wasip1.wasi-root=/wasm32-wasip1 \
+  --set target.wasm32-wasip1-threads.wasi-root=/wasm32-wasip1-threads \
   --musl-root-armv7=/musl-armv7
 
 ENV SCRIPT python3 ../x.py dist --host='' --target $TARGETS

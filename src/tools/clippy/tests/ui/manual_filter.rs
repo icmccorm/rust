@@ -135,7 +135,7 @@ fn main() {
         };
     }
 
-    #[allow(clippy::blocks_in_if_conditions)]
+    #[allow(clippy::blocks_in_conditions)]
     match Some(11) {
         // Lint, statement is preserved by `.filter`
         Some(x) => {
@@ -191,9 +191,7 @@ fn main() {
         None => None,
     };
     let _ = match Some(15) {
-        Some(x) => unsafe {
-            if f(x) { Some(x) } else { None }
-        },
+        Some(x) => unsafe { if f(x) { Some(x) } else { None } },
         None => None,
     };
 

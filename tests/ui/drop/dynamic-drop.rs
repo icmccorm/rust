@@ -1,7 +1,7 @@
-// run-pass
-// needs-unwind
+//@ run-pass
+//@ needs-unwind
 
-#![feature(generators, generator_trait)]
+#![feature(coroutines, coroutine_trait)]
 #![feature(if_let_guard)]
 
 #![allow(unused_assignments)]
@@ -9,7 +9,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
-use std::ops::Generator;
+use std::ops::Coroutine;
 use std::panic;
 use std::pin::Pin;
 
@@ -103,7 +103,7 @@ fn dynamic_drop(a: &Allocator, c: bool) {
     };
 }
 
-struct TwoPtrs<'a>(Ptr<'a>, #[allow(unused_tuple_struct_fields)] Ptr<'a>);
+struct TwoPtrs<'a>(Ptr<'a>, #[allow(dead_code)] Ptr<'a>);
 fn struct_dynamic_drop(a: &Allocator, c0: bool, c1: bool, c: bool) {
     for i in 0..2 {
         let x;
@@ -173,7 +173,7 @@ fn vec_simple(a: &Allocator) {
     let _x = vec![a.alloc(), a.alloc(), a.alloc(), a.alloc()];
 }
 
-fn generator(a: &Allocator, run_count: usize) {
+fn coroutine(a: &Allocator, run_count: usize) {
     assert!(run_count < 4);
 
     let mut gen = || {
@@ -343,6 +343,17 @@ fn if_let_guard(a: &Allocator, c: bool, d: i32) {
     }
 }
 
+fn if_let_guard_2(a: &Allocator, num: i32) {
+    let d = a.alloc();
+    match num {
+        #[allow(irrefutable_let_patterns)]
+        1 | 2 if let Ptr(ref _idx, _) = a.alloc() => {
+            a.alloc();
+        }
+        _ => {}
+    }
+}
+
 fn panic_after_return(a: &Allocator) -> Ptr<'_> {
     // Panic in the drop of `p` or `q` can leak
     let exceptions = vec![8, 9];
@@ -471,10 +482,10 @@ fn main() {
     run_test(|a| field_assignment(a, false));
     run_test(|a| field_assignment(a, true));
 
-    run_test(|a| generator(a, 0));
-    run_test(|a| generator(a, 1));
-    run_test(|a| generator(a, 2));
-    run_test(|a| generator(a, 3));
+    run_test(|a| coroutine(a, 0));
+    run_test(|a| coroutine(a, 1));
+    run_test(|a| coroutine(a, 2));
+    run_test(|a| coroutine(a, 3));
 
     run_test(|a| mixed_drop_and_nondrop(a));
 
@@ -514,6 +525,9 @@ fn main() {
     run_test(|a| if_let_guard(a, false, 0));
     run_test(|a| if_let_guard(a, false, 1));
     run_test(|a| if_let_guard(a, false, 2));
+    run_test(|a| if_let_guard_2(a, 0));
+    run_test(|a| if_let_guard_2(a, 1));
+    run_test(|a| if_let_guard_2(a, 2));
 
     run_test(|a| {
         panic_after_return(a);

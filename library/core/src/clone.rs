@@ -210,8 +210,6 @@ pub struct AssertParamIsCopy<T: Copy + ?Sized> {
 /// are implemented in `traits::SelectionContext::copy_clone_conditions()`
 /// in `rustc_trait_selection`.
 mod impls {
-    use super::Clone;
-
     macro_rules! impl_clone {
         ($($t:ty)*) => {
             $(
@@ -232,6 +230,9 @@ mod impls {
         f32 f64
         bool char
     }
+
+    #[cfg(not(bootstrap))]
+    impl_clone! { f16 f128 }
 
     #[unstable(feature = "never_type", issue = "35121")]
     impl Clone for ! {

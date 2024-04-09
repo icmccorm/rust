@@ -12,15 +12,16 @@
 
 mod dwarf;
 
-#[cfg(not(test))]
+#[cfg(not(any(test, doctest)))]
 cfg_if::cfg_if! {
     if #[cfg(target_os = "emscripten")] {
         mod emcc;
-    } else if #[cfg(target_env = "msvc")] {
+    } else if #[cfg(any(target_env = "msvc", target_family = "wasm"))] {
         // This is required by the compiler to exist (e.g., it's a lang item),
         // but it's never actually called by the compiler because
-        // _CxxFrameHandler3 is the personality function that is always used.
-        // Hence this is just an aborting stub.
+        // __CxxFrameHandler3 (msvc) / __gxx_wasm_personality_v0 (wasm) is the
+        // personality function that is always used.  Hence this is just an
+        // aborting stub.
         #[lang = "eh_personality"]
         fn rust_eh_personality() {
             core::intrinsics::abort()
@@ -28,6 +29,7 @@ cfg_if::cfg_if! {
     } else if #[cfg(any(
         all(target_family = "windows", target_env = "gnu"),
         target_os = "psp",
+        target_os = "xous",
         target_os = "solid_asp3",
         all(target_family = "unix", not(target_os = "espidf"), not(target_os = "l4re")),
         all(target_vendor = "fortanix", target_env = "sgx"),
@@ -35,7 +37,6 @@ cfg_if::cfg_if! {
         mod gcc;
     } else {
         // Targets that don't support unwinding.
-        // - family=wasm
         // - os=none ("bare metal" targets)
         // - os=uefi
         // - os=espidf

@@ -12,8 +12,7 @@
 //!
 //! Typical usage will look like this:
 //!
-#![cfg_attr(bootstrap, doc = "```rust,ignore")]
-#![cfg_attr(not(bootstrap), doc = "```rust")]
+//! ```rust
 //! #![feature(core_intrinsics, custom_mir)]
 //! #![allow(internal_features)]
 //!
@@ -63,10 +62,10 @@
 //!
 //! # Examples
 //!
-#![cfg_attr(bootstrap, doc = "```rust,ignore")]
-#![cfg_attr(not(bootstrap), doc = "```rust")]
+//! ```rust
 //! #![feature(core_intrinsics, custom_mir)]
 //! #![allow(internal_features)]
+//! #![allow(unused_assignments)]
 //!
 //! use core::intrinsics::mir::*;
 //!
@@ -106,22 +105,21 @@
 //! }
 //!
 //! #[custom_mir(dialect = "runtime", phase = "optimized")]
-#![cfg_attr(bootstrap, doc = "#[cfg(any())]")] // disable the following function in doctests when `bootstrap` is set
 //! fn push_and_pop<T>(v: &mut Vec<T>, value: T) {
 //!     mir!(
 //!         let _unused;
 //!         let popped;
 //!
 //!         {
-//!             Call(_unused = Vec::push(v, value), pop)
+//!             Call(_unused = Vec::push(v, value), ReturnTo(pop), UnwindContinue())
 //!         }
 //!
 //!         pop = {
-//!             Call(popped = Vec::pop(v), drop)
+//!             Call(popped = Vec::pop(v), ReturnTo(drop), UnwindContinue())
 //!         }
 //!
 //!         drop = {
-//!             Drop(popped, ret)
+//!             Drop(popped, ReturnTo(ret), UnwindContinue())
 //!         }
 //!
 //!         ret = {
@@ -196,7 +194,7 @@
 //! 27 | |     )
 //!    | |_____- binding declared here but left uninitialized
 //!
-//! error: aborting due to previous error
+//! error: aborting due to 1 previous error
 //!
 //! For more information about this error, try `rustc --explain E0381`.
 //! ```
@@ -241,17 +239,12 @@
 //!
 //! #### Terminators
 //!
-//! Custom MIR does not currently support cleanup blocks or non-trivial unwind paths. As such, there
-//! are no resume and abort terminators, and terminators that might unwind do not have any way to
-//! indicate the unwind block.
-//!
 //!  - [`Goto`], [`Return`], [`Unreachable`] and [`Drop`](Drop()) have associated functions.
 //!  - `match some_int_operand` becomes a `SwitchInt`. Each arm should be `literal => basic_block`
 //!     - The exception is the last arm, which must be `_ => basic_block` and corresponds to the
 //!       otherwise branch.
-//!  - [`Call`] has an associated function as well. The third argument of this function is a normal
-//!    function call expression, for example `my_other_function(a, 5)`.
-//!
+//!  - [`Call`] has an associated function as well, with special syntax:
+//!    `Call(ret_val = function(arg1, arg2, ...), ReturnTo(next_block), UnwindContinue())`.
 
 #![unstable(
     feature = "custom_mir",
@@ -263,7 +256,26 @@
 /// Type representing basic blocks.
 ///
 /// All terminators will have this type as a return type. It helps achieve some type safety.
-pub struct BasicBlock;
+#[rustc_diagnostic_item = "mir_basic_block"]
+pub enum BasicBlock {
+    /// A non-cleanup basic block.
+    Normal,
+    /// A basic block that lies on an unwind path.
+    Cleanup,
+}
+
+/// The reason we are terminating the process during unwinding.
+#[rustc_diagnostic_item = "mir_unwind_terminate_reason"]
+pub enum UnwindTerminateReason {
+    /// Unwinding is just not possible given the ABI of this function.
+    Abi,
+    /// We were already cleaning up for an ongoing unwind, and a *second*, *nested* unwind was
+    /// triggered by the drop glue.
+    InCleanup,
+}
+
+pub use UnwindTerminateReason::Abi as ReasonAbi;
+pub use UnwindTerminateReason::InCleanup as ReasonInCleanup;
 
 macro_rules! define {
     ($name:literal, $( #[ $meta:meta ] )* fn $($sig:tt)*) => {
@@ -274,13 +286,77 @@ macro_rules! define {
     }
 }
 
+// Unwind actions
+pub struct UnwindActionArg;
+define!(
+    "mir_unwind_continue",
+    /// An unwind action that continues unwinding.
+    fn UnwindContinue() -> UnwindActionArg
+);
+define!(
+    "mir_unwind_unreachable",
+    /// An unwind action that triggers undefined behaviour.
+    fn UnwindUnreachable() -> UnwindActionArg
+);
+define!(
+    "mir_unwind_terminate",
+    /// An unwind action that terminates the execution.
+    ///
+    /// `UnwindTerminate` can also be used as a terminator.
+    fn UnwindTerminate(reason: UnwindTerminateReason) -> UnwindActionArg
+);
+define!(
+    "mir_unwind_cleanup",
+    /// An unwind action that continues execution in a given basic blok.
+    fn UnwindCleanup(goto: BasicBlock) -> UnwindActionArg
+);
+
+// Return destination for `Call`
+pub struct ReturnToArg;
+define!("mir_return_to", fn ReturnTo(goto: BasicBlock) -> ReturnToArg);
+
+// Terminators
 define!("mir_return", fn Return() -> BasicBlock);
 define!("mir_goto", fn Goto(destination: BasicBlock) -> BasicBlock);
 define!("mir_unreachable", fn Unreachable() -> BasicBlock);
-define!("mir_drop", fn Drop<T>(place: T, goto: BasicBlock));
-define!("mir_call", fn Call(call: (), goto: BasicBlock));
+define!("mir_drop",
+    /// Drop the contents of a place.
+    ///
+    /// The first argument must be a place.
+    ///
+    /// The second argument must be of the form `ReturnTo(bb)`, where `bb` is the basic block that
+    /// will be jumped to after the destructor returns.
+    ///
+    /// The third argument describes what happens on unwind. It can be one of:
+    /// - [`UnwindContinue`]
+    /// - [`UnwindUnreachable`]
+    /// - [`UnwindTerminate`]
+    /// - [`UnwindCleanup`]
+    fn Drop<T>(place: T, goto: ReturnToArg, unwind_action: UnwindActionArg)
+);
+define!("mir_call",
+    /// Call a function.
+    ///
+    /// The first argument must be of the form `ret_val = fun(arg1, arg2, ...)`.
+    ///
+    /// The second argument must be of the form `ReturnTo(bb)`, where `bb` is the basic block that
+    /// will be jumped to after the function returns.
+    ///
+    /// The third argument describes what happens on unwind. It can be one of:
+    /// - [`UnwindContinue`]
+    /// - [`UnwindUnreachable`]
+    /// - [`UnwindTerminate`]
+    /// - [`UnwindCleanup`]
+    fn Call(call: (), goto: ReturnToArg, unwind_action: UnwindActionArg)
+);
+define!("mir_unwind_resume",
+    /// A terminator that resumes the unwinding.
+    fn UnwindResume()
+);
+
 define!("mir_storage_live", fn StorageLive<T>(local: T));
 define!("mir_storage_dead", fn StorageDead<T>(local: T));
+define!("mir_assume", fn Assume(operand: bool));
 define!("mir_deinit", fn Deinit<T>(place: T));
 define!("mir_checked", fn Checked<T>(binop: T) -> (T, bool));
 define!("mir_len", fn Len<T>(place: T) -> usize);
@@ -319,8 +395,7 @@ define!(
     ///
     /// # Examples
     ///
-    #[cfg_attr(bootstrap, doc = "```rust,ignore")]
-    #[cfg_attr(not(bootstrap), doc = "```rust")]
+    /// ```rust
     /// #![allow(internal_features)]
     /// #![feature(custom_mir, core_intrinsics)]
     ///
@@ -386,16 +461,15 @@ pub macro mir {
         }
 
         $(
-            $block_name:ident = {
+            $block_name:ident $(($block_cleanup:ident))? = {
                 $($block:tt)*
             }
         )*
     ) => {{
         // First, we declare all basic blocks.
-        $(
-            let $block_name: ::core::intrinsics::mir::BasicBlock;
-        )*
-
+        __internal_declare_basic_blocks!($(
+            $block_name $(($block_cleanup))?
+        )*);
         {
             // Now all locals
             #[allow(non_snake_case)]
@@ -587,5 +661,19 @@ pub macro __internal_remove_let {
             $($already_parsed)*
             $expr
         }
+    },
+}
+
+/// Helper macro that declares the basic blocks.
+#[doc(hidden)]
+pub macro __internal_declare_basic_blocks {
+    () => {},
+    ($name:ident (cleanup) $($rest:tt)*) => {
+        let $name = ::core::intrinsics::mir::BasicBlock::Cleanup;
+        __internal_declare_basic_blocks!($($rest)*)
+    },
+    ($name:ident $($rest:tt)*) => {
+        let $name = ::core::intrinsics::mir::BasicBlock::Normal;
+        __internal_declare_basic_blocks!($($rest)*)
     },
 }

@@ -3,13 +3,13 @@ pub use self::plumbing::*;
 
 mod job;
 #[cfg(parallel_compiler)]
-pub use self::job::deadlock;
-pub use self::job::{print_query_stack, QueryInfo, QueryJob, QueryJobId, QueryJobInfo, QueryMap};
+pub use self::job::break_query_cycles;
+pub use self::job::{
+    print_query_stack, report_cycle, QueryInfo, QueryJob, QueryJobId, QueryJobInfo, QueryMap,
+};
 
 mod caches;
-pub use self::caches::{
-    CacheSelector, DefaultCacheSelector, QueryCache, SingleCacheSelector, VecCacheSelector,
-};
+pub use self::caches::{DefIdCache, DefaultCache, QueryCache, SingleCache, VecCache};
 
 mod config;
 pub use self::config::{HashResult, QueryConfig};
@@ -18,7 +18,7 @@ use crate::dep_graph::DepKind;
 use crate::dep_graph::{DepNodeIndex, HasDepContext, SerializedDepNodeIndex};
 use rustc_data_structures::stable_hasher::Hash64;
 use rustc_data_structures::sync::Lock;
-use rustc_errors::Diagnostic;
+use rustc_errors::DiagInner;
 use rustc_hir::def::DefKind;
 use rustc_span::def_id::DefId;
 use rustc_span::Span;
@@ -33,7 +33,8 @@ pub struct QueryStackFrame {
     span: Option<Span>,
     pub def_id: Option<DefId>,
     pub def_kind: Option<DefKind>,
-    pub ty_adt_id: Option<DefId>,
+    /// A def-id that is extracted from a `Ty` in a query key
+    pub ty_def_id: Option<DefId>,
     pub dep_kind: DepKind,
     /// This hash is used to deterministically pick
     /// a query to remove cycles in the parallel compiler.
@@ -49,7 +50,7 @@ impl QueryStackFrame {
         def_id: Option<DefId>,
         def_kind: Option<DefKind>,
         dep_kind: DepKind,
-        ty_adt_id: Option<DefId>,
+        ty_def_id: Option<DefId>,
         _hash: impl FnOnce() -> Hash64,
     ) -> Self {
         Self {
@@ -57,7 +58,7 @@ impl QueryStackFrame {
             span,
             def_id,
             def_kind,
-            ty_adt_id,
+            ty_def_id,
             dep_kind,
             #[cfg(parallel_compiler)]
             hash: _hash(),
@@ -85,14 +86,17 @@ pub struct QuerySideEffects {
     /// Stores any diagnostics emitted during query execution.
     /// These diagnostics will be re-emitted if we mark
     /// the query as green.
-    pub(super) diagnostics: ThinVec<Diagnostic>,
+    pub(super) diagnostics: ThinVec<DiagInner>,
 }
 
 impl QuerySideEffects {
+    /// Returns true if there might be side effects.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub fn maybe_any(&self) -> bool {
         let QuerySideEffects { diagnostics } = self;
-        diagnostics.is_empty()
+        // Use `has_capacity` so that the destructor for `self.diagnostics` can be skipped
+        // if `maybe_any` is known to be false.
+        diagnostics.has_capacity()
     }
     pub fn append(&mut self, other: QuerySideEffects) {
         let QuerySideEffects { diagnostics } = self;
@@ -106,7 +110,7 @@ pub trait QueryContext: HasDepContext {
     /// Get the query information from the TLS context.
     fn current_query_job(self) -> Option<QueryJobId>;
 
-    fn try_collect_active_jobs(self) -> Option<QueryMap>;
+    fn collect_active_jobs(self) -> QueryMap;
 
     /// Load side effects associated to the node in the previous session.
     fn load_side_effects(self, prev_dep_node_index: SerializedDepNodeIndex) -> QuerySideEffects;
@@ -128,7 +132,7 @@ pub trait QueryContext: HasDepContext {
         self,
         token: QueryJobId,
         depth_limit: bool,
-        diagnostics: Option<&Lock<ThinVec<Diagnostic>>>,
+        diagnostics: Option<&Lock<ThinVec<DiagInner>>>,
         compute: impl FnOnce() -> R,
     ) -> R;
 

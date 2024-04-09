@@ -3,8 +3,8 @@
 // In each test case, we include the trailing semicolon to ensure that nothing extra comes
 // after the type like an unwanted outlives-bound.
 
-// aux-crate:dyn_trait=dyn_trait.rs
-// edition:2021
+//@ aux-crate:dyn_trait=dyn_trait.rs
+//@ edition:2021
 
 // @has user/type.Ty0.html
 // @has - '//*[@class="rust item-decl"]//code' "dyn for<'any> FnOnce(&'any str) -> bool;"
@@ -75,16 +75,16 @@ pub use dyn_trait::AmbiguousBoundWrappedEarly1;
 pub use dyn_trait::AmbiguousBoundWrappedStatic;
 
 // @has user/type.NoBoundsWrappedDefaulted.html
-// @has - '//*[@class="rust item-decl"]//code' "Box<dyn Trait, Global>;"
+// @has - '//*[@class="rust item-decl"]//code' "Box<dyn Trait>;"
 pub use dyn_trait::NoBoundsWrappedDefaulted;
 // @has user/type.NoBoundsWrappedEarly.html
-// @has - '//*[@class="rust item-decl"]//code' "Box<dyn Trait + 'e, Global>;"
+// @has - '//*[@class="rust item-decl"]//code' "Box<dyn Trait + 'e>;"
 pub use dyn_trait::NoBoundsWrappedEarly;
 // @has user/fn.nbwl.html
-// @has - '//pre[@class="rust item-decl"]' "nbwl<'l>(_: Box<dyn Trait + 'l, Global>)"
+// @has - '//pre[@class="rust item-decl"]' "nbwl<'l>(_: Box<dyn Trait + 'l>)"
 pub use dyn_trait::no_bounds_wrapped_late as nbwl;
 // @has user/fn.nbwel.html
-// @has - '//pre[@class="rust item-decl"]' "nbwel(_: Box<dyn Trait + '_, Global>)"
+// @has - '//pre[@class="rust item-decl"]' "nbwel(_: Box<dyn Trait + '_>)"
 // NB: It might seem counterintuitive to display the explicitly elided lifetime `'_` here instead of
 // eliding it but this behavior is correct: The default is `'static` here which != `'_`.
 pub use dyn_trait::no_bounds_wrapped_elided as nbwel;

@@ -10,7 +10,7 @@ use rustc_span::Span;
 use thin_vec::{thin_vec, ThinVec};
 
 pub fn expand_deriving_eq(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     span: Span,
     mitem: &MetaItem,
     item: &Annotatable,
@@ -18,19 +18,6 @@ pub fn expand_deriving_eq(
     is_const: bool,
 ) {
     let span = cx.with_def_site_ctxt(span);
-
-    let structural_trait_def = TraitDef {
-        span,
-        path: path_std!(marker::StructuralEq),
-        skip_path_as_bound: true, // crucial!
-        needs_copy_as_bound_if_packed: false,
-        additional_bounds: Vec::new(),
-        supports_unions: true,
-        methods: Vec::new(),
-        associated_types: Vec::new(),
-        is_const: false,
-    };
-    structural_trait_def.expand(cx, mitem, item, push);
 
     let trait_def = TraitDef {
         span,
@@ -62,7 +49,7 @@ pub fn expand_deriving_eq(
 }
 
 fn cs_total_eq_assert(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     trait_span: Span,
     substr: &Substructure<'_>,
 ) -> BlockOrExpr {
@@ -73,7 +60,9 @@ fn cs_total_eq_assert(
             // This basic redundancy checking only prevents duplication of
             // assertions like `AssertParamIsEq<Foo>` where the type is a
             // simple name. That's enough to get a lot of cases, though.
-            if let Some(name) = field.ty.kind.is_simple_path() && !seen_type_names.insert(name) {
+            if let Some(name) = field.ty.kind.is_simple_path()
+                && !seen_type_names.insert(name)
+            {
                 // Already produced an assertion for this type.
             } else {
                 // let _: AssertParamIsEq<FieldTy>;
@@ -97,7 +86,7 @@ fn cs_total_eq_assert(
                 process_variant(&variant.data);
             }
         }
-        _ => cx.span_bug(trait_span, "unexpected substructure in `derive(Eq)`"),
+        _ => cx.dcx().span_bug(trait_span, "unexpected substructure in `derive(Eq)`"),
     }
     BlockOrExpr::new_stmts(stmts)
 }

@@ -87,6 +87,8 @@ pub(super) fn populate_access_facts<'a, 'tcx>(
     body: &Body<'tcx>,
     location_table: &LocationTable,
     move_data: &MoveData<'tcx>,
+    //FIXME: this is not mutated, but expected to be modified as
+    // out param, bug?
     dropped_at: &mut Vec<(Local, Location)>,
 ) {
     debug!("populate_access_facts()");
@@ -100,7 +102,7 @@ pub(super) fn populate_access_facts<'a, 'tcx>(
             location_table,
             move_data,
         };
-        extractor.visit_body(&body);
+        extractor.visit_body(body);
 
         facts.var_dropped_at.extend(
             dropped_at.iter().map(|&(local, location)| (local, location_table.mid_index(location))),

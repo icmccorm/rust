@@ -228,21 +228,16 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     /// In order to have a good line stepping behavior in debugger, we overwrite debug
     /// locations of macro expansions with that of the outermost expansion site (when the macro is
     /// annotated with `#[collapse_debuginfo]` or when `-Zdebug-macros` is provided).
-    fn adjust_span_for_debugging(&self, mut span: Span) -> Span {
+    fn adjust_span_for_debugging(&self, span: Span) -> Span {
         // Bail out if debug info emission is not enabled.
         if self.debug_context.is_none() {
             return span;
         }
-
-        if self.cx.tcx().should_collapse_debuginfo(span) {
-            // Walk up the macro expansion chain until we reach a non-expanded span.
-            // We also stop at the function body level because no line stepping can occur
-            // at the level above that.
-            // Use span of the outermost expansion site, while keeping the original lexical scope.
-            span = rustc_span::hygiene::walk_chain(span, self.mir.span.ctxt());
-        }
-
-        span
+        // Walk up the macro expansion chain until we reach a non-expanded span.
+        // We also stop at the function body level because no line stepping can occur
+        // at the level above that.
+        // Use span of the outermost expansion site, while keeping the original lexical scope.
+        self.cx.tcx().collapsed_debuginfo(span, self.mir.span)
     }
 
     fn spill_operand_to_stack(
@@ -398,7 +393,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         let Some(dbg_loc) = self.dbg_loc(var.source_info) else { return };
 
         let DebugInfoOffset { direct_offset, indirect_offsets, result: _ } =
-            calculate_debuginfo_offset(bx, &var.projection, base.layout);
+            calculate_debuginfo_offset(bx, var.projection, base.layout);
 
         // When targeting MSVC, create extra allocas for arguments instead of pointing multiple
         // dbg_var_addr() calls into the same alloca with offsets. MSVC uses CodeView records
@@ -416,13 +411,10 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
         if should_create_individual_allocas {
             let DebugInfoOffset { direct_offset: _, indirect_offsets: _, result: place } =
-                calculate_debuginfo_offset(bx, &var.projection, base);
+                calculate_debuginfo_offset(bx, var.projection, base);
 
             // Create a variable which will be a pointer to the actual value
-            let ptr_ty = Ty::new_ptr(
-                bx.tcx(),
-                ty::TypeAndMut { mutbl: mir::Mutability::Mut, ty: place.layout.ty },
-            );
+            let ptr_ty = Ty::new_mut_ptr(bx.tcx(), place.layout.ty);
             let ptr_layout = bx.layout_of(ptr_ty);
             let alloca = PlaceRef::alloca(bx, ptr_layout);
             bx.set_var_name(alloca.llval, &(var.name.to_string() + ".dbg.spill"));

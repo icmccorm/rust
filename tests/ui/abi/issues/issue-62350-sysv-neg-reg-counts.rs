@@ -1,8 +1,6 @@
-// run-pass
+//@ run-pass
 #![allow(dead_code)]
 #![allow(improper_ctypes)]
-
-// ignore-wasm32-bare no libc to test ffi with
 
 #[derive(Copy, Clone)]
 pub struct QuadFloats {

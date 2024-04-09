@@ -1,6 +1,4 @@
-// edition:2021
-
-#![feature(async_fn_in_trait)]
+//@ edition:2021
 
 pub trait Foo {
     async fn test();

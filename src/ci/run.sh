@@ -47,7 +47,13 @@ source "$ci_dir/shared.sh"
 
 export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
-if ! isCI || isCiBranch auto || isCiBranch beta || isCiBranch try || isCiBranch try-perf; then
+# suppress change-tracker warnings on CI
+if [ "$CI" != "" ]; then
+    RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set change-id=99999999"
+fi
+
+if ! isCI || isCiBranch auto || isCiBranch beta || isCiBranch try || isCiBranch try-perf || \
+  isCiBranch automation/bors/try; then
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set build.print-step-timings --enable-verbose-tests"
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set build.metrics"
     HAS_METRICS=1
@@ -70,7 +76,7 @@ RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set dist.compression-profile=balance
 # the LLVM build, as not to run out of memory.
 # This is an attempt to fix the spurious build error tracked by
 # https://github.com/rust-lang/rust/issues/108227.
-if isWindows && [[ ${CUSTOM_MINGW-0} -eq 1 ]]; then
+if isKnownToBeMingwBuild; then
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set llvm.link-jobs=1"
 fi
 
@@ -78,6 +84,15 @@ fi
 # process by recompressing the existing xz ones. This decreases the storage
 # space required for CI artifacts.
 RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --dist-compression-formats=xz"
+
+# Enable the `c` feature for compiler_builtins, but only when the `compiler-rt` source is available
+# (to avoid spending a lot of time cloning llvm)
+if [ "$EXTERNAL_LLVM" = "" ]; then
+  RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set build.optimized-compiler-builtins"
+elif [ "$DEPLOY$DEPLOY_ALT" = "1" ]; then
+    echo "error: dist builds should always use optimized compiler-rt!" >&2
+    exit 1
+fi
 
 if [ "$DIST_SRC" = "" ]; then
   RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --disable-dist-src"
@@ -97,12 +112,15 @@ if [ "$DEPLOY$DEPLOY_ALT" = "1" ]; then
   if [ "$NO_LLVM_ASSERTIONS" = "1" ]; then
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --disable-llvm-assertions"
   elif [ "$DEPLOY_ALT" != "" ]; then
-    if [ "$NO_PARALLEL_COMPILER" = "" ]; then
-      RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.parallel-compiler"
+    if [ "$ALT_PARALLEL_COMPILER" = "" ]; then
+      RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.parallel-compiler=false"
     fi
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --enable-llvm-assertions"
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.verify-llvm-ir"
   fi
+
+  CODEGEN_BACKENDS="${CODEGEN_BACKENDS:-llvm}"
+  RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.codegen-backends=$CODEGEN_BACKENDS"
 else
   # We almost always want debug assertions enabled, but sometimes this takes too
   # long for too little benefit, so we just turn them off.
@@ -123,8 +141,16 @@ else
 
   RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.verify-llvm-ir"
 
-  # Test the Cranelift backend in on CI, but don't ship it.
-  RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.codegen-backends=llvm,cranelift"
+  # When running gcc backend tests, we need to install `libgccjit` and to not run llvm codegen
+  # tests as it will fail them.
+  if [[ "${ENABLE_GCC_CODEGEN}" == "1" ]]; then
+    # Test the Cranelift and GCC backends in CI. Bootstrap knows which targets to run tests on.
+    CODEGEN_BACKENDS="${CODEGEN_BACKENDS:-llvm,cranelift,gcc}"
+  else
+    # Test the Cranelift backend in CI. Bootstrap knows which targets to run tests on.
+    CODEGEN_BACKENDS="${CODEGEN_BACKENDS:-llvm,cranelift}"
+  fi
+  RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.codegen-backends=$CODEGEN_BACKENDS"
 
   # We enable this for non-dist builders, since those aren't trying to produce
   # fresh binaries. We currently don't entirely support distributing a fresh
@@ -135,7 +161,7 @@ else
   # LLVM continuously on at least some builders to ensure it works, though.
   # (And PGO is its own can of worms).
   if [ "$NO_DOWNLOAD_CI_LLVM" = "" ]; then
-    RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set llvm.download-ci-llvm=if-available"
+    RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set llvm.download-ci-llvm=if-unchanged"
   else
     # When building for CI we want to use the static C++ Standard library
     # included with LLVM, since a dynamic libstdcpp may not be available.
@@ -143,14 +169,18 @@ else
   fi
 fi
 
-if [ "$RUST_RELEASE_CHANNEL" = "nightly" ] || [ "$DIST_REQUIRE_ALL_TOOLS" = "" ]; then
-    RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --enable-missing-tools"
-fi
-
 # Unless we're using an older version of LLVM, check that all LLVM components
 # used by tests are available.
 if [ "$IS_NOT_LATEST_LLVM" = "" ]; then
   export COMPILETEST_NEEDS_ALL_LLVM_COMPONENTS=1
+fi
+
+if [ "$ENABLE_GCC_CODEGEN" = "1" ]; then
+  # If `ENABLE_GCC_CODEGEN` is set and not empty, we add the `--enable-new-symbol-mangling`
+  # argument to `RUST_CONFIGURE_ARGS` and set the `GCC_EXEC_PREFIX` environment variable.
+  # `cg_gcc` doesn't support the legacy mangling so we need to enforce the new one
+  # if we run `cg_gcc` tests.
+  RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --enable-new-symbol-mangling"
 fi
 
 # Print the date from the local machine and the date from an external source to
@@ -223,7 +253,7 @@ fi
 
 if [ "$RUN_CHECK_WITH_PARALLEL_QUERIES" != "" ]; then
   rm -f config.toml
-  $SRC/configure --set rust.parallel-compiler
+  $SRC/configure --set change-id=99999999 --set rust.parallel-compiler
 
   # Save the build metrics before we wipe the directory
   if [ "$HAS_METRICS" = 1 ]; then

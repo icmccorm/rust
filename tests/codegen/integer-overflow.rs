@@ -1,5 +1,4 @@
-// no-system-llvm
-// compile-flags: -O -C overflow-checks=on
+//@ compile-flags: -O -C overflow-checks=on
 
 #![crate_type = "lib"]
 

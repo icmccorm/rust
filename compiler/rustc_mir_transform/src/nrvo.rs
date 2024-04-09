@@ -1,7 +1,7 @@
 //! See the docs for [`RenameReturnPlace`].
 
 use rustc_hir::Mutability;
-use rustc_index::bit_set::HybridBitSet;
+use rustc_index::bit_set::BitSet;
 use rustc_middle::mir::visit::{MutVisitor, NonUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::{self, BasicBlock, Local, Location};
 use rustc_middle::ty::TyCtxt;
@@ -34,7 +34,7 @@ pub struct RenameReturnPlace;
 
 impl<'tcx> MirPass<'tcx> for RenameReturnPlace {
     fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        // #111005
+        // unsound: #111005
         sess.mir_opt_level() > 0 && sess.opts.unstable_opts.unsound_mir_opts
     }
 
@@ -84,7 +84,7 @@ impl<'tcx> MirPass<'tcx> for RenameReturnPlace {
 ///
 /// If the MIR fulfills both these conditions, this function returns the `Local` that is assigned
 /// to the return place along all possible paths through the control-flow graph.
-fn local_eligible_for_nrvo(body: &mut mir::Body<'_>) -> Option<Local> {
+fn local_eligible_for_nrvo(body: &mir::Body<'_>) -> Option<Local> {
     if IsReturnPlaceRead::run(body) {
         return None;
     }
@@ -118,12 +118,9 @@ fn local_eligible_for_nrvo(body: &mut mir::Body<'_>) -> Option<Local> {
     copied_to_return_place
 }
 
-fn find_local_assigned_to_return_place(
-    start: BasicBlock,
-    body: &mut mir::Body<'_>,
-) -> Option<Local> {
+fn find_local_assigned_to_return_place(start: BasicBlock, body: &mir::Body<'_>) -> Option<Local> {
     let mut block = start;
-    let mut seen = HybridBitSet::new_empty(body.basic_blocks.len());
+    let mut seen = BitSet::new_empty(body.basic_blocks.len());
 
     // Iterate as long as `block` has exactly one predecessor that we have not yet visited.
     while seen.insert(block) {

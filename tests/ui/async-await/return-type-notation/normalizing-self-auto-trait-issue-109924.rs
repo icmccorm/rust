@@ -1,12 +1,11 @@
-// revisions: current next
-//[current] known-bug: #109924
-//[next] check-pass
-//[next] compile-flags: -Ztrait-solver=next
-// edition:2021
+//@ check-pass
+//@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
+//@[next] compile-flags: -Znext-solver
+//@ edition:2021
 
-#![feature(async_fn_in_trait)]
 #![feature(return_type_notation)]
-//[next]~^ WARN the feature `return_type_notation` is incomplete
+//~^ WARN the feature `return_type_notation` is incomplete
 
 trait Foo {
     async fn bar(&self);

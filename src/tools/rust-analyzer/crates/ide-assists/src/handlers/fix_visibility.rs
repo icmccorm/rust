@@ -1,4 +1,6 @@
-use hir::{db::HirDatabase, HasSource, HasVisibility, ModuleDef, PathResolution, ScopeDef};
+use hir::{
+    db::HirDatabase, HasSource, HasVisibility, HirFileIdExt, ModuleDef, PathResolution, ScopeDef,
+};
 use ide_db::base_db::FileId;
 use syntax::{
     ast::{self, edit_in_place::HasVisibilityEdit, make, HasVisibility as _},
@@ -77,7 +79,7 @@ fn add_vis_to_referenced_module_def(acc: &mut Assists, ctx: &AssistContext<'_>) 
         edit.edit_file(target_file);
 
         let vis_owner = edit.make_mut(vis_owner);
-        vis_owner.set_visibility(missing_visibility.clone_for_update());
+        vis_owner.set_visibility(Some(missing_visibility.clone_for_update()));
 
         if let Some((cap, vis)) = ctx.config.snippet_cap.zip(vis_owner.visibility()) {
             edit.add_tabstop_before(cap, vis);
@@ -129,7 +131,7 @@ fn add_vis_to_referenced_record_field(acc: &mut Assists, ctx: &AssistContext<'_>
         edit.edit_file(target_file);
 
         let vis_owner = edit.make_mut(vis_owner);
-        vis_owner.set_visibility(missing_visibility.clone_for_update());
+        vis_owner.set_visibility(Some(missing_visibility.clone_for_update()));
 
         if let Some((cap, vis)) = ctx.config.snippet_cap.zip(vis_owner.visibility()) {
             edit.add_tabstop_before(cap, vis);

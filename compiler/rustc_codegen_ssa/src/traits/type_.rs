@@ -19,8 +19,10 @@ pub trait BaseTypeMethods<'tcx>: Backend<'tcx> {
     fn type_i128(&self) -> Self::Type;
     fn type_isize(&self) -> Self::Type;
 
+    fn type_f16(&self) -> Self::Type;
     fn type_f32(&self) -> Self::Type;
     fn type_f64(&self) -> Self::Type;
+    fn type_f128(&self) -> Self::Type;
 
     fn type_array(&self, ty: Self::Type, len: u64) -> Self::Type;
     fn type_func(&self, args: &[Self::Type], ret: Self::Type) -> Self::Type;
@@ -30,7 +32,7 @@ pub trait BaseTypeMethods<'tcx>: Backend<'tcx> {
     fn type_ptr_ext(&self, address_space: AddressSpace) -> Self::Type;
     fn element_type(&self, ty: Self::Type) -> Self::Type;
 
-    /// Returns the number of elements in `self` if it is a LLVM vector type.
+    /// Returns the number of elements in `self` if it is an LLVM vector type.
     fn vector_length(&self, ty: Self::Type) -> usize;
 
     fn float_width(&self, ty: Self::Type) -> usize;
@@ -111,13 +113,26 @@ pub trait LayoutTypeMethods<'tcx>: Backend<'tcx> {
     fn immediate_backend_type(&self, layout: TyAndLayout<'tcx>) -> Self::Type;
     fn is_backend_immediate(&self, layout: TyAndLayout<'tcx>) -> bool;
     fn is_backend_scalar_pair(&self, layout: TyAndLayout<'tcx>) -> bool;
-    fn backend_field_index(&self, layout: TyAndLayout<'tcx>, index: usize) -> u64;
     fn scalar_pair_element_backend_type(
         &self,
         layout: TyAndLayout<'tcx>,
         index: usize,
         immediate: bool,
     ) -> Self::Type;
+
+    /// A type that produces an [`OperandValue::Ref`] when loaded.
+    ///
+    /// AKA one that's not a ZST, not `is_backend_immediate`, and
+    /// not `is_backend_scalar_pair`. For such a type, a
+    /// [`load_operand`] doesn't actually `load` anything.
+    ///
+    /// [`OperandValue::Ref`]: crate::mir::operand::OperandValue::Ref
+    /// [`load_operand`]: super::BuilderMethods::load_operand
+    fn is_backend_ref(&self, layout: TyAndLayout<'tcx>) -> bool {
+        !(layout.is_zst()
+            || self.is_backend_immediate(layout)
+            || self.is_backend_scalar_pair(layout))
+    }
 
     /// A type that can be used in a [`super::BuilderMethods::load`] +
     /// [`super::BuilderMethods::store`] pair to implement a *typed* copy,

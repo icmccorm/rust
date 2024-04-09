@@ -1,8 +1,7 @@
-// run-pass
+//@ run-pass
 // Regression test for #36856.
 
-// compile-flags:-g
-// ignore-asmjs wasm2js does not support source maps yet
+//@ compile-flags:-g
 
 fn g() -> bool {
     false

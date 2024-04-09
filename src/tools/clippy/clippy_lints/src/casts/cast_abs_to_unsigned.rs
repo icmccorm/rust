@@ -1,5 +1,5 @@
+use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::sugg::Sugg;
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind};
@@ -34,7 +34,7 @@ pub(super) fn check(
             cx,
             CAST_ABS_TO_UNSIGNED,
             span,
-            &format!("casting the result of `{cast_from}::abs()` to {cast_to}"),
+            format!("casting the result of `{cast_from}::abs()` to {cast_to}"),
             "replace with",
             format!("{}.unsigned_abs()", Sugg::hir(cx, receiver, "..").maybe_par()),
             Applicability::MachineApplicable,

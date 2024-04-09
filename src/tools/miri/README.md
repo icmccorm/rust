@@ -108,11 +108,8 @@ assume the right toolchain is pinned via `rustup override set nightly` or
 
 Now you can run your project in Miri:
 
-1. Run `cargo clean` to eliminate any cached dependencies. Miri needs your
-   dependencies to be compiled the right way, that would not happen if they have
-   previously already been compiled.
-2. To run all tests in your project through Miri, use `cargo miri test`.
-3. If you have a binary project, you can run it through Miri using `cargo miri run`.
+- To run all tests in your project through Miri, use `cargo miri test`.
+- If you have a binary project, you can run it through Miri using `cargo miri run`.
 
 The first time you run Miri, it will perform some extra setup and install some
 dependencies. It will ask you for confirmation before installing anything.
@@ -223,9 +220,10 @@ degree documented below):
 - All Rust [Tier 1 targets](https://doc.rust-lang.org/rustc/platform-support.html) are supported by
   Miri. They are all checked on Miri's CI, and some (at least one per OS) are even checked on every
   Rust PR, so the shipped Miri should always work on these targets.
-- We also support `s390x-unknown-linux-gnu` as our "big-endian target of choice".
+- `aarch64-apple-darwin` is supported.
+- `s390x-unknown-linux-gnu` is supported as our "big-endian target of choice".
 - For every other target with OS `linux`, `macos`, or `windows`, Miri should generally work, but we
-  make no promises.
+  make no promises and we don't run tests for such targets.
 - For targets on other operating systems, even basic operations such as printing to the standard
   output might not work, and Miri might fail before even reaching the `main` function.
 
@@ -281,7 +279,7 @@ Miri builds and vice-versa.
 
 You may be running `cargo miri` with a different compiler version than the one
 used to build the custom libstd that Miri uses, and Miri failed to detect that.
-Try deleting `~/.cache/miri`.
+Try running `cargo miri clean`.
 
 #### "no mir for `std::rt::lang_start_internal`"
 
@@ -320,13 +318,13 @@ environment variable. We first document the most relevant and most commonly used
   and `warn-nobacktrace` are the supported actions. The default is to `abort`,
   which halts the machine. Some (but not all) operations also support continuing
   execution with a "permission denied" error being returned to the program.
-  `warn` prints a full backtrace when that happens; `warn-nobacktrace` is less
-  verbose. `hide` hides the warning entirely.
+  `warn` prints a full backtrace each time that happens; `warn-nobacktrace` is less
+  verbose and shown at most once per operation. `hide` hides the warning entirely.
 * `-Zmiri-num-cpus` states the number of available CPUs to be reported by miri. By default, the
   number of available CPUs is `1`. Note that this flag does not affect how miri handles threads in
   any way.
 * `-Zmiri-permissive-provenance` disables the warning for integer-to-pointer casts and
-  [`ptr::from_exposed_addr`](https://doc.rust-lang.org/nightly/std/ptr/fn.from_exposed_addr.html).
+  [`ptr::with_exposed_provenance`](https://doc.rust-lang.org/nightly/std/ptr/fn.with_exposed_provenance.html).
   This will necessarily miss some bugs as those operations are not efficiently and accurately
   implementable in a sanitizer, but it will only miss bugs that concern memory/pointers which is
   subject to these operations.
@@ -361,8 +359,6 @@ The remaining flags are for advanced use only, and more likely to change or be r
 Some of these are **unsound**, which means they can lead
 to Miri failing to detect cases of undefined behavior in a program.
 
-* `-Zmiri-disable-abi-check` disables checking [function ABI]. Using this flag
-  is **unsound**. This flag is **deprecated**.
 * `-Zmiri-disable-alignment-check` disables checking pointer alignment, so you
   can focus on other failures, but it means Miri can miss bugs in your program.
   Using this flag is **unsound**.
@@ -410,10 +406,12 @@ to Miri failing to detect cases of undefined behavior in a program.
   without an explicit value), `none` means it never recurses, `scalar` means it only recurses for
   types where we would also emit `noalias` annotations in the generated LLVM IR (types passed as
   individual scalars or pairs of scalars). Setting this to `none` is **unsound**.
-* `-Zmiri-tag-gc=<blocks>` configures how often the pointer tag garbage collector runs. The default
-  is to search for and remove unreachable tags once every `10000` basic blocks. Setting this to
-  `0` disables the garbage collector, which causes some programs to have explosive memory usage
-  and/or super-linear runtime.
+* `-Zmiri-provenance-gc=<blocks>` configures how often the pointer provenance garbage collector runs.
+  The default is to search for and remove unreachable provenance once every `10000` basic blocks. Setting
+  this to `0` disables the garbage collector, which causes some programs to have explosive memory
+  usage and/or super-linear runtime.
+* `-Zmiri-track-alloc-accesses` show not only allocation and free events for tracked allocations,
+  but also reads and writes.
 * `-Zmiri-track-alloc-id=<id1>,<id2>,...` shows a backtrace when the given allocations are
   being allocated or freed.  This helps in debugging memory leaks and
   use after free bugs. Specifying this argument multiple times does not overwrite the previous
@@ -465,11 +463,7 @@ Moreover, Miri recognizes some environment variables:
 * `MIRI_LIB_SRC` defines the directory where Miri expects the sources of the
   standard library that it will build and use for interpretation. This directory
   must point to the `library` subdirectory of a `rust-lang/rust` repository
-  checkout. Note that changing files in that directory does not automatically
-  trigger a re-build of the standard library; you have to clear the Miri build
-  cache manually (on Linux, `rm -rf ~/.cache/miri`;
-  on Windows, `rmdir /S "%LOCALAPPDATA%\rust-lang\miri\cache"`;
-  and on macOS, `rm -rf ~/Library/Caches/org.rust-lang.miri`).
+  checkout.
 * `MIRI_SYSROOT` (recognized by `cargo miri` and the Miri driver) indicates the sysroot to use. When
   using `cargo miri`, this skips the automatic setup -- only set this if you do not want to use the
   automatically created sysroot. For directly invoking the Miri driver, this variable (or a
@@ -511,6 +505,10 @@ binaries, and as such worth documenting:
 * `MIRI_LOCAL_CRATES` is set by `cargo-miri` to tell the Miri driver which
   crates should be given special treatment in diagnostics, in addition to the
   crate currently being compiled.
+* `MIRI_ORIG_RUSTDOC` is set and read by different phases of `cargo-miri` to remember the
+  value of `RUSTDOC` from before it was overwritten.
+* `MIRI_REPLACE_LIBRS_IF_NOT_TEST` when set to any value enables a hack that helps bootstrap
+  run the standard library tests in Miri.
 * `MIRI_VERBOSE` when set to any value tells the various `cargo-miri` phases to
   perform verbose logging.
 * `MIRI_HOST_SYSROOT` is set by bootstrap to tell `cargo-miri` which sysroot to use for *host*
@@ -588,6 +586,9 @@ Definite bugs found:
 * [`regex` incorrectly handling unaligned `Vec<u8>` buffers](https://www.reddit.com/r/rust/comments/vq3mmu/comment/ienc7t0?context=3)
 * [Incorrect use of `compare_exchange_weak` in `once_cell`](https://github.com/matklad/once_cell/issues/186)
 * [Dropping with unaligned pointers in `vec::IntoIter`](https://github.com/rust-lang/rust/pull/106084)
+* [Deallocating with the wrong layout in new specializations for in-place `Iterator::collect`](https://github.com/rust-lang/rust/pull/118460)
+* [Incorrect offset computation for highly-aligned types in `portable-atomic-util`](https://github.com/taiki-e/portable-atomic/pull/138)
+* [Occasional memory leak in `std::mpsc` channels](https://github.com/rust-lang/rust/issues/121582) (original code in [crossbeam](https://github.com/crossbeam-rs/crossbeam/pull/1084))
 
 Violations of [Stacked Borrows] found that are likely bugs (but Stacked Borrows is currently just an experiment):
 

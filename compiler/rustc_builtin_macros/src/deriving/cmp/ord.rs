@@ -8,7 +8,7 @@ use rustc_span::Span;
 use thin_vec::thin_vec;
 
 pub fn expand_deriving_ord(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     span: Span,
     mitem: &MetaItem,
     item: &Annotatable,
@@ -39,7 +39,7 @@ pub fn expand_deriving_ord(
     trait_def.expand(cx, mitem, item, push)
 }
 
-pub fn cs_cmp(cx: &mut ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) -> BlockOrExpr {
+pub fn cs_cmp(cx: &ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) -> BlockOrExpr {
     let test_id = Ident::new(sym::cmp, span);
     let equal_path = cx.path_global(span, cx.std_path(&[sym::cmp, sym::Ordering, sym::Equal]));
     let cmp_path = cx.std_path(&[sym::cmp, sym::Ord, sym::cmp]);
@@ -61,7 +61,7 @@ pub fn cs_cmp(cx: &mut ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) -> Bl
         |cx, fold| match fold {
             CsFold::Single(field) => {
                 let [other_expr] = &field.other_selflike_exprs[..] else {
-                    cx.span_bug(field.span, "not exactly 2 arguments in `derive(Ord)`");
+                    cx.dcx().span_bug(field.span, "not exactly 2 arguments in `derive(Ord)`");
                 };
                 let args = thin_vec![field.self_expr.clone(), other_expr.clone()];
                 cx.expr_call_global(field.span, cmp_path.clone(), args)

@@ -1,11 +1,10 @@
 //! Free functions to create `&[T]` and `&mut [T]`.
 
 use crate::array;
-use crate::intrinsics::{
-    assert_unsafe_precondition, is_aligned_and_not_null, is_valid_allocation_size,
-};
+use crate::mem::{align_of, size_of};
 use crate::ops::Range;
 use crate::ptr;
+use crate::ub_checks;
 
 /// Forms a slice from a pointer and a length.
 ///
@@ -90,13 +89,21 @@ use crate::ptr;
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_stable(feature = "const_slice_from_raw_parts", since = "1.64.0")]
 #[must_use]
+#[rustc_diagnostic_item = "slice_from_raw_parts"]
 pub const unsafe fn from_raw_parts<'a, T>(data: *const T, len: usize) -> &'a [T] {
     // SAFETY: the caller must uphold the safety contract for `from_raw_parts`.
     unsafe {
-        assert_unsafe_precondition!(
+        ub_checks::assert_unsafe_precondition!(
+            check_language_ub,
             "slice::from_raw_parts requires the pointer to be aligned and non-null, and the total size of the slice not to exceed `isize::MAX`",
-            [T](data: *const T, len: usize) => is_aligned_and_not_null(data)
-                && is_valid_allocation_size::<T>(len)
+            (
+                data: *mut () = data as *mut (),
+                size: usize = size_of::<T>(),
+                align: usize = align_of::<T>(),
+                len: usize = len,
+            ) =>
+            ub_checks::is_aligned_and_not_null(data, align)
+                && ub_checks::is_valid_allocation_size(size, len)
         );
         &*ptr::slice_from_raw_parts(data, len)
     }
@@ -136,13 +143,21 @@ pub const unsafe fn from_raw_parts<'a, T>(data: *const T, len: usize) -> &'a [T]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_unstable(feature = "const_slice_from_raw_parts_mut", issue = "67456")]
 #[must_use]
+#[rustc_diagnostic_item = "slice_from_raw_parts_mut"]
 pub const unsafe fn from_raw_parts_mut<'a, T>(data: *mut T, len: usize) -> &'a mut [T] {
     // SAFETY: the caller must uphold the safety contract for `from_raw_parts_mut`.
     unsafe {
-        assert_unsafe_precondition!(
+        ub_checks::assert_unsafe_precondition!(
+            check_language_ub,
             "slice::from_raw_parts_mut requires the pointer to be aligned and non-null, and the total size of the slice not to exceed `isize::MAX`",
-            [T](data: *mut T, len: usize) => is_aligned_and_not_null(data)
-                && is_valid_allocation_size::<T>(len)
+            (
+                data: *mut () = data as *mut (),
+                size: usize = size_of::<T>(),
+                align: usize = align_of::<T>(),
+                len: usize = len,
+            ) =>
+            ub_checks::is_aligned_and_not_null(data, align)
+                && ub_checks::is_valid_allocation_size(size, len)
         );
         &mut *ptr::slice_from_raw_parts_mut(data, len)
     }

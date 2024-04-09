@@ -1,6 +1,4 @@
-// ignore-debug: the debug assertions get in the way
-// no-system-llvm
-// compile-flags: -O
+//@ compile-flags: -O
 #![crate_type="lib"]
 
 #[no_mangle]

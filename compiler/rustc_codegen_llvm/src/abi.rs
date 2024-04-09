@@ -6,7 +6,7 @@ use crate::type_::Type;
 use crate::type_of::LayoutLlvmExt;
 use crate::value::Value;
 
-use rustc_codegen_ssa::mir::operand::OperandValue;
+use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
 use rustc_codegen_ssa::mir::place::PlaceRef;
 use rustc_codegen_ssa::traits::*;
 use rustc_codegen_ssa::MemFlags;
@@ -15,14 +15,15 @@ use rustc_middle::ty::layout::LayoutOf;
 pub use rustc_middle::ty::layout::{FAT_PTR_ADDR, FAT_PTR_EXTRA};
 use rustc_middle::ty::Ty;
 use rustc_session::config;
-use rustc_target::abi::call::ArgAbi;
 pub use rustc_target::abi::call::*;
-use rustc_target::abi::{self, HasDataLayout, Int};
+use rustc_target::abi::{self, HasDataLayout, Int, Size};
 pub use rustc_target::spec::abi::Abi;
 use rustc_target::spec::SanitizerSet;
 
 use libc::c_uint;
 use smallvec::SmallVec;
+
+use std::cmp;
 
 pub trait ArgAttributesExt {
     fn apply_attrs_to_llfn(&self, idx: AttributePlace, cx: &CodegenCx<'_, '_>, llfn: &Value);
@@ -131,42 +132,36 @@ impl LlvmType for Reg {
 impl LlvmType for CastTarget {
     fn llvm_type<'ll>(&self, cx: &CodegenCx<'ll, '_>) -> &'ll Type {
         let rest_ll_unit = self.rest.unit.llvm_type(cx);
-        let (rest_count, rem_bytes) = if self.rest.unit.size.bytes() == 0 {
-            (0, 0)
+        let rest_count = if self.rest.total == Size::ZERO {
+            0
         } else {
-            (
-                self.rest.total.bytes() / self.rest.unit.size.bytes(),
-                self.rest.total.bytes() % self.rest.unit.size.bytes(),
-            )
+            assert_ne!(
+                self.rest.unit.size,
+                Size::ZERO,
+                "total size {:?} cannot be divided into units of zero size",
+                self.rest.total
+            );
+            if self.rest.total.bytes() % self.rest.unit.size.bytes() != 0 {
+                assert_eq!(self.rest.unit.kind, RegKind::Integer, "only int regs can be split");
+            }
+            self.rest.total.bytes().div_ceil(self.rest.unit.size.bytes())
         };
 
+        // Simplify to a single unit or an array if there's no prefix.
+        // This produces the same layout, but using a simpler type.
         if self.prefix.iter().all(|x| x.is_none()) {
-            // Simplify to a single unit when there is no prefix and size <= unit size
-            if self.rest.total <= self.rest.unit.size {
+            if rest_count == 1 {
                 return rest_ll_unit;
             }
 
-            // Simplify to array when all chunks are the same size and type
-            if rem_bytes == 0 {
-                return cx.type_array(rest_ll_unit, rest_count);
-            }
+            return cx.type_array(rest_ll_unit, rest_count);
         }
 
-        // Create list of fields in the main structure
-        let mut args: Vec<_> = self
-            .prefix
-            .iter()
-            .flat_map(|option_reg| option_reg.map(|reg| reg.llvm_type(cx)))
-            .chain((0..rest_count).map(|_| rest_ll_unit))
-            .collect();
-
-        // Append final integer
-        if rem_bytes != 0 {
-            // Only integers can be really split further.
-            assert_eq!(self.rest.unit.kind, RegKind::Integer);
-            args.push(cx.type_ix(rem_bytes * 8));
-        }
-
+        // Generate a struct type with the prefix and the "rest" arguments.
+        let prefix_args =
+            self.prefix.iter().flat_map(|option_reg| option_reg.map(|reg| reg.llvm_type(cx)));
+        let rest_args = (0..rest_count).map(|_| rest_ll_unit);
+        let args: Vec<_> = prefix_args.chain(rest_args).collect();
         cx.type_struct(&args, false)
     }
 }
@@ -204,57 +199,49 @@ impl<'ll, 'tcx> ArgAbiExt<'ll, 'tcx> for ArgAbi<'tcx, Ty<'tcx>> {
         val: &'ll Value,
         dst: PlaceRef<'tcx, &'ll Value>,
     ) {
-        if self.is_ignore() {
-            return;
-        }
-        if self.is_sized_indirect() {
-            OperandValue::Ref(val, None, self.layout.align.abi).store(bx, dst)
-        } else if self.is_unsized_indirect() {
-            bug!("unsized `ArgAbi` must be handled through `store_fn_arg`");
-        } else if let PassMode::Cast { cast, pad_i32: _ } = &self.mode {
-            // FIXME(eddyb): Figure out when the simpler Store is safe, clang
-            // uses it for i16 -> {i8, i8}, but not for i24 -> {i8, i8, i8}.
-            let can_store_through_cast_ptr = false;
-            if can_store_through_cast_ptr {
-                bx.store(val, dst.llval, self.layout.align.abi);
-            } else {
-                // The actual return type is a struct, but the ABI
-                // adaptation code has cast it into some scalar type. The
-                // code that follows is the only reliable way I have
-                // found to do a transform like i64 -> {i32,i32}.
-                // Basically we dump the data onto the stack then memcpy it.
-                //
-                // Other approaches I tried:
-                // - Casting rust ret pointer to the foreign type and using Store
-                //   is (a) unsafe if size of foreign type > size of rust type and
-                //   (b) runs afoul of strict aliasing rules, yielding invalid
-                //   assembly under -O (specifically, the store gets removed).
-                // - Truncating foreign type to correct integral type and then
-                //   bitcasting to the struct type yields invalid cast errors.
-
-                // We instead thus allocate some scratch space...
+        match &self.mode {
+            PassMode::Ignore => {}
+            // Sized indirect arguments
+            PassMode::Indirect { attrs, meta_attrs: None, on_stack: _ } => {
+                let align = attrs.pointee_align.unwrap_or(self.layout.align.abi);
+                OperandValue::Ref(val, None, align).store(bx, dst);
+            }
+            // Unsized indirect qrguments
+            PassMode::Indirect { attrs: _, meta_attrs: Some(_), on_stack: _ } => {
+                bug!("unsized `ArgAbi` must be handled through `store_fn_arg`");
+            }
+            PassMode::Cast { cast, pad_i32: _ } => {
+                // The ABI mandates that the value is passed as a different struct representation.
+                // Spill and reload it from the stack to convert from the ABI representation to
+                // the Rust representation.
                 let scratch_size = cast.size(bx);
                 let scratch_align = cast.align(bx);
+                // Note that the ABI type may be either larger or smaller than the Rust type,
+                // due to the presence or absence of trailing padding. For example:
+                // - On some ABIs, the Rust layout { f64, f32, <f32 padding> } may omit padding
+                //   when passed by value, making it smaller.
+                // - On some ABIs, the Rust layout { u16, u16, u16 } may be padded up to 8 bytes
+                //   when passed by value, making it larger.
+                let copy_bytes = cmp::min(scratch_size.bytes(), self.layout.size.bytes());
+                // Allocate some scratch space...
                 let llscratch = bx.alloca(cast.llvm_type(bx), scratch_align);
                 bx.lifetime_start(llscratch, scratch_size);
-
-                // ... where we first store the value...
+                // ...store the value...
                 bx.store(val, llscratch, scratch_align);
-
                 // ... and then memcpy it to the intended destination.
                 bx.memcpy(
                     dst.llval,
                     self.layout.align.abi,
                     llscratch,
                     scratch_align,
-                    bx.const_usize(self.layout.size.bytes()),
+                    bx.const_usize(copy_bytes),
                     MemFlags::empty(),
                 );
-
                 bx.lifetime_end(llscratch, scratch_size);
             }
-        } else {
-            OperandValue::Immediate(val).store(bx, dst);
+            _ => {
+                OperandRef::from_immediate_or_packed_pair(bx, val, self.layout).val.store(bx, dst);
+            }
         }
     }
 
@@ -348,45 +335,18 @@ impl<'ll, 'tcx> FnAbiLlvmExt<'ll, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
                 PassMode::Direct(_) => {
                     // ABI-compatible Rust types have the same `layout.abi` (up to validity ranges),
                     // and for Scalar ABIs the LLVM type is fully determined by `layout.abi`,
-                    // guarnateeing that we generate ABI-compatible LLVM IR. Things get tricky for
-                    // aggregates...
-                    if matches!(arg.layout.abi, abi::Abi::Aggregate { .. }) {
-                        assert!(
-                            arg.layout.is_sized(),
-                            "`PassMode::Direct` for unsized type: {}",
-                            arg.layout.ty
-                        );
-                        // This really shouldn't happen, since `immediate_llvm_type` will use
-                        // `layout.fields` to turn this Rust type into an LLVM type. This means all
-                        // sorts of Rust type details leak into the ABI. However wasm sadly *does*
-                        // currently use this mode so we have to allow it -- but we absolutely
-                        // shouldn't let any more targets do that.
-                        // (Also see <https://github.com/rust-lang/rust/issues/115666>.)
-                        assert!(
-                            matches!(&*cx.tcx.sess.target.arch, "wasm32" | "wasm64"),
-                            "`PassMode::Direct` for aggregates only allowed on wasm targets\nProblematic type: {:#?}",
-                            arg.layout,
-                        );
-                    }
+                    // guaranteeing that we generate ABI-compatible LLVM IR.
                     arg.layout.immediate_llvm_type(cx)
                 }
                 PassMode::Pair(..) => {
                     // ABI-compatible Rust types have the same `layout.abi` (up to validity ranges),
                     // so for ScalarPair we can easily be sure that we are generating ABI-compatible
                     // LLVM IR.
-                    assert!(
-                        matches!(arg.layout.abi, abi::Abi::ScalarPair(..)),
-                        "PassMode::Pair for type {}",
-                        arg.layout.ty
-                    );
                     llargument_tys.push(arg.layout.scalar_pair_element_llvm_type(cx, 0, true));
                     llargument_tys.push(arg.layout.scalar_pair_element_llvm_type(cx, 1, true));
                     continue;
                 }
-                PassMode::Indirect { attrs: _, meta_attrs: Some(_), on_stack } => {
-                    // `Indirect` with metadata is only for unsized types, and doesn't work with
-                    // on-stack passing.
-                    assert!(arg.layout.is_unsized() && !on_stack);
+                PassMode::Indirect { attrs: _, meta_attrs: Some(_), on_stack: _ } => {
                     // Construct the type of a (wide) pointer to `ty`, and pass its two fields.
                     // Any two ABI-compatible unsized types have the same metadata type and
                     // moreover the same metadata value leads to the same dynamic size and
@@ -397,13 +357,8 @@ impl<'ll, 'tcx> FnAbiLlvmExt<'ll, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
                     llargument_tys.push(ptr_layout.scalar_pair_element_llvm_type(cx, 1, true));
                     continue;
                 }
-                PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ } => {
-                    assert!(arg.layout.is_sized());
-                    cx.type_ptr()
-                }
+                PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: _ } => cx.type_ptr(),
                 PassMode::Cast { cast, pad_i32 } => {
-                    // `Cast` means "transmute to `CastType`"; that only makes sense for sized types.
-                    assert!(arg.layout.is_sized());
                     // add padding
                     if *pad_i32 {
                         llargument_tys.push(Reg::i32().llvm_type(cx));
@@ -457,7 +412,10 @@ impl<'ll, 'tcx> FnAbiLlvmExt<'ll, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
             PassMode::Indirect { attrs, meta_attrs: _, on_stack } => {
                 assert!(!on_stack);
                 let i = apply(attrs);
-                let sret = llvm::CreateStructRetAttr(cx.llcx, self.ret.layout.llvm_type(cx));
+                let sret = llvm::CreateStructRetAttr(
+                    cx.llcx,
+                    cx.type_array(cx.type_i8(), self.ret.layout.size.bytes()),
+                );
                 attributes::apply_to_llfn(llfn, llvm::AttributePlace::Argument(i), &[sret]);
             }
             PassMode::Cast { cast, pad_i32: _ } => {
@@ -470,7 +428,10 @@ impl<'ll, 'tcx> FnAbiLlvmExt<'ll, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
                 PassMode::Ignore => {}
                 PassMode::Indirect { attrs, meta_attrs: None, on_stack: true } => {
                     let i = apply(attrs);
-                    let byval = llvm::CreateByValAttr(cx.llcx, arg.layout.llvm_type(cx));
+                    let byval = llvm::CreateByValAttr(
+                        cx.llcx,
+                        cx.type_array(cx.type_i8(), arg.layout.size.bytes()),
+                    );
                     attributes::apply_to_llfn(llfn, llvm::AttributePlace::Argument(i), &[byval]);
                 }
                 PassMode::Direct(attrs)
@@ -519,13 +480,16 @@ impl<'ll, 'tcx> FnAbiLlvmExt<'ll, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
             PassMode::Indirect { attrs, meta_attrs: _, on_stack } => {
                 assert!(!on_stack);
                 let i = apply(bx.cx, attrs);
-                let sret = llvm::CreateStructRetAttr(bx.cx.llcx, self.ret.layout.llvm_type(bx));
+                let sret = llvm::CreateStructRetAttr(
+                    bx.cx.llcx,
+                    bx.cx.type_array(bx.cx.type_i8(), self.ret.layout.size.bytes()),
+                );
                 attributes::apply_to_callsite(callsite, llvm::AttributePlace::Argument(i), &[sret]);
             }
             PassMode::Cast { cast, pad_i32: _ } => {
                 cast.attrs.apply_attrs_to_callsite(
                     llvm::AttributePlace::ReturnValue,
-                    &bx.cx,
+                    bx.cx,
                     callsite,
                 );
             }
@@ -546,7 +510,10 @@ impl<'ll, 'tcx> FnAbiLlvmExt<'ll, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
                 PassMode::Ignore => {}
                 PassMode::Indirect { attrs, meta_attrs: None, on_stack: true } => {
                     let i = apply(bx.cx, attrs);
-                    let byval = llvm::CreateByValAttr(bx.cx.llcx, arg.layout.llvm_type(bx));
+                    let byval = llvm::CreateByValAttr(
+                        bx.cx.llcx,
+                        bx.cx.type_array(bx.cx.type_i8(), arg.layout.size.bytes()),
+                    );
                     attributes::apply_to_callsite(
                         callsite,
                         llvm::AttributePlace::Argument(i),
@@ -623,7 +590,6 @@ impl From<Conv> for llvm::CallConv {
             Conv::Cold => llvm::ColdCallConv,
             Conv::PreserveMost => llvm::PreserveMost,
             Conv::PreserveAll => llvm::PreserveAll,
-            Conv::AmdGpuKernel => llvm::AmdGpuKernel,
             Conv::AvrInterrupt => llvm::AvrInterrupt,
             Conv::AvrNonBlockingInterrupt => llvm::AvrNonBlockingInterrupt,
             Conv::ArmAapcs => llvm::ArmAapcsCallConv,

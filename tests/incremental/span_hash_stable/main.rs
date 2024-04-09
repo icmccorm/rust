@@ -3,9 +3,8 @@
 // the spans and this test makes sure that we handle them correctly by hashing
 // file:line:column instead of raw byte offset.
 
-// ignore-asmjs wasm2js does not support source maps yet
-// revisions:rpass1 rpass2
-// compile-flags: -g -Z query-dep-graph
+//@ revisions:rpass1 rpass2
+//@ compile-flags: -g -Z query-dep-graph
 
 #![feature(rustc_attrs)]
 

@@ -1,14 +1,15 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::path_to_local;
-use clippy_utils::source::snippet_with_applicability;
+use clippy_utils::source::snippet;
 use clippy_utils::visitors::{for_each_expr, is_local_used};
+use clippy_utils::{in_constant, path_to_local};
 use rustc_ast::{BorrowKind, LitKind};
 use rustc_errors::Applicability;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::{Arm, BinOpKind, Expr, ExprKind, Guard, MatchSource, Node, Pat, PatKind};
+use rustc_hir::{Arm, BinOpKind, Expr, ExprKind, MatchSource, Node, Pat, PatKind, UnOp};
 use rustc_lint::LateContext;
 use rustc_span::symbol::Ident;
-use rustc_span::Span;
+use rustc_span::{Span, Symbol};
+use std::borrow::Cow;
 use std::ops::ControlFlow;
 
 use super::REDUNDANT_GUARDS;
@@ -20,21 +21,19 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'tcx>]) {
         };
 
         // `Some(x) if matches!(x, y)`
-        if let Guard::If(if_expr) = guard
-            && let ExprKind::Match(
-                scrutinee,
-                [
-                    arm,
-                    Arm {
-                        pat: Pat {
-                            kind: PatKind::Wild,
-                            ..
-                        },
-                        ..
+        if let ExprKind::Match(
+            scrutinee,
+            [
+                arm,
+                Arm {
+                    pat: Pat {
+                        kind: PatKind::Wild, ..
                     },
-                ],
-                MatchSource::Normal,
-            ) = if_expr.kind
+                    ..
+                },
+            ],
+            MatchSource::Normal,
+        ) = guard.kind
             && let Some(binding) = get_pat_binding(cx, scrutinee, outer_arm)
         {
             let pat_span = match (arm.pat.kind, binding.byref_ident) {
@@ -45,14 +44,14 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'tcx>]) {
             emit_redundant_guards(
                 cx,
                 outer_arm,
-                if_expr.span,
-                pat_span,
+                guard.span,
+                snippet(cx, pat_span, "<binding>"),
                 &binding,
                 arm.guard,
             );
         }
         // `Some(x) if let Some(2) = x`
-        else if let Guard::IfLet(let_expr) = guard
+        else if let ExprKind::Let(let_expr) = guard.kind
             && let Some(binding) = get_pat_binding(cx, let_expr.init, outer_arm)
         {
             let pat_span = match (let_expr.pat.kind, binding.byref_ident) {
@@ -64,15 +63,14 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'tcx>]) {
                 cx,
                 outer_arm,
                 let_expr.span,
-                pat_span,
+                snippet(cx, pat_span, "<binding>"),
                 &binding,
                 None,
             );
         }
         // `Some(x) if x == Some(2)`
         // `Some(x) if Some(2) == x`
-        else if let Guard::If(if_expr) = guard
-            && let ExprKind::Binary(bin_op, local, pat) = if_expr.kind
+        else if let ExprKind::Binary(bin_op, local, pat) = guard.kind
             && matches!(bin_op.node, BinOpKind::Eq)
             // Ensure they have the same type. If they don't, we'd need deref coercion which isn't
             // possible (currently) in a pattern. In some cases, you can use something like
@@ -96,13 +94,70 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'tcx>]) {
             emit_redundant_guards(
                 cx,
                 outer_arm,
-                if_expr.span,
-                pat_span,
+                guard.span,
+                snippet(cx, pat_span, "<binding>"),
                 &binding,
                 None,
             );
+        } else if let ExprKind::MethodCall(path, recv, args, ..) = guard.kind
+            && let Some(binding) = get_pat_binding(cx, recv, outer_arm)
+        {
+            check_method_calls(cx, outer_arm, path.ident.name, recv, args, guard, &binding);
         }
     }
+}
+
+fn check_method_calls<'tcx>(
+    cx: &LateContext<'tcx>,
+    arm: &Arm<'tcx>,
+    method: Symbol,
+    recv: &Expr<'_>,
+    args: &[Expr<'_>],
+    if_expr: &Expr<'_>,
+    binding: &PatBindingInfo,
+) {
+    let ty = cx.typeck_results().expr_ty(recv).peel_refs();
+    let slice_like = ty.is_slice() || ty.is_array();
+
+    let sugg = if method == sym!(is_empty) {
+        // `s if s.is_empty()` becomes ""
+        // `arr if arr.is_empty()` becomes []
+
+        if ty.is_str() && !in_constant(cx, if_expr.hir_id) {
+            r#""""#.into()
+        } else if slice_like {
+            "[]".into()
+        } else {
+            return;
+        }
+    } else if slice_like
+        && let Some(needle) = args.first()
+        && let ExprKind::AddrOf(.., needle) = needle.kind
+        && let ExprKind::Array(needles) = needle.kind
+        && needles.iter().all(|needle| expr_can_be_pat(cx, needle))
+    {
+        // `arr if arr.starts_with(&[123])` becomes [123, ..]
+        // `arr if arr.ends_with(&[123])` becomes [.., 123]
+        // `arr if arr.starts_with(&[])` becomes [..]  (why would anyone write this?)
+
+        let mut sugg = snippet(cx, needle.span, "<needle>").into_owned();
+
+        if needles.is_empty() {
+            sugg.insert_str(1, "..");
+        } else if method == sym!(starts_with) {
+            sugg.insert_str(sugg.len() - 1, ", ..");
+        } else if method == sym!(ends_with) {
+            sugg.insert_str(1, ".., ");
+        } else {
+            return;
+        }
+
+        sugg.into()
+    } else {
+        return;
+    };
+
+    emit_redundant_guards(cx, arm, if_expr.span, sugg, binding, None);
 }
 
 struct PatBindingInfo {
@@ -116,7 +171,9 @@ fn get_pat_binding<'tcx>(
     guard_expr: &Expr<'_>,
     outer_arm: &Arm<'tcx>,
 ) -> Option<PatBindingInfo> {
-    if let Some(local) = path_to_local(guard_expr) && !is_local_used(cx, outer_arm.body, local) {
+    if let Some(local) = path_to_local(guard_expr)
+        && !is_local_used(cx, outer_arm.body, local)
+    {
         let mut span = None;
         let mut byref_ident = None;
         let mut multiple_bindings = false;
@@ -125,7 +182,7 @@ fn get_pat_binding<'tcx>(
             if let PatKind::Binding(bind_annot, hir_id, ident, _) = pat.kind
                 && hir_id == local
             {
-                if matches!(bind_annot.0, rustc_ast::ByRef::Yes) {
+                if matches!(bind_annot.0, rustc_ast::ByRef::Yes(_)) {
                     let _ = byref_ident.insert(ident);
                 }
                 // the second call of `replace()` returns a `Some(span)`, meaning a multi-binding pattern
@@ -142,7 +199,7 @@ fn get_pat_binding<'tcx>(
             return span.map(|span| PatBindingInfo {
                 span,
                 byref_ident,
-                is_field: matches!(cx.tcx.hir().get_parent(local), Node::PatField(_)),
+                is_field: matches!(cx.tcx.parent_hir_node(local), Node::PatField(_)),
             });
         }
     }
@@ -154,19 +211,16 @@ fn emit_redundant_guards<'tcx>(
     cx: &LateContext<'tcx>,
     outer_arm: &Arm<'tcx>,
     guard_span: Span,
-    pat_span: Span,
+    binding_replacement: Cow<'static, str>,
     pat_binding: &PatBindingInfo,
-    inner_guard: Option<Guard<'_>>,
+    inner_guard: Option<&Expr<'_>>,
 ) {
-    let mut app = Applicability::MaybeIncorrect;
-
     span_lint_and_then(
         cx,
         REDUNDANT_GUARDS,
         guard_span.source_callsite(),
         "redundant guard",
         |diag| {
-            let binding_replacement = snippet_with_applicability(cx, pat_span, "<binding_repl>", &mut app);
             let suggestion_span = match *pat_binding {
                 PatBindingInfo {
                     span,
@@ -185,19 +239,11 @@ fn emit_redundant_guards<'tcx>(
                     (
                         guard_span.source_callsite().with_lo(outer_arm.pat.span.hi()),
                         inner_guard.map_or_else(String::new, |guard| {
-                            let (prefix, span) = match guard {
-                                Guard::If(e) => ("if", e.span),
-                                Guard::IfLet(l) => ("if let", l.span),
-                            };
-
-                            format!(
-                                " {prefix} {}",
-                                snippet_with_applicability(cx, span, "<guard>", &mut app),
-                            )
+                            format!(" if {}", snippet(cx, guard.span, "<guard>"))
                         }),
                     ),
                 ],
-                app,
+                Applicability::MaybeIncorrect,
             );
         },
     );
@@ -226,7 +272,8 @@ fn expr_can_be_pat(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
             ExprKind::AddrOf(..)
             | ExprKind::Array(..)
             | ExprKind::Tup(..)
-            | ExprKind::Struct(..) => true,
+            | ExprKind::Struct(..)
+            | ExprKind::Unary(UnOp::Neg, _) => true,
             ExprKind::Lit(lit) if !matches!(lit.node, LitKind::Float(..)) => true,
             _ => false,
         } {

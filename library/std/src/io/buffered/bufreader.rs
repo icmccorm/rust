@@ -2,7 +2,8 @@ mod buffer;
 
 use crate::fmt;
 use crate::io::{
-    self, BorrowedCursor, BufRead, IoSliceMut, Read, Seek, SeekFrom, SizeHint, DEFAULT_BUF_SIZE,
+    self, uninlined_slow_read_byte, BorrowedCursor, BufRead, IoSliceMut, Read, Seek, SeekFrom,
+    SizeHint, SpecReadByte, DEFAULT_BUF_SIZE,
 };
 use buffer::Buffer;
 
@@ -25,8 +26,7 @@ use buffer::Buffer;
 /// unwrapping the `BufReader<R>` with [`BufReader::into_inner`] can also cause
 /// data loss.
 ///
-// HACK(#78696): can't use `crate` for associated items
-/// [`TcpStream::read`]: super::super::super::net::TcpStream::read
+/// [`TcpStream::read`]: crate::net::TcpStream::read
 /// [`TcpStream`]: crate::net::TcpStream
 ///
 /// # Examples
@@ -259,6 +259,22 @@ impl<R: ?Sized + Seek> BufReader<R> {
     }
 }
 
+impl<R> SpecReadByte for BufReader<R>
+where
+    Self: Read,
+{
+    #[inline]
+    fn spec_read_byte(&mut self) -> Option<io::Result<u8>> {
+        let mut byte = 0;
+        if self.buf.consume_with(1, |claimed| byte = claimed[0]) {
+            return Some(Ok(byte));
+        }
+
+        // Fallback case, only reached once per buffer refill.
+        uninlined_slow_read_byte(self)
+    }
+}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<R: ?Sized + Read> Read for BufReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -269,10 +285,8 @@ impl<R: ?Sized + Read> Read for BufReader<R> {
             self.discard_buffer();
             return self.inner.read(buf);
         }
-        let nread = {
-            let mut rem = self.fill_buf()?;
-            rem.read(buf)?
-        };
+        let mut rem = self.fill_buf()?;
+        let nread = rem.read(buf)?;
         self.consume(nread);
         Ok(nread)
     }
@@ -314,10 +328,9 @@ impl<R: ?Sized + Read> Read for BufReader<R> {
             self.discard_buffer();
             return self.inner.read_vectored(bufs);
         }
-        let nread = {
-            let mut rem = self.fill_buf()?;
-            rem.read_vectored(bufs)?
-        };
+        let mut rem = self.fill_buf()?;
+        let nread = rem.read_vectored(bufs)?;
+
         self.consume(nread);
         Ok(nread)
     }
@@ -330,6 +343,7 @@ impl<R: ?Sized + Read> Read for BufReader<R> {
     // delegate to the inner implementation.
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
         let inner_buf = self.buffer();
+        buf.try_reserve(inner_buf.len())?;
         buf.extend_from_slice(inner_buf);
         let nread = inner_buf.len();
         self.discard_buffer();
@@ -491,6 +505,16 @@ impl<R: ?Sized + Seek> Seek for BufReader<R> {
                 "overflow when subtracting remaining buffer size from inner stream position",
             )
         })
+    }
+
+    /// Seeks relative to the current position.
+    ///
+    /// If the new position lies within the buffer, the buffer will not be
+    /// flushed, allowing for more efficient seeks. This method does not return
+    /// the location of the underlying reader, so the caller must track this
+    /// information themselves if it is required.
+    fn seek_relative(&mut self, offset: i64) -> io::Result<()> {
+        self.seek_relative(offset)
     }
 }
 

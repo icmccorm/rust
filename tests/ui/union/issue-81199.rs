@@ -4,11 +4,12 @@ union PtrRepr<T: ?Sized> {
     mut_ptr: *mut T,
     components: PtrComponents<T>,
     //~^ ERROR the trait bound
+    //~| ERROR field must implement `Copy`
 }
 
 #[repr(C)]
 struct PtrComponents<T: Pointee + ?Sized> {
-    data_address: *const (),
+    data_pointer: *const (),
     metadata: <T as Pointee>::Metadata,
 }
 

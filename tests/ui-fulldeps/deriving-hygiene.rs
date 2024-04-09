@@ -1,9 +1,10 @@
-// run-pass
+//@ run-pass
 
 #![allow(non_upper_case_globals)]
 #![feature(rustc_private)]
 extern crate rustc_macros;
 extern crate rustc_serialize;
+extern crate rustc_span;
 
 use rustc_macros::{Decodable, Encodable};
 

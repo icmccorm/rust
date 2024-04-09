@@ -2,13 +2,14 @@ error[E0308]: mismatched types
   --> $DIR/issue-13853.rs:14:9
    |
 LL |     fn nodes<'a, I: Iterator<Item=&'a N>>(&self) -> I
-   |                  - this type parameter              - expected `I` because of return type
+   |                  - expected this type parameter     - expected `I` because of return type
 ...
 LL |         self.iter()
    |         ^^^^^^^^^^^ expected type parameter `I`, found `Iter<'_, N>`
    |
    = note: expected type parameter `I`
                       found struct `std::slice::Iter<'_, N>`
+   = note: the caller chooses a type for `I` which can be different from `std::slice::Iter<'_, N>`
 
 error[E0599]: no method named `iter` found for reference `&G` in the current scope
   --> $DIR/issue-13853.rs:27:23

@@ -1,7 +1,6 @@
 use rustc_ast::{
     ptr::P,
-    token,
-    token::Delimiter,
+    token::{self, Delimiter, IdentIsRaw},
     tokenstream::{DelimSpan, TokenStream, TokenTree},
     BinOpKind, BorrowKind, DelimArgs, Expr, ExprKind, ItemKind, MacCall, MethodCall, Mutability,
     Path, PathSegment, Stmt, StructRest, UnOp, UseTree, UseTreeKind, DUMMY_NODE_ID,
@@ -151,7 +150,7 @@ impl<'cx, 'a> Context<'cx, 'a> {
     fn build_panic(&self, expr_str: &str, panic_path: Path) -> P<Expr> {
         let escaped_expr_str = escape_to_fmt(expr_str);
         let initial = [
-            TokenTree::token_alone(
+            TokenTree::token_joint_hidden(
                 token::Literal(token::Lit {
                     kind: token::LitKind::Str,
                     symbol: Symbol::intern(&if self.fmt_string.is_empty() {
@@ -170,7 +169,10 @@ impl<'cx, 'a> Context<'cx, 'a> {
         ];
         let captures = self.capture_decls.iter().flat_map(|cap| {
             [
-                TokenTree::token_alone(token::Ident(cap.ident.name, false), cap.ident.span),
+                TokenTree::token_joint_hidden(
+                    token::Ident(cap.ident.name, IdentIsRaw::No),
+                    cap.ident.span,
+                ),
                 TokenTree::token_alone(token::Comma, self.span),
             ]
         });
@@ -193,10 +195,9 @@ impl<'cx, 'a> Context<'cx, 'a> {
     fn manage_cond_expr(&mut self, expr: &mut P<Expr>) {
         match &mut expr.kind {
             ExprKind::AddrOf(_, mutability, local_expr) => {
-                self.with_is_consumed_management(
-                    matches!(mutability, Mutability::Mut),
-                    |this| this.manage_cond_expr(local_expr)
-                );
+                self.with_is_consumed_management(matches!(mutability, Mutability::Mut), |this| {
+                    this.manage_cond_expr(local_expr)
+                });
             }
             ExprKind::Array(local_exprs) => {
                 for local_expr in local_exprs {
@@ -223,7 +224,7 @@ impl<'cx, 'a> Context<'cx, 'a> {
                     |this| {
                         this.manage_cond_expr(lhs);
                         this.manage_cond_expr(rhs);
-                    }
+                    },
                 );
             }
             ExprKind::Call(_, local_exprs) => {
@@ -244,7 +245,7 @@ impl<'cx, 'a> Context<'cx, 'a> {
             ExprKind::Let(_, local_expr, _, _) => {
                 self.manage_cond_expr(local_expr);
             }
-            ExprKind::Match(local_expr, _) => {
+            ExprKind::Match(local_expr, ..) => {
                 self.manage_cond_expr(local_expr);
             }
             ExprKind::MethodCall(call) => {
@@ -285,10 +286,9 @@ impl<'cx, 'a> Context<'cx, 'a> {
                 }
             }
             ExprKind::Unary(un_op, local_expr) => {
-                self.with_is_consumed_management(
-                    matches!(un_op, UnOp::Neg | UnOp::Not),
-                    |this| this.manage_cond_expr(local_expr)
-                );
+                self.with_is_consumed_management(matches!(un_op, UnOp::Neg | UnOp::Not), |this| {
+                    this.manage_cond_expr(local_expr)
+                });
             }
             // Expressions that are not worth or can not be captured.
             //
@@ -296,16 +296,17 @@ impl<'cx, 'a> Context<'cx, 'a> {
             // sync with the `rfc-2011-nicer-assert-messages/all-expr-kinds.rs` test.
             ExprKind::Assign(_, _, _)
             | ExprKind::AssignOp(_, _, _)
-            | ExprKind::Async(_, _)
+            | ExprKind::Gen(_, _, _)
             | ExprKind::Await(_, _)
             | ExprKind::Block(_, _)
             | ExprKind::Break(_, _)
             | ExprKind::Closure(_)
             | ExprKind::ConstBlock(_)
             | ExprKind::Continue(_)
-            | ExprKind::Err
+            | ExprKind::Dummy
+            | ExprKind::Err(_)
             | ExprKind::Field(_, _)
-            | ExprKind::ForLoop(_, _, _, _)
+            | ExprKind::ForLoop { .. }
             | ExprKind::FormatArgs(_)
             | ExprKind::IncludedBytes(..)
             | ExprKind::InlineAsm(_)

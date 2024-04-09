@@ -1,8 +1,4 @@
-// edition: 2021
-
-#![feature(async_fn_in_trait)]
-#![feature(return_position_impl_trait_in_trait)]
-#![allow(incomplete_features)]
+//@ edition: 2021
 
 use std::future::Future;
 use std::pin::Pin;

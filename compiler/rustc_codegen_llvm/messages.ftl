@@ -28,6 +28,8 @@ codegen_llvm_invalid_minimum_alignment_not_power_of_two =
 codegen_llvm_invalid_minimum_alignment_too_large =
     invalid minimum global alignment: {$align} is too large
 
+codegen_llvm_invalid_target_feature_prefix = target feature `{$feature}` must begin with a `+` or `-`"
+
 codegen_llvm_load_bitcode = failed to load bitcode of module "{$name}"
 codegen_llvm_load_bitcode_with_llvm_err = failed to load bitcode of module "{$name}": {$llvm_err}
 
@@ -38,6 +40,9 @@ codegen_llvm_lto_disallowed = lto can only be run for executables, cdylibs and s
 codegen_llvm_lto_dylib = lto cannot be used for `dylib` crate type without `-Zdylib-lto`
 
 codegen_llvm_lto_proc_macro = lto cannot be used for `proc-macro` crate type without `-Zdylib-lto`
+
+codegen_llvm_mismatch_data_layout =
+    data-layout for target `{$rustc_target}`, `{$rustc_layout}`, differs from LLVM target's `{$llvm_target}` default layout, `{$llvm_layout}`
 
 codegen_llvm_missing_features =
     add the missing features in a `target_feature` attribute
@@ -76,8 +81,8 @@ codegen_llvm_target_machine = could not create LLVM TargetMachine for triple: {$
 codegen_llvm_target_machine_with_llvm_err = could not create LLVM TargetMachine for triple: {$triple}: {$llvm_err}
 
 codegen_llvm_unknown_ctarget_feature =
-    unknown feature specified for `-Ctarget-feature`: `{$feature}`
-    .note = it is still passed through to the codegen backend
+    unknown and unstable feature specified for `-Ctarget-feature`: `{$feature}`
+    .note = it is still passed through to the codegen backend, but use of this feature might be unsound and the behavior of this feature can change in the future
     .possible_feature = you might have meant: `{$rust_feature}`
     .consider_filing_feature_request = consider filing a feature request
 
@@ -86,6 +91,10 @@ codegen_llvm_unknown_ctarget_feature_prefix =
     .note = features must begin with a `+` to enable or `-` to disable it
 
 codegen_llvm_unknown_debuginfo_compression = unknown debuginfo compression algorithm {$algorithm} - will fall back to uncompressed debuginfo
+
+codegen_llvm_unstable_ctarget_feature =
+    unstable feature specified for `-Ctarget-feature`: `{$feature}`
+    .note = this feature is not stably supported; its behavior can change in the future
 
 codegen_llvm_write_bytecode = failed to write bytecode to {$path}: {$err}
 

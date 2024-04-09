@@ -1,9 +1,9 @@
 use rustc_middle::mir;
 use rustc_middle::mir::NonDivergingIntrinsic;
+use rustc_session::config::OptLevel;
 
 use super::FunctionCx;
 use super::LocalRef;
-use crate::traits::BuilderMethods;
 use crate::traits::*;
 
 impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
@@ -64,12 +64,14 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     cg_indirect_place.storage_dead(bx);
                 }
             }
-            mir::StatementKind::Coverage(box ref coverage) => {
-                self.codegen_coverage(bx, coverage, statement.source_info.scope);
+            mir::StatementKind::Coverage(ref kind) => {
+                self.codegen_coverage(bx, kind, statement.source_info.scope);
             }
             mir::StatementKind::Intrinsic(box NonDivergingIntrinsic::Assume(ref op)) => {
-                let op_val = self.codegen_operand(bx, op);
-                bx.assume(op_val.immediate());
+                if !matches!(bx.tcx().sess.opts.optimize, OptLevel::No | OptLevel::Less) {
+                    let op_val = self.codegen_operand(bx, op);
+                    bx.assume(op_val.immediate());
+                }
             }
             mir::StatementKind::Intrinsic(box NonDivergingIntrinsic::CopyNonOverlapping(
                 mir::CopyNonOverlapping { ref count, ref src, ref dst },

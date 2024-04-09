@@ -4,7 +4,7 @@
 //! so `TextEdit` is the ultimate representation of the work done by
 //! rust-analyzer.
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![warn(rust_2018_idioms, unused_lifetimes)]
 
 use itertools::Itertools;
 use std::cmp::max;
@@ -231,11 +231,11 @@ mod tests {
 
     #[test]
     fn test_apply() {
-        let mut text = "_11h1_2222_xx3333_4444_6666".to_string();
+        let mut text = "_11h1_2222_xx3333_4444_6666".to_owned();
         let mut builder = TextEditBuilder::default();
-        builder.replace(range(3, 4), "1".to_string());
+        builder.replace(range(3, 4), "1".to_owned());
         builder.delete(range(11, 13));
-        builder.insert(22.into(), "_5555".to_string());
+        builder.insert(22.into(), "_5555".to_owned());
 
         let text_edit = builder.finish();
         text_edit.apply(&mut text);

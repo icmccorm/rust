@@ -1,22 +1,24 @@
 use super::abi::AbiBuilderMethods;
 use super::asm::AsmBuilderMethods;
+use super::consts::ConstMethods;
 use super::coverageinfo::CoverageInfoBuilderMethods;
 use super::debuginfo::DebugInfoBuilderMethods;
 use super::intrinsic::IntrinsicCallMethods;
 use super::misc::MiscMethods;
-use super::type_::{ArgAbiMethods, BaseTypeMethods};
+use super::type_::{ArgAbiMethods, BaseTypeMethods, LayoutTypeMethods};
 use super::{HasCodegen, StaticBuilderMethods};
 
 use crate::common::{
     AtomicOrdering, AtomicRmwBinOp, IntPredicate, RealPredicate, SynchronizationScope, TypeKind,
 };
-use crate::mir::operand::OperandRef;
+use crate::mir::operand::{OperandRef, OperandValue};
 use crate::mir::place::PlaceRef;
 use crate::MemFlags;
 
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::ty::layout::{HasParamEnv, TyAndLayout};
-use rustc_middle::ty::Ty;
+use rustc_middle::ty::{Instance, Ty};
+use rustc_session::config::OptLevel;
 use rustc_span::Span;
 use rustc_target::abi::call::FnAbi;
 use rustc_target::abi::{Abi, Align, Scalar, Size, WrappingRange};
@@ -80,28 +82,34 @@ pub trait BuilderMethods<'a, 'tcx>:
         then: Self::BasicBlock,
         catch: Self::BasicBlock,
         funclet: Option<&Self::Funclet>,
+        instance: Option<Instance<'tcx>>,
     ) -> Self::Value;
     fn unreachable(&mut self);
 
     fn add(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fadd(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fadd_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    fn fadd_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn sub(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fsub(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fsub_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    fn fsub_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn mul(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fmul(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fmul_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    fn fmul_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn udiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn exactudiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn sdiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn exactsdiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fdiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fdiv_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    fn fdiv_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn urem(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn srem(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn frem(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn frem_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    fn frem_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn shl(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn lshr(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn ashr(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
@@ -185,7 +193,12 @@ pub trait BuilderMethods<'a, 'tcx>:
         ptr: Self::Value,
         indices: &[Self::Value],
     ) -> Self::Value;
-    fn struct_gep(&mut self, ty: Self::Type, ptr: Self::Value, idx: u64) -> Self::Value;
+    fn ptradd(&mut self, ptr: Self::Value, offset: Self::Value) -> Self::Value {
+        self.gep(self.cx().type_i8(), ptr, &[offset])
+    }
+    fn inbounds_ptradd(&mut self, ptr: Self::Value, offset: Self::Value) -> Self::Value {
+        self.inbounds_gep(self.cx().type_i8(), ptr, &[offset])
+    }
 
     fn trunc(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
     fn sext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
@@ -257,6 +270,54 @@ pub trait BuilderMethods<'a, 'tcx>:
         flags: MemFlags,
     );
 
+    /// *Typed* copy for non-overlapping places.
+    ///
+    /// Has a default implementation in terms of `memcpy`, but specific backends
+    /// can override to do something smarter if possible.
+    ///
+    /// (For example, typed load-stores with alias metadata.)
+    fn typed_place_copy(
+        &mut self,
+        dst: PlaceRef<'tcx, Self::Value>,
+        src: PlaceRef<'tcx, Self::Value>,
+    ) {
+        debug_assert!(src.llextra.is_none());
+        debug_assert!(dst.llextra.is_none());
+        debug_assert_eq!(dst.layout.size, src.layout.size);
+        if self.sess().opts.optimize == OptLevel::No && self.is_backend_immediate(dst.layout) {
+            // If we're not optimizing, the aliasing information from `memcpy`
+            // isn't useful, so just load-store the value for smaller code.
+            let temp = self.load_operand(src);
+            temp.val.store(self, dst);
+        } else if !dst.layout.is_zst() {
+            let bytes = self.const_usize(dst.layout.size.bytes());
+            self.memcpy(dst.llval, dst.align, src.llval, src.align, bytes, MemFlags::empty());
+        }
+    }
+
+    /// *Typed* swap for non-overlapping places.
+    ///
+    /// Avoids `alloca`s for Immediates and ScalarPairs.
+    ///
+    /// FIXME: Maybe do something smarter for Ref types too?
+    /// For now, the `typed_swap` intrinsic just doesn't call this for those
+    /// cases (in non-debug), preferring the fallback body instead.
+    fn typed_place_swap(
+        &mut self,
+        left: PlaceRef<'tcx, Self::Value>,
+        right: PlaceRef<'tcx, Self::Value>,
+    ) {
+        let mut temp = self.load_operand(left);
+        if let OperandValue::Ref(..) = temp.val {
+            // The SSA value isn't stand-alone, so we need to copy it elsewhere
+            let alloca = PlaceRef::alloca(self, left.layout);
+            self.typed_place_copy(alloca, left);
+            temp = self.load_operand(alloca);
+        }
+        self.typed_place_copy(left, right);
+        temp.val.store(self, right);
+    }
+
     fn select(
         &mut self,
         cond: Self::Value,
@@ -296,7 +357,7 @@ pub trait BuilderMethods<'a, 'tcx>:
         order: AtomicOrdering,
         failure_order: AtomicOrdering,
         weak: bool,
-    ) -> Self::Value;
+    ) -> (Self::Value, Self::Value);
     fn atomic_rmw(
         &mut self,
         op: AtomicRmwBinOp,
@@ -329,8 +390,9 @@ pub trait BuilderMethods<'a, 'tcx>:
         llfn: Self::Value,
         args: &[Self::Value],
         funclet: Option<&Self::Funclet>,
+        instance: Option<Instance<'tcx>>,
     ) -> Self::Value;
     fn zext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
 
-    fn do_not_inline(&mut self, llret: Self::Value);
+    fn apply_attrs_to_cleanup_callsite(&mut self, llret: Self::Value);
 }

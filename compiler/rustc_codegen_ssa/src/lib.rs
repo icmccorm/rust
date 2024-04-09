@@ -1,14 +1,16 @@
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(associated_type_bounds)]
+#![doc(rust_logo)]
+#![feature(rustdoc_internals)]
+#![allow(internal_features)]
+#![allow(rustc::diagnostic_outside_of_impl)]
+#![allow(rustc::untranslatable_diagnostic)]
+#![cfg_attr(bootstrap, feature(associated_type_bounds))]
 #![feature(box_patterns)]
 #![feature(if_let_guard)]
 #![feature(let_chains)]
 #![feature(negative_impls)]
-#![feature(never_type)]
 #![feature(strict_provenance)]
 #![feature(try_blocks)]
-#![recursion_limit = "256"]
-#![allow(rustc::potential_query_instability)]
 
 //! This crate contains codegen code that is used by all codegen backends (LLVM and others).
 //! The backend-agnostic functions of this crate use functions defined in various traits that
@@ -22,10 +24,10 @@ extern crate tracing;
 extern crate rustc_middle;
 
 use rustc_ast as ast;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::sync::Lrc;
-use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
-use rustc_fluent_macro::fluent_messages;
+use rustc_data_structures::unord::UnordMap;
 use rustc_hir::def_id::CrateNum;
 use rustc_middle::dep_graph::WorkProduct;
 use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
@@ -43,20 +45,21 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub mod assert_module_sources;
 pub mod back;
 pub mod base;
 pub mod codegen_attrs;
 pub mod common;
 pub mod debuginfo;
 pub mod errors;
-pub mod glue;
 pub mod meth;
 pub mod mir;
 pub mod mono_item;
+pub mod size_of_val;
 pub mod target_features;
 pub mod traits;
 
-fluent_messages! { "../messages.ftl" }
+rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 pub struct ModuleCodegen<M> {
     /// The name of the module. When the crate may be saved between
@@ -108,6 +111,7 @@ pub enum ModuleKind {
 }
 
 bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct MemFlags: u8 {
         const VOLATILE = 1 << 0;
         const NONTEMPORAL = 1 << 1;
@@ -150,16 +154,16 @@ impl From<&cstore::NativeLib> for NativeLib {
 pub struct CrateInfo {
     pub target_cpu: String,
     pub crate_types: Vec<CrateType>,
-    pub exported_symbols: FxHashMap<CrateType, Vec<String>>,
-    pub linked_symbols: FxHashMap<CrateType, Vec<(String, SymbolExportKind)>>,
+    pub exported_symbols: UnordMap<CrateType, Vec<String>>,
+    pub linked_symbols: FxIndexMap<CrateType, Vec<(String, SymbolExportKind)>>,
     pub local_crate_name: Symbol,
     pub compiler_builtins: Option<CrateNum>,
     pub profiler_runtime: Option<CrateNum>,
     pub is_no_builtins: FxHashSet<CrateNum>,
-    pub native_libraries: FxHashMap<CrateNum, Vec<NativeLib>>,
-    pub crate_name: FxHashMap<CrateNum, Symbol>,
+    pub native_libraries: FxIndexMap<CrateNum, Vec<NativeLib>>,
+    pub crate_name: UnordMap<CrateNum, Symbol>,
     pub used_libraries: Vec<NativeLib>,
-    pub used_crate_source: FxHashMap<CrateNum, Lrc<CrateSource>>,
+    pub used_crate_source: UnordMap<CrateNum, Lrc<CrateSource>>,
     pub used_crates: Vec<CrateNum>,
     pub dependency_formats: Lrc<Dependencies>,
     pub windows_subsystem: Option<String>,
@@ -214,6 +218,7 @@ impl CodegenResults {
         sess: &Session,
         rlink_file: &Path,
         codegen_results: &CodegenResults,
+        outputs: &OutputFilenames,
     ) -> Result<usize, io::Error> {
         let mut encoder = FileEncoder::new(rlink_file)?;
         encoder.emit_raw_bytes(RLINK_MAGIC);
@@ -222,10 +227,14 @@ impl CodegenResults {
         encoder.emit_raw_bytes(&RLINK_VERSION.to_be_bytes());
         encoder.emit_str(sess.cfg_version);
         Encodable::encode(codegen_results, &mut encoder);
-        encoder.finish()
+        Encodable::encode(outputs, &mut encoder);
+        encoder.finish().map_err(|(_path, err)| err)
     }
 
-    pub fn deserialize_rlink(sess: &Session, data: Vec<u8>) -> Result<Self, CodegenErrors> {
+    pub fn deserialize_rlink(
+        sess: &Session,
+        data: Vec<u8>,
+    ) -> Result<(Self, OutputFilenames), CodegenErrors> {
         // The Decodable machinery is not used here because it panics if the input data is invalid
         // and because its internal representation may change.
         if !data.starts_with(RLINK_MAGIC) {
@@ -254,6 +263,7 @@ impl CodegenResults {
         }
 
         let codegen_results = CodegenResults::decode(&mut decoder);
-        Ok(codegen_results)
+        let outputs = OutputFilenames::decode(&mut decoder);
+        Ok((codegen_results, outputs))
     }
 }

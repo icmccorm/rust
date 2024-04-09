@@ -25,11 +25,32 @@ macro_rules! TrivialTypeTraversalImpls {
                 fn visit_with<F: $crate::visit::TypeVisitor<I>>(
                     &self,
                     _: &mut F)
-                    -> ::std::ops::ControlFlow<F::BreakTy>
+                    -> F::Result
                 {
-                    ::std::ops::ControlFlow::Continue(())
+                    <F::Result as rustc_ast_ir::visit::VisitorResult>::output()
                 }
             }
         )+
     };
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Atomic structs
+//
+// For things that don't carry any arena-allocated data (and are
+// copy...), just add them to this list.
+
+TrivialTypeTraversalImpls! {
+    (),
+    bool,
+    usize,
+    u16,
+    u32,
+    u64,
+    String,
+    crate::DebruijnIndex,
+    crate::AliasRelationDirection,
+    crate::UniverseIndex,
+    rustc_ast_ir::Mutability,
+    rustc_ast_ir::Movability,
 }

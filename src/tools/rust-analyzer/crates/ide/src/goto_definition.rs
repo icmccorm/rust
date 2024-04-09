@@ -1,10 +1,10 @@
-use std::mem::discriminant;
+use std::{iter, mem::discriminant};
 
 use crate::{
     doc_links::token_as_doc_comment, navigation_target::ToNav, FilePosition, NavigationTarget,
     RangeInfo, TryToNav,
 };
-use hir::{AsAssocItem, AssocItem, Semantics};
+use hir::{AsAssocItem, AssocItem, DescendPreference, MacroFileIdExt, ModuleDef, Semantics};
 use ide_db::{
     base_db::{AnchoredPath, FileId, FileLoader},
     defs::{Definition, IdentClass},
@@ -52,21 +52,41 @@ pub(crate) fn goto_definition(
     if let Some(doc_comment) = token_as_doc_comment(&original_token) {
         return doc_comment.get_definition_with_descend_at(sema, offset, |def, _, link_range| {
             let nav = def.try_to_nav(db)?;
-            Some(RangeInfo::new(link_range, vec![nav]))
+            Some(RangeInfo::new(link_range, nav.collect()))
         });
     }
+
+    if let Some((range, resolution)) =
+        sema.check_for_format_args_template(original_token.clone(), offset)
+    {
+        return Some(RangeInfo::new(
+            range,
+            match resolution {
+                Some(res) => def_to_nav(db, Definition::from(res)),
+                None => vec![],
+            },
+        ));
+    }
+
     let navs = sema
-        .descend_into_macros(original_token.clone(), offset)
+        .descend_into_macros(DescendPreference::None, original_token.clone())
         .into_iter()
         .filter_map(|token| {
             let parent = token.parent()?;
-            if let Some(tt) = ast::TokenTree::cast(parent) {
-                if let Some(x) = try_lookup_include_path(sema, tt, token.clone(), file_id) {
+
+            if let Some(token) = ast::String::cast(token.clone()) {
+                if let Some(x) = try_lookup_include_path(sema, token, file_id) {
+                    return Some(vec![x]);
+                }
+            }
+
+            if ast::TokenTree::can_cast(parent.kind()) {
+                if let Some(x) = try_lookup_macro_def_in_macro_use(sema, token) {
                     return Some(vec![x]);
                 }
             }
             Some(
-                IdentClass::classify_token(sema, &token)?
+                IdentClass::classify_node(sema, &parent)?
                     .definitions()
                     .into_iter()
                     .flat_map(|def| {
@@ -75,6 +95,7 @@ pub(crate) fn goto_definition(
                                 .resolved_crate(db)
                                 .map(|it| it.root_module().to_nav(sema.db))
                                 .into_iter()
+                                .flatten()
                                 .collect();
                         }
                         try_filter_trait_item_definition(sema, &def)
@@ -92,24 +113,17 @@ pub(crate) fn goto_definition(
 
 fn try_lookup_include_path(
     sema: &Semantics<'_, RootDatabase>,
-    tt: ast::TokenTree,
-    token: SyntaxToken,
+    token: ast::String,
     file_id: FileId,
 ) -> Option<NavigationTarget> {
-    let token = ast::String::cast(token)?;
-    let path = token.value()?.into_owned();
-    let macro_call = tt.syntax().parent().and_then(ast::MacroCall::cast)?;
-    let name = macro_call.path()?.segment()?.name_ref()?;
-    if !matches!(&*name.text(), "include" | "include_str" | "include_bytes") {
+    let file = sema.hir_file_for(&token.syntax().parent()?).macro_file()?;
+    if !iter::successors(Some(file), |file| file.parent(sema.db).macro_file())
+        // Check that we are in the eager argument expansion of an include macro
+        .any(|file| file.is_include_like_macro(sema.db) && file.eager_arg(sema.db).is_none())
+    {
         return None;
     }
-
-    // Ignore non-built-in macros to account for shadowing
-    if let Some(it) = sema.resolve_macro_call(&macro_call) {
-        if !matches!(it.kind(sema.db), hir::MacroKind::BuiltIn) {
-            return None;
-        }
-    }
+    let path = token.value()?;
 
     let file_id = sema.db.resolve_path(AnchoredPath { anchor: file_id, path: &path })?;
     let size = sema.db.file_text(file_id).len().try_into().ok()?;
@@ -125,6 +139,28 @@ fn try_lookup_include_path(
         docs: None,
     })
 }
+
+fn try_lookup_macro_def_in_macro_use(
+    sema: &Semantics<'_, RootDatabase>,
+    token: SyntaxToken,
+) -> Option<NavigationTarget> {
+    let extern_crate = token.parent()?.ancestors().find_map(ast::ExternCrate::cast)?;
+    let extern_crate = sema.to_def(&extern_crate)?;
+    let krate = extern_crate.resolved_crate(sema.db)?;
+
+    for mod_def in krate.root_module().declarations(sema.db) {
+        if let ModuleDef::Macro(mac) = mod_def {
+            if mac.name(sema.db).as_str() == Some(token.text()) {
+                if let Some(nav) = mac.try_to_nav(sema.db) {
+                    return Some(nav.call_site);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// finds the trait definition of an impl'd item, except function
 /// e.g.
 /// ```rust
@@ -141,11 +177,7 @@ fn try_filter_trait_item_definition(
     match assoc {
         AssocItem::Function(..) => None,
         AssocItem::Const(..) | AssocItem::TypeAlias(..) => {
-            let imp = match assoc.container(db) {
-                hir::AssocItemContainer::Impl(imp) => imp,
-                _ => return None,
-            };
-            let trait_ = imp.trait_(db)?;
+            let trait_ = assoc.implemented_trait(db)?;
             let name = def.name(db)?;
             let discri_value = discriminant(&assoc);
             trait_
@@ -153,13 +185,13 @@ fn try_filter_trait_item_definition(
                 .iter()
                 .filter(|itm| discriminant(*itm) == discri_value)
                 .find_map(|itm| (itm.name(db)? == name).then(|| itm.try_to_nav(db)).flatten())
-                .map(|it| vec![it])
+                .map(|it| it.collect())
         }
     }
 }
 
 fn def_to_nav(db: &RootDatabase, def: Definition) -> Vec<NavigationTarget> {
-    def.try_to_nav(db).map(|it| vec![it]).unwrap_or_default()
+    def.try_to_nav(db).map(|it| it.collect()).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -185,6 +217,7 @@ mod tests {
             .map(|(FileRange { file_id, range }, _)| FileRange { file_id, range })
             .sorted_by_key(cmp)
             .collect::<Vec<_>>();
+
         assert_eq!(expected, navs);
     }
 
@@ -193,6 +226,60 @@ mod tests {
         let navs = analysis.goto_definition(position).unwrap().expect("no definition found").info;
 
         assert!(navs.is_empty(), "didn't expect this to resolve anywhere: {navs:?}")
+    }
+
+    #[test]
+    fn goto_def_in_included_file() {
+        check(
+            r#"
+//- minicore:include
+//- /main.rs
+
+include!("a.rs");
+
+fn main() {
+    foo();
+}
+
+//- /a.rs
+fn func_in_include() {
+ //^^^^^^^^^^^^^^^
+}
+
+fn foo() {
+    func_in_include$0();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn goto_def_in_included_file_nested() {
+        check(
+            r#"
+//- minicore:include
+//- /main.rs
+
+macro_rules! passthrough {
+    ($($tt:tt)*) => { $($tt)* }
+}
+
+passthrough!(include!("a.rs"));
+
+fn main() {
+    foo();
+}
+
+//- /a.rs
+fn func_in_include() {
+ //^^^^^^^^^^^^^^^
+}
+
+fn foo() {
+    func_in_include$0();
+}
+"#,
+        );
     }
 
     #[test]
@@ -399,11 +486,11 @@ fn bar() {
 //- /lib.rs
 macro_rules! define_fn {
     () => (fn foo() {})
+            //^^^
 }
 
   define_fn!();
 //^^^^^^^^^^^^^
-
 fn bar() {
    $0foo();
 }
@@ -438,6 +525,24 @@ macro_rules! foo {() => {0}}
 fn bar() {
     match 0 {
         $0foo!() => {}
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn goto_definition_works_for_consts_inside_range_pattern() {
+        check(
+            r#"
+//- /lib.rs
+const A: u32 = 0;
+    //^
+
+fn bar(v: u32) {
+    match v {
+        0..=$0A => {}
+        _ => {}
     }
 }
 "#,
@@ -807,18 +912,13 @@ mod confuse_index { fn foo(); }
     fn goto_through_format() {
         check(
             r#"
+//- minicore: fmt
 #[macro_export]
 macro_rules! format {
     ($($arg:tt)*) => ($crate::fmt::format($crate::__export::format_args!($($arg)*)))
 }
-#[rustc_builtin_macro]
-#[macro_export]
-macro_rules! format_args {
-    ($fmt:expr) => ({ /* compiler built-in */ });
-    ($fmt:expr, $($args:tt)*) => ({ /* compiler built-in */ })
-}
 pub mod __export {
-    pub use crate::format_args;
+    pub use core::format_args;
     fn foo() {} // for index confusion
 }
 fn foo() -> i8 {}
@@ -1427,6 +1527,26 @@ fn main() {
     }
 
     #[test]
+    fn goto_include_has_eager_input() {
+        check(
+            r#"
+//- /main.rs
+#[rustc_builtin_macro]
+macro_rules! include_str {}
+#[rustc_builtin_macro]
+macro_rules! concat {}
+
+fn main() {
+    let str = include_str!(concat!("foo", ".tx$0t"));
+}
+//- /foo.txt
+// empty
+//^file
+"#,
+        );
+    }
+
+    #[test]
     fn goto_doc_include_str() {
         check(
             r#"
@@ -1738,9 +1858,9 @@ macro_rules! foo {
         fn $ident(Foo { $ident }: Foo) {}
     }
 }
-foo!(foo$0);
-   //^^^
-   //^^^
+  foo!(foo$0);
+     //^^^
+     //^^^
 "#,
         );
         check(
@@ -1869,6 +1989,34 @@ fn f() {
     }
 
     #[test]
+    fn goto_index_mut_op() {
+        check(
+            r#"
+//- minicore: index
+
+struct Foo;
+struct Bar;
+
+impl core::ops::Index<usize> for Foo {
+    type Output = Bar;
+
+    fn index(&self, index: usize) -> &Self::Output {}
+}
+
+impl core::ops::IndexMut<usize> for Foo {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {}
+     //^^^^^^^^^
+}
+
+fn f() {
+    let mut foo = Foo;
+    foo[0]$0 = Bar;
+}
+"#,
+        );
+    }
+
+    #[test]
     fn goto_prefix_op() {
         check(
             r#"
@@ -1885,6 +2033,33 @@ impl core::ops::Deref for Struct {
 
 fn f() {
     $0*Struct;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn goto_deref_mut() {
+        check(
+            r#"
+//- minicore: deref, deref_mut
+
+struct Foo;
+struct Bar;
+
+impl core::ops::Deref for Foo {
+    type Target = Bar;
+    fn deref(&self) -> &Self::Target {}
+}
+
+impl core::ops::DerefMut for Foo {
+    fn deref_mut(&mut self) -> &mut Self::Target {}
+     //^^^^^^^^^
+}
+
+fn f() {
+    let a = Foo;
+    $0*a = Bar;
 }
 "#,
         );
@@ -2055,6 +2230,63 @@ fn f2() {
     S1::e$0();
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn implicit_format_args() {
+        check(
+            r#"
+//- minicore: fmt
+fn test() {
+    let a = "world";
+     // ^
+    format_args!("hello {a$0}");
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn goto_macro_def_from_macro_use() {
+        check(
+            r#"
+//- /main.rs crate:main deps:mac
+#[macro_use(foo$0)]
+extern crate mac;
+
+//- /mac.rs crate:mac
+#[macro_export]
+macro_rules! foo {
+           //^^^
+    () => {};
+}
+            "#,
+        );
+
+        check(
+            r#"
+//- /main.rs crate:main deps:mac
+#[macro_use(foo, bar$0, baz)]
+extern crate mac;
+
+//- /mac.rs crate:mac
+#[macro_export]
+macro_rules! foo {
+    () => {};
+}
+
+#[macro_export]
+macro_rules! bar {
+           //^^^
+    () => {};
+}
+
+#[macro_export]
+macro_rules! baz {
+    () => {};
+}
+            "#,
         );
     }
 }

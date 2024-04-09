@@ -1,10 +1,10 @@
-// build-pass (FIXME(62277): could be check-pass?)
-// force-host
-// no-prefer-dynamic
+//@ build-pass (FIXME(62277): could be check-pass?)
+//@ force-host
+//@ no-prefer-dynamic
+//@ needs-unwind compiling proc macros with panic=abort causes a warning
 
 #![crate_type = "proc-macro"]
 #![deny(rust_2018_compatibility)]
-#![feature(rust_2018_preview)]
 
 extern crate proc_macro;
 

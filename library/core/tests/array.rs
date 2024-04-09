@@ -1,7 +1,6 @@
-use core::{array, assert_eq};
-use core::convert::TryFrom;
-use core::num::NonZeroUsize;
+use core::num::NonZero;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{array, assert_eq};
 
 #[test]
 fn array_from_ref() {
@@ -263,7 +262,7 @@ fn array_default_impl_avoids_leaks_on_panic() {
     use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     #[derive(Debug)]
-    struct Bomb(usize);
+    struct Bomb(#[allow(dead_code)] usize);
 
     impl Default for Bomb {
         fn default() -> Bomb {
@@ -549,7 +548,7 @@ fn array_intoiter_advance_by() {
     assert_eq!(counter.get(), 13);
 
     let r = it.advance_by(123456);
-    assert_eq!(r, Err(NonZeroUsize::new(123456 - 87).unwrap()));
+    assert_eq!(r, Err(NonZero::new(123456 - 87).unwrap()));
     assert_eq!(it.len(), 0);
     assert_eq!(counter.get(), 100);
 
@@ -559,7 +558,7 @@ fn array_intoiter_advance_by() {
     assert_eq!(counter.get(), 100);
 
     let r = it.advance_by(10);
-    assert_eq!(r, Err(NonZeroUsize::new(10).unwrap()));
+    assert_eq!(r, Err(NonZero::new(10).unwrap()));
     assert_eq!(it.len(), 0);
     assert_eq!(counter.get(), 100);
 }
@@ -602,7 +601,7 @@ fn array_intoiter_advance_back_by() {
     assert_eq!(counter.get(), 13);
 
     let r = it.advance_back_by(123456);
-    assert_eq!(r, Err(NonZeroUsize::new(123456 - 87).unwrap()));
+    assert_eq!(r, Err(NonZero::new(123456 - 87).unwrap()));
     assert_eq!(it.len(), 0);
     assert_eq!(counter.get(), 100);
 
@@ -612,7 +611,7 @@ fn array_intoiter_advance_back_by() {
     assert_eq!(counter.get(), 100);
 
     let r = it.advance_back_by(10);
-    assert_eq!(r, Err(NonZeroUsize::new(10).unwrap()));
+    assert_eq!(r, Err(NonZero::new(10).unwrap()));
     assert_eq!(it.len(), 0);
     assert_eq!(counter.get(), 100);
 }
@@ -663,7 +662,7 @@ fn array_mixed_equality_nans() {
 
 #[test]
 fn array_into_iter_fold() {
-    // Strings to help MIRI catch if we double-free or something
+    // Strings to help Miri catch if we double-free or something
     let a = ["Aa".to_string(), "Bb".to_string(), "Cc".to_string()];
     let mut s = "s".to_string();
     a.into_iter().for_each(|b| s += &b);
@@ -679,7 +678,7 @@ fn array_into_iter_fold() {
 
 #[test]
 fn array_into_iter_rfold() {
-    // Strings to help MIRI catch if we double-free or something
+    // Strings to help Miri catch if we double-free or something
     let a = ["Aa".to_string(), "Bb".to_string(), "Cc".to_string()];
     let mut s = "s".to_string();
     a.into_iter().rev().for_each(|b| s += &b);

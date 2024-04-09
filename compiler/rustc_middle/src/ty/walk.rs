@@ -158,8 +158,8 @@ fn push_inner<'tcx>(stack: &mut TypeWalkerStack<'tcx>, parent: GenericArg<'tcx>)
             ty::Slice(ty) => {
                 stack.push(ty.into());
             }
-            ty::RawPtr(mt) => {
-                stack.push(mt.ty.into());
+            ty::RawPtr(ty, _) => {
+                stack.push(ty.into());
             }
             ty::Ref(lt, ty, _) => {
                 stack.push(ty.into());
@@ -189,8 +189,9 @@ fn push_inner<'tcx>(stack: &mut TypeWalkerStack<'tcx>, parent: GenericArg<'tcx>)
             }
             ty::Adt(_, args)
             | ty::Closure(_, args)
-            | ty::Generator(_, args, _)
-            | ty::GeneratorWitness(_, args)
+            | ty::CoroutineClosure(_, args)
+            | ty::Coroutine(_, args)
+            | ty::CoroutineWitness(_, args)
             | ty::FnDef(_, args) => {
                 stack.extend(args.iter().rev());
             }

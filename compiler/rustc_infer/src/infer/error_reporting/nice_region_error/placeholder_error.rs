@@ -8,7 +8,7 @@ use crate::infer::ValuePairs;
 use crate::infer::{SubregionOrigin, TypeTrace};
 use crate::traits::{ObligationCause, ObligationCauseCode};
 use rustc_data_structures::intern::Interned;
-use rustc_errors::{DiagnosticBuilder, ErrorGuaranteed, IntoDiagnosticArg};
+use rustc_errors::{Diag, IntoDiagArg};
 use rustc_hir::def::Namespace;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::error::ExpectedFound;
@@ -26,12 +26,12 @@ pub struct Highlighted<'tcx, T> {
     value: T,
 }
 
-impl<'tcx, T> IntoDiagnosticArg for Highlighted<'tcx, T>
+impl<'tcx, T> IntoDiagArg for Highlighted<'tcx, T>
 where
-    T: for<'a> Print<'tcx, FmtPrinter<'a, 'tcx>, Error = fmt::Error, Output = FmtPrinter<'a, 'tcx>>,
+    T: for<'a> Print<'tcx, FmtPrinter<'a, 'tcx>>,
 {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
-        rustc_errors::DiagnosticArgValue::Str(self.to_string().into())
+    fn into_diag_arg(self) -> rustc_errors::DiagArgValue {
+        rustc_errors::DiagArgValue::Str(self.to_string().into())
     }
 }
 
@@ -43,23 +43,21 @@ impl<'tcx, T> Highlighted<'tcx, T> {
 
 impl<'tcx, T> fmt::Display for Highlighted<'tcx, T>
 where
-    T: for<'a> Print<'tcx, FmtPrinter<'a, 'tcx>, Error = fmt::Error, Output = FmtPrinter<'a, 'tcx>>,
+    T: for<'a> Print<'tcx, FmtPrinter<'a, 'tcx>>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut printer = ty::print::FmtPrinter::new(self.tcx, Namespace::TypeNS);
         printer.region_highlight_mode = self.highlight;
 
-        let s = self.value.print(printer)?.into_buffer();
-        f.write_str(&s)
+        self.value.print(&mut printer)?;
+        f.write_str(&printer.into_buffer())
     }
 }
 
 impl<'tcx> NiceRegionError<'_, 'tcx> {
     /// When given a `ConcreteFailure` for a function with arguments containing a named region and
     /// an anonymous region, emit a descriptive diagnostic error.
-    pub(super) fn try_report_placeholder_conflict(
-        &self,
-    ) -> Option<DiagnosticBuilder<'tcx, ErrorGuaranteed>> {
+    pub(super) fn try_report_placeholder_conflict(&self) -> Option<Diag<'tcx>> {
         match &self.error {
             ///////////////////////////////////////////////////////////////////////////
             // NB. The ordering of cases in this match is very
@@ -195,13 +193,8 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
         sub_placeholder: Option<Region<'tcx>>,
         sup_placeholder: Option<Region<'tcx>>,
         value_pairs: &ValuePairs<'tcx>,
-    ) -> Option<DiagnosticBuilder<'tcx, ErrorGuaranteed>> {
+    ) -> Option<Diag<'tcx>> {
         let (expected_args, found_args, trait_def_id) = match value_pairs {
-            ValuePairs::TraitRefs(ExpectedFound { expected, found })
-                if expected.def_id == found.def_id =>
-            {
-                (expected.args, found.args, expected.def_id)
-            }
             ValuePairs::PolyTraitRefs(ExpectedFound { expected, found })
                 if expected.def_id() == found.def_id() =>
             {
@@ -243,7 +236,7 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
         trait_def_id: DefId,
         expected_args: GenericArgsRef<'tcx>,
         actual_args: GenericArgsRef<'tcx>,
-    ) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
+    ) -> Diag<'tcx> {
         let span = cause.span();
 
         let (leading_ellipsis, satisfy_span, where_span, dup_span, def_id) =
@@ -338,7 +331,7 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
             leading_ellipsis,
         );
 
-        self.tcx().sess.create_err(TraitPlaceholderMismatch {
+        self.tcx().dcx().create_err(TraitPlaceholderMismatch {
             span,
             satisfy_span,
             where_span,

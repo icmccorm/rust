@@ -1,6 +1,11 @@
+// different number of duplicated diagnostics on different targets
+//@ only-x86_64
+//@ only-linux
+//@ compile-flags: -Zdeduplicate-diagnostics=yes
+
 #![allow(bare_trait_objects)]
-use std::collections::HashMap;
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 pub union Foo<'t, 'k> {
     i: &'t i64,
@@ -38,18 +43,10 @@ thread_local! {
 thread_local! {
     static e: RefCell<HashMap<i32, Vec<Vec<Qux<'static, i32>>>>> = RefCell::new(HashMap::new());
     //~^ ERROR union takes 2 lifetime arguments but 1 lifetime argument
-    //~| ERROR union takes 2 lifetime arguments but 1 lifetime argument was supplied
-    //~| ERROR union takes 2 lifetime arguments but 1 lifetime argument was supplied
-    //~| ERROR union takes 2 lifetime arguments but 1 lifetime argument was supplied
-    //~| ERROR union takes 2 lifetime arguments but 1 lifetime argument was supplied
 }
 thread_local! {
     static f: RefCell<HashMap<i32, Vec<Vec<&Tar<'static, i32>>>>> = RefCell::new(HashMap::new());
     //~^ ERROR trait takes 2 lifetime arguments but 1 lifetime argument was supplied
-    //~| ERROR trait takes 2 lifetime arguments but 1 lifetime argument was supplied
-    //~| ERROR trait takes 2 lifetime arguments but 1 lifetime argument was supplied
-    //~| ERROR trait takes 2 lifetime arguments but 1 lifetime argument was supplied
-    //~| ERROR trait takes 2 lifetime arguments but 1 lifetime argument was supplied
     //~| ERROR missing lifetime
     //~| ERROR missing lifetime
 }

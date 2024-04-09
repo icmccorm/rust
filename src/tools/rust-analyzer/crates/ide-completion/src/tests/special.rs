@@ -1,10 +1,16 @@
 //! Tests that don't fit into a specific category.
 
 use expect_test::{expect, Expect};
+use ide_db::SymbolKind;
 
-use crate::tests::{
-    check_edit, completion_list, completion_list_no_kw, completion_list_with_trigger_character,
+use crate::{
+    tests::{
+        check_edit, completion_list, completion_list_no_kw, completion_list_with_trigger_character,
+    },
+    CompletionItemKind,
 };
+
+use super::{do_completion_with_config, TEST_CONFIG};
 
 fn check_no_kw(ra_fixture: &str, expect: Expect) {
     let actual = completion_list_no_kw(ra_fixture);
@@ -79,10 +85,10 @@ pub mod prelude {
 }
 "#,
         expect![[r#"
-                md std
-                st Option
-                bt u32
-            "#]],
+            md std
+            st Option Option
+            bt u32    u32
+        "#]],
     );
 }
 
@@ -107,11 +113,11 @@ mod macros {
 }
 "#,
         expect![[r#"
-                fn f()        fn()
-                ma concat!(…) macro_rules! concat
-                md std
-                bt u32
-            "#]],
+            fn f()        fn()
+            ma concat!(…) macro_rules! concat
+            md std
+            bt u32        u32
+        "#]],
     );
 }
 
@@ -137,11 +143,11 @@ pub mod prelude {
 }
 "#,
         expect![[r#"
-                md core
-                md std
-                st String
-                bt u32
-            "#]],
+            md core
+            md std
+            st String String
+            bt u32    u32
+        "#]],
     );
 }
 
@@ -166,10 +172,10 @@ pub mod prelude {
 }
             "#,
         expect![[r#"
-                fn f() fn()
-                md std
-                bt u32
-            "#]],
+            fn f() fn()
+            md std
+            bt u32 u32
+        "#]],
     );
 }
 
@@ -220,10 +226,10 @@ impl S {
 fn foo() { let _ = lib::S::$0 }
 "#,
         expect![[r#"
-                ct PUBLIC_CONST    pub const PUBLIC_CONST: u32
-                fn public_method() fn()
-                ta PublicType      pub type PublicType = u32
-            "#]],
+            ct PUBLIC_CONST    pub const PUBLIC_CONST: u32
+            fn public_method() fn()
+            ta PublicType      pub type PublicType = u32
+        "#]],
     );
 }
 
@@ -237,8 +243,8 @@ impl U { fn m() { } }
 fn foo() { let _ = U::$0 }
 "#,
         expect![[r#"
-                fn m() fn()
-            "#]],
+            fn m() fn()
+        "#]],
     );
 }
 
@@ -251,8 +257,8 @@ trait Trait { fn m(); }
 fn foo() { let _ = Trait::$0 }
 "#,
         expect![[r#"
-                fn m() (as Trait) fn()
-            "#]],
+            fn m() (as Trait) fn()
+        "#]],
     );
 }
 
@@ -268,8 +274,8 @@ impl Trait for S {}
 fn foo() { let _ = S::$0 }
 "#,
         expect![[r#"
-                fn m() (as Trait) fn()
-            "#]],
+            fn m() (as Trait) fn()
+        "#]],
     );
 }
 
@@ -285,8 +291,8 @@ impl Trait for S {}
 fn foo() { let _ = <S as Trait>::$0 }
 "#,
         expect![[r#"
-                fn m() (as Trait) fn()
-            "#]],
+            fn m() (as Trait) fn()
+        "#]],
     );
 }
 
@@ -311,15 +317,15 @@ trait Sub: Super {
 fn foo<T: Sub>() { T::$0 }
 "#,
         expect![[r#"
-                ct C2 (as Sub)           const C2: ()
-                ct CONST (as Super)      const CONST: u8
-                fn func() (as Super)     fn()
-                fn subfunc() (as Sub)    fn()
-                ta SubTy (as Sub)        type SubTy
-                ta Ty (as Super)         type Ty
-                me method(…) (as Super)  fn(&self)
-                me submethod(…) (as Sub) fn(&self)
-            "#]],
+            ct C2 (as Sub)           const C2: ()
+            ct CONST (as Super)      const CONST: u8
+            fn func() (as Super)     fn()
+            fn subfunc() (as Sub)    fn()
+            me method(…) (as Super)  fn(&self)
+            me submethod(…) (as Sub) fn(&self)
+            ta SubTy (as Sub)        type SubTy
+            ta Ty (as Super)         type Ty
+        "#]],
     );
 }
 
@@ -351,15 +357,15 @@ impl<T> Sub for Wrap<T> {
 }
 "#,
         expect![[r#"
-                ct C2 (as Sub)           const C2: ()
-                ct CONST (as Super)      const CONST: u8
-                fn func() (as Super)     fn()
-                fn subfunc() (as Sub)    fn()
-                ta SubTy (as Sub)        type SubTy
-                ta Ty (as Super)         type Ty
-                me method(…) (as Super)  fn(&self)
-                me submethod(…) (as Sub) fn(&self)
-            "#]],
+            ct C2 (as Sub)           const C2: ()
+            ct CONST (as Super)      const CONST: u8
+            fn func() (as Super)     fn()
+            fn subfunc() (as Sub)    fn()
+            me method(…) (as Super)  fn(&self)
+            me submethod(…) (as Sub) fn(&self)
+            ta SubTy (as Sub)        type SubTy
+            ta Ty (as Super)         type Ty
+        "#]],
     );
 }
 
@@ -391,9 +397,9 @@ macro_rules! foo { () => {} }
 fn main() { let _ = crate::$0 }
 "#,
         expect![[r#"
-                fn main()  fn()
-                ma foo!(…) macro_rules! foo
-            "#]],
+            fn main()  fn()
+            ma foo!(…) macro_rules! foo
+        "#]],
     );
 }
 
@@ -441,10 +447,10 @@ mod p {
 }
 "#,
         expect![[r#"
-                ct RIGHT_CONST
-                fn right_fn()  fn()
-                st RightType
-            "#]],
+            ct RIGHT_CONST u32
+            fn right_fn()  fn()
+            st RightType   WrongType
+        "#]],
     );
 
     check_edit(
@@ -550,10 +556,10 @@ impl Foo {
 }
 "#,
         expect![[r#"
-                ev Bar    Bar
-                ev Baz    Baz
-                me foo(…) fn(self)
-            "#]],
+            me foo(…) fn(self)
+            ev Bar    Bar
+            ev Baz    Baz
+        "#]],
     );
 }
 
@@ -689,8 +695,10 @@ fn bar() -> Bar {
 }
 "#,
         expect![[r#"
-                fn foo() (as Foo) fn() -> Self
-            "#]],
+            fn foo() (as Foo) fn() -> Self
+            ex Bar
+            ex bar()
+        "#]],
     );
 }
 
@@ -717,6 +725,8 @@ fn bar() -> Bar {
         expect![[r#"
             fn bar()          fn()
             fn foo() (as Foo) fn() -> Self
+            ex Bar
+            ex bar()
         "#]],
     );
 }
@@ -743,6 +753,8 @@ fn bar() -> Bar {
 "#,
         expect![[r#"
             fn foo() (as Foo) fn() -> Self
+            ex Bar
+            ex bar()
         "#]],
     );
 }
@@ -876,7 +888,7 @@ fn main() {
             fn main() fn()
             lc foobar i32
             ma x!(…)  macro_rules! x
-            bt u32
+            bt u32    u32
         "#]],
     )
 }
@@ -1003,8 +1015,8 @@ fn here_we_go() {
 "#,
         expect![[r#"
             fn here_we_go()    fn()
-            st Foo (alias Bar)
-            bt u32
+            st Foo (alias Bar) Foo
+            bt u32             u32
             kw const
             kw crate::
             kw enum
@@ -1052,8 +1064,8 @@ fn here_we_go() {
 "#,
         expect![[r#"
             fn here_we_go()           fn()
-            st Foo (alias Bar, Qux, Baz)
-            bt u32
+            st Foo (alias Bar, Qux, Baz) Foo
+            bt u32                    u32
             kw const
             kw crate::
             kw enum
@@ -1152,11 +1164,13 @@ fn here_we_go() {
             sn call              function(expr)
             sn dbg               dbg!(expr)
             sn dbgr              dbg!(&expr)
+            sn deref             *expr
             sn let               let
             sn letm              let mut
             sn match             match expr {}
             sn ref               &expr
             sn refm              &mut expr
+            sn return            return expr
             sn unsafe            unsafe {}
         "#]],
     );
@@ -1173,7 +1187,7 @@ fn bar() { qu$0 }
         expect![[r#"
             fn bar()             fn()
             fn foo() (alias qux) fn()
-            bt u32
+            bt u32               u32
             kw const
             kw crate::
             kw enum
@@ -1222,7 +1236,7 @@ fn here_we_go() {
 }
 "#,
         expect![[r#"
-            st Bar (alias Qux)
+            st Bar (alias Qux) Bar
         "#]],
     );
 }
@@ -1241,7 +1255,7 @@ fn here_we_go() {
 }
 "#,
         expect![[r#"
-            st Bar (alias Qux)
+            st Bar (alias Qux) Bar
         "#]],
     );
 }
@@ -1262,8 +1276,8 @@ fn here_we_go() {
         expect![[r#"
             fn here_we_go()           fn()
             md foo
-            st Bar (alias Qux) (use foo::Bar)
-            bt u32
+            st Bar (alias Qux) (use foo::Bar) Bar
+            bt u32                    u32
             kw crate::
             kw false
             kw for
@@ -1279,6 +1293,30 @@ fn here_we_go() {
             kw while let
         "#]],
     );
+}
+
+#[test]
+fn completes_only_public() {
+    check(
+        r#"
+//- /e.rs
+pub(self) fn i_should_be_hidden() {}
+pub(in crate::e) fn i_should_also_be_hidden() {}
+pub fn i_am_public () {}
+
+//- /lib.rs crate:krate
+pub mod e;
+
+//- /main.rs deps:krate crate:main
+use krate::e;
+fn main() {
+    e::$0
+}"#,
+        expect![
+            "fn i_am_public() fn()
+"
+        ],
+    )
 }
 
 #[test]
@@ -1301,5 +1339,178 @@ trait PartialOrd {}
 
 struct Foo<T: PartialOrd
 "#,
+    );
+}
+
+fn check_signatures(src: &str, kind: CompletionItemKind, reduced: Expect, full: Expect) {
+    const FULL_SIGNATURES_CONFIG: crate::CompletionConfig = {
+        let mut x = TEST_CONFIG;
+        x.full_function_signatures = true;
+        x
+    };
+
+    // reduced signature
+    let completion = do_completion_with_config(TEST_CONFIG, src, kind);
+    assert!(completion[0].detail.is_some());
+    reduced.assert_eq(completion[0].detail.as_ref().unwrap());
+
+    // full signature
+    let completion = do_completion_with_config(FULL_SIGNATURES_CONFIG, src, kind);
+    assert!(completion[0].detail.is_some());
+    full.assert_eq(completion[0].detail.as_ref().unwrap());
+}
+
+#[test]
+fn respects_full_function_signatures() {
+    check_signatures(
+        r#"
+pub fn foo<'x, T>(x: &'x mut T) -> u8 where T: Clone, { 0u8 }
+fn main() { fo$0 }
+"#,
+        CompletionItemKind::SymbolKind(ide_db::SymbolKind::Function),
+        expect!("fn(&mut T) -> u8"),
+        expect!("pub fn foo<'x, T>(x: &'x mut T) -> u8 where T: Clone,"),
+    );
+
+    check_signatures(
+        r#"
+struct Foo;
+struct Bar;
+impl Bar {
+    pub const fn baz(x: Foo) -> ! { loop {} };
+}
+
+fn main() { Bar::b$0 }
+"#,
+        CompletionItemKind::SymbolKind(ide_db::SymbolKind::Function),
+        expect!("const fn(Foo) -> !"),
+        expect!("pub const fn baz(x: Foo) -> !"),
+    );
+
+    check_signatures(
+        r#"
+struct Foo;
+struct Bar;
+impl Bar {
+    pub const fn baz<'foo>(&'foo mut self, x: &'foo Foo) -> ! { loop {} };
+}
+
+fn main() {
+    let mut bar = Bar;
+    bar.b$0
+}
+"#,
+        CompletionItemKind::SymbolKind(SymbolKind::Method),
+        expect!("const fn(&'foo mut self, &Foo) -> !"),
+        expect!("pub const fn baz<'foo>(&'foo mut self, x: &'foo Foo) -> !"),
+    );
+}
+
+#[test]
+fn skips_underscore() {
+    check_with_trigger_character(
+        r#"
+fn foo(_$0) { }
+"#,
+        Some('_'),
+        expect![[r#""#]],
+    );
+    check_with_trigger_character(
+        r#"
+fn foo(_: _$0) { }
+"#,
+        Some('_'),
+        expect![[r#""#]],
+    );
+    check_with_trigger_character(
+        r#"
+fn foo<T>() {
+    foo::<_$0>();
+}
+"#,
+        Some('_'),
+        expect![[r#""#]],
+    );
+    // underscore expressions are fine, they are invalid so the user definitely meant to type an
+    // underscored name here
+    check_with_trigger_character(
+        r#"
+fn foo() {
+    _$0
+}
+"#,
+        Some('_'),
+        expect![[r#"
+            fn foo()       fn()
+            bt u32         u32
+            kw const
+            kw crate::
+            kw enum
+            kw extern
+            kw false
+            kw fn
+            kw for
+            kw if
+            kw if let
+            kw impl
+            kw let
+            kw loop
+            kw match
+            kw mod
+            kw return
+            kw self::
+            kw static
+            kw struct
+            kw trait
+            kw true
+            kw type
+            kw union
+            kw unsafe
+            kw use
+            kw while
+            kw while let
+            sn macro_rules
+            sn pd
+            sn ppd
+        "#]],
+    );
+}
+
+#[test]
+fn no_skip_underscore_ident() {
+    check_with_trigger_character(
+        r#"
+fn foo(a_$0) { }
+"#,
+        Some('_'),
+        expect![[r#"
+            kw mut
+            kw ref
+        "#]],
+    );
+    check_with_trigger_character(
+        r#"
+fn foo(_: a_$0) { }
+"#,
+        Some('_'),
+        expect![[r#"
+            bt u32     u32
+            kw crate::
+            kw self::
+        "#]],
+    );
+    check_with_trigger_character(
+        r#"
+fn foo<T>() {
+    foo::<a_$0>();
+}
+"#,
+        Some('_'),
+        expect![[r#"
+            tp T
+            bt u32     u32
+            kw crate::
+            kw self::
+        "#]],
     );
 }

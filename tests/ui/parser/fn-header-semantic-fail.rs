@@ -1,6 +1,6 @@
 // Ensures that all `fn` forms can have all the function qualifiers syntactically.
 
-// edition:2018
+//@ edition:2018
 
 #![feature(const_extern_fn)]
 
@@ -13,25 +13,23 @@ fn main() {
     //~^ ERROR functions cannot be both `const` and `async`
 
     trait X {
-        async fn ft1(); //~ ERROR functions in traits cannot be declared `async`
+        async fn ft1(); // OK.
         unsafe fn ft2(); // OK.
         const fn ft3(); //~ ERROR functions in traits cannot be declared const
         extern "C" fn ft4(); // OK.
         const async unsafe extern "C" fn ft5();
-        //~^ ERROR functions in traits cannot be declared `async`
-        //~| ERROR functions in traits cannot be declared const
+        //~^ ERROR functions in traits cannot be declared const
         //~| ERROR functions cannot be both `const` and `async`
     }
 
     struct Y;
     impl X for Y {
-        async fn ft1() {} //~ ERROR functions in traits cannot be declared `async`
+        async fn ft1() {} // OK.
         unsafe fn ft2() {} // OK.
-        const fn ft3() {} //~ ERROR functions in traits cannot be declared const
+        const fn ft3() {} //~ ERROR functions in trait impls cannot be declared const
         extern "C" fn ft4() {}
         const async unsafe extern "C" fn ft5() {}
-        //~^ ERROR functions in traits cannot be declared `async`
-        //~| ERROR functions in traits cannot be declared const
+        //~^ ERROR functions in trait impls cannot be declared const
         //~| ERROR functions cannot be both `const` and `async`
     }
 
@@ -50,6 +48,9 @@ fn main() {
         const fn fe3(); //~ ERROR functions in `extern` blocks cannot have qualifiers
         extern "C" fn fe4(); //~ ERROR functions in `extern` blocks cannot have qualifiers
         const async unsafe extern "C" fn fe5(); //~ ERROR functions in `extern` blocks
-        //~^ ERROR functions cannot be both `const` and `async`
+        //~| ERROR functions in `extern` blocks
+        //~| ERROR functions in `extern` blocks
+        //~| ERROR functions in `extern` blocks
+        //~| ERROR functions cannot be both `const` and `async`
     }
 }

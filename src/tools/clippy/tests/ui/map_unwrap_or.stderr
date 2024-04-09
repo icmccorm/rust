@@ -1,5 +1,5 @@
-error: called `map(<f>).unwrap_or(<a>)` on an `Option` value. This can be done more directly by calling `map_or(<a>, <f>)` instead
-  --> $DIR/map_unwrap_or.rs:17:13
+error: called `map(<f>).unwrap_or(<a>)` on an `Option` value
+  --> tests/ui/map_unwrap_or.rs:17:13
    |
 LL |       let _ = opt.map(|x| x + 1)
    |  _____________^
@@ -15,8 +15,8 @@ LL -     let _ = opt.map(|x| x + 1)
 LL +     let _ = opt.map_or(0, |x| x + 1);
    |
 
-error: called `map(<f>).unwrap_or(<a>)` on an `Option` value. This can be done more directly by calling `map_or(<a>, <f>)` instead
-  --> $DIR/map_unwrap_or.rs:21:13
+error: called `map(<f>).unwrap_or(<a>)` on an `Option` value
+  --> tests/ui/map_unwrap_or.rs:21:13
    |
 LL |       let _ = opt.map(|x| {
    |  _____________^
@@ -33,8 +33,8 @@ LL |     }
 LL ~     );
    |
 
-error: called `map(<f>).unwrap_or(<a>)` on an `Option` value. This can be done more directly by calling `map_or(<a>, <f>)` instead
-  --> $DIR/map_unwrap_or.rs:25:13
+error: called `map(<f>).unwrap_or(<a>)` on an `Option` value
+  --> tests/ui/map_unwrap_or.rs:25:13
    |
 LL |       let _ = opt.map(|x| x + 1)
    |  _____________^
@@ -50,8 +50,8 @@ LL +             0
 LL ~         }, |x| x + 1);
    |
 
-error: called `map(<f>).unwrap_or(None)` on an `Option` value. This can be done more directly by calling `and_then(<f>)` instead
-  --> $DIR/map_unwrap_or.rs:30:13
+error: called `map(<f>).unwrap_or(None)` on an `Option` value
+  --> tests/ui/map_unwrap_or.rs:30:13
    |
 LL |     let _ = opt.map(|x| Some(x + 1)).unwrap_or(None);
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -62,8 +62,8 @@ LL -     let _ = opt.map(|x| Some(x + 1)).unwrap_or(None);
 LL +     let _ = opt.and_then(|x| Some(x + 1));
    |
 
-error: called `map(<f>).unwrap_or(None)` on an `Option` value. This can be done more directly by calling `and_then(<f>)` instead
-  --> $DIR/map_unwrap_or.rs:32:13
+error: called `map(<f>).unwrap_or(None)` on an `Option` value
+  --> tests/ui/map_unwrap_or.rs:32:13
    |
 LL |       let _ = opt.map(|x| {
    |  _____________^
@@ -80,8 +80,8 @@ LL |     }
 LL ~     );
    |
 
-error: called `map(<f>).unwrap_or(None)` on an `Option` value. This can be done more directly by calling `and_then(<f>)` instead
-  --> $DIR/map_unwrap_or.rs:36:13
+error: called `map(<f>).unwrap_or(None)` on an `Option` value
+  --> tests/ui/map_unwrap_or.rs:36:13
    |
 LL |       let _ = opt
    |  _____________^
@@ -95,8 +95,8 @@ LL -         .map(|x| Some(x + 1))
 LL +         .and_then(|x| Some(x + 1));
    |
 
-error: called `map(<f>).unwrap_or(<a>)` on an `Option` value. This can be done more directly by calling `map_or(<a>, <f>)` instead
-  --> $DIR/map_unwrap_or.rs:47:13
+error: called `map(<f>).unwrap_or(<a>)` on an `Option` value
+  --> tests/ui/map_unwrap_or.rs:47:13
    |
 LL |     let _ = Some("prefix").map(|p| format!("{}.", p)).unwrap_or(id);
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -107,8 +107,8 @@ LL -     let _ = Some("prefix").map(|p| format!("{}.", p)).unwrap_or(id);
 LL +     let _ = Some("prefix").map_or(id, |p| format!("{}.", p));
    |
 
-error: called `map(<f>).unwrap_or_else(<g>)` on an `Option` value. This can be done more directly by calling `map_or_else(<g>, <f>)` instead
-  --> $DIR/map_unwrap_or.rs:51:13
+error: called `map(<f>).unwrap_or_else(<g>)` on an `Option` value
+  --> tests/ui/map_unwrap_or.rs:51:13
    |
 LL |       let _ = opt.map(|x| {
    |  _____________^
@@ -117,8 +117,8 @@ LL | |     }
 LL | |     ).unwrap_or_else(|| 0);
    | |__________________________^
 
-error: called `map(<f>).unwrap_or_else(<g>)` on an `Option` value. This can be done more directly by calling `map_or_else(<g>, <f>)` instead
-  --> $DIR/map_unwrap_or.rs:55:13
+error: called `map(<f>).unwrap_or_else(<g>)` on an `Option` value
+  --> tests/ui/map_unwrap_or.rs:55:13
    |
 LL |       let _ = opt.map(|x| x + 1)
    |  _____________^
@@ -127,8 +127,8 @@ LL | |             0
 LL | |         );
    | |_________^
 
-error: called `map(<f>).unwrap_or(false)` on an `Option` value. This can be done more directly by calling `is_some_and(<f>)` instead
-  --> $DIR/map_unwrap_or.rs:61:13
+error: called `map(<f>).unwrap_or(false)` on an `Option` value
+  --> tests/ui/map_unwrap_or.rs:61:13
    |
 LL |     let _ = opt.map(|x| x > 5).unwrap_or(false);
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -139,8 +139,8 @@ LL -     let _ = opt.map(|x| x > 5).unwrap_or(false);
 LL +     let _ = opt.is_some_and(|x| x > 5);
    |
 
-error: called `map(<f>).unwrap_or_else(<g>)` on a `Result` value. This can be done more directly by calling `.map_or_else(<g>, <f>)` instead
-  --> $DIR/map_unwrap_or.rs:71:13
+error: called `map(<f>).unwrap_or_else(<g>)` on a `Result` value
+  --> tests/ui/map_unwrap_or.rs:71:13
    |
 LL |       let _ = res.map(|x| {
    |  _____________^
@@ -149,8 +149,8 @@ LL | |     }
 LL | |     ).unwrap_or_else(|_e| 0);
    | |____________________________^
 
-error: called `map(<f>).unwrap_or_else(<g>)` on a `Result` value. This can be done more directly by calling `.map_or_else(<g>, <f>)` instead
-  --> $DIR/map_unwrap_or.rs:75:13
+error: called `map(<f>).unwrap_or_else(<g>)` on a `Result` value
+  --> tests/ui/map_unwrap_or.rs:75:13
    |
 LL |       let _ = res.map(|x| x + 1)
    |  _____________^
@@ -159,14 +159,14 @@ LL | |             0
 LL | |         });
    | |__________^
 
-error: called `map(<f>).unwrap_or_else(<g>)` on a `Result` value. This can be done more directly by calling `.map_or_else(<g>, <f>)` instead
-  --> $DIR/map_unwrap_or.rs:99:13
+error: called `map(<f>).unwrap_or_else(<g>)` on a `Result` value
+  --> tests/ui/map_unwrap_or.rs:99:13
    |
 LL |     let _ = res.map(|x| x + 1).unwrap_or_else(|_e| 0);
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `res.map_or_else(|_e| 0, |x| x + 1)`
 
-error: called `map(<f>).unwrap_or(<a>)` on an `Option` value. This can be done more directly by calling `map_or(<a>, <f>)` instead
-  --> $DIR/map_unwrap_or.rs:106:13
+error: called `map(<f>).unwrap_or(<a>)` on an `Option` value
+  --> tests/ui/map_unwrap_or.rs:106:13
    |
 LL |     let _ = opt.map(|x| x > 5).unwrap_or(false);
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -177,8 +177,8 @@ LL -     let _ = opt.map(|x| x > 5).unwrap_or(false);
 LL +     let _ = opt.map_or(false, |x| x > 5);
    |
 
-error: called `map(<f>).unwrap_or(false)` on an `Option` value. This can be done more directly by calling `is_some_and(<f>)` instead
-  --> $DIR/map_unwrap_or.rs:113:13
+error: called `map(<f>).unwrap_or(false)` on an `Option` value
+  --> tests/ui/map_unwrap_or.rs:113:13
    |
 LL |     let _ = opt.map(|x| x > 5).unwrap_or(false);
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

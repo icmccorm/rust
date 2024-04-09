@@ -1,10 +1,9 @@
-use hir::{AsAssocItem, Impl, Semantics};
+use hir::{AsAssocItem, DescendPreference, Impl, Semantics};
 use ide_db::{
     defs::{Definition, NameClass, NameRefClass},
     helpers::pick_best_token,
     RootDatabase,
 };
-use itertools::Itertools;
 use syntax::{ast, AstNode, SyntaxKind::*, T};
 
 use crate::{FilePosition, NavigationTarget, RangeInfo, TryToNav};
@@ -34,10 +33,10 @@ pub(crate) fn goto_implementation(
     })?;
     let range = original_token.text_range();
     let navs =
-        sema.descend_into_macros(original_token, offset)
-            .into_iter()
-            .filter_map(|token| token.parent().and_then(ast::NameLike::cast))
-            .filter_map(|node| match &node {
+        sema.descend_into_macros_single(DescendPreference::SameText, original_token)
+            .parent()
+            .and_then(ast::NameLike::cast)
+            .and_then(|node| match &node {
                 ast::NameLike::Name(name) => {
                     NameClass::classify(&sema, name).and_then(|class| match class {
                         NameClass::Definition(it) | NameClass::ConstReference(it) => Some(it),
@@ -52,8 +51,7 @@ pub(crate) fn goto_implementation(
                     }),
                 ast::NameLike::Lifetime(_) => None,
             })
-            .unique()
-            .filter_map(|def| {
+            .and_then(|def| {
                 let navs = match def {
                     Definition::Trait(trait_) => impls_for_trait(&sema, trait_),
                     Definition::Adt(adt) => impls_for_ty(&sema, adt.ty(sema.db)),
@@ -62,27 +60,30 @@ pub(crate) fn goto_implementation(
                     Definition::Function(f) => {
                         let assoc = f.as_assoc_item(sema.db)?;
                         let name = assoc.name(sema.db)?;
-                        let trait_ = assoc.containing_trait_or_trait_impl(sema.db)?;
+                        let trait_ = assoc.container_or_implemented_trait(sema.db)?;
                         impls_for_trait_item(&sema, trait_, name)
                     }
                     Definition::Const(c) => {
                         let assoc = c.as_assoc_item(sema.db)?;
                         let name = assoc.name(sema.db)?;
-                        let trait_ = assoc.containing_trait_or_trait_impl(sema.db)?;
+                        let trait_ = assoc.container_or_implemented_trait(sema.db)?;
                         impls_for_trait_item(&sema, trait_, name)
                     }
                     _ => return None,
                 };
                 Some(navs)
             })
-            .flatten()
-            .collect();
+            .unwrap_or_default();
 
     Some(RangeInfo { range, info: navs })
 }
 
 fn impls_for_ty(sema: &Semantics<'_, RootDatabase>, ty: hir::Type) -> Vec<NavigationTarget> {
-    Impl::all_for_type(sema.db, ty).into_iter().filter_map(|imp| imp.try_to_nav(sema.db)).collect()
+    Impl::all_for_type(sema.db, ty)
+        .into_iter()
+        .filter_map(|imp| imp.try_to_nav(sema.db))
+        .flatten()
+        .collect()
 }
 
 fn impls_for_trait(
@@ -92,6 +93,7 @@ fn impls_for_trait(
     Impl::all_for_trait(sema.db, trait_)
         .into_iter()
         .filter_map(|imp| imp.try_to_nav(sema.db))
+        .flatten()
         .collect()
 }
 
@@ -109,6 +111,7 @@ fn impls_for_trait_item(
             })?;
             item.try_to_nav(sema.db)
         })
+        .flatten()
         .collect()
 }
 
@@ -249,7 +252,7 @@ impl T for &Foo {}
             r#"
 //- minicore: copy, derive
   #[derive(Copy)]
-//^^^^^^^^^^^^^^^
+         //^^^^
 struct Foo$0;
 "#,
         );
@@ -333,6 +336,77 @@ struct S;
 impl Tr for S {
     const C: usize = 4;
         //^
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn goto_adt_implementation_inside_block() {
+        check(
+            r#"
+//- minicore: copy, derive
+trait Bar {}
+
+fn test() {
+    #[derive(Copy)]
+  //^^^^^^^^^^^^^^^
+    struct Foo$0;
+
+    impl Foo {}
+       //^^^
+
+    trait Baz {}
+
+    impl Bar for Foo {}
+               //^^^
+
+    impl Baz for Foo {}
+               //^^^
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn goto_trait_implementation_inside_block() {
+        check(
+            r#"
+struct Bar;
+
+fn test() {
+    trait Foo$0 {}
+
+    struct Baz;
+
+    impl Foo for Bar {}
+               //^^^
+
+    impl Foo for Baz {}
+               //^^^
+}
+"#,
+        );
+        check(
+            r#"
+struct Bar;
+
+fn test() {
+    trait Foo {
+        fn foo$0() {}
+    }
+
+    struct Baz;
+
+    impl Foo for Bar {
+        fn foo() {}
+         //^^^
+    }
+
+    impl Foo for Baz {
+        fn foo() {}
+         //^^^
+    }
 }
 "#,
         );

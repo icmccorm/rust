@@ -20,13 +20,27 @@ impl<'tcx> super::QueryTypeOp<'tcx> for ProvePredicate<'tcx> {
         // such cases.
         if let ty::PredicateKind::Clause(ty::ClauseKind::Trait(trait_ref)) =
             key.value.predicate.kind().skip_binder()
+            && let Some(sized_def_id) = tcx.lang_items().sized_trait()
+            && trait_ref.def_id() == sized_def_id
+            && trait_ref.self_ty().is_trivially_sized(tcx)
         {
-            if let Some(sized_def_id) = tcx.lang_items().sized_trait() {
-                if trait_ref.def_id() == sized_def_id {
-                    if trait_ref.self_ty().is_trivially_sized(tcx) {
-                        return Some(());
-                    }
+            return Some(());
+        }
+
+        if let ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(arg)) =
+            key.value.predicate.kind().skip_binder()
+        {
+            match arg.as_type()?.kind() {
+                ty::Param(_)
+                | ty::Bool
+                | ty::Char
+                | ty::Int(_)
+                | ty::Float(_)
+                | ty::Str
+                | ty::Uint(_) => {
+                    return Some(());
                 }
+                _ => {}
             }
         }
 
@@ -40,7 +54,7 @@ impl<'tcx> super::QueryTypeOp<'tcx> for ProvePredicate<'tcx> {
         tcx.type_op_prove_predicate(canonicalized)
     }
 
-    fn perform_locally_in_new_solver(
+    fn perform_locally_with_next_solver(
         ocx: &ObligationCtxt<'_, 'tcx>,
         key: ParamEnvAnd<'tcx, Self>,
     ) -> Result<Self::QueryResponse, NoSolution> {

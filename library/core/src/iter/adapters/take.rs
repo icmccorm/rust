@@ -1,8 +1,9 @@
 use crate::cmp;
 use crate::iter::{
-    adapters::SourceIter, FusedIterator, InPlaceIterable, TrustedLen, TrustedRandomAccess,
+    adapters::SourceIter, FusedIterator, InPlaceIterable, TrustedFused, TrustedLen,
+    TrustedRandomAccess,
 };
-use crate::num::NonZeroUsize;
+use crate::num::NonZero;
 use crate::ops::{ControlFlow, Try};
 
 /// An iterator that only iterates over the first `n` iterations of `iter`.
@@ -116,7 +117,7 @@ where
 
     #[inline]
     #[rustc_inherit_overflow_checks]
-    fn advance_by(&mut self, n: usize) -> Result<(), NonZeroUsize> {
+    fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
         let min = self.n.min(n);
         let rem = match self.iter.advance_by(min) {
             Ok(()) => 0,
@@ -124,7 +125,7 @@ where
         };
         let advanced = min - rem;
         self.n -= advanced;
-        NonZeroUsize::new(n - advanced).map_or(Ok(()), Err)
+        NonZero::new(n - advanced).map_or(Ok(()), Err)
     }
 }
 
@@ -143,7 +144,10 @@ where
 }
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<I: InPlaceIterable> InPlaceIterable for Take<I> {}
+unsafe impl<I: InPlaceIterable> InPlaceIterable for Take<I> {
+    const EXPAND_BY: Option<NonZero<usize>> = I::EXPAND_BY;
+    const MERGE_BY: Option<NonZero<usize>> = I::MERGE_BY;
+}
 
 #[stable(feature = "double_ended_take_iterator", since = "1.38.0")]
 impl<I> DoubleEndedIterator for Take<I>
@@ -215,7 +219,7 @@ where
 
     #[inline]
     #[rustc_inherit_overflow_checks]
-    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZeroUsize> {
+    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
         // The amount by which the inner iterator needs to be shortened for it to be
         // at most as long as the take() amount.
         let trim_inner = self.iter.len().saturating_sub(self.n);
@@ -231,7 +235,7 @@ where
         let advanced_by_inner = advance_by - remainder;
         let advanced_by = advanced_by_inner - trim_inner;
         self.n -= advanced_by;
-        NonZeroUsize::new(n - advanced_by).map_or(Ok(()), Err)
+        NonZero::new(n - advanced_by).map_or(Ok(()), Err)
     }
 }
 
@@ -240,6 +244,9 @@ impl<I> ExactSizeIterator for Take<I> where I: ExactSizeIterator {}
 
 #[stable(feature = "fused", since = "1.26.0")]
 impl<I> FusedIterator for Take<I> where I: FusedIterator {}
+
+#[unstable(issue = "none", feature = "trusted_fused")]
+unsafe impl<I: TrustedFused> TrustedFused for Take<I> {}
 
 #[unstable(feature = "trusted_len", issue = "37572")]
 unsafe impl<I: TrustedLen> TrustedLen for Take<I> {}

@@ -1,8 +1,6 @@
-// run-pass
+//@ run-pass
 
 #![feature(lang_items, unboxed_closures, fn_traits)]
-
-use std::ops::{Fn, FnMut, FnOnce};
 
 struct S1 {
     x: i32,

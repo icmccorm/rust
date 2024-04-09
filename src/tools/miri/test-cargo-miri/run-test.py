@@ -31,11 +31,11 @@ def cargo_miri(cmd, quiet = True):
 
 def normalize_stdout(str):
     str = str.replace("src\\", "src/") # normalize paths across platforms
-    str = re.sub("finished in \d+\.\d\ds", "finished in $TIME", str) # the time keeps changing, obviously
+    str = re.sub("finished in \\d+\\.\\d\\ds", "finished in $TIME", str) # the time keeps changing, obviously
     return str
 
 def normalize_stderr(str):
-    str = re.sub("Preparing a sysroot for Miri \(target: [a-z0-9_-]+\)\.\.\. done\n", "", str) # remove leading cargo-miri setup output
+    str = re.sub("Preparing a sysroot for Miri \\(target: [a-z0-9_-]+\\)\\.\\.\\. done\n", "", str) # remove leading cargo-miri setup output
     return str
 
 def check_output(actual, path, name):
@@ -181,7 +181,7 @@ def test_cargo_miri_test():
     )
     del os.environ["CARGO_TARGET_DIR"] # this overrides `build.target-dir` passed by `--config`, so unset it
     test("`cargo miri test` (config-cli)",
-        cargo_miri("test") + ["--config=build.target-dir=\"config-cli\"", "-Zunstable-options"],
+        cargo_miri("test") + ["--config=build.target-dir=\"config-cli\""],
         default_ref, "test.stderr-empty.ref",
         env={'MIRIFLAGS': "-Zmiri-permissive-provenance"},
     )

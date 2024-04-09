@@ -1,39 +1,45 @@
 //
-// revisions: verbose normal
+//@ revisions: verbose normal
 //
-//[verbose] compile-flags: -Z verbose
+//@[verbose] compile-flags: -Z verbose-internals
 
-trait Foo<'b, 'c, S=u32> {
-    fn bar<'a, T>() where T: 'a {}
+trait Foo<'b, 'c, S = u32> {
+    fn bar<'a, T>()
+    where
+        T: 'a,
+    {
+    }
     fn baz() {}
 }
 
-impl<'a,'b,T,S> Foo<'a, 'b, S> for T {}
+impl<'a, 'b, T, S> Foo<'a, 'b, S> for T {}
 
 fn main() {}
 
-fn foo<'z>() where &'z (): Sized {
-    let x: () = <i8 as Foo<'static, 'static,  u8>>::bar::<'static, char>;
+fn foo<'z>()
+where
+    &'z (): Sized,
+{
+    let x: () = <i8 as Foo<'static, 'static, u8>>::bar::<'static, char>;
     //[verbose]~^ ERROR mismatched types
     //[verbose]~| expected unit type `()`
-    //[verbose]~| found fn item `fn() {<i8 as Foo<ReStatic, ReStatic, u8>>::bar::<ReStatic, char>}`
+    //[verbose]~| found fn item `fn() {<i8 as Foo<'static, 'static, u8>>::bar::<'static, char>}`
     //[normal]~^^^^ ERROR mismatched types
     //[normal]~| expected unit type `()`
     //[normal]~| found fn item `fn() {<i8 as Foo<'static, 'static, u8>>::bar::<'static, char>}`
 
-
-    let x: () = <i8 as Foo<'static, 'static,  u32>>::bar::<'static, char>;
+    let x: () = <i8 as Foo<'static, 'static, u32>>::bar::<'static, char>;
     //[verbose]~^ ERROR mismatched types
     //[verbose]~| expected unit type `()`
-    //[verbose]~| found fn item `fn() {<i8 as Foo<ReStatic, ReStatic>>::bar::<ReStatic, char>}`
+    //[verbose]~| found fn item `fn() {<i8 as Foo<'static, 'static>>::bar::<'static, char>}`
     //[normal]~^^^^ ERROR mismatched types
     //[normal]~| expected unit type `()`
     //[normal]~| found fn item `fn() {<i8 as Foo<'static, 'static>>::bar::<'static, char>}`
 
-    let x: () = <i8 as Foo<'static, 'static,  u8>>::baz;
+    let x: () = <i8 as Foo<'static, 'static, u8>>::baz;
     //[verbose]~^ ERROR mismatched types
     //[verbose]~| expected unit type `()`
-    //[verbose]~| found fn item `fn() {<i8 as Foo<ReStatic, ReStatic, u8>>::baz}`
+    //[verbose]~| found fn item `fn() {<i8 as Foo<'static, 'static, u8>>::baz}`
     //[normal]~^^^^ ERROR mismatched types
     //[normal]~| expected unit type `()`
     //[normal]~| found fn item `fn() {<i8 as Foo<'static, 'static, u8>>::baz}`
@@ -41,12 +47,12 @@ fn foo<'z>() where &'z (): Sized {
     let x: () = foo::<'static>;
     //[verbose]~^ ERROR mismatched types
     //[verbose]~| expected unit type `()`
-    //[verbose]~| found fn item `fn() {foo::<ReStatic>}`
+    //[verbose]~| found fn item `fn() {foo::<'static>}`
     //[normal]~^^^^ ERROR mismatched types
     //[normal]~| expected unit type `()`
     //[normal]~| found fn item `fn() {foo::<'static>}`
 
     <str as Foo<u8>>::bar;
-    //[verbose]~^ ERROR the size for values of type
-    //[normal]~^^ ERROR the size for values of type
+    //[verbose]~^ ERROR the trait bound `str: Foo<'?0, '?1, u8>` is not satisfied
+    //[normal]~^^ ERROR the trait bound `str: Foo<'_, '_, u8>` is not satisfied
 }

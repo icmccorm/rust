@@ -49,7 +49,7 @@ impl<'tcx> TyCtxt<'tcx> {
         let value = self.erase_regions(value);
         debug!(?value);
 
-        if !value.has_projections() {
+        if !value.has_aliases() {
             value
         } else {
             value.fold_with(&mut NormalizeAfterErasingRegionsFolder { tcx: self, param_env })
@@ -81,7 +81,7 @@ impl<'tcx> TyCtxt<'tcx> {
         let value = self.erase_regions(value);
         debug!(?value);
 
-        if !value.has_projections() {
+        if !value.has_aliases() {
             Ok(value)
         } else {
             let mut folder = TryNormalizeAfterErasingRegionsFolder::new(self, param_env);
@@ -97,6 +97,10 @@ impl<'tcx> TyCtxt<'tcx> {
     /// N.B., currently, higher-ranked type bounds inhibit
     /// normalization. Therefore, each time we erase them in
     /// codegen, we need to normalize the contents.
+    // FIXME(@lcnr): This method should not be necessary, we now normalize
+    // inside of binders. We should be able to only use
+    // `tcx.instantiate_bound_regions_with_erased`. Same for the `try_X`
+    // variant.
     #[tracing::instrument(level = "debug", skip(self, param_env))]
     pub fn normalize_erasing_late_bound_regions<T>(
         self,
@@ -106,7 +110,7 @@ impl<'tcx> TyCtxt<'tcx> {
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        let value = self.erase_late_bound_regions(value);
+        let value = self.instantiate_bound_regions_with_erased(value);
         self.normalize_erasing_regions(param_env, value)
     }
 
@@ -126,12 +130,12 @@ impl<'tcx> TyCtxt<'tcx> {
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        let value = self.erase_late_bound_regions(value);
+        let value = self.instantiate_bound_regions_with_erased(value);
         self.try_normalize_erasing_regions(param_env, value)
     }
 
     /// Monomorphizes a type from the AST by first applying the
-    /// in-scope substitutions and then normalizing any associated
+    /// in-scope instantiations and then normalizing any associated
     /// types.
     /// Panics if normalization fails. In case normalization might fail
     /// use `try_instantiate_and_normalize_erasing_regions` instead.
@@ -145,12 +149,12 @@ impl<'tcx> TyCtxt<'tcx> {
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        let substituted = value.instantiate(self, param_args);
-        self.normalize_erasing_regions(param_env, substituted)
+        let instantiated = value.instantiate(self, param_args);
+        self.normalize_erasing_regions(param_env, instantiated)
     }
 
     /// Monomorphizes a type from the AST by first applying the
-    /// in-scope substitutions and then trying to normalize any associated
+    /// in-scope instantiations and then trying to normalize any associated
     /// types. Contrary to `instantiate_and_normalize_erasing_regions` this does
     /// not assume that normalization succeeds.
     #[instrument(level = "debug", skip(self))]
@@ -163,8 +167,8 @@ impl<'tcx> TyCtxt<'tcx> {
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        let substituted = value.instantiate(self, param_args);
-        self.try_normalize_erasing_regions(param_env, substituted)
+        let instantiated = value.instantiate(self, param_args);
+        self.try_normalize_erasing_regions(param_env, instantiated)
     }
 }
 

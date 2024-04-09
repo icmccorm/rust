@@ -1,20 +1,30 @@
 use std::io::Read;
 use std::path::Path;
+use std::str::FromStr;
 
-use crate::common::{Config, Debugger};
+use crate::common::{Config, Debugger, Mode};
 use crate::header::{parse_normalization_string, EarlyProps, HeadersCache};
+
+use super::iter_header;
 
 fn make_test_description<R: Read>(
     config: &Config,
     name: test::TestName,
     path: &Path,
     src: R,
-    cfg: Option<&str>,
+    revision: Option<&str>,
 ) -> test::TestDesc {
     let cache = HeadersCache::load(config);
     let mut poisoned = false;
-    let test =
-        crate::header::make_test_description(config, &cache, name, path, src, cfg, &mut poisoned);
+    let test = crate::header::make_test_description(
+        config,
+        &cache,
+        name,
+        path,
+        src,
+        revision,
+        &mut poisoned,
+    );
     if poisoned {
         panic!("poisoned!");
     }
@@ -55,6 +65,7 @@ fn test_parse_normalization_string() {
 
 #[derive(Default)]
 struct ConfigBuilder {
+    mode: Option<String>,
     channel: Option<String>,
     host: Option<String>,
     target: Option<String>,
@@ -62,9 +73,15 @@ struct ConfigBuilder {
     llvm_version: Option<String>,
     git_hash: bool,
     system_llvm: bool,
+    profiler_support: bool,
 }
 
 impl ConfigBuilder {
+    fn mode(&mut self, s: &str) -> &mut Self {
+        self.mode = Some(s.to_owned());
+        self
+    }
+
     fn channel(&mut self, s: &str) -> &mut Self {
         self.channel = Some(s.to_owned());
         self
@@ -100,10 +117,16 @@ impl ConfigBuilder {
         self
     }
 
+    fn profiler_support(&mut self, s: bool) -> &mut Self {
+        self.profiler_support = s;
+        self
+    }
+
     fn build(&mut self) -> Config {
         let args = &[
             "compiletest",
-            "--mode=ui",
+            "--mode",
+            self.mode.as_deref().unwrap_or("ui"),
             "--suite=ui",
             "--compile-lib-path=",
             "--run-lib-path=",
@@ -126,6 +149,8 @@ impl ConfigBuilder {
             self.host.as_deref().unwrap_or("x86_64-unknown-linux-gnu"),
             "--target",
             self.target.as_deref().unwrap_or("x86_64-unknown-linux-gnu"),
+            "--git-repository=",
+            "--nightly-branch=",
         ];
         let mut args: Vec<String> = args.iter().map(ToString::to_string).collect();
 
@@ -139,6 +164,9 @@ impl ConfigBuilder {
         }
         if self.system_llvm {
             args.push("--system-llvm".to_owned());
+        }
+        if self.profiler_support {
+            args.push("--profiler-support".to_owned());
         }
 
         args.push("--rustc-path".to_string());
@@ -191,7 +219,7 @@ fn should_fail() {
 
     let d = make_test_description(&config, tn.clone(), p, std::io::Cursor::new(""), None);
     assert_eq!(d.should_panic, test::ShouldPanic::No);
-    let d = make_test_description(&config, tn, p, std::io::Cursor::new("// should-fail"), None);
+    let d = make_test_description(&config, tn, p, std::io::Cursor::new("//@ should-fail"), None);
     assert_eq!(d.should_panic, test::ShouldPanic::Yes);
 }
 
@@ -199,7 +227,7 @@ fn should_fail() {
 fn revisions() {
     let config: Config = cfg().build();
 
-    assert_eq!(parse_rs(&config, "// revisions: a b c").revisions, vec!["a", "b", "c"],);
+    assert_eq!(parse_rs(&config, "//@ revisions: a b c").revisions, vec!["a", "b", "c"],);
     assert_eq!(
         parse_makefile(&config, "# revisions: hello there").revisions,
         vec!["hello", "there"],
@@ -214,8 +242,8 @@ fn aux_build() {
         parse_rs(
             &config,
             r"
-        // aux-build: a.rs
-        // aux-build: b.rs
+        //@ aux-build: a.rs
+        //@ aux-build: b.rs
         "
         )
         .aux,
@@ -224,118 +252,132 @@ fn aux_build() {
 }
 
 #[test]
-fn no_system_llvm() {
-    let config: Config = cfg().system_llvm(false).build();
-    assert!(!check_ignore(&config, "// no-system-llvm"));
+fn llvm_version() {
+    let config: Config = cfg().llvm_version("8.1.2").build();
+    assert!(check_ignore(&config, "//@ min-llvm-version: 9.0"));
 
-    let config: Config = cfg().system_llvm(true).build();
-    assert!(check_ignore(&config, "// no-system-llvm"));
+    let config: Config = cfg().llvm_version("9.0.1").build();
+    assert!(check_ignore(&config, "//@ min-llvm-version: 9.2"));
+
+    let config: Config = cfg().llvm_version("9.3.1").build();
+    assert!(!check_ignore(&config, "//@ min-llvm-version: 9.2"));
+
+    let config: Config = cfg().llvm_version("10.0.0").build();
+    assert!(!check_ignore(&config, "//@ min-llvm-version: 9.0"));
 }
 
 #[test]
-fn llvm_version() {
-    let config: Config = cfg().llvm_version("8.1.2").build();
-    assert!(check_ignore(&config, "// min-llvm-version: 9.0"));
+fn system_llvm_version() {
+    let config: Config = cfg().system_llvm(true).llvm_version("17.0.0").build();
+    assert!(check_ignore(&config, "//@ min-system-llvm-version: 18.0"));
 
-    let config: Config = cfg().llvm_version("9.0.1").build();
-    assert!(check_ignore(&config, "// min-llvm-version: 9.2"));
+    let config: Config = cfg().system_llvm(true).llvm_version("18.0.0").build();
+    assert!(!check_ignore(&config, "//@ min-system-llvm-version: 18.0"));
 
-    let config: Config = cfg().llvm_version("9.3.1").build();
-    assert!(!check_ignore(&config, "// min-llvm-version: 9.2"));
-
-    let config: Config = cfg().llvm_version("10.0.0").build();
-    assert!(!check_ignore(&config, "// min-llvm-version: 9.0"));
+    let config: Config = cfg().llvm_version("17.0.0").build();
+    assert!(!check_ignore(&config, "//@ min-system-llvm-version: 18.0"));
 }
 
 #[test]
 fn ignore_target() {
     let config: Config = cfg().target("x86_64-unknown-linux-gnu").build();
 
-    assert!(check_ignore(&config, "// ignore-x86_64-unknown-linux-gnu"));
-    assert!(check_ignore(&config, "// ignore-x86_64"));
-    assert!(check_ignore(&config, "// ignore-linux"));
-    assert!(check_ignore(&config, "// ignore-gnu"));
-    assert!(check_ignore(&config, "// ignore-64bit"));
+    assert!(check_ignore(&config, "//@ ignore-x86_64-unknown-linux-gnu"));
+    assert!(check_ignore(&config, "//@ ignore-x86_64"));
+    assert!(check_ignore(&config, "//@ ignore-linux"));
+    assert!(check_ignore(&config, "//@ ignore-unix"));
+    assert!(check_ignore(&config, "//@ ignore-gnu"));
+    assert!(check_ignore(&config, "//@ ignore-64bit"));
 
-    assert!(!check_ignore(&config, "// ignore-x86"));
-    assert!(!check_ignore(&config, "// ignore-windows"));
-    assert!(!check_ignore(&config, "// ignore-msvc"));
-    assert!(!check_ignore(&config, "// ignore-32bit"));
+    assert!(!check_ignore(&config, "//@ ignore-x86"));
+    assert!(!check_ignore(&config, "//@ ignore-windows"));
+    assert!(!check_ignore(&config, "//@ ignore-msvc"));
+    assert!(!check_ignore(&config, "//@ ignore-32bit"));
 }
 
 #[test]
 fn only_target() {
     let config: Config = cfg().target("x86_64-pc-windows-gnu").build();
 
-    assert!(check_ignore(&config, "// only-x86"));
-    assert!(check_ignore(&config, "// only-linux"));
-    assert!(check_ignore(&config, "// only-msvc"));
-    assert!(check_ignore(&config, "// only-32bit"));
+    assert!(check_ignore(&config, "//@ only-x86"));
+    assert!(check_ignore(&config, "//@ only-linux"));
+    assert!(check_ignore(&config, "//@ only-unix"));
+    assert!(check_ignore(&config, "//@ only-msvc"));
+    assert!(check_ignore(&config, "//@ only-32bit"));
 
-    assert!(!check_ignore(&config, "// only-x86_64-pc-windows-gnu"));
-    assert!(!check_ignore(&config, "// only-x86_64"));
-    assert!(!check_ignore(&config, "// only-windows"));
-    assert!(!check_ignore(&config, "// only-gnu"));
-    assert!(!check_ignore(&config, "// only-64bit"));
+    assert!(!check_ignore(&config, "//@ only-x86_64-pc-windows-gnu"));
+    assert!(!check_ignore(&config, "//@ only-x86_64"));
+    assert!(!check_ignore(&config, "//@ only-windows"));
+    assert!(!check_ignore(&config, "//@ only-gnu"));
+    assert!(!check_ignore(&config, "//@ only-64bit"));
 }
 
 #[test]
 fn stage() {
     let config: Config = cfg().stage_id("stage1-x86_64-unknown-linux-gnu").build();
 
-    assert!(check_ignore(&config, "// ignore-stage1"));
-    assert!(!check_ignore(&config, "// ignore-stage2"));
+    assert!(check_ignore(&config, "//@ ignore-stage1"));
+    assert!(!check_ignore(&config, "//@ ignore-stage2"));
 }
 
 #[test]
 fn cross_compile() {
     let config: Config = cfg().host("x86_64-apple-darwin").target("wasm32-unknown-unknown").build();
-    assert!(check_ignore(&config, "// ignore-cross-compile"));
+    assert!(check_ignore(&config, "//@ ignore-cross-compile"));
 
     let config: Config = cfg().host("x86_64-apple-darwin").target("x86_64-apple-darwin").build();
-    assert!(!check_ignore(&config, "// ignore-cross-compile"));
+    assert!(!check_ignore(&config, "//@ ignore-cross-compile"));
 }
 
 #[test]
 fn debugger() {
     let mut config = cfg().build();
     config.debugger = None;
-    assert!(!check_ignore(&config, "// ignore-cdb"));
+    assert!(!check_ignore(&config, "//@ ignore-cdb"));
 
     config.debugger = Some(Debugger::Cdb);
-    assert!(check_ignore(&config, "// ignore-cdb"));
+    assert!(check_ignore(&config, "//@ ignore-cdb"));
 
     config.debugger = Some(Debugger::Gdb);
-    assert!(check_ignore(&config, "// ignore-gdb"));
+    assert!(check_ignore(&config, "//@ ignore-gdb"));
 
     config.debugger = Some(Debugger::Lldb);
-    assert!(check_ignore(&config, "// ignore-lldb"));
+    assert!(check_ignore(&config, "//@ ignore-lldb"));
 }
 
 #[test]
 fn git_hash() {
     let config: Config = cfg().git_hash(false).build();
-    assert!(check_ignore(&config, "// needs-git-hash"));
+    assert!(check_ignore(&config, "//@ needs-git-hash"));
 
     let config: Config = cfg().git_hash(true).build();
-    assert!(!check_ignore(&config, "// needs-git-hash"));
+    assert!(!check_ignore(&config, "//@ needs-git-hash"));
 }
 
 #[test]
 fn sanitizers() {
     // Target that supports all sanitizers:
     let config: Config = cfg().target("x86_64-unknown-linux-gnu").build();
-    assert!(!check_ignore(&config, "// needs-sanitizer-address"));
-    assert!(!check_ignore(&config, "// needs-sanitizer-leak"));
-    assert!(!check_ignore(&config, "// needs-sanitizer-memory"));
-    assert!(!check_ignore(&config, "// needs-sanitizer-thread"));
+    assert!(!check_ignore(&config, "//@ needs-sanitizer-address"));
+    assert!(!check_ignore(&config, "//@ needs-sanitizer-leak"));
+    assert!(!check_ignore(&config, "//@ needs-sanitizer-memory"));
+    assert!(!check_ignore(&config, "//@ needs-sanitizer-thread"));
 
     // Target that doesn't support sanitizers:
     let config: Config = cfg().target("wasm32-unknown-emscripten").build();
-    assert!(check_ignore(&config, "// needs-sanitizer-address"));
-    assert!(check_ignore(&config, "// needs-sanitizer-leak"));
-    assert!(check_ignore(&config, "// needs-sanitizer-memory"));
-    assert!(check_ignore(&config, "// needs-sanitizer-thread"));
+    assert!(check_ignore(&config, "//@ needs-sanitizer-address"));
+    assert!(check_ignore(&config, "//@ needs-sanitizer-leak"));
+    assert!(check_ignore(&config, "//@ needs-sanitizer-memory"));
+    assert!(check_ignore(&config, "//@ needs-sanitizer-thread"));
+}
+
+#[test]
+fn profiler_support() {
+    let config: Config = cfg().profiler_support(false).build();
+    assert!(check_ignore(&config, "//@ needs-profiler-support"));
+
+    let config: Config = cfg().profiler_support(true).build();
+    assert!(!check_ignore(&config, "//@ needs-profiler-support"));
 }
 
 #[test]
@@ -351,7 +393,7 @@ fn asm_support() {
     for (target, has_asm) in asms {
         let config = cfg().target(target).build();
         assert_eq!(config.has_asm_support(), has_asm);
-        assert_eq!(check_ignore(&config, "// needs-asm-support"), !has_asm)
+        assert_eq!(check_ignore(&config, "//@ needs-asm-support"), !has_asm)
     }
 }
 
@@ -359,13 +401,13 @@ fn asm_support() {
 fn channel() {
     let config: Config = cfg().channel("beta").build();
 
-    assert!(check_ignore(&config, "// ignore-beta"));
-    assert!(check_ignore(&config, "// only-nightly"));
-    assert!(check_ignore(&config, "// only-stable"));
+    assert!(check_ignore(&config, "//@ ignore-beta"));
+    assert!(check_ignore(&config, "//@ only-nightly"));
+    assert!(check_ignore(&config, "//@ only-stable"));
 
-    assert!(!check_ignore(&config, "// only-beta"));
-    assert!(!check_ignore(&config, "// ignore-nightly"));
-    assert!(!check_ignore(&config, "// ignore-stable"));
+    assert!(!check_ignore(&config, "//@ only-beta"));
+    assert!(!check_ignore(&config, "//@ ignore-nightly"));
+    assert!(!check_ignore(&config, "//@ ignore-stable"));
 }
 
 #[test]
@@ -387,7 +429,7 @@ fn test_extract_version_range() {
 #[should_panic(expected = "Duplicate revision: `rpass1` in line ` rpass1 rpass1`")]
 fn test_duplicate_revisions() {
     let config: Config = cfg().build();
-    parse_rs(&config, "// revisions: rpass1 rpass1");
+    parse_rs(&config, "//@ revisions: rpass1 rpass1");
 }
 
 #[test]
@@ -396,14 +438,12 @@ fn ignore_arch() {
         ("x86_64-unknown-linux-gnu", "x86_64"),
         ("i686-unknown-linux-gnu", "x86"),
         ("nvptx64-nvidia-cuda", "nvptx64"),
-        ("asmjs-unknown-emscripten", "wasm32"),
-        ("asmjs-unknown-emscripten", "asmjs"),
         ("thumbv7m-none-eabi", "thumb"),
     ];
     for (target, arch) in archs {
         let config: Config = cfg().target(target).build();
         assert!(config.matches_arch(arch), "{target} {arch}");
-        assert!(check_ignore(&config, &format!("// ignore-{arch}")));
+        assert!(check_ignore(&config, &format!("//@ ignore-{arch}")));
     }
 }
 
@@ -418,7 +458,7 @@ fn matches_os() {
     for (target, os) in oss {
         let config = cfg().target(target).build();
         assert!(config.matches_os(os), "{target} {os}");
-        assert!(check_ignore(&config, &format!("// ignore-{os}")));
+        assert!(check_ignore(&config, &format!("//@ ignore-{os}")));
     }
 }
 
@@ -432,7 +472,7 @@ fn matches_env() {
     for (target, env) in envs {
         let config: Config = cfg().target(target).build();
         assert!(config.matches_env(env), "{target} {env}");
-        assert!(check_ignore(&config, &format!("// ignore-{env}")));
+        assert!(check_ignore(&config, &format!("//@ ignore-{env}")));
     }
 }
 
@@ -446,7 +486,7 @@ fn matches_abi() {
     for (target, abi) in abis {
         let config: Config = cfg().target(target).build();
         assert!(config.matches_abi(abi), "{target} {abi}");
-        assert!(check_ignore(&config, &format!("// ignore-{abi}")));
+        assert!(check_ignore(&config, &format!("//@ ignore-{abi}")));
     }
 }
 
@@ -462,7 +502,7 @@ fn is_big_endian() {
     for (target, is_big) in endians {
         let config = cfg().target(target).build();
         assert_eq!(config.is_big_endian(), is_big, "{target} {is_big}");
-        assert_eq!(check_ignore(&config, "// ignore-endian-big"), is_big);
+        assert_eq!(check_ignore(&config, "//@ ignore-endian-big"), is_big);
     }
 }
 
@@ -477,9 +517,9 @@ fn pointer_width() {
     for (target, width) in widths {
         let config: Config = cfg().target(target).build();
         assert_eq!(config.get_pointer_width(), width, "{target} {width}");
-        assert_eq!(check_ignore(&config, "// ignore-16bit"), width == 16);
-        assert_eq!(check_ignore(&config, "// ignore-32bit"), width == 32);
-        assert_eq!(check_ignore(&config, "// ignore-64bit"), width == 64);
+        assert_eq!(check_ignore(&config, "//@ ignore-16bit"), width == 16);
+        assert_eq!(check_ignore(&config, "//@ ignore-32bit"), width == 32);
+        assert_eq!(check_ignore(&config, "//@ ignore-64bit"), width == 64);
     }
 }
 
@@ -490,9 +530,6 @@ fn wasm_special() {
         ("wasm32-unknown-unknown", "wasm32", true),
         ("wasm32-unknown-unknown", "wasm32-bare", true),
         ("wasm32-unknown-unknown", "wasm64", false),
-        ("asmjs-unknown-emscripten", "emscripten", true),
-        ("asmjs-unknown-emscripten", "wasm32", true),
-        ("asmjs-unknown-emscripten", "wasm32-bare", false),
         ("wasm32-unknown-emscripten", "emscripten", true),
         ("wasm32-unknown-emscripten", "wasm32", true),
         ("wasm32-unknown-emscripten", "wasm32-bare", false),
@@ -500,6 +537,10 @@ fn wasm_special() {
         ("wasm32-wasi", "wasm32", true),
         ("wasm32-wasi", "wasm32-bare", false),
         ("wasm32-wasi", "wasi", true),
+        ("wasm32-wasip1", "emscripten", false),
+        ("wasm32-wasip1", "wasm32", true),
+        ("wasm32-wasip1", "wasm32-bare", false),
+        ("wasm32-wasip1", "wasi", true),
         ("wasm64-unknown-unknown", "emscripten", false),
         ("wasm64-unknown-unknown", "wasm32", false),
         ("wasm64-unknown-unknown", "wasm32-bare", false),
@@ -508,7 +549,7 @@ fn wasm_special() {
     for (target, pattern, ignore) in ignores {
         let config: Config = cfg().target(target).build();
         assert_eq!(
-            check_ignore(&config, &format!("// ignore-{pattern}")),
+            check_ignore(&config, &format!("//@ ignore-{pattern}")),
             ignore,
             "{target} {pattern}"
         );
@@ -529,7 +570,100 @@ fn families() {
         assert!(config.matches_family(family));
         let other = if family == "windows" { "unix" } else { "windows" };
         assert!(!config.matches_family(other));
-        assert!(check_ignore(&config, &format!("// ignore-{family}")));
-        assert!(!check_ignore(&config, &format!("// ignore-{other}")));
+        assert!(check_ignore(&config, &format!("//@ ignore-{family}")));
+        assert!(!check_ignore(&config, &format!("//@ ignore-{other}")));
     }
+}
+
+#[test]
+fn ignore_mode() {
+    for &mode in Mode::STR_VARIANTS {
+        // Indicate profiler support so that "coverage-run" tests aren't skipped.
+        let config: Config = cfg().mode(mode).profiler_support(true).build();
+        let other = if mode == "coverage-run" { "coverage-map" } else { "coverage-run" };
+
+        assert_ne!(mode, other);
+        assert_eq!(config.mode, Mode::from_str(mode).unwrap());
+        assert_ne!(config.mode, Mode::from_str(other).unwrap());
+
+        assert!(check_ignore(&config, &format!("//@ ignore-mode-{mode}")));
+        assert!(!check_ignore(&config, &format!("//@ ignore-mode-{other}")));
+    }
+}
+
+#[test]
+fn threads_support() {
+    let threads = [
+        ("x86_64-unknown-linux-gnu", true),
+        ("aarch64-apple-darwin", true),
+        ("wasm32-unknown-unknown", false),
+        ("wasm64-unknown-unknown", false),
+        ("wasm32-wasip1", false),
+        ("wasm32-wasip1-threads", true),
+    ];
+    for (target, has_threads) in threads {
+        let config = cfg().target(target).build();
+        assert_eq!(config.has_threads(), has_threads);
+        assert_eq!(check_ignore(&config, "//@ needs-threads"), !has_threads)
+    }
+}
+
+fn run_path(poisoned: &mut bool, path: &Path, buf: &[u8]) {
+    let rdr = std::io::Cursor::new(&buf);
+    iter_header(Mode::Ui, "ui", poisoned, path, rdr, &mut |_| {});
+}
+
+#[test]
+fn test_unknown_directive_check() {
+    let mut poisoned = false;
+    run_path(
+        &mut poisoned,
+        Path::new("a.rs"),
+        include_bytes!("./test-auxillary/unknown_directive.rs"),
+    );
+    assert!(poisoned);
+}
+
+#[test]
+fn test_known_legacy_directive_check() {
+    let mut poisoned = false;
+    run_path(
+        &mut poisoned,
+        Path::new("a.rs"),
+        include_bytes!("./test-auxillary/known_legacy_directive.rs"),
+    );
+    assert!(poisoned);
+}
+
+#[test]
+fn test_known_directive_check_no_error() {
+    let mut poisoned = false;
+    run_path(
+        &mut poisoned,
+        Path::new("a.rs"),
+        include_bytes!("./test-auxillary/known_directive.rs"),
+    );
+    assert!(!poisoned);
+}
+
+#[test]
+fn test_error_annotation_no_error() {
+    let mut poisoned = false;
+    run_path(
+        &mut poisoned,
+        Path::new("a.rs"),
+        include_bytes!("./test-auxillary/error_annotation.rs"),
+    );
+    assert!(!poisoned);
+}
+
+#[test]
+fn test_non_rs_unknown_directive_not_checked() {
+    let mut poisoned = false;
+    run_path(
+        &mut poisoned,
+        Path::new("a.Makefile"),
+        include_bytes!("./test-auxillary/not_rs.Makefile"),
+    );
+    assert!(!poisoned);
 }

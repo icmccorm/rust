@@ -5,16 +5,14 @@ use super::*;
 
 use crate::errors::UnableToConstructConstantValue;
 use crate::infer::region_constraints::{Constraint, RegionConstraintData};
-use crate::infer::InferCtxt;
 use crate::traits::project::ProjectAndUnifyResult;
+
+use rustc_data_structures::fx::{FxIndexMap, FxIndexSet, IndexEntry};
+use rustc_data_structures::unord::UnordSet;
 use rustc_infer::infer::DefineOpaqueTypes;
 use rustc_middle::mir::interpret::ErrorHandled;
-use rustc_middle::ty::visit::TypeVisitableExt;
-use rustc_middle::ty::{ImplPolarity, Region, RegionVid};
+use rustc_middle::ty::{Region, RegionVid};
 
-use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexSet};
-
-use std::collections::hash_map::Entry;
 use std::collections::VecDeque;
 use std::iter;
 
@@ -27,8 +25,8 @@ pub enum RegionTarget<'tcx> {
 
 #[derive(Default, Debug, Clone)]
 pub struct RegionDeps<'tcx> {
-    larger: FxIndexSet<RegionTarget<'tcx>>,
-    smaller: FxIndexSet<RegionTarget<'tcx>>,
+    pub larger: FxIndexSet<RegionTarget<'tcx>>,
+    pub smaller: FxIndexSet<RegionTarget<'tcx>>,
 }
 
 pub enum AutoTraitResult<A> {
@@ -37,17 +35,10 @@ pub enum AutoTraitResult<A> {
     NegativeImpl,
 }
 
-#[allow(dead_code)]
-impl<A> AutoTraitResult<A> {
-    fn is_auto(&self) -> bool {
-        matches!(self, AutoTraitResult::PositiveImpl(_) | AutoTraitResult::NegativeImpl)
-    }
-}
-
 pub struct AutoTraitInfo<'cx> {
     pub full_user_env: ty::ParamEnv<'cx>,
     pub region_data: RegionConstraintData<'cx>,
-    pub vid_to_region: FxHashMap<ty::RegionVid, ty::Region<'cx>>,
+    pub vid_to_region: FxIndexMap<ty::RegionVid, ty::Region<'cx>>,
 }
 
 pub struct AutoTraitFinder<'tcx> {
@@ -90,19 +81,12 @@ impl<'tcx> AutoTraitFinder<'tcx> {
 
         let infcx = tcx.infer_ctxt().build();
         let mut selcx = SelectionContext::new(&infcx);
-        for polarity in [true, false] {
+        for polarity in [ty::PredicatePolarity::Positive, ty::PredicatePolarity::Negative] {
             let result = selcx.select(&Obligation::new(
                 tcx,
                 ObligationCause::dummy(),
                 orig_env,
-                ty::TraitPredicate {
-                    trait_ref,
-                    polarity: if polarity {
-                        ImplPolarity::Positive
-                    } else {
-                        ImplPolarity::Negative
-                    },
-                },
+                ty::TraitPredicate { trait_ref, polarity },
             ));
             if let Ok(Some(ImplSource::UserDefined(_))) = result {
                 debug!(
@@ -116,7 +100,7 @@ impl<'tcx> AutoTraitFinder<'tcx> {
         }
 
         let infcx = tcx.infer_ctxt().build();
-        let mut fresh_preds = FxHashSet::default();
+        let mut fresh_preds = FxIndexSet::default();
 
         // Due to the way projections are handled by SelectionContext, we need to run
         // evaluate_predicates twice: once on the original param env, and once on the result of
@@ -181,7 +165,7 @@ impl<'tcx> AutoTraitFinder<'tcx> {
         }
 
         let outlives_env = OutlivesEnvironment::new(full_env);
-        infcx.process_registered_region_obligations(&outlives_env);
+        let _ = infcx.process_registered_region_obligations(&outlives_env, |ty, _| Ok(ty));
 
         let region_data =
             infcx.inner.borrow_mut().unwrap_region_constraints().region_constraint_data().clone();
@@ -241,7 +225,7 @@ impl<'tcx> AutoTraitFinder<'tcx> {
         ty: Ty<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
         user_env: ty::ParamEnv<'tcx>,
-        fresh_preds: &mut FxHashSet<ty::Predicate<'tcx>>,
+        fresh_preds: &mut FxIndexSet<ty::Predicate<'tcx>>,
     ) -> Option<(ty::ParamEnv<'tcx>, ty::ParamEnv<'tcx>)> {
         let tcx = infcx.tcx;
 
@@ -252,15 +236,15 @@ impl<'tcx> AutoTraitFinder<'tcx> {
             fresh_preds.insert(self.clean_pred(infcx, predicate.as_predicate()));
         }
 
-        let mut select = SelectionContext::new(&infcx);
+        let mut select = SelectionContext::new(infcx);
 
-        let mut already_visited = FxHashSet::default();
+        let mut already_visited = UnordSet::new();
         let mut predicates = VecDeque::new();
         predicates.push_back(ty::Binder::dummy(ty::TraitPredicate {
             trait_ref: ty::TraitRef::new(infcx.tcx, trait_did, [ty]),
 
             // Auto traits are positive
-            polarity: ty::ImplPolarity::Positive,
+            polarity: ty::PredicatePolarity::Positive,
         }));
 
         let computed_preds = param_env.caller_bounds().iter().map(|c| c.as_predicate());
@@ -297,7 +281,7 @@ impl<'tcx> AutoTraitFinder<'tcx> {
                     }) = impl_source
                     {
                         // Blame 'tidy' for the weird bracket placement.
-                        if infcx.tcx.impl_polarity(*impl_def_id) == ty::ImplPolarity::Negative {
+                        if infcx.tcx.impl_polarity(*impl_def_id) != ty::ImplPolarity::Positive {
                             debug!(
                                 "evaluate_nested_obligations: found explicit negative impl\
                                         {:?}, bailing out",
@@ -410,11 +394,11 @@ impl<'tcx> AutoTraitFinder<'tcx> {
                         iter::zip(new_args.regions(), old_args.regions())
                     {
                         match (*new_region, *old_region) {
-                            // If both predicates have an `ReLateBound` (a HRTB) in the
+                            // If both predicates have an `ReBound` (a HRTB) in the
                             // same spot, we do nothing.
-                            (ty::ReLateBound(_, _), ty::ReLateBound(_, _)) => {}
+                            (ty::ReBound(_, _), ty::ReBound(_, _)) => {}
 
-                            (ty::ReLateBound(_, _), _) | (_, ty::ReVar(_)) => {
+                            (ty::ReBound(_, _), _) | (_, ty::ReVar(_)) => {
                                 // One of these is true:
                                 // The new predicate has a HRTB in a spot where the old
                                 // predicate does not (if they both had a HRTB, the previous
@@ -440,7 +424,7 @@ impl<'tcx> AutoTraitFinder<'tcx> {
                                 // `user_computed_preds`.
                                 return false;
                             }
-                            (_, ty::ReLateBound(_, _)) | (ty::ReVar(_), _) => {
+                            (_, ty::ReBound(_, _)) | (ty::ReVar(_), _) => {
                                 // This is the opposite situation as the previous arm.
                                 // One of these is true:
                                 //
@@ -475,11 +459,11 @@ impl<'tcx> AutoTraitFinder<'tcx> {
     fn map_vid_to_region<'cx>(
         &self,
         regions: &RegionConstraintData<'cx>,
-    ) -> FxHashMap<ty::RegionVid, ty::Region<'cx>> {
-        let mut vid_map: FxHashMap<RegionTarget<'cx>, RegionDeps<'cx>> = FxHashMap::default();
-        let mut finished_map = FxHashMap::default();
+    ) -> FxIndexMap<ty::RegionVid, ty::Region<'cx>> {
+        let mut vid_map = FxIndexMap::<RegionTarget<'cx>, RegionDeps<'cx>>::default();
+        let mut finished_map = FxIndexMap::default();
 
-        for constraint in regions.constraints.keys() {
+        for (constraint, _) in &regions.constraints {
             match constraint {
                 &Constraint::VarSubVar(r1, r2) => {
                     {
@@ -515,23 +499,23 @@ impl<'tcx> AutoTraitFinder<'tcx> {
         }
 
         while !vid_map.is_empty() {
-            let target = *vid_map.keys().next().expect("Keys somehow empty");
-            let deps = vid_map.remove(&target).expect("Entry somehow missing");
+            let target = *vid_map.keys().next().unwrap();
+            let deps = vid_map.swap_remove(&target).unwrap();
 
             for smaller in deps.smaller.iter() {
                 for larger in deps.larger.iter() {
                     match (smaller, larger) {
                         (&RegionTarget::Region(_), &RegionTarget::Region(_)) => {
-                            if let Entry::Occupied(v) = vid_map.entry(*smaller) {
+                            if let IndexEntry::Occupied(v) = vid_map.entry(*smaller) {
                                 let smaller_deps = v.into_mut();
                                 smaller_deps.larger.insert(*larger);
-                                smaller_deps.larger.remove(&target);
+                                smaller_deps.larger.swap_remove(&target);
                             }
 
-                            if let Entry::Occupied(v) = vid_map.entry(*larger) {
+                            if let IndexEntry::Occupied(v) = vid_map.entry(*larger) {
                                 let larger_deps = v.into_mut();
                                 larger_deps.smaller.insert(*smaller);
-                                larger_deps.smaller.remove(&target);
+                                larger_deps.smaller.swap_remove(&target);
                             }
                         }
                         (&RegionTarget::RegionVid(v1), &RegionTarget::Region(r1)) => {
@@ -541,22 +525,23 @@ impl<'tcx> AutoTraitFinder<'tcx> {
                             // Do nothing; we don't care about regions that are smaller than vids.
                         }
                         (&RegionTarget::RegionVid(_), &RegionTarget::RegionVid(_)) => {
-                            if let Entry::Occupied(v) = vid_map.entry(*smaller) {
+                            if let IndexEntry::Occupied(v) = vid_map.entry(*smaller) {
                                 let smaller_deps = v.into_mut();
                                 smaller_deps.larger.insert(*larger);
-                                smaller_deps.larger.remove(&target);
+                                smaller_deps.larger.swap_remove(&target);
                             }
 
-                            if let Entry::Occupied(v) = vid_map.entry(*larger) {
+                            if let IndexEntry::Occupied(v) = vid_map.entry(*larger) {
                                 let larger_deps = v.into_mut();
                                 larger_deps.smaller.insert(*smaller);
-                                larger_deps.smaller.remove(&target);
+                                larger_deps.smaller.swap_remove(&target);
                             }
                         }
                     }
                 }
             }
         }
+
         finished_map
     }
 
@@ -585,7 +570,7 @@ impl<'tcx> AutoTraitFinder<'tcx> {
         ty: Ty<'_>,
         nested: impl Iterator<Item = PredicateObligation<'tcx>>,
         computed_preds: &mut FxIndexSet<ty::Predicate<'tcx>>,
-        fresh_preds: &mut FxHashSet<ty::Predicate<'tcx>>,
+        fresh_preds: &mut FxIndexSet<ty::Predicate<'tcx>>,
         predicates: &mut VecDeque<ty::PolyTraitPredicate<'tcx>>,
         selcx: &mut SelectionContext<'_, 'tcx>,
     ) -> bool {
@@ -783,13 +768,13 @@ impl<'tcx> AutoTraitFinder<'tcx> {
                             match selcx.infcx.const_eval_resolve(
                                 obligation.param_env,
                                 unevaluated,
-                                Some(obligation.cause.span),
+                                obligation.cause.span,
                             ) {
                                 Ok(Some(valtree)) => Ok(ty::Const::new_value(selcx.tcx(),valtree, c.ty())),
                                 Ok(None) => {
                                     let tcx = self.tcx;
                                     let reported =
-                                        tcx.sess.emit_err(UnableToConstructConstantValue {
+                                        tcx.dcx().emit_err(UnableToConstructConstantValue {
                                             span: tcx.def_span(unevaluated.def),
                                             unevaluated: unevaluated,
                                         });
@@ -820,9 +805,9 @@ impl<'tcx> AutoTraitFinder<'tcx> {
                 // the `ParamEnv`.
                 ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(..))
                 | ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(..))
+                | ty::PredicateKind::NormalizesTo(..)
                 | ty::PredicateKind::AliasRelate(..)
                 | ty::PredicateKind::ObjectSafe(..)
-                | ty::PredicateKind::ClosureKind(..)
                 | ty::PredicateKind::Subtype(..)
                 // FIXME(generic_const_exprs): you can absolutely add this as a where clauses
                 | ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(..))

@@ -61,7 +61,7 @@ pub fn run_tests(env: &Environment) -> anyhow::Result<()> {
 
     let config_content = format!(
         r#"profile = "user"
-changelog-seen = 2
+change-id = 115898
 
 [build]
 rustc = "{rustc}"
@@ -84,6 +84,8 @@ llvm-config = "{llvm_config}"
         env.python_binary(),
         x_py.as_str(),
         "test",
+        "--build",
+        env.host_triple(),
         "--stage",
         "0",
         "tests/assembly",

@@ -1,9 +1,9 @@
-// revisions:x86-linux x86-darwin
+//@ revisions:x86-linux x86-darwin
 
-//[x86-linux] compile-flags: --target i686-unknown-linux-gnu
-//[x86-linux] needs-llvm-components: x86
-//[x86-darwin] compile-flags: --target i686-apple-darwin
-//[x86-darwin] needs-llvm-components: x86
+//@[x86-linux] compile-flags: --target i686-unknown-linux-gnu
+//@[x86-linux] needs-llvm-components: x86
+//@[x86-darwin] compile-flags: --target i686-apple-darwin
+//@[x86-darwin] needs-llvm-components: x86
 
 // Tests that aggregates containing vector types get their alignment increased to 16 on Darwin.
 
@@ -37,12 +37,12 @@ pub struct DoubleFoo {
 }
 
 extern "C" {
-    // x86-linux: declare void @f({{.*}}byval(%Foo) align 4{{.*}})
-    // x86-darwin: declare void @f({{.*}}byval(%Foo) align 16{{.*}})
+    // x86-linux: declare void @f({{.*}}byval([32 x i8]) align 4{{.*}})
+    // x86-darwin: declare void @f({{.*}}byval([32 x i8]) align 16{{.*}})
     fn f(foo: Foo);
 
-    // x86-linux: declare void @g({{.*}}byval(%DoubleFoo) align 4{{.*}})
-    // x86-darwin: declare void @g({{.*}}byval(%DoubleFoo) align 16{{.*}})
+    // x86-linux: declare void @g({{.*}}byval([64 x i8]) align 4{{.*}})
+    // x86-darwin: declare void @g({{.*}}byval([64 x i8]) align 16{{.*}})
     fn g(foo: DoubleFoo);
 }
 

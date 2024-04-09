@@ -644,7 +644,7 @@ fn issue_4953() {
         "#,
         expect![[r#"
             58..72 '{ Self(0i64) }': Foo
-            60..64 'Self': Foo(i64) -> Foo
+            60..64 'Self': extern "rust-call" Foo(i64) -> Foo
             60..70 'Self(0i64)': Foo
             65..69 '0i64': i64
         "#]],
@@ -658,7 +658,7 @@ fn issue_4953() {
         "#,
         expect![[r#"
             64..78 '{ Self(0i64) }': Foo<i64>
-            66..70 'Self': Foo<i64>(i64) -> Foo<i64>
+            66..70 'Self': extern "rust-call" Foo<i64>(i64) -> Foo<i64>
             66..76 'Self(0i64)': Foo<i64>
             71..75 '0i64': i64
         "#]],
@@ -858,11 +858,11 @@ fn main() {
             94..96 '{}': ()
             109..160 '{     ...10); }': ()
             119..120 's': S<i32>
-            123..124 'S': S<i32>() -> S<i32>
+            123..124 'S': extern "rust-call" S<i32>() -> S<i32>
             123..126 'S()': S<i32>
             132..133 's': S<i32>
             132..144 's.g(|_x| {})': ()
-            136..143 '|_x| {}': impl Fn(&i32)
+            136..143 '|_x| {}': impl FnOnce(&i32)
             137..139 '_x': &i32
             141..143 '{}': ()
             150..151 's': S<i32>
@@ -896,13 +896,13 @@ fn flush(&self) {
 "#,
         expect![[r#"
             123..127 'self': &Mutex<T>
-            150..152 '{}': MutexGuard<'_, T>
+            150..152 '{}': MutexGuard<'static, T>
             234..238 'self': &{unknown}
             240..290 '{     ...()); }': ()
             250..251 'w': &Mutex<BufWriter>
             276..287 '*(w.lock())': BufWriter
             278..279 'w': &Mutex<BufWriter>
-            278..286 'w.lock()': MutexGuard<'_, BufWriter>
+            278..286 'w.lock()': MutexGuard<'static, BufWriter>
         "#]],
     );
 }
@@ -1689,18 +1689,18 @@ fn main() {
 }
         "#,
         expect![[r#"
-        27..85 '{     ...1,); }': ()
-        37..48 'S(.., a, b)': S
-        43..44 'a': usize
-        46..47 'b': {unknown}
-        51..52 'S': S(usize) -> S
-        51..55 'S(1)': S
-        53..54 '1': usize
-        65..75 '(.., a, b)': (i32, {unknown})
-        70..71 'a': i32
-        73..74 'b': {unknown}
-        78..82 '(1,)': (i32,)
-        79..80 '1': i32
+            27..85 '{     ...1,); }': ()
+            37..48 'S(.., a, b)': S
+            43..44 'a': usize
+            46..47 'b': {unknown}
+            51..52 'S': extern "rust-call" S(usize) -> S
+            51..55 'S(1)': S
+            53..54 '1': usize
+            65..75 '(.., a, b)': (i32, {unknown})
+            70..71 'a': i32
+            73..74 'b': {unknown}
+            78..82 '(1,)': (i32,)
+            79..80 '1': i32
         "#]],
     );
 }
@@ -1999,4 +1999,44 @@ fn test() {
 }
 "#,
     );
+}
+
+#[test]
+fn rustc_test_issue_52437() {
+    check_types(
+        r#"
+    fn main() {
+        let x = [(); &(&'static: loop { |x| {}; }) as *const _ as usize]
+          //^ [(); _]
+    }
+    "#,
+    );
+}
+
+#[test]
+fn incorrect_variant_form_through_alias_caught() {
+    check_types(
+        r#"
+enum Enum { Braced {}, Unit, Tuple() }
+type Alias = Enum;
+
+fn main() {
+    Alias::Braced;
+  //^^^^^^^^^^^^^ {unknown}
+    let Alias::Braced = loop {};
+      //^^^^^^^^^^^^^ !
+  let Alias::Braced(..) = loop {};
+    //^^^^^^^^^^^^^^^^^ Enum
+
+    Alias::Unit();
+  //^^^^^^^^^^^^^ {unknown}
+    Alias::Unit{};
+  //^^^^^^^^^^^^^ Enum
+    let Alias::Unit() = loop {};
+      //^^^^^^^^^^^^^ Enum
+    let Alias::Unit{} = loop {};
+      //^^^^^^^^^^^^^ Enum
+}
+"#,
+    )
 }

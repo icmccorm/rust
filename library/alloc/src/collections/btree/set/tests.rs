@@ -1,9 +1,6 @@
 use super::*;
 use crate::testing::crash_test::{CrashTestDummy, Panic};
 use crate::testing::rng::DeterministicRng;
-use crate::vec::Vec;
-use std::cmp::Ordering;
-use std::hash::{Hash, Hasher};
 use std::ops::Bound::{Excluded, Included};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -527,7 +524,7 @@ fn test_extend_ref() {
 #[test]
 fn test_recovery() {
     #[derive(Debug)]
-    struct Foo(&'static str, i32);
+    struct Foo(&'static str, #[allow(dead_code)] i32);
 
     impl PartialEq for Foo {
         fn eq(&self, other: &Self) -> bool {

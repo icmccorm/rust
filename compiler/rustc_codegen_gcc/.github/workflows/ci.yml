@@ -19,9 +19,8 @@ jobs:
       fail-fast: false
       matrix:
         libgccjit_version:
-          - { gcc: "libgccjit.so", extra: "", env_extra: "", artifacts_branch: "master" }
-          - { gcc: "libgccjit_without_int128.so", extra: "", env_extra: "", artifacts_branch: "master-without-128bit-integers" }
-          - { gcc: "libgccjit12.so", extra: "--no-default-features", env_extra: "TEST_FLAGS='-Cpanic=abort -Zpanic-abort-tests'", artifacts_branch: "gcc12" }
+          - { gcc: "gcc-13.deb" }
+          - { gcc: "gcc-13-without-int128.deb" }
         commands: [
           "--mini-tests",
           "--std-tests",
@@ -33,80 +32,39 @@ jobs:
           "--extended-regex-tests",
           "--test-successful-rustc --nb-parts 2 --current-part 0",
           "--test-successful-rustc --nb-parts 2 --current-part 1",
-          "--test-failing-rustc",
+          "--projects",
         ]
 
     steps:
     - uses: actions/checkout@v3
 
-    - uses: actions/checkout@v3
-      with:
-        repository: llvm/llvm-project
-        path: llvm
+    # `rustup show` installs from rust-toolchain.toml
+    - name: Setup rust toolchain
+      run: rustup show
+
+    - name: Setup rust cache
+      uses: Swatinem/rust-cache@v2
 
     - name: Install packages
       # `llvm-14-tools` is needed to install the `FileCheck` binary which is used for asm tests.
       run: sudo apt-get install ninja-build ripgrep llvm-14-tools
 
-    - name: Install libgccjit12
-      if: matrix.libgccjit_version.gcc == 'libgccjit12.so'
-      run: sudo apt-get install libgccjit-12-dev
+    - name: Install rustfmt
+      run: rustup component add rustfmt
 
     - name: Download artifact
-      if: matrix.libgccjit_version.gcc != 'libgccjit12.so'
-      uses: dawidd6/action-download-artifact@v2
-      with:
-          workflow: main.yml
-          name: ${{ matrix.libgccjit_version.gcc }}
-          path: gcc-build
-          repo: antoyo/gcc
-          branch: ${{ matrix.libgccjit_version.artifacts_branch }}
-          event: push
-          search_artifacts: true # Because, instead, the action only check the last job ran and that won't work since we want multiple artifacts.
+      run: curl -LO https://github.com/antoyo/gcc/releases/latest/download/${{ matrix.libgccjit_version.gcc }}
 
     - name: Setup path to libgccjit
-      if: matrix.libgccjit_version.gcc == 'libgccjit12.so'
-      run: echo /usr/lib/gcc/x86_64-linux-gnu/12 > gcc_path
-
-    - name: Setup path to libgccjit
-      if: matrix.libgccjit_version.gcc != 'libgccjit12.so'
       run: |
-          echo $(readlink -f gcc-build) > gcc_path
-          # NOTE: the filename is still libgccjit.so even when the artifact name is different.
-          ln gcc-build/libgccjit.so gcc-build/libgccjit.so.0
+          sudo dpkg --force-overwrite -i ${{ matrix.libgccjit_version.gcc }}
+          echo 'gcc-path = "/usr/lib/"' > config.toml
 
     - name: Set env
       run: |
-        echo "LIBRARY_PATH=$(cat gcc_path)" >> $GITHUB_ENV
-        echo "LD_LIBRARY_PATH=$(cat gcc_path)" >> $GITHUB_ENV
         echo "workspace="$GITHUB_WORKSPACE >> $GITHUB_ENV
-
-    - name: Set RUST_COMPILER_RT_ROOT
-      run: echo "RUST_COMPILER_RT_ROOT="${{ env.workspace }}/llvm/compiler-rt >> $GITHUB_ENV
-
-    - name: Cache cargo installed crates
-      uses: actions/cache@v3
-      with:
-        path: ~/.cargo/bin
-        key: cargo-installed-crates2-ubuntu-latest
-
-    - name: Cache cargo registry
-      uses: actions/cache@v3
-      with:
-        path: ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-registry2-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Cache cargo index
-      uses: actions/cache@v3
-      with:
-        path: ~/.cargo/git
-        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Cache cargo target dir
-      uses: actions/cache@v3
-      with:
-        path: target
-        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('rust-toolchain') }}
+        echo "LIBRARY_PATH=/usr/lib" >> $GITHUB_ENV
+        echo "LD_LIBRARY_PATH=/usr/lib" >> $GITHUB_ENV
 
     #- name: Cache rust repository
       ## We only clone the rust repository for rustc tests
@@ -119,34 +77,38 @@ jobs:
 
     - name: Build
       run: |
-        ./prepare_build.sh
-        ${{ matrix.libgccjit_version.env_extra }} ./build.sh ${{ matrix.libgccjit_version.extra }}
-        ${{ matrix.libgccjit_version.env_extra }} cargo test ${{ matrix.libgccjit_version.extra }}
-        ./clean_all.sh
+        ./y.sh prepare --only-libcore
+        ./y.sh build
+        cargo test
+        ./y.sh clean all
 
     - name: Prepare dependencies
       run: |
         git config --global user.email "user@example.com"
         git config --global user.name "User"
-        ./prepare.sh
+        ./y.sh prepare
 
-    # Compile is a separate step, as the actions-rs/cargo action supports error annotations
-    - name: Compile
-      uses: actions-rs/cargo@v1.0.3
-      with:
-        command: build
-        args: --release
-
-    - name: Add more failing tests for GCC 12
-      if: ${{ matrix.libgccjit_version.gcc == 'libgccjit12.so' }}
-      run: cat failing-ui-tests12.txt >> failing-ui-tests.txt
+    - name: Add more failing tests because the sysroot is not compiled with LTO
+      run: cat tests/failing-non-lto-tests.txt >> tests/failing-ui-tests.txt
 
     - name: Run tests
       run: |
-        ${{ matrix.libgccjit_version.env_extra }} ./test.sh --release --clean --build-sysroot ${{ matrix.commands }} ${{ matrix.libgccjit_version.extra }}
+        ./y.sh test --release --clean --build-sysroot ${{ matrix.commands }}
+
+    - name: Check formatting
+      run: cargo fmt -- --check
 
   duplicates:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
       - run: python tools/check_intrinsics_duplicates.py
+
+  build_system:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Test build system
+        run: |
+          cd build_system
+          cargo test

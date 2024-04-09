@@ -1,5 +1,5 @@
 // A test exploiting the bug behind #25860 except with
-// implied trait bounds which currently don't exist without `-Ztrait-solver=chalk`.
+// implied trait bounds which currently don't exist.
 use std::marker::PhantomData;
 struct Foo<'a, 'b, T>(PhantomData<(&'a (), &'b (), T)>)
 where
@@ -29,16 +29,19 @@ impl<'long: 'short, 'short, T> Convert<'long, 'short> for T {
 fn badboi<'in_, 'out, T>(x: Foo<'in_, 'out, T>, sadness: &'in_ T) -> &'out T {
     //~^ ERROR lifetime mismatch
     sadness.cast()
+    //~^ ERROR may not live long enough
 }
 
 fn badboi2<'in_, 'out, T>(x: Foo<'in_, 'out, T>, sadness: &'in_ T) {
     //~^ ERROR lifetime mismatch
     let _: &'out T = sadness.cast();
+    //~^ ERROR may not live long enough
 }
 
 fn badboi3<'in_, 'out, T>(a: Foo<'in_, 'out, (&'in_ T, &'out T)>, sadness: &'in_ T) {
     //~^ ERROR lifetime mismatch
     let _: &'out T = sadness.cast();
+    //~^ ERROR may not live long enough
 }
 
 fn bad<'short, T>(value: &'short T) -> &'static T {

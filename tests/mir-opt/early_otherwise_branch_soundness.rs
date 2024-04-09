@@ -1,4 +1,5 @@
-// unit-test: EarlyOtherwiseBranch
+// skip-filecheck
+//@ unit-test: EarlyOtherwiseBranch
 
 // Tests various cases that the `early_otherwise_branch` opt should *not* optimize
 

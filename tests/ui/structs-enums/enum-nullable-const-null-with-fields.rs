@@ -1,7 +1,4 @@
-// run-pass
-
-use std::result::Result;
-use std::result::Result::Ok;
+//@ run-pass
 
 static C: Result<(), Box<isize>> = Ok(());
 

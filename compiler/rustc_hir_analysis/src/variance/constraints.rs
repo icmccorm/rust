@@ -1,6 +1,6 @@
 //! Constraint construction and representation
 //!
-//! The second pass over the AST determines the set of constraints.
+//! The second pass over the HIR determines the set of constraints.
 //! We walk the set of items and, for each member, generate new constraints.
 
 use hir::def_id::{DefId, LocalDefId};
@@ -235,8 +235,8 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
                 // leaf type -- noop
             }
 
-            ty::FnDef(..) | ty::Generator(..) | ty::Closure(..) => {
-                bug!("Unexpected closure type in variance computation");
+            ty::FnDef(..) | ty::Coroutine(..) | ty::Closure(..) | ty::CoroutineClosure(..) => {
+                bug!("Unexpected coroutine/closure type in variance computation");
             }
 
             ty::Ref(region, ty, mutbl) => {
@@ -253,8 +253,8 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
                 self.add_constraints_from_ty(current, typ, variance);
             }
 
-            ty::RawPtr(ref mt) => {
-                self.add_constraints_from_mt(current, mt, variance);
+            ty::RawPtr(ty, mutbl) => {
+                self.add_constraints_from_mt(current, &ty::TypeAndMut { ty, mutbl }, variance);
             }
 
             ty::Tuple(subtys) => {
@@ -312,7 +312,7 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
                 // types, where we use Error as the Self type
             }
 
-            ty::Placeholder(..) | ty::GeneratorWitness(..) | ty::Bound(..) | ty::Infer(..) => {
+            ty::Placeholder(..) | ty::CoroutineWitness(..) | ty::Bound(..) | ty::Infer(..) => {
                 bug!("unexpected type encountered in variance inference: {}", ty);
             }
         }
@@ -413,20 +413,22 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
         variance: VarianceTermPtr<'a>,
     ) {
         match *region {
-            ty::ReEarlyBound(ref data) => {
+            ty::ReEarlyParam(ref data) => {
                 self.add_constraint(current, data.index, variance);
             }
 
             ty::ReStatic => {}
 
-            ty::ReLateBound(..) => {
-                // Late-bound regions do not get substituted the same
-                // way early-bound regions do, so we skip them here.
+            ty::ReBound(..) => {
+                // Either a higher-ranked region inside of a type or a
+                // late-bound function parameter.
+                //
+                // We do not compute constraints for either of these.
             }
 
             ty::ReError(_) => {}
 
-            ty::ReFree(..) | ty::ReVar(..) | ty::RePlaceholder(..) | ty::ReErased => {
+            ty::ReLateParam(..) | ty::ReVar(..) | ty::RePlaceholder(..) | ty::ReErased => {
                 // We don't expect to see anything but 'static or bound
                 // regions when visiting member types or method types.
                 bug!(

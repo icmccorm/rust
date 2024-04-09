@@ -56,7 +56,10 @@ impl Target {
                     LinkerFlavor::Msvc(..) => {
                         assert_matches!(flavor, LinkerFlavor::Msvc(..))
                     }
-                    LinkerFlavor::EmCc | LinkerFlavor::Bpf | LinkerFlavor::Ptx => {
+                    LinkerFlavor::EmCc
+                    | LinkerFlavor::Bpf
+                    | LinkerFlavor::Ptx
+                    | LinkerFlavor::Llbc => {
                         assert_eq!(flavor, self.linker_flavor)
                     }
                 }
@@ -97,7 +100,7 @@ impl Target {
             );
         }
 
-        if self.link_self_contained == LinkSelfContainedDefault::False {
+        if self.link_self_contained.is_disabled() {
             assert!(
                 self.pre_link_objects_self_contained.is_empty()
                     && self.post_link_objects_self_contained.is_empty()
@@ -116,7 +119,8 @@ impl Target {
 
         // Check dynamic linking stuff
         // BPF: when targeting user space vms (like rbpf), those can load dynamic libraries.
-        if self.os == "none" && self.arch != "bpf" {
+        // hexagon: when targeting QuRT, that OS can load dynamic libraries.
+        if self.os == "none" && (self.arch != "bpf" && self.arch != "hexagon") {
             assert!(!self.dynamic_linking);
         }
         if self.only_cdylib

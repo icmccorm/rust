@@ -11,7 +11,7 @@ use rustc_span::Span;
 use thin_vec::{thin_vec, ThinVec};
 
 pub fn expand_deriving_rustc_decodable(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     span: Span,
     mitem: &MetaItem,
     item: &Annotatable,
@@ -63,7 +63,7 @@ pub fn expand_deriving_rustc_decodable(
 }
 
 fn decodable_substructure(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     trait_span: Span,
     substr: &Substructure<'_>,
     krate: Symbol,
@@ -177,7 +177,7 @@ fn decodable_substructure(
                 ],
             )
         }
-        _ => cx.bug("expected StaticEnum or StaticStruct in derive(Decodable)"),
+        _ => cx.dcx().bug("expected StaticEnum or StaticStruct in derive(Decodable)"),
     };
     BlockOrExpr::new_expr(expr)
 }
@@ -186,19 +186,19 @@ fn decodable_substructure(
 /// - `outer_pat_path` is the path to this enum variant/struct
 /// - `getarg` should retrieve the `usize`-th field with name `@str`.
 fn decode_static_fields<F>(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     trait_span: Span,
     outer_pat_path: ast::Path,
     fields: &StaticFields,
     mut getarg: F,
 ) -> P<Expr>
 where
-    F: FnMut(&mut ExtCtxt<'_>, Span, Symbol, usize) -> P<Expr>,
+    F: FnMut(&ExtCtxt<'_>, Span, Symbol, usize) -> P<Expr>,
 {
     match fields {
         Unnamed(fields, is_tuple) => {
             let path_expr = cx.expr_path(outer_pat_path);
-            if !*is_tuple {
+            if matches!(is_tuple, IsTuple::No) {
                 path_expr
             } else {
                 let fields = fields

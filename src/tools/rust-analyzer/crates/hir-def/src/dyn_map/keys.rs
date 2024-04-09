@@ -8,13 +8,14 @@ use syntax::{ast, AstNode, AstPtr};
 
 use crate::{
     dyn_map::{DynMap, Policy},
-    ConstId, EnumId, EnumVariantId, ExternCrateId, FieldId, FunctionId, ImplId, LifetimeParamId,
-    Macro2Id, MacroRulesId, ProcMacroId, StaticId, StructId, TraitAliasId, TraitId, TypeAliasId,
-    TypeOrConstParamId, UnionId, UseId,
+    BlockId, ConstId, EnumId, EnumVariantId, ExternCrateId, FieldId, FunctionId, ImplId,
+    LifetimeParamId, Macro2Id, MacroRulesId, ProcMacroId, StaticId, StructId, TraitAliasId,
+    TraitId, TypeAliasId, TypeOrConstParamId, UnionId, UseId,
 };
 
 pub type Key<K, V> = crate::dyn_map::Key<K, V, AstPtrPolicy<K, V>>;
 
+pub const BLOCK: Key<ast::BlockExpr, BlockId> = Key::new();
 pub const FUNCTION: Key<ast::Fn, FunctionId> = Key::new();
 pub const CONST: Key<ast::Const, ConstId> = Key::new();
 pub const STATIC: Key<ast::Static, StaticId> = Key::new();
@@ -28,7 +29,7 @@ pub const ENUM: Key<ast::Enum, EnumId> = Key::new();
 pub const EXTERN_CRATE: Key<ast::ExternCrate, ExternCrateId> = Key::new();
 pub const USE: Key<ast::Use, UseId> = Key::new();
 
-pub const VARIANT: Key<ast::Variant, EnumVariantId> = Key::new();
+pub const ENUM_VARIANT: Key<ast::Variant, EnumVariantId> = Key::new();
 pub const TUPLE_FIELD: Key<ast::TupleField, FieldId> = Key::new();
 pub const RECORD_FIELD: Key<ast::RecordField, FieldId> = Key::new();
 pub const TYPE_PARAM: Key<ast::TypeParam, TypeOrConstParamId> = Key::new();

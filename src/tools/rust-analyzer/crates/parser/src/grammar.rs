@@ -30,12 +30,12 @@
 
 mod attributes;
 mod expressions;
+mod generic_args;
+mod generic_params;
 mod items;
 mod params;
 mod paths;
 mod patterns;
-mod generic_args;
-mod generic_params;
 mod types;
 
 use crate::{
@@ -244,7 +244,7 @@ impl BlockLike {
     }
 }
 
-const VISIBILITY_FIRST: TokenSet = TokenSet::new(&[T![pub], T![crate]]);
+const VISIBILITY_FIRST: TokenSet = TokenSet::new(&[T![pub]]);
 
 fn opt_visibility(p: &mut Parser<'_>, in_tuple_field: bool) -> bool {
     if !p.at(T![pub]) {
@@ -376,6 +376,16 @@ fn error_block(p: &mut Parser<'_>, message: &str) {
     m.complete(p, ERROR);
 }
 
+// test_err top_level_let
+// let ref foo: fn() = 1 + 3;
+fn error_let_stmt(p: &mut Parser<'_>, message: &str) {
+    assert!(p.at(T![let]));
+    let m = p.start();
+    p.error(message);
+    expressions::let_stmt(p, expressions::Semicolon::Optional);
+    m.complete(p, ERROR);
+}
+
 /// The `parser` passed this is required to at least consume one token if it returns `true`.
 /// If the `parser` returns false, parsing will stop.
 fn delimited(
@@ -383,22 +393,35 @@ fn delimited(
     bra: SyntaxKind,
     ket: SyntaxKind,
     delim: SyntaxKind,
+    unexpected_delim_message: impl Fn() -> String,
     first_set: TokenSet,
     mut parser: impl FnMut(&mut Parser<'_>) -> bool,
 ) {
     p.bump(bra);
     while !p.at(ket) && !p.at(EOF) {
+        if p.at(delim) {
+            // Recover if an argument is missing and only got a delimiter,
+            // e.g. `(a, , b)`.
+
+            // Wrap the erroneous delimiter in an error node so that fixup logic gets rid of it.
+            // FIXME: Ideally this should be handled in fixup in a structured way, but our list
+            // nodes currently have no concept of a missing node between two delimiters.
+            // So doing it this way is easier.
+            let m = p.start();
+            p.error(unexpected_delim_message());
+            p.bump(delim);
+            m.complete(p, ERROR);
+            continue;
+        }
         if !parser(p) {
             break;
         }
-        if !p.at(delim) {
+        if !p.eat(delim) {
             if p.at_ts(first_set) {
                 p.error(format!("expected {:?}", delim));
             } else {
                 break;
             }
-        } else {
-            p.bump(delim);
         }
     }
     p.expect(ket);

@@ -1,8 +1,7 @@
-// run-pass
+//@ run-pass
 #![allow(stable_features)]
-
-// ignore-emscripten no processes
-// ignore-sgx no processes
+//@ ignore-wasm32 no processes
+//@ ignore-sgx no processes
 
 #![feature(os)]
 

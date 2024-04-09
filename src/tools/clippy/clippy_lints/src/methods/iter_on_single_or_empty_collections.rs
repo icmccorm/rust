@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet;
-use clippy_utils::{get_expr_use_or_unification_node, is_no_std_crate, is_res_lang_ctor, path_res};
+use clippy_utils::{get_expr_use_or_unification_node, is_res_lang_ctor, path_res, std_or_core};
 
 use rustc_errors::Applicability;
 use rustc_hir::LangItem::{OptionNone, OptionSome};
@@ -50,7 +50,7 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, method_name: &str, re
             | ExprKind::Break(_, _) => true,
             _ => false,
         },
-        Some((Node::Stmt(_) | Node::Local(_), _)) => false,
+        Some((Node::Stmt(_) | Node::LetStmt(_), _)) => false,
         _ => true,
     };
 
@@ -58,10 +58,10 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, method_name: &str, re
         return;
     }
 
+    let Some(top_crate) = std_or_core(cx) else { return };
     if let Some(i) = item {
         let sugg = format!(
-            "{}::iter::once({}{})",
-            if is_no_std_crate(cx) { "core" } else { "std" },
+            "{top_crate}::iter::once({}{})",
             iter_type.ref_prefix(),
             snippet(cx, i.span, "...")
         );
@@ -69,7 +69,7 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, method_name: &str, re
             cx,
             ITER_ON_SINGLE_ITEMS,
             expr.span,
-            &format!("`{method_name}` call on a collection with only one item"),
+            format!("`{method_name}` call on a collection with only one item"),
             "try",
             sugg,
             Applicability::MaybeIncorrect,
@@ -79,13 +79,9 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, method_name: &str, re
             cx,
             ITER_ON_EMPTY_COLLECTIONS,
             expr.span,
-            &format!("`{method_name}` call on an empty collection"),
+            format!("`{method_name}` call on an empty collection"),
             "try",
-            if is_no_std_crate(cx) {
-                "core::iter::empty()".to_string()
-            } else {
-                "std::iter::empty()".to_string()
-            },
+            format!("{top_crate}::iter::empty()"),
             Applicability::MaybeIncorrect,
         );
     }

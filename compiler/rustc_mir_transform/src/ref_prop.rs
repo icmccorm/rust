@@ -7,9 +7,9 @@ use rustc_middle::ty::TyCtxt;
 use rustc_mir_dataflow::impls::MaybeStorageDead;
 use rustc_mir_dataflow::storage::always_storage_live_locals;
 use rustc_mir_dataflow::Analysis;
+use std::borrow::Cow;
 
 use crate::ssa::{SsaLocals, StorageLiveLocals};
-use crate::MirPass;
 
 /// Propagate references using SSA analysis.
 ///
@@ -44,7 +44,7 @@ use crate::MirPass;
 ///
 /// # Liveness
 ///
-/// When performing a substitution, we must take care not to introduce uses of dangling locals.
+/// When performing an instantiation, we must take care not to introduce uses of dangling locals.
 /// To ensure this, we walk the body with the `MaybeStorageDead` dataflow analysis:
 /// - if we want to replace `*x` by reborrow `*y` and `y` may be dead, we allow replacement and
 ///   mark storage statements on `y` for removal;
@@ -55,7 +55,7 @@ use crate::MirPass;
 ///
 /// For `&mut` borrows, we also need to preserve the uniqueness property:
 /// we must avoid creating a state where we interleave uses of `*_1` and `_2`.
-/// To do it, we only perform full substitution of mutable borrows:
+/// To do it, we only perform full instantiation of mutable borrows:
 /// we replace either all or none of the occurrences of `*_1`.
 ///
 /// Some care has to be taken when `_1` is copied in other locals.
@@ -63,10 +63,10 @@ use crate::MirPass;
 ///   _3 = *_1;
 ///   _4 = _1
 ///   _5 = *_4
-/// In such cases, fully substituting `_1` means fully substituting all of the copies.
+/// In such cases, fully instantiating `_1` means fully instantiating all of the copies.
 ///
 /// For immutable borrows, we do not need to preserve such uniqueness property,
-/// so we perform all the possible substitutions without removing the `_1 = &_2` statement.
+/// so we perform all the possible instantiations without removing the `_1 = &_2` statement.
 pub struct ReferencePropagation;
 
 impl<'tcx> MirPass<'tcx> for ReferencePropagation {
@@ -121,7 +121,7 @@ fn compute_replacement<'tcx>(
 
     // Compute `MaybeStorageDead` dataflow to check that we only replace when the pointee is
     // definitely live.
-    let mut maybe_dead = MaybeStorageDead::new(always_live_locals)
+    let mut maybe_dead = MaybeStorageDead::new(Cow::Owned(always_live_locals))
         .into_engine(tcx, body)
         .iterate_to_fixpoint()
         .into_results_cursor(body);
@@ -210,14 +210,17 @@ fn compute_replacement<'tcx>(
             // have been visited before.
             Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
             | Rvalue::CopyForDeref(place) => {
-                if let Some(rhs) = place.as_local() && ssa.is_ssa(rhs) {
+                if let Some(rhs) = place.as_local()
+                    && ssa.is_ssa(rhs)
+                {
                     let target = targets[rhs];
                     // Only see through immutable reference and pointers, as we do not know yet if
                     // mutable references are fully replaced.
                     if !needs_unique && matches!(target, Value::Pointer(..)) {
                         targets[local] = target;
                     } else {
-                        targets[local] = Value::Pointer(tcx.mk_place_deref(rhs.into()), needs_unique);
+                        targets[local] =
+                            Value::Pointer(tcx.mk_place_deref(rhs.into()), needs_unique);
                     }
                 }
             }
@@ -365,7 +368,7 @@ impl<'tcx> MutVisitor<'tcx> for Replacer<'tcx> {
                 *place = Place::from(target.local).project_deeper(rest, self.tcx);
                 self.any_replacement = true;
             } else {
-                break
+                break;
             }
         }
 

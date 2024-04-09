@@ -9,6 +9,30 @@
     clippy::useless_vec
 )]
 
+use std::fmt::Display;
+use std::ops::{Neg, Shl};
+
+struct Cout;
+
+impl<T> Shl<T> for Cout
+where
+    T: Display,
+{
+    type Output = Self;
+    fn shl(self, rhs: T) -> Self::Output {
+        println!("{}", rhs);
+        self
+    }
+}
+
+impl Neg for Cout {
+    type Output = Self;
+    fn neg(self) -> Self::Output {
+        println!("hello world");
+        self
+    }
+}
+
 struct Unit;
 struct Tuple(i32);
 struct Struct {
@@ -157,6 +181,8 @@ fn main() {
     //~^ ERROR: binding to `_` prefixed variable with no side-effect
     let _cat = [2, 4, 6, 8][2];
     //~^ ERROR: binding to `_` prefixed variable with no side-effect
+    let _issue_12166 = 42;
+    let underscore_variable_above_can_be_used_dont_lint = _issue_12166;
 
     #[allow(clippy::no_effect)]
     0;
@@ -174,4 +200,11 @@ fn main() {
     GreetStruct1("world");
     GreetStruct2()("world");
     GreetStruct3 {}("world");
+
+    fn n() -> i32 {
+        42
+    }
+
+    Cout << 142;
+    -Cout;
 }

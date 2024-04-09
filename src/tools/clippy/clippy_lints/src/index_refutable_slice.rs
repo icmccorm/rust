@@ -1,10 +1,9 @@
+use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::consts::{constant, Constant};
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::higher::IfLet;
-use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::ty::is_copy;
 use clippy_utils::{is_expn_of, is_lint_allowed, path_to_local};
-use if_chain::if_chain;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_errors::Applicability;
 use rustc_hir as hir;
@@ -12,7 +11,7 @@ use rustc_hir::intravisit::{self, Visitor};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty;
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_session::impl_lint_pass;
 use rustc_span::symbol::Ident;
 use rustc_span::Span;
 
@@ -31,7 +30,7 @@ declare_clippy_lint! {
     /// patterns.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let slice: Option<&[u32]> = Some(&[1, 2, 3]);
     ///
     /// if let Some(slice) = slice {
@@ -39,7 +38,7 @@ declare_clippy_lint! {
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// let slice: Option<&[u32]> = Some(&[1, 2, 3]);
     ///
     /// if let Some(&[first, ..]) = slice {
@@ -70,20 +69,17 @@ impl_lint_pass!(IndexRefutableSlice => [INDEX_REFUTABLE_SLICE]);
 
 impl<'tcx> LateLintPass<'tcx> for IndexRefutableSlice {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'_>) {
-        if_chain! {
-            if !expr.span.from_expansion() || is_expn_of(expr.span, "if_chain").is_some();
-            if let Some(IfLet {let_pat, if_then, ..}) = IfLet::hir(cx, expr);
-            if !is_lint_allowed(cx, INDEX_REFUTABLE_SLICE, expr.hir_id);
-            if self.msrv.meets(msrvs::SLICE_PATTERNS);
-
-            let found_slices = find_slice_values(cx, let_pat);
-            if !found_slices.is_empty();
-            let filtered_slices = filter_lintable_slices(cx, found_slices, self.max_suggested_slice, if_then);
-            if !filtered_slices.is_empty();
-            then {
-                for slice in filtered_slices.values() {
-                    lint_slice(cx, slice);
-                }
+        if (!expr.span.from_expansion() || is_expn_of(expr.span, "if_chain").is_some())
+            && let Some(IfLet { let_pat, if_then, .. }) = IfLet::hir(cx, expr)
+            && !is_lint_allowed(cx, INDEX_REFUTABLE_SLICE, expr.hir_id)
+            && self.msrv.meets(msrvs::SLICE_PATTERNS)
+            && let found_slices = find_slice_values(cx, let_pat)
+            && !found_slices.is_empty()
+            && let filtered_slices = filter_lintable_slices(cx, found_slices, self.max_suggested_slice, if_then)
+            && !filtered_slices.is_empty()
+        {
+            for slice in filtered_slices.values() {
+                lint_slice(cx, slice);
             }
         }
     }
@@ -101,7 +97,7 @@ fn find_slice_values(cx: &LateContext<'_>, pat: &hir::Pat<'_>) -> FxIndexMap<hir
             value_hir_id,
             ident,
             sub_pat,
-        ) = pat.kind
+        ) = pat.kind && by_ref != hir::ByRef::Yes(hir::Mutability::Mut)
         {
             // This block catches bindings with sub patterns. It would be hard to build a correct suggestion
             // for them and it's likely that the user knows what they are doing in such a case.
@@ -110,7 +106,8 @@ fn find_slice_values(cx: &LateContext<'_>, pat: &hir::Pat<'_>) -> FxIndexMap<hir
             }
             if sub_pat.is_some() {
                 removed_pat.insert(value_hir_id);
-                slices.remove(&value_hir_id);
+                // FIXME(rust/#120456) - is `swap_remove` correct?
+                slices.swap_remove(&value_hir_id);
                 return;
             }
 
@@ -118,7 +115,7 @@ fn find_slice_values(cx: &LateContext<'_>, pat: &hir::Pat<'_>) -> FxIndexMap<hir
             if let ty::Slice(inner_ty) | ty::Array(inner_ty, _) = bound_ty.peel_refs().kind() {
                 // The values need to use the `ref` keyword if they can't be copied.
                 // This will need to be adjusted if the lint want to support mutable access in the future
-                let src_is_ref = bound_ty.is_ref() && by_ref != hir::ByRef::Yes;
+                let src_is_ref = bound_ty.is_ref() && by_ref == hir::ByRef::No;
                 let needs_ref = !(src_is_ref || is_copy(cx, *inner_ty));
 
                 let slice_info = slices
@@ -245,32 +242,28 @@ impl<'a, 'tcx> Visitor<'tcx> for SliceIndexLintingVisitor<'a, 'tcx> {
                 max_suggested_slice,
             } = *self;
 
-            if_chain! {
-                // Check if this is even a local we're interested in
-                if let Some(use_info) = slice_lint_info.get_mut(&local_id);
-
-                let map = cx.tcx.hir();
-
+            if let Some(use_info) = slice_lint_info.get_mut(&local_id)
                 // Checking for slice indexing
-                let parent_id = map.parent_id(expr.hir_id);
-                if let Some(hir::Node::Expr(parent_expr)) = map.find(parent_id);
-                if let hir::ExprKind::Index(_, index_expr, _) = parent_expr.kind;
-                if let Some(Constant::Int(index_value)) = constant(cx, cx.typeck_results(), index_expr);
-                if let Ok(index_value) = index_value.try_into();
-                if index_value < max_suggested_slice;
+                && let parent_id = cx.tcx.parent_hir_id(expr.hir_id)
+                && let hir::Node::Expr(parent_expr) = cx.tcx.hir_node(parent_id)
+                && let hir::ExprKind::Index(_, index_expr, _) = parent_expr.kind
+                && let Some(Constant::Int(index_value)) = constant(cx, cx.typeck_results(), index_expr)
+                && let Ok(index_value) = index_value.try_into()
+                && index_value < max_suggested_slice
 
                 // Make sure that this slice index is read only
-                let maybe_addrof_id = map.parent_id(parent_id);
-                if let Some(hir::Node::Expr(maybe_addrof_expr)) = map.find(maybe_addrof_id);
-                if let hir::ExprKind::AddrOf(_kind, hir::Mutability::Not, _inner_expr) = maybe_addrof_expr.kind;
-                then {
-                    use_info.index_use.push((index_value, map.span(parent_expr.hir_id)));
-                    return;
-                }
+                && let hir::Node::Expr(maybe_addrof_expr) = cx.tcx.parent_hir_node(parent_id)
+                && let hir::ExprKind::AddrOf(_kind, hir::Mutability::Not, _inner_expr) = maybe_addrof_expr.kind
+            {
+                use_info
+                    .index_use
+                    .push((index_value, cx.tcx.hir().span(parent_expr.hir_id)));
+                return;
             }
 
             // The slice was used for something other than indexing
-            self.slice_lint_info.remove(&local_id);
+            // FIXME(rust/#120456) - is `swap_remove` correct?
+            self.slice_lint_info.swap_remove(&local_id);
         }
         intravisit::walk_expr(self, expr);
     }

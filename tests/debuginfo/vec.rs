@@ -1,7 +1,7 @@
-// min-lldb-version: 310
-// ignore-gdb // Test temporarily ignored due to debuginfo tests being disabled, see PR 47155
+//@ min-lldb-version: 310
+//@ ignore-gdb // Test temporarily ignored due to debuginfo tests being disabled, see PR 47155
 
-// compile-flags:-g
+//@ compile-flags:-g
 
 // === GDB TESTS ===================================================================================
 
@@ -17,8 +17,8 @@
 // === LLDB TESTS ==================================================================================
 
 // lldb-command:run
-// lldb-command:print a
-// lldbg-check:[...]$0 = { [0] = 1 [1] = 2 [2] = 3 }
+// lldb-command:v a
+// lldbg-check:[...] { [0] = 1 [1] = 2 [2] = 3 }
 // lldbr-check:([i32; 3]) a = { [0] = 1 [1] = 2 [2] = 3 }
 
 #![allow(unused_variables)]

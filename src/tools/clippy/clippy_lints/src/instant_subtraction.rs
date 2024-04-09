@@ -1,12 +1,12 @@
-use clippy_utils::diagnostics::{self, span_lint_and_sugg};
-use clippy_utils::msrvs::{self, Msrv};
+use clippy_config::msrvs::{self, Msrv};
+use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet_with_context;
 use clippy_utils::sugg::Sugg;
 use clippy_utils::ty;
 use rustc_errors::Applicability;
 use rustc_hir::{BinOpKind, Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_session::impl_lint_pass;
 use rustc_span::source_map::Spanned;
 use rustc_span::sym;
 
@@ -21,13 +21,13 @@ declare_clippy_lint! {
     /// `prev_instant.elapsed()` also more clearly signals intention.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// use std::time::Instant;
     /// let prev_instant = Instant::now();
     /// let duration = Instant::now() - prev_instant;
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// use std::time::Instant;
     /// let prev_instant = Instant::now();
     /// let duration = prev_instant.elapsed();
@@ -40,26 +40,23 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Lints subtraction between an [`Instant`] and a [`Duration`].
+    /// Lints subtraction between an `Instant` and a `Duration`.
     ///
     /// ### Why is this bad?
     /// Unchecked subtraction could cause underflow on certain platforms, leading to
     /// unintentional panics.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # use std::time::{Instant, Duration};
     /// let time_passed = Instant::now() - Duration::from_secs(5);
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # use std::time::{Instant, Duration};
     /// let time_passed = Instant::now().checked_sub(Duration::from_secs(5));
     /// ```
-    ///
-    /// [`Duration`]: std::time::Duration
-    /// [`Instant::now()`]: std::time::Instant::now;
     #[clippy::version = "1.67.0"]
     pub UNCHECKED_DURATION_SUBTRACTION,
     pedantic,
@@ -89,27 +86,17 @@ impl LateLintPass<'_> for InstantSubtraction {
             rhs,
         ) = expr.kind
         {
-            if_chain! {
-                if is_instant_now_call(cx, lhs);
-
-                if is_an_instant(cx, rhs);
-                if let Some(sugg) = Sugg::hir_opt(cx, rhs);
-
-                then {
-                    print_manual_instant_elapsed_sugg(cx, expr, sugg)
-                } else {
-                    if_chain! {
-                        if !expr.span.from_expansion();
-                        if self.msrv.meets(msrvs::TRY_FROM);
-
-                        if is_an_instant(cx, lhs);
-                        if is_a_duration(cx, rhs);
-
-                        then {
-                            print_unchecked_duration_subtraction_sugg(cx, lhs, rhs, expr)
-                        }
-                    }
-                }
+            if is_instant_now_call(cx, lhs)
+                && is_an_instant(cx, rhs)
+                && let Some(sugg) = Sugg::hir_opt(cx, rhs)
+            {
+                print_manual_instant_elapsed_sugg(cx, expr, sugg);
+            } else if !expr.span.from_expansion()
+                && self.msrv.meets(msrvs::TRY_FROM)
+                && is_an_instant(cx, lhs)
+                && is_a_duration(cx, rhs)
+            {
+                print_unchecked_duration_subtraction_sugg(cx, lhs, rhs, expr);
             }
         }
     }
@@ -130,11 +117,7 @@ fn is_instant_now_call(cx: &LateContext<'_>, expr_block: &'_ Expr<'_>) -> bool {
 
 fn is_an_instant(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     let expr_ty = cx.typeck_results().expr_ty(expr);
-
-    match expr_ty.kind() {
-        rustc_middle::ty::Adt(def, _) => clippy_utils::match_def_path(cx, def.did(), &clippy_utils::paths::INSTANT),
-        _ => false,
-    }
+    ty::is_type_diagnostic_item(cx, expr_ty, sym::Instant)
 }
 
 fn is_a_duration(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
@@ -166,7 +149,7 @@ fn print_unchecked_duration_subtraction_sugg(
     let left_expr = snippet_with_context(cx, left_expr.span, ctxt, "<instant>", &mut applicability).0;
     let right_expr = snippet_with_context(cx, right_expr.span, ctxt, "<duration>", &mut applicability).0;
 
-    diagnostics::span_lint_and_sugg(
+    span_lint_and_sugg(
         cx,
         UNCHECKED_DURATION_SUBTRACTION,
         expr.span,

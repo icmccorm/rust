@@ -1,4 +1,4 @@
-use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::diagnostics::span_lint_hir_and_then;
 use clippy_utils::source::snippet;
 use clippy_utils::{is_lint_allowed, path_to_local, search_same, SpanlessEq, SpanlessHash};
 use core::cmp::Ordering;
@@ -11,7 +11,7 @@ use rustc_hir::{Arm, Expr, ExprKind, HirId, HirIdMap, HirIdMapEntry, HirIdSet, P
 use rustc_lint::builtin::NON_EXHAUSTIVE_OMITTED_PATTERNS;
 use rustc_lint::LateContext;
 use rustc_middle::ty;
-use rustc_span::Symbol;
+use rustc_span::{ErrorGuaranteed, Symbol};
 
 use super::MATCH_SAME_ARMS;
 
@@ -64,40 +64,50 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
         let min_index = usize::min(lindex, rindex);
         let max_index = usize::max(lindex, rindex);
 
-        let mut local_map: HirIdMap<HirId> = HirIdMap::default();
-        let eq_fallback = |a: &Expr<'_>, b: &Expr<'_>| {
-            if_chain! {
-                if let Some(a_id) = path_to_local(a);
-                if let Some(b_id) = path_to_local(b);
-                let entry = match local_map.entry(a_id) {
-                    HirIdMapEntry::Vacant(entry) => entry,
-                    // check if using the same bindings as before
-                    HirIdMapEntry::Occupied(entry) => return *entry.get() == b_id,
-                };
+        let check_eq_with_pat = |expr_a: &Expr<'_>, expr_b: &Expr<'_>| {
+            let mut local_map: HirIdMap<HirId> = HirIdMap::default();
+            let eq_fallback = |a: &Expr<'_>, b: &Expr<'_>| {
+                if let Some(a_id) = path_to_local(a)
+                    && let Some(b_id) = path_to_local(b)
+                    && let entry = match local_map.entry(a_id) {
+                        HirIdMapEntry::Vacant(entry) => entry,
+                        // check if using the same bindings as before
+                        HirIdMapEntry::Occupied(entry) => return *entry.get() == b_id,
+                    }
                 // the names technically don't have to match; this makes the lint more conservative
-                if cx.tcx.hir().name(a_id) == cx.tcx.hir().name(b_id);
-                if cx.typeck_results().expr_ty(a) == cx.typeck_results().expr_ty(b);
-                if pat_contains_local(lhs.pat, a_id);
-                if pat_contains_local(rhs.pat, b_id);
-                then {
+                && cx.tcx.hir().name(a_id) == cx.tcx.hir().name(b_id)
+                    && cx.typeck_results().expr_ty(a) == cx.typeck_results().expr_ty(b)
+                    && pat_contains_local(lhs.pat, a_id)
+                    && pat_contains_local(rhs.pat, b_id)
+                {
                     entry.insert(b_id);
                     true
                 } else {
                     false
                 }
-            }
-        };
-        // Arms with a guard are ignored, those can’t always be merged together
-        // If both arms overlap with an arm in between then these can't be merged either.
-        !(backwards_blocking_idxs[max_index] > min_index && forwards_blocking_idxs[min_index] < max_index)
-                && lhs.guard.is_none()
-                && rhs.guard.is_none()
-                && SpanlessEq::new(cx)
-                    .expr_fallback(eq_fallback)
-                    .eq_expr(lhs.body, rhs.body)
+            };
+
+            SpanlessEq::new(cx)
+                .expr_fallback(eq_fallback)
+                .eq_expr(expr_a, expr_b)
                 // these checks could be removed to allow unused bindings
                 && bindings_eq(lhs.pat, local_map.keys().copied().collect())
                 && bindings_eq(rhs.pat, local_map.values().copied().collect())
+        };
+
+        let check_same_guard = || match (&lhs.guard, &rhs.guard) {
+            (None, None) => true,
+            (Some(lhs_guard), Some(rhs_guard)) => check_eq_with_pat(lhs_guard, rhs_guard),
+            _ => false,
+        };
+
+        let check_same_body = || check_eq_with_pat(lhs.body, rhs.body);
+
+        // Arms with different guard are ignored, those can’t always be merged together
+        // If both arms overlap with an arm in between then these can't be merged either.
+        !(backwards_blocking_idxs[max_index] > min_index && forwards_blocking_idxs[min_index] < max_index)
+            && check_same_guard()
+            && check_same_body()
     };
 
     let indexed_arms: Vec<(usize, &Arm<'_>)> = arms.iter().enumerate().collect();
@@ -106,9 +116,10 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
             if !cx.tcx.features().non_exhaustive_omitted_patterns_lint
                 || is_lint_allowed(cx, NON_EXHAUSTIVE_OMITTED_PATTERNS, arm2.hir_id)
             {
-                span_lint_and_then(
+                span_lint_hir_and_then(
                     cx,
                     MATCH_SAME_ARMS,
+                    arm1.hir_id,
                     arm1.span,
                     "this match arm has an identical body to the `_` wildcard arm",
                     |diag| {
@@ -126,9 +137,10 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
                 (arm2, arm1)
             };
 
-            span_lint_and_then(
+            span_lint_hir_and_then(
                 cx,
                 MATCH_SAME_ARMS,
+                keep_arm.hir_id,
                 keep_arm.span,
                 "this match arm has an identical body to another arm",
                 |diag| {
@@ -152,6 +164,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
 #[derive(Clone, Copy)]
 enum NormalizedPat<'a> {
     Wild,
+    Never,
     Struct(Option<DefId>, &'a [(Symbol, Self)]),
     Tuple(Option<DefId>, &'a [Self]),
     Or(&'a [Self]),
@@ -166,6 +179,8 @@ enum NormalizedPat<'a> {
     /// contains everything afterwards. Note that either side, or both sides, may contain zero
     /// patterns.
     Slice(&'a [Self], Option<&'a [Self]>),
+    /// A placeholder for a pattern that wasn't well formed in some way.
+    Err(ErrorGuaranteed),
 }
 
 #[derive(Clone, Copy)]
@@ -223,14 +238,15 @@ fn iter_matching_struct_fields<'a>(
     Iter(left.iter(), right.iter())
 }
 
-#[expect(clippy::similar_names)]
+#[expect(clippy::similar_names, clippy::too_many_lines)]
 impl<'a> NormalizedPat<'a> {
     fn from_pat(cx: &LateContext<'_>, arena: &'a DroplessArena, pat: &'a Pat<'_>) -> Self {
         match pat.kind {
             PatKind::Wild | PatKind::Binding(.., None) => Self::Wild,
-            PatKind::Binding(.., Some(pat)) | PatKind::Box(pat) | PatKind::Ref(pat, _) => {
+            PatKind::Binding(.., Some(pat)) | PatKind::Box(pat) | PatKind::Deref(pat) | PatKind::Ref(pat, _) => {
                 Self::from_pat(cx, arena, pat)
             },
+            PatKind::Never => Self::Never,
             PatKind::Struct(ref path, fields, _) => {
                 let fields =
                     arena.alloc_from_iter(fields.iter().map(|f| (f.ident.name, Self::from_pat(cx, arena, f.pat))));
@@ -289,9 +305,10 @@ impl<'a> NormalizedPat<'a> {
                     LitKind::ByteStr(ref bytes, _) | LitKind::CStr(ref bytes, _) => Self::LitBytes(bytes),
                     LitKind::Byte(val) => Self::LitInt(val.into()),
                     LitKind::Char(val) => Self::LitInt(val.into()),
-                    LitKind::Int(val, _) => Self::LitInt(val),
+                    LitKind::Int(val, _) => Self::LitInt(val.get()),
                     LitKind::Bool(val) => Self::LitBool(val),
-                    LitKind::Float(..) | LitKind::Err => Self::Wild,
+                    LitKind::Float(..) => Self::Wild,
+                    LitKind::Err(guar) => Self::Err(guar),
                 },
                 _ => Self::Wild,
             },
@@ -301,7 +318,7 @@ impl<'a> NormalizedPat<'a> {
                     None => 0,
                     Some(e) => match &e.kind {
                         ExprKind::Lit(lit) => match lit.node {
-                            LitKind::Int(val, _) => val,
+                            LitKind::Int(val, _) => val.get(),
                             LitKind::Char(val) => val.into(),
                             LitKind::Byte(val) => val.into(),
                             _ => return Self::Wild,
@@ -313,7 +330,7 @@ impl<'a> NormalizedPat<'a> {
                     None => (u128::MAX, RangeEnd::Included),
                     Some(e) => match &e.kind {
                         ExprKind::Lit(lit) => match lit.node {
-                            LitKind::Int(val, _) => (val, bounds),
+                            LitKind::Int(val, _) => (val.get(), bounds),
                             LitKind::Char(val) => (val.into(), bounds),
                             LitKind::Byte(val) => (val.into(), bounds),
                             _ => return Self::Wild,
@@ -327,6 +344,7 @@ impl<'a> NormalizedPat<'a> {
                 arena.alloc_from_iter(front.iter().map(|pat| Self::from_pat(cx, arena, pat))),
                 wild_pat.map(|_| &*arena.alloc_from_iter(back.iter().map(|pat| Self::from_pat(cx, arena, pat)))),
             ),
+            PatKind::Err(guar) => Self::Err(guar),
         }
     }
 
@@ -334,7 +352,7 @@ impl<'a> NormalizedPat<'a> {
     /// type.
     fn has_overlapping_values(&self, other: &Self) -> bool {
         match (*self, *other) {
-            (Self::Wild, _) | (_, Self::Wild) => true,
+            (Self::Wild, _) | (_, Self::Wild) | (Self::Never, Self::Never) => true,
             (Self::Or(pats), ref other) | (ref other, Self::Or(pats)) => {
                 pats.iter().any(|pat| pat.has_overlapping_values(other))
             },
@@ -410,6 +428,7 @@ fn pat_contains_local(pat: &Pat<'_>, id: HirId) -> bool {
 /// Returns true if all the bindings in the `Pat` are in `ids` and vice versa
 fn bindings_eq(pat: &Pat<'_>, mut ids: HirIdSet) -> bool {
     let mut result = true;
-    pat.each_binding_or_first(&mut |_, id, _, _| result &= ids.remove(&id));
+    // FIXME(rust/#120456) - is `swap_remove` correct?
+    pat.each_binding_or_first(&mut |_, id, _, _| result &= ids.swap_remove(&id));
     result && ids.is_empty()
 }

@@ -1,12 +1,11 @@
+#![allow(rustc::diagnostic_outside_of_impl)]
+#![allow(rustc::untranslatable_diagnostic)]
 #![feature(if_let_guard)]
 #![feature(let_chains)]
 #![feature(try_blocks)]
 #![feature(never_type)]
 #![feature(box_patterns)]
-#![feature(min_specialization)]
 #![feature(control_flow_enum)]
-#![feature(option_as_slice)]
-#![recursion_limit = "256"]
 
 #[macro_use]
 extern crate tracing;
@@ -32,7 +31,6 @@ pub mod expr_use_visitor;
 mod fallback;
 mod fn_ctxt;
 mod gather_locals;
-mod inherited;
 mod intrinsicck;
 mod mem_categorization;
 mod method;
@@ -40,31 +38,29 @@ mod op;
 mod pat;
 mod place_op;
 mod rvalue_scopes;
+mod typeck_root_ctxt;
 mod upvar;
 mod writeback;
 
 pub use fn_ctxt::FnCtxt;
-pub use inherited::Inherited;
+pub use typeck_root_ctxt::TypeckRootCtxt;
 
 use crate::check::check_fn;
 use crate::coercion::DynamicCoerceMany;
 use crate::diverges::Diverges;
 use crate::expectation::Expectation;
-use crate::fn_ctxt::RawTy;
+use crate::fn_ctxt::LoweredTy;
 use crate::gather_locals::GatherLocalsVisitor;
 use rustc_data_structures::unord::UnordSet;
-use rustc_errors::{
-    struct_span_err, DiagnosticId, DiagnosticMessage, ErrorGuaranteed, MultiSpan,
-    SubdiagnosticMessage,
-};
-use rustc_fluent_macro::fluent_messages;
+use rustc_errors::{codes::*, struct_span_code_err, ErrorGuaranteed};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::{HirIdMap, Node};
-use rustc_hir_analysis::astconv::AstConv;
 use rustc_hir_analysis::check::check_abi;
+use rustc_hir_analysis::hir_ty_lowering::HirTyLowerer;
 use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
+use rustc_infer::traits::{ObligationCauseCode, ObligationInspector, WellFormedLoc};
 use rustc_middle::query::Providers;
 use rustc_middle::traits;
 use rustc_middle::ty::{self, Ty, TyCtxt};
@@ -72,12 +68,12 @@ use rustc_session::config;
 use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::Span;
 
-fluent_messages! { "../messages.ftl" }
+rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 #[macro_export]
 macro_rules! type_error_struct {
-    ($session:expr, $span:expr, $typ:expr, $code:ident, $($message:tt)*) => ({
-        let mut err = rustc_errors::struct_span_err!($session, $span, $code, $($message)*);
+    ($dcx:expr, $span:expr, $typ:expr, $code:expr, $($message:tt)*) => ({
+        let mut err = rustc_errors::struct_span_code_err!($dcx, $span, $code, $($message)*);
 
         if $typ.references_error() {
             err.downgrade_to_delayed_bug();
@@ -85,42 +81,6 @@ macro_rules! type_error_struct {
 
         err
     })
-}
-
-/// If this `DefId` is a "primary tables entry", returns
-/// `Some((body_id, body_ty, fn_sig))`. Otherwise, returns `None`.
-///
-/// If this function returns `Some`, then `typeck_results(def_id)` will
-/// succeed; if it returns `None`, then `typeck_results(def_id)` may or
-/// may not succeed. In some cases where this function returns `None`
-/// (notably closures), `typeck_results(def_id)` would wind up
-/// redirecting to the owning function.
-fn primary_body_of(
-    node: Node<'_>,
-) -> Option<(hir::BodyId, Option<&hir::Ty<'_>>, Option<&hir::FnSig<'_>>)> {
-    match node {
-        Node::Item(item) => match item.kind {
-            hir::ItemKind::Const(ty, _, body) | hir::ItemKind::Static(ty, _, body) => {
-                Some((body, Some(ty), None))
-            }
-            hir::ItemKind::Fn(ref sig, .., body) => Some((body, None, Some(sig))),
-            _ => None,
-        },
-        Node::TraitItem(item) => match item.kind {
-            hir::TraitItemKind::Const(ty, Some(body)) => Some((body, Some(ty), None)),
-            hir::TraitItemKind::Fn(ref sig, hir::TraitFn::Provided(body)) => {
-                Some((body, None, Some(sig)))
-            }
-            _ => None,
-        },
-        Node::ImplItem(item) => match item.kind {
-            hir::ImplItemKind::Const(ty, body) => Some((body, Some(ty), None)),
-            hir::ImplItemKind::Fn(ref sig, body) => Some((body, None, Some(sig))),
-            _ => None,
-        },
-        Node::AnonConst(constant) => Some((constant.body, None, None)),
-        _ => None,
-    }
 }
 
 fn has_typeck_results(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
@@ -132,7 +92,7 @@ fn has_typeck_results(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     }
 
     if let Some(def_id) = def_id.as_local() {
-        primary_body_of(tcx.hir().get_by_def_id(def_id)).is_some()
+        tcx.hir_node_by_def_id(def_id).body_id().is_some()
     } else {
         false
     }
@@ -144,24 +104,38 @@ fn used_trait_imports(tcx: TyCtxt<'_>, def_id: LocalDefId) -> &UnordSet<LocalDef
 
 fn typeck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &ty::TypeckResults<'tcx> {
     let fallback = move || tcx.type_of(def_id.to_def_id()).instantiate_identity();
-    typeck_with_fallback(tcx, def_id, fallback)
+    typeck_with_fallback(tcx, def_id, fallback, None)
 }
 
 /// Used only to get `TypeckResults` for type inference during error recovery.
 /// Currently only used for type inference of `static`s and `const`s to avoid type cycle errors.
 fn diagnostic_only_typeck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &ty::TypeckResults<'tcx> {
     let fallback = move || {
-        let span = tcx.hir().span(tcx.hir().local_def_id_to_hir_id(def_id));
+        let span = tcx.hir().span(tcx.local_def_id_to_hir_id(def_id));
         Ty::new_error_with_message(tcx, span, "diagnostic only typeck table used")
     };
-    typeck_with_fallback(tcx, def_id, fallback)
+    typeck_with_fallback(tcx, def_id, fallback, None)
 }
 
-#[instrument(level = "debug", skip(tcx, fallback), ret)]
+/// Same as `typeck` but `inspect` is invoked on evaluation of each root obligation.
+/// Inspecting obligations only works with the new trait solver.
+/// This function is *only to be used* by external tools, it should not be
+/// called from within rustc. Note, this is not a query, and thus is not cached.
+pub fn inspect_typeck<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    inspect: ObligationInspector<'tcx>,
+) -> &'tcx ty::TypeckResults<'tcx> {
+    let fallback = move || tcx.type_of(def_id.to_def_id()).instantiate_identity();
+    typeck_with_fallback(tcx, def_id, fallback, Some(inspect))
+}
+
+#[instrument(level = "debug", skip(tcx, fallback, inspector), ret)]
 fn typeck_with_fallback<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     fallback: impl Fn() -> Ty<'tcx> + 'tcx,
+    inspector: Option<ObligationInspector<'tcx>>,
 ) -> &'tcx ty::TypeckResults<'tcx> {
     // Closures' typeck results come from their outermost function,
     // as they are part of the same "inference environment".
@@ -170,24 +144,27 @@ fn typeck_with_fallback<'tcx>(
         return tcx.typeck(typeck_root_def_id);
     }
 
-    let id = tcx.hir().local_def_id_to_hir_id(def_id);
-    let node = tcx.hir().get(id);
+    let id = tcx.local_def_id_to_hir_id(def_id);
+    let node = tcx.hir_node(id);
     let span = tcx.hir().span(id);
 
     // Figure out what primary body this item has.
-    let (body_id, body_ty, fn_sig) = primary_body_of(node).unwrap_or_else(|| {
+    let body_id = node.body_id().unwrap_or_else(|| {
         span_bug!(span, "can't type-check body of {:?}", def_id);
     });
     let body = tcx.hir().body(body_id);
 
     let param_env = tcx.param_env(def_id);
 
-    let inh = Inherited::new(tcx, def_id);
-    let mut fcx = FnCtxt::new(&inh, param_env, def_id);
+    let root_ctxt = TypeckRootCtxt::new(tcx, def_id);
+    if let Some(inspector) = inspector {
+        root_ctxt.infcx.attach_obligation_inspector(inspector);
+    }
+    let mut fcx = FnCtxt::new(&root_ctxt, param_env, def_id);
 
-    if let Some(hir::FnSig { header, decl, .. }) = fn_sig {
-        let fn_sig = if rustc_hir_analysis::collect::get_infer_ret_ty(&decl.output).is_some() {
-            fcx.astconv().ty_of_fn(id, header.unsafety, header.abi, decl, None, None)
+    if let Some(hir::FnSig { header, decl, .. }) = node.fn_sig() {
+        let fn_sig = if decl.output.get_infer_ret_ty().is_some() {
+            fcx.lowerer().lower_fn_ty(id, header.unsafety, header.abi, decl, None, None)
         } else {
             tcx.fn_sig(def_id).instantiate_identity()
         };
@@ -198,53 +175,22 @@ fn typeck_with_fallback<'tcx>(
         let fn_sig = tcx.liberate_late_bound_regions(def_id.to_def_id(), fn_sig);
         let fn_sig = fcx.normalize(body.value.span, fn_sig);
 
-        check_fn(&mut fcx, fn_sig, decl, def_id, body, None, tcx.features().unsized_fn_params);
+        check_fn(&mut fcx, fn_sig, None, decl, def_id, body, tcx.features().unsized_fn_params);
     } else {
-        let expected_type = if let Some(&hir::Ty { kind: hir::TyKind::Infer, span, .. }) = body_ty {
-            Some(fcx.next_ty_var(TypeVariableOrigin {
-                kind: TypeVariableOriginKind::TypeInference,
-                span,
-            }))
-        } else if let Node::AnonConst(_) = node {
-            match tcx.hir().get(tcx.hir().parent_id(id)) {
-                Node::Ty(&hir::Ty { kind: hir::TyKind::Typeof(ref anon_const), .. })
-                    if anon_const.hir_id == id =>
-                {
-                    Some(fcx.next_ty_var(TypeVariableOrigin {
-                        kind: TypeVariableOriginKind::TypeInference,
-                        span,
-                    }))
-                }
-                Node::Expr(&hir::Expr { kind: hir::ExprKind::InlineAsm(asm), .. })
-                | Node::Item(&hir::Item { kind: hir::ItemKind::GlobalAsm(asm), .. }) => {
-                    asm.operands.iter().find_map(|(op, _op_sp)| match op {
-                        hir::InlineAsmOperand::Const { anon_const } if anon_const.hir_id == id => {
-                            // Inline assembly constants must be integers.
-                            Some(fcx.next_int_var())
-                        }
-                        hir::InlineAsmOperand::SymFn { anon_const } if anon_const.hir_id == id => {
-                            Some(fcx.next_ty_var(TypeVariableOrigin {
-                                kind: TypeVariableOriginKind::MiscVariable,
-                                span,
-                            }))
-                        }
-                        _ => None,
-                    })
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let expected_type = infer_type_if_missing(&fcx, node);
         let expected_type = expected_type.unwrap_or_else(fallback);
 
         let expected_type = fcx.normalize(body.value.span, expected_type);
+
+        let wf_code = ObligationCauseCode::WellFormed(Some(WellFormedLoc::Ty(def_id)));
+        fcx.register_wf_obligation(expected_type.into(), body.value.span, wf_code);
+
         fcx.require_type_is_sized(expected_type, body.value.span, traits::ConstSized);
 
         // Gather locals in statics (because of block expressions).
         GatherLocalsVisitor::new(&fcx).visit_body(body);
 
-        fcx.check_expr_coercible_to_type(&body.value, expected_type, None);
+        fcx.check_expr_coercible_to_type(body.value, expected_type, None);
 
         fcx.write_ty(id, expected_type);
     };
@@ -256,11 +202,11 @@ fn typeck_with_fallback<'tcx>(
     fcx.check_casts();
     fcx.select_obligations_where_possible(|_| {});
 
-    // Closure and generator analysis may run after fallback
+    // Closure and coroutine analysis may run after fallback
     // because they don't constrain other type variables.
     fcx.closure_analyze(body);
     assert!(fcx.deferred_call_resolutions.borrow().is_empty());
-    // Before the generator analysis, temporary scopes shall be marked to provide more
+    // Before the coroutine analysis, temporary scopes shall be marked to provide more
     // precise information on types to be captured.
     fcx.resolve_rvalue_scopes(def_id.to_def_id());
 
@@ -274,7 +220,7 @@ fn typeck_with_fallback<'tcx>(
     debug!(pending_obligations = ?fcx.fulfillment_cx.borrow().pending_obligations());
 
     // This must be the last thing before `report_ambiguity_errors`.
-    fcx.resolve_generator_interiors(def_id.to_def_id());
+    fcx.resolve_coroutine_interiors();
 
     debug!(pending_obligations = ?fcx.fulfillment_cx.borrow().pending_obligations());
 
@@ -288,9 +234,11 @@ fn typeck_with_fallback<'tcx>(
 
     fcx.check_asms();
 
-    fcx.infcx.skip_region_resolution();
-
     let typeck_results = fcx.resolve_type_vars_in_body(body);
+
+    // We clone the defined opaque types during writeback in the new solver
+    // because we have to use them during normalization.
+    let _ = fcx.infcx.take_opaque_types();
 
     // Consistency check our TypeckResults instance can hold all ItemLocalIds
     // it will need to hold.
@@ -299,21 +247,69 @@ fn typeck_with_fallback<'tcx>(
     typeck_results
 }
 
-/// When `check_fn` is invoked on a generator (i.e., a body that
+fn infer_type_if_missing<'tcx>(fcx: &FnCtxt<'_, 'tcx>, node: Node<'tcx>) -> Option<Ty<'tcx>> {
+    let tcx = fcx.tcx;
+    let def_id = fcx.body_id;
+    let expected_type = if let Some(&hir::Ty { kind: hir::TyKind::Infer, span, .. }) = node.ty() {
+        if let Some(item) = tcx.opt_associated_item(def_id.into())
+            && let ty::AssocKind::Const = item.kind
+            && let ty::ImplContainer = item.container
+            && let Some(trait_item) = item.trait_item_def_id
+        {
+            let args =
+                tcx.impl_trait_ref(item.container_id(tcx)).unwrap().instantiate_identity().args;
+            Some(tcx.type_of(trait_item).instantiate(tcx, args))
+        } else {
+            Some(fcx.next_ty_var(TypeVariableOrigin {
+                kind: TypeVariableOriginKind::TypeInference,
+                span,
+            }))
+        }
+    } else if let Node::AnonConst(_) = node {
+        let id = tcx.local_def_id_to_hir_id(def_id);
+        match tcx.parent_hir_node(id) {
+            Node::Ty(&hir::Ty { kind: hir::TyKind::Typeof(ref anon_const), span, .. })
+                if anon_const.hir_id == id =>
+            {
+                Some(fcx.next_ty_var(TypeVariableOrigin {
+                    kind: TypeVariableOriginKind::TypeInference,
+                    span,
+                }))
+            }
+            Node::Expr(&hir::Expr { kind: hir::ExprKind::InlineAsm(asm), span, .. })
+            | Node::Item(&hir::Item { kind: hir::ItemKind::GlobalAsm(asm), span, .. }) => {
+                asm.operands.iter().find_map(|(op, _op_sp)| match op {
+                    hir::InlineAsmOperand::Const { anon_const } if anon_const.hir_id == id => {
+                        // Inline assembly constants must be integers.
+                        Some(fcx.next_int_var())
+                    }
+                    hir::InlineAsmOperand::SymFn { anon_const } if anon_const.hir_id == id => {
+                        Some(fcx.next_ty_var(TypeVariableOrigin {
+                            kind: TypeVariableOriginKind::MiscVariable,
+                            span,
+                        }))
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    expected_type
+}
+
+/// When `check_fn` is invoked on a coroutine (i.e., a body that
 /// includes yield), it returns back some information about the yield
 /// points.
-struct GeneratorTypes<'tcx> {
-    /// Type of generator argument / values returned by `yield`.
+#[derive(Debug, PartialEq, Copy, Clone)]
+struct CoroutineTypes<'tcx> {
+    /// Type of coroutine argument / values returned by `yield`.
     resume_ty: Ty<'tcx>,
 
     /// Type of value that is yielded.
     yield_ty: Ty<'tcx>,
-
-    /// Types that are captured (see `GeneratorInterior` for more).
-    interior: Ty<'tcx>,
-
-    /// Indicates if the generator is movable or static (immovable).
-    movability: hir::Movability,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -370,7 +366,7 @@ fn report_unexpected_variant_res(
     res: Res,
     qpath: &hir::QPath<'_>,
     span: Span,
-    err_code: &str,
+    err_code: ErrCode,
     expected: &str,
 ) -> ErrorGuaranteed {
     let res_descr = match res {
@@ -378,18 +374,17 @@ fn report_unexpected_variant_res(
         _ => res.descr(),
     };
     let path_str = rustc_hir_pretty::qpath_to_string(qpath);
-    let mut err = tcx.sess.struct_span_err_with_code(
-        span,
-        format!("expected {expected}, found {res_descr} `{path_str}`"),
-        DiagnosticId::Error(err_code.into()),
-    );
+    let err = tcx
+        .dcx()
+        .struct_span_err(span, format!("expected {expected}, found {res_descr} `{path_str}`"))
+        .with_code(err_code);
     match res {
-        Res::Def(DefKind::Fn | DefKind::AssocFn, _) if err_code == "E0164" => {
+        Res::Def(DefKind::Fn | DefKind::AssocFn, _) if err_code == E0164 => {
             let patterns_url = "https://doc.rust-lang.org/book/ch18-00-patterns.html";
-            err.span_label(span, "`fn` calls are not allowed in patterns");
-            err.help(format!("for more information, visit {patterns_url}"))
+            err.with_span_label(span, "`fn` calls are not allowed in patterns")
+                .with_help(format!("for more information, visit {patterns_url}"))
         }
-        _ => err.span_label(span, format!("not a {expected}")),
+        _ => err.with_span_label(span, format!("not a {expected}")),
     }
     .emit()
 }
@@ -419,33 +414,25 @@ enum TupleArgumentsFlag {
     TupleArguments,
 }
 
-fn fatally_break_rust(tcx: TyCtxt<'_>) {
-    let handler = tcx.sess.diagnostic();
-    handler.span_bug_no_panic(
-        MultiSpan::new(),
+fn fatally_break_rust(tcx: TyCtxt<'_>, span: Span) -> ! {
+    let dcx = tcx.dcx();
+    let mut diag = dcx.struct_span_bug(
+        span,
         "It looks like you're trying to break rust; would you like some ICE?",
     );
-    handler.note_without_error("the compiler expectedly panicked. this is a feature.");
-    handler.note_without_error(
+    diag.note("the compiler expectedly panicked. this is a feature.");
+    diag.note(
         "we would appreciate a joke overview: \
          https://github.com/rust-lang/rust/issues/43162#issuecomment-320764675",
     );
-    handler.note_without_error(format!(
-        "rustc {} running on {}",
-        tcx.sess.cfg_version,
-        config::host_triple(),
-    ));
+    diag.note(format!("rustc {} running on {}", tcx.sess.cfg_version, config::host_triple(),));
     if let Some((flags, excluded_cargo_defaults)) = rustc_session::utils::extra_compiler_flags() {
-        handler.note_without_error(format!("compiler flags: {}", flags.join(" ")));
+        diag.note(format!("compiler flags: {}", flags.join(" ")));
         if excluded_cargo_defaults {
-            handler.note_without_error("some of the compiler flags provided by cargo are hidden");
+            diag.note("some of the compiler flags provided by cargo are hidden");
         }
     }
-}
-
-fn has_expected_num_generic_args(tcx: TyCtxt<'_>, trait_did: DefId, expected: usize) -> bool {
-    let generics = tcx.generics_of(trait_did);
-    generics.count() == expected + if generics.has_self { 1 } else { 0 }
+    diag.emit()
 }
 
 pub fn provide(providers: &mut Providers) {

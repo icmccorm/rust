@@ -1,6 +1,7 @@
-// compile-flags: -O -C debuginfo=0 -Zmir-opt-level=2
-// only-64bit
-// ignore-debug the standard library debug assertions leak into this test
+// skip-filecheck
+//@ compile-flags: -O -C debuginfo=0 -Zmir-opt-level=2 -Zinline-mir
+//@ ignore-debug: precondition checks on ptr::read/write are under cfg(debug_assertions)
+// EMIT_MIR_FOR_EACH_PANIC_STRATEGY
 
 #![crate_type = "lib"]
 

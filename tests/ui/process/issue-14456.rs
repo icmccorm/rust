@@ -1,7 +1,7 @@
-// run-pass
+//@ run-pass
 #![allow(unused_mut)]
-// ignore-emscripten no processes
-// ignore-sgx no processes
+//@ ignore-wasm32 no processes
+//@ ignore-sgx no processes
 
 use std::env;
 use std::io::prelude::*;

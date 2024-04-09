@@ -2,7 +2,7 @@
 //!
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/mir/index.html
 
-use crate::mir::interpret::{AllocRange, ConstAllocation, ErrorHandled, Scalar};
+use crate::mir::interpret::{AllocRange, Scalar};
 use crate::mir::visit::MirVisitable;
 use crate::ty::codec::{TyDecoder, TyEncoder};
 use crate::ty::fold::{FallibleTypeFolder, TypeFoldable};
@@ -10,16 +10,19 @@ use crate::ty::print::{pretty_print_const, with_no_trimmed_paths};
 use crate::ty::print::{FmtPrinter, Printer};
 use crate::ty::visit::TypeVisitableExt;
 use crate::ty::{self, List, Ty, TyCtxt};
-use crate::ty::{AdtDef, InstanceDef, UserTypeAnnotationIndex};
+use crate::ty::{AdtDef, Instance, InstanceDef, UserTypeAnnotationIndex};
 use crate::ty::{GenericArg, GenericArgsRef};
 
 use rustc_data_structures::captures::Captures;
-use rustc_errors::{DiagnosticArgValue, DiagnosticMessage, ErrorGuaranteed, IntoDiagnosticArg};
+use rustc_errors::{DiagArgName, DiagArgValue, DiagMessage, ErrorGuaranteed, IntoDiagArg};
 use rustc_hir::def::{CtorKind, Namespace};
 use rustc_hir::def_id::{DefId, CRATE_DEF_ID};
-use rustc_hir::{self, GeneratorKind, ImplicitSelfKind};
-use rustc_hir::{self as hir, HirId};
+use rustc_hir::{
+    self as hir, BindingAnnotation, ByRef, CoroutineDesugaring, CoroutineKind, HirId,
+    ImplicitSelfKind,
+};
 use rustc_session::Session;
+use rustc_span::source_map::Spanned;
 use rustc_target::abi::{FieldIdx, VariantIdx};
 
 use polonius_engine::Atom;
@@ -27,6 +30,8 @@ pub use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::graph::dominators::Dominators;
+use rustc_data_structures::stack::ensure_sufficient_stack;
+use rustc_index::bit_set::BitSet;
 use rustc_index::{Idx, IndexSlice, IndexVec};
 use rustc_serialize::{Decodable, Encodable};
 use rustc_span::symbol::Symbol;
@@ -42,6 +47,7 @@ use std::ops::{Index, IndexMut};
 use std::{iter, mem};
 
 pub use self::query::*;
+use self::visit::TyContext;
 pub use basic_blocks::BasicBlocks;
 
 mod basic_blocks;
@@ -55,7 +61,6 @@ pub mod mono;
 pub mod patch;
 pub mod pretty;
 mod query;
-pub mod spanview;
 mod statement;
 mod syntax;
 pub mod tcx;
@@ -139,8 +144,12 @@ fn to_profiler_name(type_name: &'static str) -> &'static str {
 /// loop that goes over each available MIR and applies `run_pass`.
 pub trait MirPass<'tcx> {
     fn name(&self) -> &'static str {
-        let name = std::any::type_name::<Self>();
-        if let Some((_, tail)) = name.rsplit_once(':') { tail } else { name }
+        // FIXME Simplify the implementation once more `str` methods get const-stable.
+        // See copypaste in `MirLint`
+        const {
+            let name = std::any::type_name::<Self>();
+            crate::util::common::c_name(name)
+        }
     }
 
     fn profiler_name(&self) -> &'static str {
@@ -245,20 +254,73 @@ impl<'tcx> MirSource<'tcx> {
     }
 }
 
+/// Additional information carried by a MIR body when it is lowered from a coroutine.
+/// This information is modified as it is lowered during the `StateTransform` MIR pass,
+/// so not all fields will be active at a given time. For example, the `yield_ty` is
+/// taken out of the field after yields are turned into returns, and the `coroutine_drop`
+/// body is only populated after the state transform pass.
 #[derive(Clone, TyEncodable, TyDecodable, Debug, HashStable, TypeFoldable, TypeVisitable)]
-pub struct GeneratorInfo<'tcx> {
-    /// The yield type of the function, if it is a generator.
+pub struct CoroutineInfo<'tcx> {
+    /// The yield type of the function. This field is removed after the state transform pass.
     pub yield_ty: Option<Ty<'tcx>>,
 
-    /// Generator drop glue.
-    pub generator_drop: Option<Body<'tcx>>,
+    /// The resume type of the function. This field is removed after the state transform pass.
+    pub resume_ty: Option<Ty<'tcx>>,
 
-    /// The layout of a generator. Produced by the state transformation.
-    pub generator_layout: Option<GeneratorLayout<'tcx>>,
+    /// Coroutine drop glue. This field is populated after the state transform pass.
+    pub coroutine_drop: Option<Body<'tcx>>,
 
-    /// If this is a generator then record the type of source expression that caused this generator
+    /// The body of the coroutine, modified to take its upvars by move rather than by ref.
+    ///
+    /// This is used by coroutine-closures, which must return a different flavor of coroutine
+    /// when called using `AsyncFnOnce::call_once`. It is produced by the `ByMoveBody` pass which
+    /// is run right after building the initial MIR, and will only be populated for coroutines
+    /// which come out of the async closure desugaring.
+    ///
+    /// This body should be processed in lockstep with the containing body -- any optimization
+    /// passes, etc, should be applied to this body as well. This is done automatically if
+    /// using `run_passes`.
+    pub by_move_body: Option<Body<'tcx>>,
+
+    /// The layout of a coroutine. This field is populated after the state transform pass.
+    pub coroutine_layout: Option<CoroutineLayout<'tcx>>,
+
+    /// If this is a coroutine then record the type of source expression that caused this coroutine
     /// to be created.
-    pub generator_kind: GeneratorKind,
+    pub coroutine_kind: CoroutineKind,
+}
+
+impl<'tcx> CoroutineInfo<'tcx> {
+    // Sets up `CoroutineInfo` for a pre-coroutine-transform MIR body.
+    pub fn initial(
+        coroutine_kind: CoroutineKind,
+        yield_ty: Ty<'tcx>,
+        resume_ty: Ty<'tcx>,
+    ) -> CoroutineInfo<'tcx> {
+        CoroutineInfo {
+            coroutine_kind,
+            yield_ty: Some(yield_ty),
+            resume_ty: Some(resume_ty),
+            by_move_body: None,
+            coroutine_drop: None,
+            coroutine_layout: None,
+        }
+    }
+}
+
+/// Some item that needs to monomorphize successfully for a MIR body to be considered well-formed.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, HashStable, TyEncodable, TyDecodable)]
+#[derive(TypeFoldable, TypeVisitable)]
+pub enum MentionedItem<'tcx> {
+    /// A function that gets called. We don't necessarily know its precise type yet, since it can be
+    /// hidden behind a generic.
+    Fn(Ty<'tcx>),
+    /// A type that has its drop shim called.
+    Drop(Ty<'tcx>),
+    /// Unsizing casts might require vtables, so we have to record them.
+    UnsizeCast { source_ty: Ty<'tcx>, target_ty: Ty<'tcx> },
+    /// A closure that is coerced to a function pointer.
+    Closure(Ty<'tcx>),
 }
 
 /// The lowered representation of a single function.
@@ -284,7 +346,13 @@ pub struct Body<'tcx> {
     /// and used for debuginfo. Indexed by a `SourceScope`.
     pub source_scopes: IndexVec<SourceScope, SourceScopeData<'tcx>>,
 
-    pub generator: Option<Box<GeneratorInfo<'tcx>>>,
+    /// Additional information carried by a MIR body when it is lowered from a coroutine.
+    ///
+    /// Note that the coroutine drop shim, any promoted consts, and other synthetic MIR
+    /// bodies that come from processing a coroutine body are not typically coroutines
+    /// themselves, and should probably set this to `None` to avoid carrying redundant
+    /// information.
+    pub coroutine: Option<Box<CoroutineInfo<'tcx>>>,
 
     /// Declarations of locals.
     ///
@@ -318,7 +386,23 @@ pub struct Body<'tcx> {
 
     /// Constants that are required to evaluate successfully for this MIR to be well-formed.
     /// We hold in this field all the constants we are not able to evaluate yet.
+    ///
+    /// This is soundness-critical, we make a guarantee that all consts syntactically mentioned in a
+    /// function have successfully evaluated if the function ever gets executed at runtime.
     pub required_consts: Vec<ConstOperand<'tcx>>,
+
+    /// Further items that were mentioned in this function and hence *may* become monomorphized,
+    /// depending on optimizations. We use this to avoid optimization-dependent compile errors: the
+    /// collector recursively traverses all "mentioned" items and evaluates all their
+    /// `required_consts`.
+    ///
+    /// This is *not* soundness-critical and the contents of this list are *not* a stable guarantee.
+    /// All that's relevant is that this set is optimization-level-independent, and that it includes
+    /// everything that the collector would consider "used". (For example, we currently compute this
+    /// set after drop elaboration, so some drop calls that can never be reached are not considered
+    /// "mentioned".) See the documentation of `CollectionMode` in
+    /// `compiler/rustc_monomorphize/src/collector.rs` for more context.
+    pub mentioned_items: Vec<Spanned<MentionedItem<'tcx>>>,
 
     /// Does this body use generic parameters. This is used for the `ConstEvaluatable` check.
     ///
@@ -345,6 +429,20 @@ pub struct Body<'tcx> {
     pub injection_phase: Option<MirPhase>,
 
     pub tainted_by_errors: Option<ErrorGuaranteed>,
+
+    /// Branch coverage information collected during MIR building, to be used by
+    /// the `InstrumentCoverage` pass.
+    ///
+    /// Only present if branch coverage is enabled and this function is eligible.
+    pub coverage_branch_info: Option<Box<coverage::BranchInfo>>,
+
+    /// Per-function coverage information added by the `InstrumentCoverage`
+    /// pass, to be used in conjunction with the coverage statements injected
+    /// into this body's blocks.
+    ///
+    /// If `-Cinstrument-coverage` is not active, or if an individual function
+    /// is not eligible for coverage, then this should always be `None`.
+    pub function_coverage_info: Option<Box<coverage::FunctionCoverageInfo>>,
 }
 
 impl<'tcx> Body<'tcx> {
@@ -357,7 +455,7 @@ impl<'tcx> Body<'tcx> {
         arg_count: usize,
         var_debug_info: Vec<VarDebugInfo<'tcx>>,
         span: Span,
-        generator_kind: Option<GeneratorKind>,
+        coroutine: Option<Box<CoroutineInfo<'tcx>>>,
         tainted_by_errors: Option<ErrorGuaranteed>,
     ) -> Self {
         // We need `arg_count` locals, and one for the return place.
@@ -374,14 +472,7 @@ impl<'tcx> Body<'tcx> {
             source,
             basic_blocks: BasicBlocks::new(basic_blocks),
             source_scopes,
-            generator: generator_kind.map(|generator_kind| {
-                Box::new(GeneratorInfo {
-                    yield_ty: None,
-                    generator_drop: None,
-                    generator_layout: None,
-                    generator_kind,
-                })
-            }),
+            coroutine,
             local_decls,
             user_type_annotations,
             arg_count,
@@ -389,9 +480,12 @@ impl<'tcx> Body<'tcx> {
             var_debug_info,
             span,
             required_consts: Vec::new(),
+            mentioned_items: Vec::new(),
             is_polymorphic: false,
             injection_phase: None,
             tainted_by_errors,
+            coverage_branch_info: None,
+            function_coverage_info: None,
         };
         body.is_polymorphic = body.has_non_region_param();
         body
@@ -409,17 +503,20 @@ impl<'tcx> Body<'tcx> {
             source: MirSource::item(CRATE_DEF_ID.to_def_id()),
             basic_blocks: BasicBlocks::new(basic_blocks),
             source_scopes: IndexVec::new(),
-            generator: None,
+            coroutine: None,
             local_decls: IndexVec::new(),
             user_type_annotations: IndexVec::new(),
             arg_count: 0,
             spread_arg: None,
             span: DUMMY_SP,
             required_consts: Vec::new(),
+            mentioned_items: Vec::new(),
             var_debug_info: Vec::new(),
             is_polymorphic: false,
             injection_phase: None,
             tainted_by_errors: None,
+            coverage_branch_info: None,
+            function_coverage_info: None,
         };
         body.is_polymorphic = body.has_non_region_param();
         body
@@ -508,6 +605,17 @@ impl<'tcx> Body<'tcx> {
         }
     }
 
+    pub fn span_for_ty_context(&self, ty_context: TyContext) -> Span {
+        match ty_context {
+            TyContext::UserTy(span) => span,
+            TyContext::ReturnTy(source_info)
+            | TyContext::LocalDecl { source_info, .. }
+            | TyContext::YieldTy(source_info)
+            | TyContext::ResumeTy(source_info) => source_info.span,
+            TyContext::Location(loc) => self.source_info(loc).span,
+        }
+    }
+
     /// Returns the return type; it always return first element from `local_decls` array.
     #[inline]
     pub fn return_ty(&self) -> Ty<'tcx> {
@@ -538,22 +646,32 @@ impl<'tcx> Body<'tcx> {
 
     #[inline]
     pub fn yield_ty(&self) -> Option<Ty<'tcx>> {
-        self.generator.as_ref().and_then(|generator| generator.yield_ty)
+        self.coroutine.as_ref().and_then(|coroutine| coroutine.yield_ty)
     }
 
     #[inline]
-    pub fn generator_layout(&self) -> Option<&GeneratorLayout<'tcx>> {
-        self.generator.as_ref().and_then(|generator| generator.generator_layout.as_ref())
+    pub fn resume_ty(&self) -> Option<Ty<'tcx>> {
+        self.coroutine.as_ref().and_then(|coroutine| coroutine.resume_ty)
+    }
+
+    /// Prefer going through [`TyCtxt::coroutine_layout`] rather than using this directly.
+    #[inline]
+    pub fn coroutine_layout_raw(&self) -> Option<&CoroutineLayout<'tcx>> {
+        self.coroutine.as_ref().and_then(|coroutine| coroutine.coroutine_layout.as_ref())
     }
 
     #[inline]
-    pub fn generator_drop(&self) -> Option<&Body<'tcx>> {
-        self.generator.as_ref().and_then(|generator| generator.generator_drop.as_ref())
+    pub fn coroutine_drop(&self) -> Option<&Body<'tcx>> {
+        self.coroutine.as_ref().and_then(|coroutine| coroutine.coroutine_drop.as_ref())
+    }
+
+    pub fn coroutine_by_move_body(&self) -> Option<&Body<'tcx>> {
+        self.coroutine.as_ref()?.by_move_body.as_ref()
     }
 
     #[inline]
-    pub fn generator_kind(&self) -> Option<GeneratorKind> {
-        self.generator.as_ref().map(|generator| generator.generator_kind)
+    pub fn coroutine_kind(&self) -> Option<CoroutineKind> {
+        self.coroutine.as_ref().map(|coroutine| coroutine.coroutine_kind)
     }
 
     #[inline]
@@ -569,44 +687,162 @@ impl<'tcx> Body<'tcx> {
         self.injection_phase.is_some()
     }
 
-    /// *Must* be called once the full substitution for this body is known, to ensure that the body
-    /// is indeed fit for code generation or consumption more generally.
+    /// Finds which basic blocks are actually reachable for a specific
+    /// monomorphization of this body.
     ///
-    /// Sadly there's no nice way to represent an "arbitrary normalizer", so we take one for
-    /// constants specifically. (`Option<GenericArgsRef>` could be used for that, but the fact
-    /// that `Instance::args_for_mir_body` is private and instead instance exposes normalization
-    /// functions makes it seem like exposing the generic args is not the intended strategy.)
+    /// This is allowed to have false positives; just because this says a block
+    /// is reachable doesn't mean that's necessarily true. It's thus always
+    /// legal for this to return a filled set.
     ///
-    /// Also sadly, CTFE doesn't even know whether it runs on MIR that is already polymorphic or still monomorphic,
-    /// so we cannot just immediately ICE on TooGeneric.
+    /// Regardless, the [`BitSet::domain_size`] of the returned set will always
+    /// exactly match the number of blocks in the body so that `contains`
+    /// checks can be done without worrying about panicking.
     ///
-    /// Returns Ok(()) if everything went fine, and `Err` if a problem occurred and got reported.
-    pub fn post_mono_checks(
+    /// This is mostly useful because it lets us skip lowering the `false` side
+    /// of `if <T as Trait>::CONST`, as well as `intrinsics::debug_assertions`.
+    pub fn reachable_blocks_in_mono(
         &self,
         tcx: TyCtxt<'tcx>,
-        param_env: ty::ParamEnv<'tcx>,
-        normalize_const: impl Fn(Const<'tcx>) -> Result<Const<'tcx>, ErrorHandled>,
-    ) -> Result<(), ErrorHandled> {
-        // For now, the only thing we have to check is is to ensure that all the constants used in
-        // the body successfully evaluate.
-        for &const_ in &self.required_consts {
-            let c = normalize_const(const_.const_)?;
-            c.eval(tcx, param_env, Some(const_.span))?;
+        instance: Instance<'tcx>,
+    ) -> BitSet<BasicBlock> {
+        let mut set = BitSet::new_empty(self.basic_blocks.len());
+        self.reachable_blocks_in_mono_from(tcx, instance, &mut set, START_BLOCK);
+        set
+    }
+
+    fn reachable_blocks_in_mono_from(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: Instance<'tcx>,
+        set: &mut BitSet<BasicBlock>,
+        bb: BasicBlock,
+    ) {
+        if !set.insert(bb) {
+            return;
         }
 
-        Ok(())
-    }
-}
+        let data = &self.basic_blocks[bb];
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, TyEncodable, TyDecodable, HashStable)]
-pub enum Safety {
-    Safe,
-    /// Unsafe because of compiler-generated unsafe code, like `await` desugaring
-    BuiltinUnsafe,
-    /// Unsafe because of an unsafe fn
-    FnUnsafe,
-    /// Unsafe because of an `unsafe` block
-    ExplicitUnsafe(hir::HirId),
+        if let Some((bits, targets)) = Self::try_const_mono_switchint(tcx, instance, data) {
+            let target = targets.target_for_value(bits);
+            ensure_sufficient_stack(|| {
+                self.reachable_blocks_in_mono_from(tcx, instance, set, target)
+            });
+            return;
+        }
+
+        for target in data.terminator().successors() {
+            ensure_sufficient_stack(|| {
+                self.reachable_blocks_in_mono_from(tcx, instance, set, target)
+            });
+        }
+    }
+
+    /// If this basic block ends with a [`TerminatorKind::SwitchInt`] for which we can evaluate the
+    /// dimscriminant in monomorphization, we return the discriminant bits and the
+    /// [`SwitchTargets`], just so the caller doesn't also have to match on the terminator.
+    fn try_const_mono_switchint<'a>(
+        tcx: TyCtxt<'tcx>,
+        instance: Instance<'tcx>,
+        block: &'a BasicBlockData<'tcx>,
+    ) -> Option<(u128, &'a SwitchTargets)> {
+        // There are two places here we need to evaluate a constant.
+        let eval_mono_const = |constant: &ConstOperand<'tcx>| {
+            let env = ty::ParamEnv::reveal_all();
+            let mono_literal = instance.instantiate_mir_and_normalize_erasing_regions(
+                tcx,
+                env,
+                crate::ty::EarlyBinder::bind(constant.const_),
+            );
+            let Some(bits) = mono_literal.try_eval_bits(tcx, env) else {
+                bug!("Couldn't evaluate constant {:?} in mono {:?}", constant, instance);
+            };
+            bits
+        };
+
+        let TerminatorKind::SwitchInt { discr, targets } = &block.terminator().kind else {
+            return None;
+        };
+
+        // If this is a SwitchInt(const _), then we can just evaluate the constant and return.
+        let discr = match discr {
+            Operand::Constant(constant) => {
+                let bits = eval_mono_const(constant);
+                return Some((bits, targets));
+            }
+            Operand::Move(place) | Operand::Copy(place) => place,
+        };
+
+        // MIR for `if false` actually looks like this:
+        // _1 = const _
+        // SwitchInt(_1)
+        //
+        // And MIR for if intrinsics::debug_assertions() looks like this:
+        // _1 = cfg!(debug_assertions)
+        // SwitchInt(_1)
+        //
+        // So we're going to try to recognize this pattern.
+        //
+        // If we have a SwitchInt on a non-const place, we find the most recent statement that
+        // isn't a storage marker. If that statement is an assignment of a const to our
+        // discriminant place, we evaluate and return the const, as if we've const-propagated it
+        // into the SwitchInt.
+
+        let last_stmt = block.statements.iter().rev().find(|stmt| {
+            !matches!(stmt.kind, StatementKind::StorageDead(_) | StatementKind::StorageLive(_))
+        })?;
+
+        let (place, rvalue) = last_stmt.kind.as_assign()?;
+
+        if discr != place {
+            return None;
+        }
+
+        match rvalue {
+            Rvalue::NullaryOp(NullOp::UbChecks, _) => {
+                Some((tcx.sess.opts.debug_assertions as u128, targets))
+            }
+            Rvalue::Use(Operand::Constant(constant)) => {
+                let bits = eval_mono_const(constant);
+                Some((bits, targets))
+            }
+            _ => None,
+        }
+    }
+
+    /// For a `Location` in this scope, determine what the "caller location" at that point is. This
+    /// is interesting because of inlining: the `#[track_caller]` attribute of inlined functions
+    /// must be honored. Falls back to the `tracked_caller` value for `#[track_caller]` functions,
+    /// or the function's scope.
+    pub fn caller_location_span<T>(
+        &self,
+        mut source_info: SourceInfo,
+        caller_location: Option<T>,
+        tcx: TyCtxt<'tcx>,
+        from_span: impl FnOnce(Span) -> T,
+    ) -> T {
+        loop {
+            let scope_data = &self.source_scopes[source_info.scope];
+
+            if let Some((callee, callsite_span)) = scope_data.inlined {
+                // Stop inside the most nested non-`#[track_caller]` function,
+                // before ever reaching its caller (which is irrelevant).
+                if !callee.def.requires_caller_location(tcx) {
+                    return from_span(source_info.span);
+                }
+                source_info.span = callsite_span;
+            }
+
+            // Skip past all of the parents with `inlined: None`.
+            match scope_data.inlined_parent_scope {
+                Some(parent) => source_info.scope = parent,
+                None => break,
+            }
+        }
+
+        // No inlined `SourceScope`s, or all of them were `#[track_caller]`.
+        caller_location.unwrap_or_else(|| from_span(source_info.span))
+    }
 }
 
 impl<'tcx> Index<BasicBlock> for Body<'tcx> {
@@ -704,7 +940,7 @@ pub struct SourceInfo {
     pub span: Span,
 
     /// The source scope, keeping track of which bindings can be
-    /// seen by debuginfo, active lint levels, `unsafe {...}`, etc.
+    /// seen by debuginfo, active lint levels, etc.
     pub scope: SourceScope,
 }
 
@@ -720,6 +956,8 @@ impl SourceInfo {
 
 rustc_index::newtype_index! {
     #[derive(HashStable)]
+    #[encodable]
+    #[orderable]
     #[debug_format = "_{}"]
     pub struct Local {
         const RETURN_PLACE = 0;
@@ -745,8 +983,8 @@ pub enum LocalKind {
 
 #[derive(Clone, Debug, TyEncodable, TyDecodable, HashStable)]
 pub struct VarBindingForm<'tcx> {
-    /// Is variable bound via `x`, `mut x`, `ref x`, or `ref mut x`?
-    pub binding_mode: ty::BindingMode,
+    /// Is variable bound via `x`, `mut x`, `ref x`, `ref mut x`, `mut ref x`, or `mut ref mut x`?
+    pub binding_mode: BindingAnnotation,
     /// If an explicit type was provided for this variable binding,
     /// this holds the source Span of that type.
     ///
@@ -829,22 +1067,6 @@ pub struct LocalDecl<'tcx> {
 
     // FIXME(matthewjasper) Don't store in this in `Body`
     pub local_info: ClearCrossCrate<Box<LocalInfo<'tcx>>>,
-
-    /// `true` if this is an internal local.
-    ///
-    /// These locals are not based on types in the source code and are only used
-    /// for a few desugarings at the moment.
-    ///
-    /// The generator transformation will sanity check the locals which are live
-    /// across a suspension point against the type components of the generator
-    /// which type checking knows are live across a suspension point. We need to
-    /// flag drop flags to avoid triggering this check as they are introduced
-    /// outside of type inference.
-    ///
-    /// This should be sound because the drop flags are fully algebraic, and
-    /// therefore don't affect the auto-trait or outlives properties of the
-    /// generator.
-    pub internal: bool,
 
     /// The type of this local.
     pub ty: Ty<'tcx>,
@@ -940,7 +1162,7 @@ pub struct LocalDecl<'tcx> {
 
 /// Extra information about a some locals that's used for diagnostics and for
 /// classifying variables into local variables, statics, etc, which is needed e.g.
-/// for unsafety checking.
+/// for borrow checking.
 ///
 /// Not used for non-StaticRef temporaries, the return place, or anonymous
 /// function parameters.
@@ -973,7 +1195,7 @@ pub enum LocalInfo<'tcx> {
 
 impl<'tcx> LocalDecl<'tcx> {
     pub fn local_info(&self) -> &LocalInfo<'tcx> {
-        &self.local_info.as_ref().assert_crate_local()
+        self.local_info.as_ref().assert_crate_local()
     }
 
     /// Returns `true` only if local is a binding that can itself be
@@ -987,7 +1209,7 @@ impl<'tcx> LocalDecl<'tcx> {
             self.local_info(),
             LocalInfo::User(
                 BindingForm::Var(VarBindingForm {
-                    binding_mode: ty::BindingMode::BindByValue(_),
+                    binding_mode: BindingAnnotation(ByRef::No, _),
                     opt_ty_info: _,
                     opt_match_place: _,
                     pat_span: _,
@@ -1004,7 +1226,7 @@ impl<'tcx> LocalDecl<'tcx> {
             self.local_info(),
             LocalInfo::User(
                 BindingForm::Var(VarBindingForm {
-                    binding_mode: ty::BindingMode::BindByValue(_),
+                    binding_mode: BindingAnnotation(ByRef::No, _),
                     opt_ty_info: _,
                     opt_match_place: _,
                     pat_span: _,
@@ -1058,7 +1280,7 @@ impl<'tcx> LocalDecl<'tcx> {
         self.source_info.span.desugaring_kind().is_some()
     }
 
-    /// Creates a new `LocalDecl` for a temporary: mutable, non-internal.
+    /// Creates a new `LocalDecl` for a temporary, mutable.
     #[inline]
     pub fn new(ty: Ty<'tcx>, span: Span) -> Self {
         Self::with_source_info(ty, SourceInfo::outermost(span))
@@ -1070,18 +1292,10 @@ impl<'tcx> LocalDecl<'tcx> {
         LocalDecl {
             mutability: Mutability::Mut,
             local_info: ClearCrossCrate::Set(Box::new(LocalInfo::Boring)),
-            internal: false,
             ty,
             user_ty: None,
             source_info,
         }
-    }
-
-    /// Converts `self` into same `LocalDecl` except tagged as internal.
-    #[inline]
-    pub fn internal(mut self) -> Self {
-        self.internal = true;
-        self
     }
 
     /// Converts `self` into same `LocalDecl` except tagged as immutable.
@@ -1179,6 +1393,8 @@ rustc_index::newtype_index! {
     /// [`CriticalCallEdges`]: ../../rustc_const_eval/transform/add_call_guards/enum.AddCallGuards.html#variant.CriticalCallEdges
     /// [guide-mir]: https://rustc-dev-guide.rust-lang.org/mir/
     #[derive(HashStable)]
+    #[encodable]
+    #[orderable]
     #[debug_format = "bb{}"]
     pub struct BasicBlock {
         const START_BLOCK = 0;
@@ -1303,6 +1519,7 @@ impl<'tcx> BasicBlockData<'tcx> {
     }
 
     /// Does the block have no statements and an unreachable terminator?
+    #[inline]
     pub fn is_empty_unreachable(&self) -> bool {
         self.statements.is_empty() && matches!(self.terminator().kind, TerminatorKind::Unreachable)
     }
@@ -1313,6 +1530,7 @@ impl<'tcx> BasicBlockData<'tcx> {
 
 rustc_index::newtype_index! {
     #[derive(HashStable)]
+    #[encodable]
     #[debug_format = "scope[{}]"]
     pub struct SourceScope {
         const OUTERMOST_SOURCE_SCOPE = 0;
@@ -1382,8 +1600,6 @@ pub struct SourceScopeData<'tcx> {
 pub struct SourceScopeLocalData {
     /// An `HirId` with lint levels equivalent to this scope's lint levels.
     pub lint_root: hir::HirId,
-    /// The unsafe block that contains this node.
-    pub safety: Safety,
 }
 
 /// A collection of projections into user types.
@@ -1541,6 +1757,8 @@ impl UserTypeProjection {
 
 rustc_index::newtype_index! {
     #[derive(HashStable)]
+    #[encodable]
+    #[orderable]
     #[debug_format = "promoted[{}]"]
     pub struct Promoted {}
 }
@@ -1569,6 +1787,7 @@ impl Location {
     ///
     /// Note that if this location represents a terminator, then the
     /// resulting location would be out of bounds and invalid.
+    #[inline]
     pub fn successor_within_block(&self) -> Location {
         Location { block: self.block, statement_index: self.statement_index + 1 }
     }
@@ -1605,6 +1824,7 @@ impl Location {
         false
     }
 
+    #[inline]
     pub fn dominates(&self, other: Location, dominators: &Dominators<BasicBlock>) -> bool {
         if self.block == other.block {
             self.statement_index <= other.statement_index
@@ -1614,19 +1834,52 @@ impl Location {
     }
 }
 
+/// `DefLocation` represents the location of a definition - either an argument or an assignment
+/// within MIR body.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DefLocation {
+    Argument,
+    Assignment(Location),
+    CallReturn { call: BasicBlock, target: Option<BasicBlock> },
+}
+
+impl DefLocation {
+    #[inline]
+    pub fn dominates(self, location: Location, dominators: &Dominators<BasicBlock>) -> bool {
+        match self {
+            DefLocation::Argument => true,
+            DefLocation::Assignment(def) => {
+                def.successor_within_block().dominates(location, dominators)
+            }
+            DefLocation::CallReturn { target: None, .. } => false,
+            DefLocation::CallReturn { call, target: Some(target) } => {
+                // The definition occurs on the call -> target edge. The definition dominates a use
+                // if and only if the edge is on all paths from the entry to the use.
+                //
+                // Note that a call terminator has only one edge that can reach the target, so when
+                // the call strongly dominates the target, all paths from the entry to the target
+                // go through the call -> target edge.
+                call != target
+                    && dominators.dominates(call, target)
+                    && dominators.dominates(target, location.block)
+            }
+        }
+    }
+}
+
 // Some nodes are used a lot. Make sure they don't unintentionally get bigger.
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_pointer_width = "64"))]
 mod size_asserts {
     use super::*;
     use rustc_data_structures::static_assert_size;
     // tidy-alphabetical-start
-    static_assert_size!(BasicBlockData<'_>, 136);
+    static_assert_size!(BasicBlockData<'_>, 144);
     static_assert_size!(LocalDecl<'_>, 40);
-    static_assert_size!(SourceScopeData<'_>, 72);
+    static_assert_size!(SourceScopeData<'_>, 64);
     static_assert_size!(Statement<'_>, 32);
     static_assert_size!(StatementKind<'_>, 16);
-    static_assert_size!(Terminator<'_>, 104);
-    static_assert_size!(TerminatorKind<'_>, 88);
+    static_assert_size!(Terminator<'_>, 112);
+    static_assert_size!(TerminatorKind<'_>, 96);
     static_assert_size!(VarDebugInfo<'_>, 88);
     // tidy-alphabetical-end
 }

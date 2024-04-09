@@ -1,8 +1,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 
-use rustc_session::Session;
-
 use jobserver::HelperThread;
+use rustc_session::Session;
 
 // FIXME don't panic when a worker thread panics
 
@@ -47,7 +46,7 @@ impl ConcurrencyLimiter {
         }
     }
 
-    pub(super) fn acquire(&mut self, handler: &rustc_errors::Handler) -> ConcurrencyLimiterToken {
+    pub(super) fn acquire(&mut self, dcx: &rustc_errors::DiagCtxt) -> ConcurrencyLimiterToken {
         let mut state = self.state.lock().unwrap();
         loop {
             state.assert_invariants();
@@ -65,7 +64,7 @@ impl ConcurrencyLimiter {
                     // Make sure to drop the mutex guard first to prevent poisoning the mutex.
                     drop(state);
                     if let Some(err) = err {
-                        handler.fatal(err).raise();
+                        dcx.fatal(err);
                     } else {
                         // The error was already emitted, but compilation continued. Raise a silent
                         // fatal error.

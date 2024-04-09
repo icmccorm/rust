@@ -1,10 +1,10 @@
+use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::msrvs::{self, Msrv};
 use rustc_ast::ast::{Expr, ExprKind};
 use rustc_errors::Applicability;
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
 use rustc_middle::lint::in_external_macro;
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_session::impl_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -16,7 +16,7 @@ declare_clippy_lint! {
     /// the field name is redundant.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let bar: u8 = 123;
     ///
     /// struct Foo {
@@ -59,24 +59,22 @@ impl EarlyLintPass for RedundantFieldNames {
         }
         if let ExprKind::Struct(ref se) = expr.kind {
             for field in &se.fields {
-                if field.is_shorthand {
-                    continue;
-                }
-                if let ExprKind::Path(None, path) = &field.expr.kind {
-                    if path.segments.len() == 1
-                        && path.segments[0].ident == field.ident
-                        && path.segments[0].args.is_none()
-                    {
-                        span_lint_and_sugg(
-                            cx,
-                            REDUNDANT_FIELD_NAMES,
-                            field.span,
-                            "redundant field names in struct initialization",
-                            "replace it with",
-                            field.ident.to_string(),
-                            Applicability::MachineApplicable,
-                        );
-                    }
+                if !field.is_shorthand
+                    && let ExprKind::Path(None, path) = &field.expr.kind
+                    && let [segment] = path.segments.as_slice()
+                    && segment.args.is_none()
+                    && segment.ident == field.ident
+                    && field.span.eq_ctxt(field.ident.span)
+                {
+                    span_lint_and_sugg(
+                        cx,
+                        REDUNDANT_FIELD_NAMES,
+                        field.span,
+                        "redundant field names in struct initialization",
+                        "replace it with",
+                        field.ident.to_string(),
+                        Applicability::MachineApplicable,
+                    );
                 }
             }
         }

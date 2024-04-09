@@ -1,5 +1,5 @@
 error: recursing into entrypoint `main`
-  --> $DIR/std_main_recursion.rs:5:5
+  --> tests/ui/crate_level_checks/std_main_recursion.rs:5:5
    |
 LL |     main();
    |     ^^^^
@@ -8,5 +8,5 @@ LL |     main();
    = note: `-D clippy::main-recursion` implied by `-D warnings`
    = help: to override `-D warnings` add `#[allow(clippy::main_recursion)]`
 
-error: aborting due to previous error
+error: aborting due to 1 previous error
 

@@ -12,7 +12,7 @@ impl<'tcx> MirLint<'tcx> for CheckPackedRef {
         let param_env = tcx.param_env(body.source.def_id());
         let source_info = SourceInfo::outermost(body.span);
         let mut checker = PackedRefChecker { body, tcx, param_env, source_info };
-        checker.visit_body(&body);
+        checker.visit_body(body);
     }
 }
 
@@ -46,9 +46,14 @@ impl<'tcx> Visitor<'tcx> for PackedRefChecker<'_, 'tcx> {
                     // If we ever reach here it means that the generated derive
                     // code is somehow doing an unaligned reference, which it
                     // shouldn't do.
-                    span_bug!(self.source_info.span, "builtin derive created an unaligned reference");
+                    span_bug!(
+                        self.source_info.span,
+                        "builtin derive created an unaligned reference"
+                    );
                 } else {
-                    self.tcx.sess.emit_err(errors::UnalignedPackedRef { span: self.source_info.span });
+                    self.tcx
+                        .dcx()
+                        .emit_err(errors::UnalignedPackedRef { span: self.source_info.span });
                 }
             }
         }

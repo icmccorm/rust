@@ -16,20 +16,29 @@
 //!
 //! The goal is to eventually be published on
 //! [crates.io](https://crates.io).
-
-use std::cell::Cell;
-use std::fmt;
-use std::fmt::Debug;
-
-use self::ty::{
-    GenericPredicates, Generics, ImplDef, ImplTrait, Span, TraitDecl, TraitDef, Ty, TyKind,
-};
-
 #[macro_use]
 extern crate scoped_tls;
 
-pub mod fold;
+use std::fmt;
+use std::fmt::Debug;
+use std::io;
+
+use crate::compiler_interface::with;
+pub use crate::crate_def::CrateDef;
+pub use crate::crate_def::DefId;
+pub use crate::error::*;
+use crate::mir::Body;
+use crate::mir::Mutability;
+use crate::ty::{ForeignModuleDef, ImplDef, IndexedVal, Span, TraitDef, Ty};
+
+pub mod abi;
+#[macro_use]
+pub mod crate_def;
+pub mod compiler_interface;
+#[macro_use]
+pub mod error;
 pub mod mir;
+pub mod target;
 pub mod ty;
 pub mod visitor;
 
@@ -39,22 +48,24 @@ pub type Symbol = String;
 /// The number that identifies a crate.
 pub type CrateNum = usize;
 
-/// A unique identification number for each item accessible for the current compilation unit.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct DefId(pub usize);
-
 impl Debug for DefId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DefId")
             .field("id", &self.0)
-            .field("name", &with(|cx| cx.name_of_def_id(*self)))
+            .field("name", &with(|cx| cx.def_name(*self, false)))
             .finish()
     }
 }
 
-/// A unique identification number for each provenance
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct AllocId(pub usize);
+impl IndexedVal for DefId {
+    fn to_val(index: usize) -> Self {
+        DefId(index)
+    }
+
+    fn to_index(&self) -> usize {
+        self.0
+    }
+}
 
 /// A list of crate items.
 pub type CrateItems = Vec<CrateItem>;
@@ -65,20 +76,6 @@ pub type TraitDecls = Vec<TraitDef>;
 /// A list of impl trait decls.
 pub type ImplTraitDecls = Vec<ImplDef>;
 
-/// An error type used to represent an error that has already been reported by the compiler.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CompilerError<T> {
-    /// Internal compiler error (I.e.: Compiler crashed).
-    ICE,
-    /// Compilation failed.
-    CompilationFailed,
-    /// Compilation was interrupted.
-    Interrupted(T),
-    /// Compilation skipped. This happens when users invoke rustc to retrieve information such as
-    /// --version.
-    Skipped,
-}
-
 /// Holds information about a crate.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Crate {
@@ -87,13 +84,43 @@ pub struct Crate {
     pub is_local: bool,
 }
 
-pub type DefKind = Opaque;
+impl Crate {
+    /// The list of foreign modules in this crate.
+    pub fn foreign_modules(&self) -> Vec<ForeignModuleDef> {
+        with(|cx| cx.foreign_modules(self.id))
+    }
 
-/// Holds information about an item in the crate.
-/// For now, it only stores the item DefId. Use functions inside `rustc_internal` module to
-/// use this item.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct CrateItem(pub DefId);
+    /// The list of traits declared in this crate.
+    pub fn trait_decls(&self) -> TraitDecls {
+        with(|cx| cx.trait_decls(self.id))
+    }
+
+    /// The list of trait implementations in this crate.
+    pub fn trait_impls(&self) -> ImplTraitDecls {
+        with(|cx| cx.trait_impls(self.id))
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+pub enum ItemKind {
+    Fn,
+    Static,
+    Const,
+    Ctor(CtorKind),
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+pub enum CtorKind {
+    Const,
+    Fn,
+}
+
+pub type Filename = String;
+
+crate_def! {
+    /// Holds information about an item in a crate.
+    pub CrateItem;
+}
 
 impl CrateItem {
     pub fn body(&self) -> mir::Body {
@@ -104,12 +131,24 @@ impl CrateItem {
         with(|cx| cx.span_of_an_item(self.0))
     }
 
-    pub fn name(&self) -> String {
-        with(|cx| cx.name_of_def_id(self.0))
+    pub fn kind(&self) -> ItemKind {
+        with(|cx| cx.item_kind(*self))
     }
 
-    pub fn kind(&self) -> DefKind {
-        with(|cx| cx.def_kind(self.0))
+    pub fn requires_monomorphization(&self) -> bool {
+        with(|cx| cx.requires_monomorphization(self.0))
+    }
+
+    pub fn ty(&self) -> Ty {
+        with(|cx| cx.def_ty(self.0))
+    }
+
+    pub fn is_foreign_item(&self) -> bool {
+        with(|cx| cx.is_foreign_item(self.0))
+    }
+
+    pub fn emit_mir<W: io::Write>(&self, w: &mut W) -> io::Result<()> {
+        self.body().dump(w, &self.name())
     }
 }
 
@@ -125,9 +164,9 @@ pub fn local_crate() -> Crate {
     with(|cx| cx.local_crate())
 }
 
-/// Try to find a crate with the given name.
-pub fn find_crate(name: &str) -> Option<Crate> {
-    with(|cx| cx.find_crate(name))
+/// Try to find a crate or crates if multiple crates exist from given name.
+pub fn find_crates(name: &str) -> Vec<Crate> {
+    with(|cx| cx.find_crates(name))
 }
 
 /// Try to find a crate with the given name.
@@ -144,85 +183,12 @@ pub fn all_trait_decls() -> TraitDecls {
     with(|cx| cx.all_trait_decls())
 }
 
-pub fn trait_decl(trait_def: &TraitDef) -> TraitDecl {
-    with(|cx| cx.trait_decl(trait_def))
-}
-
 pub fn all_trait_impls() -> ImplTraitDecls {
     with(|cx| cx.all_trait_impls())
 }
 
-pub fn trait_impl(trait_impl: &ImplDef) -> ImplTrait {
-    with(|cx| cx.trait_impl(trait_impl))
-}
-
-pub trait Context {
-    fn entry_fn(&mut self) -> Option<CrateItem>;
-    /// Retrieve all items of the local crate that have a MIR associated with them.
-    fn all_local_items(&mut self) -> CrateItems;
-    fn mir_body(&mut self, item: DefId) -> mir::Body;
-    fn all_trait_decls(&mut self) -> TraitDecls;
-    fn trait_decl(&mut self, trait_def: &TraitDef) -> TraitDecl;
-    fn all_trait_impls(&mut self) -> ImplTraitDecls;
-    fn trait_impl(&mut self, trait_impl: &ImplDef) -> ImplTrait;
-    fn generics_of(&mut self, def_id: DefId) -> Generics;
-    fn predicates_of(&mut self, def_id: DefId) -> GenericPredicates;
-    fn explicit_predicates_of(&mut self, def_id: DefId) -> GenericPredicates;
-    /// Get information about the local crate.
-    fn local_crate(&self) -> Crate;
-    /// Retrieve a list of all external crates.
-    fn external_crates(&self) -> Vec<Crate>;
-
-    /// Find a crate with the given name.
-    fn find_crate(&self, name: &str) -> Option<Crate>;
-
-    /// Prints the name of given `DefId`
-    fn name_of_def_id(&self, def_id: DefId) -> String;
-
-    /// Prints a human readable form of `Span`
-    fn print_span(&self, span: Span) -> String;
-
-    /// Prints the kind of given `DefId`
-    fn def_kind(&mut self, def_id: DefId) -> DefKind;
-
-    /// `Span` of an item
-    fn span_of_an_item(&mut self, def_id: DefId) -> Span;
-
-    /// Obtain the representation of a type.
-    fn ty_kind(&mut self, ty: Ty) -> TyKind;
-
-    /// Create a new `Ty` from scratch without information from rustc.
-    fn mk_ty(&mut self, kind: TyKind) -> Ty;
-}
-
-// A thread local variable that stores a pointer to the tables mapping between TyCtxt
-// datastructures and stable MIR datastructures
-scoped_thread_local! (static TLV: Cell<*mut ()>);
-
-pub fn run(mut context: impl Context, f: impl FnOnce()) {
-    assert!(!TLV.is_set());
-    fn g<'a>(mut context: &mut (dyn Context + 'a), f: impl FnOnce()) {
-        let ptr: *mut () = &mut context as *mut &mut _ as _;
-        TLV.set(&Cell::new(ptr), || {
-            f();
-        });
-    }
-    g(&mut context, f);
-}
-
-/// Loads the current context and calls a function with it.
-/// Do not nest these, as that will ICE.
-pub fn with<R>(f: impl FnOnce(&mut dyn Context) -> R) -> R {
-    assert!(TLV.is_set());
-    TLV.with(|tlv| {
-        let ptr = tlv.get();
-        assert!(!ptr.is_null());
-        f(unsafe { *(ptr as *mut &mut dyn Context) })
-    })
-}
-
 /// A type that provides internal information but that can still be used for debug purpose.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Opaque(String);
 
 impl std::fmt::Display for Opaque {
@@ -233,7 +199,7 @@ impl std::fmt::Display for Opaque {
 
 impl std::fmt::Debug for Opaque {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.0)
+        write!(f, "{}", self.0)
     }
 }
 

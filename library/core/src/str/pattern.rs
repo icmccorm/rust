@@ -40,6 +40,7 @@
 
 use crate::cmp;
 use crate::cmp::Ordering;
+use crate::convert::TryInto as _;
 use crate::fmt;
 use crate::slice::memchr;
 
@@ -370,9 +371,15 @@ pub struct CharSearcher<'a> {
 
     // safety invariant: `utf8_size` must be less than 5
     /// The number of bytes `needle` takes up when encoded in utf8.
-    utf8_size: usize,
+    utf8_size: u8,
     /// A utf8 encoded copy of the `needle`
     utf8_encoded: [u8; 4],
+}
+
+impl CharSearcher<'_> {
+    fn utf8_size(&self) -> usize {
+        self.utf8_size.into()
+    }
 }
 
 unsafe impl<'a> Searcher<'a> for CharSearcher<'a> {
@@ -414,7 +421,7 @@ unsafe impl<'a> Searcher<'a> for CharSearcher<'a> {
             let bytes = self.haystack.as_bytes().get(self.finger..self.finger_back)?;
             // the last byte of the utf8 encoded needle
             // SAFETY: we have an invariant that `utf8_size < 5`
-            let last_byte = unsafe { *self.utf8_encoded.get_unchecked(self.utf8_size - 1) };
+            let last_byte = unsafe { *self.utf8_encoded.get_unchecked(self.utf8_size() - 1) };
             if let Some(index) = memchr::memchr(last_byte, bytes) {
                 // The new finger is the index of the byte we found,
                 // plus one, since we memchr'd for the last byte of the character.
@@ -434,10 +441,10 @@ unsafe impl<'a> Searcher<'a> for CharSearcher<'a> {
                 // find something. When we find something the `finger` will be set
                 // to a UTF8 boundary.
                 self.finger += index + 1;
-                if self.finger >= self.utf8_size {
-                    let found_char = self.finger - self.utf8_size;
+                if self.finger >= self.utf8_size() {
+                    let found_char = self.finger - self.utf8_size();
                     if let Some(slice) = self.haystack.as_bytes().get(found_char..self.finger) {
-                        if slice == &self.utf8_encoded[0..self.utf8_size] {
+                        if slice == &self.utf8_encoded[0..self.utf8_size()] {
                             return Some((found_char, self.finger));
                         }
                     }
@@ -482,7 +489,7 @@ unsafe impl<'a> ReverseSearcher<'a> for CharSearcher<'a> {
             let bytes = haystack.get(self.finger..self.finger_back)?;
             // the last byte of the utf8 encoded needle
             // SAFETY: we have an invariant that `utf8_size < 5`
-            let last_byte = unsafe { *self.utf8_encoded.get_unchecked(self.utf8_size - 1) };
+            let last_byte = unsafe { *self.utf8_encoded.get_unchecked(self.utf8_size() - 1) };
             if let Some(index) = memchr::memrchr(last_byte, bytes) {
                 // we searched a slice that was offset by self.finger,
                 // add self.finger to recoup the original index
@@ -493,14 +500,14 @@ unsafe impl<'a> ReverseSearcher<'a> for CharSearcher<'a> {
                 // char in the paradigm of reverse iteration). For
                 // multibyte chars we need to skip down by the number of more
                 // bytes they have than ASCII
-                let shift = self.utf8_size - 1;
+                let shift = self.utf8_size() - 1;
                 if index >= shift {
                     let found_char = index - shift;
-                    if let Some(slice) = haystack.get(found_char..(found_char + self.utf8_size)) {
-                        if slice == &self.utf8_encoded[0..self.utf8_size] {
+                    if let Some(slice) = haystack.get(found_char..(found_char + self.utf8_size())) {
+                        if slice == &self.utf8_encoded[0..self.utf8_size()] {
                             // move finger to before the character found (i.e., at its start index)
                             self.finger_back = found_char;
-                            return Some((self.finger_back, self.finger_back + self.utf8_size));
+                            return Some((self.finger_back, self.finger_back + self.utf8_size()));
                         }
                     }
                 }
@@ -542,7 +549,12 @@ impl<'a> Pattern<'a> for char {
     #[inline]
     fn into_searcher(self, haystack: &'a str) -> Self::Searcher {
         let mut utf8_encoded = [0; 4];
-        let utf8_size = self.encode_utf8(&mut utf8_encoded).len();
+        let utf8_size = self
+            .encode_utf8(&mut utf8_encoded)
+            .len()
+            .try_into()
+            .expect("char len should be less than 255");
+
         CharSearcher {
             haystack,
             finger: 0,
@@ -806,6 +818,8 @@ unsafe impl<'a, const N: usize> ReverseSearcher<'a> for CharArraySearcher<'a, N>
     searcher_methods!(reverse);
 }
 
+impl<'a, const N: usize> DoubleEndedSearcher<'a> for CharArraySearcher<'a, N> {}
+
 /// Searches for chars that are equal to any of the [`char`]s in the array.
 ///
 /// # Examples
@@ -825,6 +839,8 @@ unsafe impl<'a, 'b, const N: usize> Searcher<'a> for CharArrayRefSearcher<'a, 'b
 unsafe impl<'a, 'b, const N: usize> ReverseSearcher<'a> for CharArrayRefSearcher<'a, 'b, N> {
     searcher_methods!(reverse);
 }
+
+impl<'a, 'b, const N: usize> DoubleEndedSearcher<'a> for CharArrayRefSearcher<'a, 'b, N> {}
 
 /////////////////////////////////////////////////////////////////////////////
 // Impl for &[char]
@@ -1736,9 +1752,9 @@ fn simd_contains(needle: &str, haystack: &str) -> Option<bool> {
     debug_assert!(needle.len() > 1);
 
     use crate::ops::BitAnd;
+    use crate::simd::cmp::SimdPartialEq;
     use crate::simd::mask8x16 as Mask;
     use crate::simd::u8x16 as Block;
-    use crate::simd::{SimdPartialEq, ToBitMask};
 
     let first_probe = needle[0];
     let last_byte_offset = needle.len() - 1;
@@ -1761,7 +1777,7 @@ fn simd_contains(needle: &str, haystack: &str) -> Option<bool> {
     };
 
     // do a naive search if the haystack is too small to fit
-    if haystack.len() < Block::LANES + last_byte_offset {
+    if haystack.len() < Block::LEN + last_byte_offset {
         return Some(haystack.windows(needle.len()).any(|c| c == needle));
     }
 
@@ -1808,7 +1824,7 @@ fn simd_contains(needle: &str, haystack: &str) -> Option<bool> {
         let eq_first: Mask = a.simd_eq(first_probe);
         let eq_last: Mask = b.simd_eq(second_probe);
         let both = eq_first.bitand(eq_last);
-        let mask = both.to_bitmask();
+        let mask = both.to_bitmask() as u16;
 
         return mask;
     };
@@ -1818,32 +1834,32 @@ fn simd_contains(needle: &str, haystack: &str) -> Option<bool> {
     // The loop condition must ensure that there's enough headroom to read LANE bytes,
     // and not only at the current index but also at the index shifted by block_offset
     const UNROLL: usize = 4;
-    while i + last_byte_offset + UNROLL * Block::LANES < haystack.len() && !result {
+    while i + last_byte_offset + UNROLL * Block::LEN < haystack.len() && !result {
         let mut masks = [0u16; UNROLL];
         for j in 0..UNROLL {
-            masks[j] = test_chunk(i + j * Block::LANES);
+            masks[j] = test_chunk(i + j * Block::LEN);
         }
         for j in 0..UNROLL {
             let mask = masks[j];
             if mask != 0 {
-                result |= check_mask(i + j * Block::LANES, mask, result);
+                result |= check_mask(i + j * Block::LEN, mask, result);
             }
         }
-        i += UNROLL * Block::LANES;
+        i += UNROLL * Block::LEN;
     }
-    while i + last_byte_offset + Block::LANES < haystack.len() && !result {
+    while i + last_byte_offset + Block::LEN < haystack.len() && !result {
         let mask = test_chunk(i);
         if mask != 0 {
             result |= check_mask(i, mask, result);
         }
-        i += Block::LANES;
+        i += Block::LEN;
     }
 
     // Process the tail that didn't fit into LANES-sized steps.
     // This simply repeats the same procedure but as right-aligned chunk instead
     // of a left-aligned one. The last byte must be exactly flush with the string end so
     // we don't miss a single byte or read out of bounds.
-    let i = haystack.len() - last_byte_offset - Block::LANES;
+    let i = haystack.len() - last_byte_offset - Block::LEN;
     let mask = test_chunk(i);
     if mask != 0 {
         result |= check_mask(i, mask, result);

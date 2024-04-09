@@ -10,20 +10,20 @@
 // ICEs as tracked by #86193. So we also use the transparent wrapper to verify proper validation
 // errors are emitted instead of ICEs.
 
-// stderr-per-bitwidth
-// normalize-stderr-test "alloc\d+" -> "allocN"
+//@ stderr-per-bitwidth
+
 
 trait Trait {}
 
 const INVALID_VTABLE_ALIGNMENT: &dyn Trait =
     unsafe { std::mem::transmute((&92u8, &[0usize, 1usize, 1000usize])) };
-//~^ ERROR evaluation of constant value failed
-//~| does not point to a vtable
+//~^^ ERROR it is undefined behavior to use this value
+//~| expected a vtable pointer
 
 const INVALID_VTABLE_SIZE: &dyn Trait =
     unsafe { std::mem::transmute((&92u8, &[1usize, usize::MAX, 1usize])) };
-//~^ ERROR evaluation of constant value failed
-//~| does not point to a vtable
+//~^^ ERROR it is undefined behavior to use this value
+//~| expected a vtable pointer
 
 #[repr(transparent)]
 struct W<T>(T);

@@ -4,8 +4,6 @@ use std::collections::btree_map::Entry as BTreeEntry;
 use std::collections::BTreeMap;
 use std::task::Poll;
 
-use log::trace;
-
 use rustc_middle::ty;
 use rustc_target::abi::{HasDataLayout, Size};
 use rustc_target::spec::abi::Abi;
@@ -207,15 +205,15 @@ impl<'tcx> TlsData<'tcx> {
     }
 }
 
-impl VisitTags for TlsData<'_> {
-    fn visit_tags(&self, visit: &mut dyn FnMut(BorTag)) {
+impl VisitProvenance for TlsData<'_> {
+    fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
         let TlsData { keys, macos_thread_dtors, next_key: _ } = self;
 
         for scalar in keys.values().flat_map(|v| v.data.values()) {
-            scalar.visit_tags(visit);
+            scalar.visit_provenance(visit);
         }
         for (_, scalar) in macos_thread_dtors.values() {
-            scalar.visit_tags(visit);
+            scalar.visit_provenance(visit);
         }
     }
 }
@@ -356,7 +354,7 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             state.last_key = Some(key);
             trace!("Running TLS dtor {:?} on {:?} at {:?}", instance, ptr, active_thread);
             assert!(
-                !ptr.to_target_usize(this).unwrap() != 0,
+                ptr.to_target_usize(this).unwrap() != 0,
                 "data can't be NULL when dtor is called!"
             );
 

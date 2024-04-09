@@ -1,7 +1,4 @@
-// edition:2018
-
-#![no_core]
-#![feature(no_core)]
+//@ edition:2018
 
 // @is "$.index[*][?(@.name=='mod1')].inner.module.is_stripped" "true"
 mod mod1 {

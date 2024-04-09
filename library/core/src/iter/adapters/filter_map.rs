@@ -1,6 +1,8 @@
-use crate::iter::{adapters::SourceIter, FusedIterator, InPlaceIterable};
+use crate::iter::{adapters::SourceIter, FusedIterator, InPlaceIterable, TrustedFused};
 use crate::mem::{ManuallyDrop, MaybeUninit};
+use crate::num::NonZero;
 use crate::ops::{ControlFlow, Try};
+use crate::ptr::addr_of;
 use crate::{array, fmt};
 
 /// An iterator that uses `f` to both filter and map elements from `iter`.
@@ -97,9 +99,10 @@ where
             // SAFETY: Loop conditions ensure the index is in bounds.
 
             unsafe {
-                let opt_payload_at = core::intrinsics::option_payload_ptr(&val);
+                let opt_payload_at: *const MaybeUninit<B> =
+                    addr_of!(val).byte_add(core::mem::offset_of!(Option<B>, Some.0)).cast();
                 let dst = guard.array.as_mut_ptr().add(idx);
-                crate::ptr::copy_nonoverlapping(opt_payload_at.cast(), dst, 1);
+                crate::ptr::copy_nonoverlapping(opt_payload_at, dst, 1);
                 crate::mem::forget(val);
             };
 
@@ -188,6 +191,9 @@ where
 #[stable(feature = "fused", since = "1.26.0")]
 impl<B, I: FusedIterator, F> FusedIterator for FilterMap<I, F> where F: FnMut(I::Item) -> Option<B> {}
 
+#[unstable(issue = "none", feature = "trusted_fused")]
+unsafe impl<I: TrustedFused, F> TrustedFused for FilterMap<I, F> {}
+
 #[unstable(issue = "none", feature = "inplace_iteration")]
 unsafe impl<I, F> SourceIter for FilterMap<I, F>
 where
@@ -203,7 +209,7 @@ where
 }
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<B, I: InPlaceIterable, F> InPlaceIterable for FilterMap<I, F> where
-    F: FnMut(I::Item) -> Option<B>
-{
+unsafe impl<I: InPlaceIterable, F> InPlaceIterable for FilterMap<I, F> {
+    const EXPAND_BY: Option<NonZero<usize>> = I::EXPAND_BY;
+    const MERGE_BY: Option<NonZero<usize>> = I::MERGE_BY;
 }

@@ -30,24 +30,23 @@ jobs:
             code-target: win32-x64
           - os: windows-latest
             target: i686-pc-windows-msvc
-            code-target: win32-ia32
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             code-target: win32-arm64
           - os: ubuntu-20.04
             target: x86_64-unknown-linux-gnu
             code-target: linux-x64
-            container: ubuntu:18.04
+            container: rockylinux:8
           - os: ubuntu-20.04
             target: aarch64-unknown-linux-gnu
             code-target: linux-arm64
           - os: ubuntu-20.04
             target: arm-unknown-linux-gnueabihf
             code-target: linux-armhf
-          - os: macos-11
+          - os: macos-12
             target: x86_64-apple-darwin
             code-target: darwin-x64
-          - os: macos-11
+          - os: macos-12
             target: aarch64-apple-darwin
             code-target: darwin-arm64
 
@@ -60,15 +59,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: ${{ env.FETCH_DEPTH }}
 
       - name: Install toolchain dependencies
-        if: matrix.container == 'ubuntu:18.04'
+        if: matrix.container == 'rockylinux:8'
         shell: bash
         run: |
-          apt-get update && apt-get install -y build-essential curl
+          dnf install -y gcc
           curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --profile minimal --default-toolchain none -y
           echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
 
@@ -79,9 +78,9 @@ jobs:
           rustup component add rust-src
 
       - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: 16
+          node-version: 18
 
       - name: Update apt repositories
         if: matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'arm-unknown-linux-gnueabihf'
@@ -102,12 +101,12 @@ jobs:
         working-directory: editors/code
 
       - name: Package Extension (release)
-        if: github.ref == 'refs/heads/release'
+        if: github.ref == 'refs/heads/release' && matrix.code-target
         run: npx vsce package -o "../../dist/rust-analyzer-${{ matrix.code-target }}.vsix" --target ${{ matrix.code-target }}
         working-directory: editors/code
 
       - name: Package Extension (nightly)
-        if: github.ref != 'refs/heads/release'
+        if: github.ref != 'refs/heads/release' && matrix.code-target
         run: npx vsce package -o "../../dist/rust-analyzer-${{ matrix.code-target }}.vsix" --target ${{ matrix.code-target }} --pre-release
         working-directory: editors/code
 
@@ -155,7 +154,7 @@ jobs:
         run: apk add --no-cache git clang lld musl-dev nodejs npm
 
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: ${{ env.FETCH_DEPTH }}
 
@@ -189,9 +188,9 @@ jobs:
     needs: ["dist", "dist-x86_64-unknown-linux-musl"]
     steps:
       - name: Install Nodejs
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: 16
+          node-version: 20
 
       - run: echo "TAG=$(date --iso -u)" >> $GITHUB_ENV
         if: github.ref == 'refs/heads/release'
@@ -200,7 +199,7 @@ jobs:
       - run: 'echo "TAG: $TAG"'
 
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: ${{ env.FETCH_DEPTH }}
 

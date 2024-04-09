@@ -130,18 +130,18 @@ impl Cfg {
     ///
     /// Equivalent to `attr::cfg_matches`.
     // FIXME: Actually make use of `features`.
-    pub(crate) fn matches(&self, parse_sess: &ParseSess, features: Option<&Features>) -> bool {
+    pub(crate) fn matches(&self, psess: &ParseSess, features: Option<&Features>) -> bool {
         match *self {
             Cfg::False => false,
             Cfg::True => true,
-            Cfg::Not(ref child) => !child.matches(parse_sess, features),
+            Cfg::Not(ref child) => !child.matches(psess, features),
             Cfg::All(ref sub_cfgs) => {
-                sub_cfgs.iter().all(|sub_cfg| sub_cfg.matches(parse_sess, features))
+                sub_cfgs.iter().all(|sub_cfg| sub_cfg.matches(psess, features))
             }
             Cfg::Any(ref sub_cfgs) => {
-                sub_cfgs.iter().any(|sub_cfg| sub_cfg.matches(parse_sess, features))
+                sub_cfgs.iter().any(|sub_cfg| sub_cfg.matches(psess, features))
             }
-            Cfg::Cfg(name, value) => parse_sess.config.contains(&(name, value)),
+            Cfg::Cfg(name, value) => psess.config.contains(&(name, value)),
         }
     }
 
@@ -164,8 +164,8 @@ impl Cfg {
     /// Renders the configuration for human display, as a short HTML description.
     pub(crate) fn render_short_html(&self) -> String {
         let mut msg = Display(self, Format::ShortHtml).to_string();
-        if self.should_capitalize_first_letter() &&
-            let Some(i) = msg.find(|c: char| c.is_ascii_alphanumeric())
+        if self.should_capitalize_first_letter()
+            && let Some(i) = msg.find(|c: char| c.is_ascii_alphanumeric())
         {
             msg[i..i + 1].make_ascii_uppercase();
         }
@@ -511,12 +511,12 @@ impl<'a> fmt::Display for Display<'a> {
                         "wasi" => "WASI",
                         "watchos" => "watchOS",
                         "windows" => "Windows",
+                        "visionos" => "visionOS",
                         _ => "",
                     },
                     (sym::target_arch, Some(arch)) => match arch.as_str() {
                         "aarch64" => "AArch64",
                         "arm" => "ARM",
-                        "asmjs" => "JavaScript",
                         "loongarch64" => "LoongArch LA64",
                         "m68k" => "M68k",
                         "csky" => "CSKY",

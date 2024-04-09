@@ -166,13 +166,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         span: Span,
         body_id: hir::BodyId,
         body: &'tcx hir::Body<'tcx>,
-        capture_clause: hir::CaptureBy,
+        mut capture_clause: hir::CaptureBy,
     ) {
         // Extract the type of the closure.
         let ty = self.node_ty(closure_hir_id);
-        let (closure_def_id, args) = match *ty.kind() {
-            ty::Closure(def_id, args) => (def_id, UpvarArgs::Closure(args)),
-            ty::Generator(def_id, args, _) => (def_id, UpvarArgs::Generator(args)),
+        let (closure_def_id, args, infer_kind) = match *ty.kind() {
+            ty::Closure(def_id, args) => {
+                (def_id, UpvarArgs::Closure(args), self.closure_kind(ty).is_none())
+            }
+            ty::CoroutineClosure(def_id, args) => {
+                (def_id, UpvarArgs::CoroutineClosure(args), self.closure_kind(ty).is_none())
+            }
+            ty::Coroutine(def_id, args) => (def_id, UpvarArgs::Coroutine(args), false),
             ty::Error(_) => {
                 // #51714: skip analysis when we have already encountered type errors
                 return;
@@ -188,18 +193,63 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         };
         let closure_def_id = closure_def_id.expect_local();
 
-        let infer_kind = if let UpvarArgs::Closure(closure_args) = args {
-            self.closure_kind(closure_args).is_none().then_some(closure_args)
-        } else {
-            None
-        };
-
         assert_eq!(self.tcx.hir().body_owner_def_id(body.id()), closure_def_id);
         let mut delegate = InferBorrowKind {
             closure_def_id,
             capture_information: Default::default(),
             fake_reads: Default::default(),
         };
+
+        // As noted in `lower_coroutine_body_with_moved_arguments`, we default the capture mode
+        // to `ByRef` for the `async {}` block internal to async fns/closure. This means
+        // that we would *not* be moving all of the parameters into the async block by default.
+        //
+        // We force all of these arguments to be captured by move before we do expr use analysis.
+        //
+        // FIXME(async_closures): This could be cleaned up. It's a bit janky that we're just
+        // moving all of the `LocalSource::AsyncFn` locals here.
+        if let Some(hir::CoroutineKind::Desugared(
+            _,
+            hir::CoroutineSource::Fn | hir::CoroutineSource::Closure,
+        )) = self.tcx.coroutine_kind(closure_def_id)
+        {
+            let hir::ExprKind::Block(block, _) = body.value.kind else {
+                bug!();
+            };
+            for stmt in block.stmts {
+                let hir::StmtKind::Let(hir::LetStmt {
+                    init: Some(init),
+                    source: hir::LocalSource::AsyncFn,
+                    pat,
+                    ..
+                }) = stmt.kind
+                else {
+                    bug!();
+                };
+                let hir::PatKind::Binding(hir::BindingAnnotation(hir::ByRef::No, _), _, _, _) =
+                    pat.kind
+                else {
+                    // Complex pattern, skip the non-upvar local.
+                    continue;
+                };
+                let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = init.kind else {
+                    bug!();
+                };
+                let hir::def::Res::Local(local_id) = path.res else {
+                    bug!();
+                };
+                let place = self.place_for_root_variable(closure_def_id, local_id);
+                delegate.capture_information.push((
+                    place,
+                    ty::CaptureInfo {
+                        capture_kind_expr_id: Some(init.hir_id),
+                        path_expr_id: Some(init.hir_id),
+                        capture_kind: UpvarCapture::ByValue,
+                    },
+                ));
+            }
+        }
+
         euv::ExprUseVisitor::new(
             &mut delegate,
             &self.infcx,
@@ -208,6 +258,28 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             &self.typeck_results.borrow(),
         )
         .consume_body(body);
+
+        // If a coroutine is comes from a coroutine-closure that is `move`, but
+        // the coroutine-closure was inferred to be `FnOnce` during signature
+        // inference, then it's still possible that we try to borrow upvars from
+        // the coroutine-closure because they are not used by the coroutine body
+        // in a way that forces a move.
+        //
+        // This would lead to an impossible to satisfy situation, since `AsyncFnOnce`
+        // coroutine bodies can't borrow from their parent closure. To fix this,
+        // we force the inner coroutine to also be `move`. This only matters for
+        // coroutine-closures that are `move` since otherwise they themselves will
+        // be borrowing from the outer environment, so there's no self-borrows occuring.
+        if let UpvarArgs::Coroutine(..) = args
+            && let hir::CoroutineKind::Desugared(_, hir::CoroutineSource::Closure) =
+                self.tcx.coroutine_kind(closure_def_id).expect("coroutine should have kind")
+            && let parent_hir_id =
+                self.tcx.local_def_id_to_hir_id(self.tcx.local_parent(closure_def_id))
+            && let parent_ty = self.node_ty(parent_hir_id)
+            && let Some(ty::ClosureKind::FnOnce) = self.closure_kind(parent_ty)
+        {
+            capture_clause = self.tcx.hir_node(parent_hir_id).expect_closure().capture_clause;
+        }
 
         debug!(
             "For closure={:?}, capture_information={:#?}",
@@ -221,7 +293,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         self.compute_min_captures(closure_def_id, capture_information, span);
 
-        let closure_hir_id = self.tcx.hir().local_def_id_to_hir_id(closure_def_id);
+        let closure_hir_id = self.tcx.local_def_id_to_hir_id(closure_def_id);
 
         if should_do_rust_2021_incompatible_closure_captures_analysis(self.tcx, closure_hir_id) {
             self.perform_2229_migration_analysis(closure_def_id, body_id, capture_clause, span);
@@ -257,11 +329,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         let before_feature_tys = self.final_upvar_tys(closure_def_id);
 
-        if let Some(closure_args) = infer_kind {
+        if infer_kind {
             // Unify the (as yet unbound) type variable in the closure
             // args with the kind we inferred.
-            let closure_kind_ty = closure_args.as_closure().kind_ty();
-            self.demand_eqtype(span, closure_kind.to_ty(self.tcx), closure_kind_ty);
+            let closure_kind_ty = match args {
+                UpvarArgs::Closure(args) => args.as_closure().kind_ty(),
+                UpvarArgs::CoroutineClosure(args) => args.as_coroutine_closure().kind_ty(),
+                UpvarArgs::Coroutine(_) => unreachable!("coroutines don't have an inferred kind"),
+            };
+            self.demand_eqtype(
+                span,
+                Ty::from_closure_kind(self.tcx, closure_kind),
+                closure_kind_ty,
+            );
 
             // If we have an origin, store it.
             if let Some(mut origin) = origin {
@@ -275,6 +355,87 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     .borrow_mut()
                     .closure_kind_origins_mut()
                     .insert(closure_hir_id, origin);
+            }
+        }
+
+        // For coroutine-closures, we additionally must compute the
+        // `coroutine_captures_by_ref_ty` type, which is used to generate the by-ref
+        // version of the coroutine-closure's output coroutine.
+        if let UpvarArgs::CoroutineClosure(args) = args {
+            let closure_env_region: ty::Region<'_> = ty::Region::new_bound(
+                self.tcx,
+                ty::INNERMOST,
+                ty::BoundRegion { var: ty::BoundVar::ZERO, kind: ty::BoundRegionKind::BrEnv },
+            );
+            let tupled_upvars_ty_for_borrow = Ty::new_tup_from_iter(
+                self.tcx,
+                self.typeck_results
+                    .borrow()
+                    .closure_min_captures_flattened(
+                        self.tcx.coroutine_for_closure(closure_def_id).expect_local(),
+                    )
+                    // Skip the captures that are just moving the closure's args
+                    // into the coroutine. These are always by move, and we append
+                    // those later in the `CoroutineClosureSignature` helper functions.
+                    .skip(
+                        args.as_coroutine_closure()
+                            .coroutine_closure_sig()
+                            .skip_binder()
+                            .tupled_inputs_ty
+                            .tuple_fields()
+                            .len(),
+                    )
+                    .map(|captured_place| {
+                        let upvar_ty = captured_place.place.ty();
+                        let capture = captured_place.info.capture_kind;
+                        // Not all upvars are captured by ref, so use
+                        // `apply_capture_kind_on_capture_ty` to ensure that we
+                        // compute the right captured type.
+                        apply_capture_kind_on_capture_ty(
+                            self.tcx,
+                            upvar_ty,
+                            capture,
+                            Some(closure_env_region),
+                        )
+                    }),
+            );
+            let coroutine_captures_by_ref_ty = Ty::new_fn_ptr(
+                self.tcx,
+                ty::Binder::bind_with_vars(
+                    self.tcx.mk_fn_sig(
+                        [],
+                        tupled_upvars_ty_for_borrow,
+                        false,
+                        hir::Unsafety::Normal,
+                        rustc_target::spec::abi::Abi::Rust,
+                    ),
+                    self.tcx.mk_bound_variable_kinds(&[ty::BoundVariableKind::Region(
+                        ty::BoundRegionKind::BrEnv,
+                    )]),
+                ),
+            );
+            self.demand_eqtype(
+                span,
+                args.as_coroutine_closure().coroutine_captures_by_ref_ty(),
+                coroutine_captures_by_ref_ty,
+            );
+
+            // Additionally, we can now constrain the coroutine's kind type.
+            //
+            // We only do this if `infer_kind`, because if we have constrained
+            // the kind from closure signature inference, the kind inferred
+            // for the inner coroutine may actually be more restrictive.
+            if infer_kind {
+                let ty::Coroutine(_, coroutine_args) =
+                    *self.typeck_results.borrow().expr_ty(body.value).kind()
+                else {
+                    bug!();
+                };
+                self.demand_eqtype(
+                    span,
+                    coroutine_args.as_coroutine().kind_ty(),
+                    Ty::from_coroutine_closure_kind(self.tcx, closure_kind),
+                );
             }
         }
 
@@ -315,11 +476,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let final_tupled_upvars_type = Ty::new_tup(self.tcx, &final_upvar_tys);
         self.demand_suptype(span, args.tupled_upvars_ty(), final_tupled_upvars_type);
 
-        let fake_reads = delegate
-            .fake_reads
-            .into_iter()
-            .map(|(place, cause, hir_id)| (place, cause, hir_id))
-            .collect();
+        let fake_reads = delegate.fake_reads;
+
         self.typeck_results.borrow_mut().closure_fake_reads.insert(closure_def_id, fake_reads);
 
         if self.tcx.sess.opts.unstable_opts.profile_closures {
@@ -366,7 +524,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// Note that we *always* infer a minimal kind, even if
     /// we don't always *use* that in the final result (i.e., sometimes
     /// we've taken the closure kind from the expectations instead, and
-    /// for generators we don't even implement the closure traits
+    /// for coroutines we don't even implement the closure traits
     /// really).
     ///
     /// If we inferred that the closure needs to be FnMut/FnOnce, last element of the returned tuple
@@ -424,7 +582,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 origin = updated.1;
 
                 let (place, capture_kind) = match capture_clause {
-                    hir::CaptureBy::Value => adjust_for_move_closure(place, capture_kind),
+                    hir::CaptureBy::Value { .. } => adjust_for_move_closure(place, capture_kind),
                     hir::CaptureBy::Ref => adjust_for_non_move_closure(place, capture_kind),
                 };
 
@@ -550,7 +708,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             };
 
             // Go through each entry in the current list of min_captures
-            // - if ancestor is found, update it's capture kind to account for current place's
+            // - if ancestor is found, update its capture kind to account for current place's
             // capture information.
             //
             // - if descendant is found, remove it from the list, and update the current place's
@@ -679,53 +837,41 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // `tests/ui/closures/2229_closure_analysis/preserve_field_drop_order.rs`.
         for (_, captures) in &mut root_var_min_capture_list {
             captures.sort_by(|capture1, capture2| {
-                for (p1, p2) in capture1.place.projections.iter().zip(&capture2.place.projections) {
+                fn is_field<'a>(p: &&Projection<'a>) -> bool {
+                    match p.kind {
+                        ProjectionKind::Field(_, _) => true,
+                        ProjectionKind::Deref | ProjectionKind::OpaqueCast => false,
+                        p @ (ProjectionKind::Subslice | ProjectionKind::Index) => {
+                            bug!("ProjectionKind {:?} was unexpected", p)
+                        }
+                    }
+                }
+
+                // Need to sort only by Field projections, so filter away others.
+                // A previous implementation considered other projection types too
+                // but that caused ICE #118144
+                let capture1_field_projections = capture1.place.projections.iter().filter(is_field);
+                let capture2_field_projections = capture2.place.projections.iter().filter(is_field);
+
+                for (p1, p2) in capture1_field_projections.zip(capture2_field_projections) {
                     // We do not need to look at the `Projection.ty` fields here because at each
                     // step of the iteration, the projections will either be the same and therefore
                     // the types must be as well or the current projection will be different and
                     // we will return the result of comparing the field indexes.
                     match (p1.kind, p2.kind) {
-                        // Paths are the same, continue to next loop.
-                        (ProjectionKind::Deref, ProjectionKind::Deref) => {}
-                        (ProjectionKind::OpaqueCast, ProjectionKind::OpaqueCast) => {}
-                        (ProjectionKind::Field(i1, _), ProjectionKind::Field(i2, _))
-                            if i1 == i2 => {}
-
-                        // Fields are different, compare them.
                         (ProjectionKind::Field(i1, _), ProjectionKind::Field(i2, _)) => {
-                            return i1.cmp(&i2);
+                            // Compare only if paths are different.
+                            // Otherwise continue to the next iteration
+                            if i1 != i2 {
+                                return i1.cmp(&i2);
+                            }
                         }
-
-                        // We should have either a pair of `Deref`s or a pair of `Field`s.
-                        // Anything else is a bug.
-                        (
-                            l @ (ProjectionKind::Deref | ProjectionKind::Field(..)),
-                            r @ (ProjectionKind::Deref | ProjectionKind::Field(..)),
-                        ) => bug!(
-                            "ProjectionKinds Deref and Field were mismatched: ({:?}, {:?})",
-                            l,
-                            r
-                        ),
-                        (
-                            l @ (ProjectionKind::Index
-                            | ProjectionKind::Subslice
-                            | ProjectionKind::Deref
-                            | ProjectionKind::OpaqueCast
-                            | ProjectionKind::Field(..)),
-                            r @ (ProjectionKind::Index
-                            | ProjectionKind::Subslice
-                            | ProjectionKind::Deref
-                            | ProjectionKind::OpaqueCast
-                            | ProjectionKind::Field(..)),
-                        ) => bug!(
-                            "ProjectionKinds Index or Subslice were unexpected: ({:?}, {:?})",
-                            l,
-                            r
-                        ),
+                        // Given the filter above, this arm should never be hit
+                        (l, r) => bug!("ProjectionKinds {:?} or {:?} were unexpected", l, r),
                     }
                 }
 
-                self.tcx.sess.delay_span_bug(
+                self.dcx().span_delayed_bug(
                     closure_span,
                     format!(
                         "two identical projections: ({:?}, {:?})",
@@ -763,9 +909,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let (migration_string, migrated_variables_concat) =
                 migration_suggestion_for_2229(self.tcx, &need_migrations);
 
-            let closure_hir_id = self.tcx.hir().local_def_id_to_hir_id(closure_def_id);
+            let closure_hir_id = self.tcx.local_def_id_to_hir_id(closure_def_id);
             let closure_head_span = self.tcx.def_span(closure_def_id);
-            self.tcx.struct_span_lint_hir(
+            self.tcx.node_span_lint(
                 lint::builtin::RUST_2021_INCOMPATIBLE_CLOSURE_CAPTURES,
                 closure_hir_id,
                 closure_head_span,
@@ -851,9 +997,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     if let Ok(mut s) = self.tcx.sess.source_map().span_to_snippet(closure_body_span) {
                         if s.starts_with('$') {
                             // Looks like a macro fragment. Try to find the real block.
-                            if let Some(hir::Node::Expr(&hir::Expr {
+                            if let hir::Node::Expr(&hir::Expr {
                                 kind: hir::ExprKind::Block(block, ..), ..
-                            })) = self.tcx.hir().find(body_id.hir_id) {
+                            }) = self.tcx.hir_node(body_id.hir_id) {
                                 // If the body is a block (with `{..}`), we use the span of that block.
                                 // E.g. with a `|| $body` expanded from a `m!({ .. })`, we use `{ .. }`, and not `$body`.
                                 // Since we know it's a block, we know we can insert the `let _ = ..` without
@@ -911,8 +1057,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             Applicability::HasPlaceholders
                         );
                     }
-
-                    lint
                 },
             );
         }
@@ -925,7 +1069,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         drop_order: bool,
     ) -> MigrationWarningReason {
         MigrationWarningReason {
-            auto_traits: auto_trait_reasons.to_sorted_stable_ord(),
+            auto_traits: auto_trait_reasons.into_sorted_stable_ord(),
             drop_order,
         }
     }
@@ -958,7 +1102,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let ty = self.resolve_vars_if_possible(self.node_ty(var_hir_id));
 
         let ty = match closure_clause {
-            hir::CaptureBy::Value => ty, // For move closure the capture kind should be by value
+            hir::CaptureBy::Value { .. } => ty, // For move closure the capture kind should be by value
             hir::CaptureBy::Ref => {
                 // For non move closure the capture kind is the max capture kind of all captures
                 // according to the ordering ImmBorrow < UniqueImmBorrow < MutBorrow < ByValue
@@ -1073,7 +1217,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
             match closure_clause {
                 // Only migrate if closure is a move closure
-                hir::CaptureBy::Value => {
+                hir::CaptureBy::Value { .. } => {
                     let mut diagnostics_info = FxIndexSet::default();
                     let upvars =
                         self.tcx.upvars_mentioned(closure_def_id).expect("must be an upvar");
@@ -1479,10 +1623,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // If the data will be moved out of this place, then the place will be truncated
             // at the first Deref in `adjust_upvar_borrow_kind_for_consume` and then moved into
             // the closure.
-            hir::CaptureBy::Value if !place.deref_tys().any(Ty::is_ref) => {
+            hir::CaptureBy::Value { .. } if !place.deref_tys().any(Ty::is_ref) => {
                 ty::UpvarCapture::ByValue
             }
-            hir::CaptureBy::Value | hir::CaptureBy::Ref => ty::UpvarCapture::ByRef(ty::ImmBorrow),
+            hir::CaptureBy::Value { .. } | hir::CaptureBy::Ref => {
+                ty::UpvarCapture::ByRef(ty::ImmBorrow)
+            }
         }
     }
 
@@ -1512,7 +1658,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ) {
         if self.should_log_capture_analysis(closure_def_id) {
             let mut diag =
-                self.tcx.sess.struct_span_err(closure_span, "First Pass analysis includes:");
+                self.dcx().struct_span_err(closure_span, "First Pass analysis includes:");
             for (place, capture_info) in capture_information {
                 let capture_str = construct_capture_info_string(self.tcx, place, capture_info);
                 let output_str = format!("Capturing {capture_str}");
@@ -1531,7 +1677,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 self.typeck_results.borrow().closure_min_captures.get(&closure_def_id)
             {
                 let mut diag =
-                    self.tcx.sess.struct_span_err(closure_span, "Min Capture analysis includes:");
+                    self.dcx().struct_span_err(closure_span, "Min Capture analysis includes:");
 
                 for (_, min_captures_for_var) in min_captures {
                     for capture in min_captures_for_var {
@@ -1590,15 +1736,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         let bm = *typeck_results.pat_binding_modes().get(var_hir_id).expect("missing binding mode");
 
-        let mut is_mutbl = match bm {
-            ty::BindByValue(mutability) => mutability,
-            ty::BindByReference(_) => hir::Mutability::Not,
-        };
+        let mut is_mutbl = bm.1;
 
         for pointer_ty in place.deref_tys() {
             match pointer_ty.kind() {
                 // We don't capture derefs of raw ptrs
-                ty::RawPtr(_) => unreachable!(),
+                ty::RawPtr(_, _) => unreachable!(),
 
                 // Dereferencing a mut-ref allows us to mut the Place if we don't deref
                 // an immut-ref after on top of this.
@@ -1659,11 +1802,9 @@ fn apply_capture_kind_on_capture_ty<'tcx>(
 ) -> Ty<'tcx> {
     match capture_kind {
         ty::UpvarCapture::ByValue => ty,
-        ty::UpvarCapture::ByRef(kind) => Ty::new_ref(
-            tcx,
-            region.unwrap(),
-            ty::TypeAndMut { ty: ty, mutbl: kind.to_mutbl_lossy() },
-        ),
+        ty::UpvarCapture::ByRef(kind) => {
+            Ty::new_ref(tcx, region.unwrap(), ty, kind.to_mutbl_lossy())
+        }
     }
 }
 
@@ -1671,7 +1812,7 @@ fn apply_capture_kind_on_capture_ty<'tcx>(
 fn drop_location_span(tcx: TyCtxt<'_>, hir_id: hir::HirId) -> Span {
     let owner_id = tcx.hir().get_enclosing_scope(hir_id).unwrap();
 
-    let owner_node = tcx.hir().get(owner_id);
+    let owner_node = tcx.hir_node(owner_id);
     let owner_span = match owner_node {
         hir::Node::Item(item) => match item.kind {
             hir::ItemKind::Fn(_, _, owner_id) => tcx.hir().span(owner_id.hir_id),

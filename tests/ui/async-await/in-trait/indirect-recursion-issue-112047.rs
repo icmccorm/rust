@@ -1,8 +1,7 @@
-// edition: 2021
-// build-fail
-//~^^ ERROR cycle detected when computing layout of
+//@ edition: 2021
 
-#![feature(async_fn_in_trait)]
+// Test doesn't fail until monomorphization time, unfortunately.
+//@ build-fail
 
 fn main() {
     let _ = async {
@@ -33,6 +32,7 @@ where
     C: First,
 {
     async fn second(self) {
+        //~^ ERROR recursion in an async fn requires boxing
         self.first().await.second().await;
     }
 }

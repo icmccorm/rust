@@ -1,12 +1,10 @@
-// edition:2021
-// check-pass
-
-#![feature(async_fn_in_trait, return_position_impl_trait_in_trait)]
-#![allow(incomplete_features)]
+//@ edition:2021
+//@ check-pass
 
 use std::fmt::Debug;
 
 trait Foo {
+    #[allow(async_fn_in_trait)]
     async fn baz(&self) -> impl Debug {
         ""
     }

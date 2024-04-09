@@ -1,9 +1,8 @@
-// run-pass
+//@ run-pass
 
 #![allow(unused_imports)]
 
-// ignore-windows
-// ignore-wasm32-bare no libc to test ffi with
+//@ ignore-windows
 
 // issue-53200
 

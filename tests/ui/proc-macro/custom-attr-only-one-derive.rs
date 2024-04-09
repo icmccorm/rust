@@ -1,7 +1,5 @@
-// run-pass
-// aux-build:custom-attr-only-one-derive.rs
-
-#![feature(rust_2018_preview)]
+//@ run-pass
+//@ aux-build:custom-attr-only-one-derive.rs
 
 #[macro_use]
 extern crate custom_attr_only_one_derive;

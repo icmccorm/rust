@@ -24,18 +24,38 @@ mir_build_borrow_of_layout_constrained_field_requires_unsafe_unsafe_op_in_unsafe
 
 mir_build_borrow_of_moved_value = borrow of moved value
     .label = value moved into `{$name}` here
-    .occurs_because_label = move occurs because `{$name}` has type `{$ty}` which does not implement the `Copy` trait
+    .occurs_because_label = move occurs because `{$name}` has type `{$ty}`, which does not implement the `Copy` trait
     .value_borrowed_label = value borrowed here after move
     .suggestion = borrow this binding in the pattern to avoid moving the value
 
 mir_build_call_to_fn_with_requires_unsafe =
     call to function `{$function}` with `#[target_feature]` is unsafe and requires unsafe block
-    .note = can only be called if the required target features are available
+    .help = in order for the call to be safe, the context requires the following additional target {$missing_target_features_count ->
+        [1] feature
+        *[count] features
+        }: {$missing_target_features}
+    .note = the {$build_target_features} target {$build_target_features_count ->
+        [1] feature
+        *[count] features
+        } being enabled in the build configuration does not remove the requirement to list {$build_target_features_count ->
+        [1] it
+        *[count] them
+        } in `#[target_feature]`
     .label = call to function with `#[target_feature]`
 
 mir_build_call_to_fn_with_requires_unsafe_unsafe_op_in_unsafe_fn_allowed =
     call to function `{$function}` with `#[target_feature]` is unsafe and requires unsafe function or block
-    .note = can only be called if the required target features are available
+    .help = in order for the call to be safe, the context requires the following additional target {$missing_target_features_count ->
+        [1] feature
+        *[count] features
+        }: {$missing_target_features}
+    .note = the {$build_target_features} target {$build_target_features_count ->
+        [1] feature
+        *[count] features
+        } being enabled in the build configuration does not remove the requirement to list {$build_target_features_count ->
+        [1] it
+        *[count] them
+        } in `#[target_feature]`
     .label = call to function with `#[target_feature]`
 
 mir_build_call_to_unsafe_fn_requires_unsafe =
@@ -87,10 +107,8 @@ mir_build_extern_static_requires_unsafe_unsafe_op_in_unsafe_fn_allowed =
     .note = extern statics are not controlled by the Rust type system: invalid data, aliasing violations or data races will cause undefined behavior
     .label = use of extern static
 
-mir_build_float_pattern = floating-point types cannot be used in patterns
-
 mir_build_indirect_structural_match =
-    to use a constant of type `{$non_sm_ty}` in a pattern, `{$non_sm_ty}` must be annotated with `#[derive(PartialEq, Eq)]`
+    to use a constant of type `{$non_sm_ty}` in a pattern, `{$non_sm_ty}` must be annotated with `#[derive(PartialEq)]`
 
 mir_build_inform_irrefutable = `let` bindings require an "irrefutable pattern", like a `struct` or an `enum` with only one variant
 
@@ -173,7 +191,7 @@ mir_build_leading_irrefutable_let_patterns = leading irrefutable {$count ->
 
 mir_build_literal_in_range_out_of_bounds =
     literal out of range for `{$ty}`
-    .label = this value doesn't fit in `{$ty}` whose maximum value is `{$max}`
+    .label = this value does not fit into the type `{$ty}` whose range is `{$min}..={$max}`
 
 mir_build_lower_range_bound_must_be_less_than_or_equal_to_upper =
     lower range bound must be less than or equal to upper
@@ -212,14 +230,19 @@ mir_build_mutation_of_layout_constrained_field_requires_unsafe_unsafe_op_in_unsa
     .note = mutating layout constrained fields cannot statically be checked for valid values
     .label = mutation of layout constrained field
 
+mir_build_nan_pattern = cannot use NaN in patterns
+    .note = NaNs compare inequal to everything, even themselves, so this pattern would never match
+    .help = try using the `is_nan` method instead
+
 mir_build_non_const_path = runtime values cannot be referenced in patterns
+
+mir_build_non_empty_never_pattern =
+    mismatched types
+    .label = a never pattern must be used on an uninhabited type
+    .note = the matched value is of type `{$ty}`
 
 mir_build_non_exhaustive_match_all_arms_guarded =
     match arms with guards don't count towards exhaustivity
-
-mir_build_non_exhaustive_omitted_pattern = some variants are not matched explicitly
-    .help = ensure that all variants are matched explicitly by adding the suggested match arms
-    .note = the matched value is of type `{$scrut_ty}` and the `non_exhaustive_omitted_patterns` attribute was found
 
 mir_build_non_exhaustive_patterns_type_not_empty = non-exhaustive patterns: type `{$ty}` is non-empty
     .def_note = `{$peeled_ty}` defined here
@@ -233,16 +256,12 @@ mir_build_non_partial_eq_match =
     to use a constant of type `{$non_peq_ty}` in a pattern, the type must implement `PartialEq`
 
 mir_build_nontrivial_structural_match =
-    to use a constant of type `{$non_sm_ty}` in a pattern, the constant's initializer must be trivial or `{$non_sm_ty}` must be annotated with `#[derive(PartialEq, Eq)]`
-
-mir_build_overlapping_range_endpoints = multiple patterns overlap on their endpoints
-    .range = ... with this range
-    .note = you likely meant to write mutually exclusive ranges
+    to use a constant of type `{$non_sm_ty}` in a pattern, the constant's initializer must be trivial or `{$non_sm_ty}` must be annotated with `#[derive(PartialEq)]`
 
 mir_build_pattern_not_covered = refutable pattern in {$origin}
     .pattern_ty = the matched value is of type `{$pattern_ty}`
 
-mir_build_pointer_pattern = function pointers and unsized pointers in patterns behave unpredictably and should not be relied upon. See https://github.com/rust-lang/rust/issues/70861 for details.
+mir_build_pointer_pattern = function pointers and raw pointers not derived from integers in patterns behave unpredictably and should not be relied upon. See https://github.com/rust-lang/rust/issues/70861 for details.
 
 mir_build_privately_uninhabited = pattern `{$witness_1}` is currently uninhabited, but this variant contains private fields which may become inhabited in the future
 
@@ -280,9 +299,9 @@ mir_build_trailing_irrefutable_let_patterns = trailing irrefutable {$count ->
     } into the body
 
 mir_build_type_not_structural =
-     to use a constant of type `{$non_sm_ty}` in a pattern, `{$non_sm_ty}` must be annotated with `#[derive(PartialEq, Eq)]`
+     to use a constant of type `{$non_sm_ty}` in a pattern, `{$non_sm_ty}` must be annotated with `#[derive(PartialEq)]`
 
-mir_build_type_not_structural_more_info = see https://doc.rust-lang.org/stable/std/marker/trait.StructuralEq.html for details
+mir_build_type_not_structural_more_info = see https://doc.rust-lang.org/stable/std/marker/trait.StructuralPartialEq.html for details
 
 mir_build_type_not_structural_tip = the traits must be derived, manual `impl`s are not sufficient
 
@@ -291,13 +310,6 @@ mir_build_unconditional_recursion = function cannot return without recursing
     .help = a `loop` may express intention better if this is on purpose
 
 mir_build_unconditional_recursion_call_site_label = recursive call site
-
-mir_build_uncovered = {$count ->
-        [1] pattern `{$witness_1}`
-        [2] patterns `{$witness_1}` and `{$witness_2}`
-        [3] patterns `{$witness_1}`, `{$witness_2}` and `{$witness_3}`
-        *[other] patterns `{$witness_1}`, `{$witness_2}`, `{$witness_3}` and {$remainder} more
-    } not covered
 
 mir_build_union_field_requires_unsafe =
     access to union field is unsafe and requires unsafe block
@@ -315,6 +327,7 @@ mir_build_unreachable_pattern = unreachable pattern
     .label = unreachable pattern
     .catchall_label = matches any value
 
+mir_build_unsafe_fn_safe_body = an unsafe function restricts its caller, but its body is safe by default
 mir_build_unsafe_not_inherited = items do not inherit unsafety from separate enclosing items
 
 mir_build_unsafe_op_in_unsafe_fn_borrow_of_layout_constrained_field_requires_unsafe =
@@ -324,7 +337,17 @@ mir_build_unsafe_op_in_unsafe_fn_borrow_of_layout_constrained_field_requires_uns
 
 mir_build_unsafe_op_in_unsafe_fn_call_to_fn_with_requires_unsafe =
     call to function `{$function}` with `#[target_feature]` is unsafe and requires unsafe block (error E0133)
-    .note = can only be called if the required target features are available
+    .help = in order for the call to be safe, the context requires the following additional target {$missing_target_features_count ->
+        [1] feature
+        *[count] features
+        }: {$missing_target_features}
+    .note = the {$build_target_features} target {$build_target_features_count ->
+        [1] feature
+        *[count] features
+        } being enabled in the build configuration does not remove the requirement to list {$build_target_features_count ->
+        [1] it
+        *[count] them
+        } in `#[target_feature]`
     .label = call to function with `#[target_feature]`
 
 mir_build_unsafe_op_in_unsafe_fn_call_to_unsafe_fn_requires_unsafe =
@@ -379,6 +402,7 @@ mir_build_unused_unsafe = unnecessary `unsafe` block
     .label = unnecessary `unsafe` block
 
 mir_build_unused_unsafe_enclosing_block_label = because it's nested under this `unsafe` block
-mir_build_unused_unsafe_enclosing_fn_label = because it's nested under this `unsafe` fn
 
 mir_build_variant_defined_here = not covered
+
+mir_build_wrap_suggestion = consider wrapping the function body in an unsafe block

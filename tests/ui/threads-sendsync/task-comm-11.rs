@@ -1,7 +1,7 @@
-// run-pass
+//@ run-pass
 #![allow(unused_must_use)]
-// pretty-expanded FIXME #23616
-// ignore-emscripten no threads support
+//@ pretty-expanded FIXME #23616
+//@ needs-threads
 
 use std::sync::mpsc::{channel, Sender};
 use std::thread;

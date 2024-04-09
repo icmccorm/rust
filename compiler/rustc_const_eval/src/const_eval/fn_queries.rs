@@ -33,18 +33,23 @@ pub fn is_parent_const_impl_raw(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
 /// return if it has a `const` modifier. If it is an intrinsic, report whether said intrinsic
 /// has a `rustc_const_{un,}stable` attribute. Otherwise, return `Constness::NotConst`.
 fn constness(tcx: TyCtxt<'_>, def_id: LocalDefId) -> hir::Constness {
-    let node = tcx.hir().get_by_def_id(def_id);
+    let node = tcx.hir_node_by_def_id(def_id);
 
     match node {
         hir::Node::Ctor(_)
         | hir::Node::AnonConst(_)
         | hir::Node::ConstBlock(_)
-        | hir::Node::ImplItem(hir::ImplItem { kind: hir::ImplItemKind::Const(..), .. }) => hir::Constness::Const,
-        hir::Node::Item(hir::Item { kind: hir::ItemKind::Impl(_), .. }) => tcx.generics_of(def_id).host_effect_index.map_or(hir::Constness::NotConst, |_| hir::Constness::Const),
+        | hir::Node::ImplItem(hir::ImplItem { kind: hir::ImplItemKind::Const(..), .. }) => {
+            hir::Constness::Const
+        }
+        hir::Node::Item(hir::Item { kind: hir::ItemKind::Impl(_), .. }) => tcx
+            .generics_of(def_id)
+            .host_effect_index
+            .map_or(hir::Constness::NotConst, |_| hir::Constness::Const),
         hir::Node::ForeignItem(hir::ForeignItem { kind: hir::ForeignItemKind::Fn(..), .. }) => {
             // Intrinsics use `rustc_const_{un,}stable` attributes to indicate constness. All other
             // foreign items cannot be evaluated at compile-time.
-            let is_const = if tcx.is_intrinsic(def_id) {
+            let is_const = if tcx.intrinsic(def_id).is_some() {
                 tcx.lookup_const_stability(def_id).is_some()
             } else {
                 false

@@ -1,12 +1,12 @@
 //! checks for `#[inline]` on trait methods without bodies
 
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::sugg::DiagnosticExt;
+use clippy_utils::sugg::DiagExt;
 use rustc_ast::ast::Attribute;
 use rustc_errors::Applicability;
 use rustc_hir::{TraitFn, TraitItem, TraitItemKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 use rustc_span::{sym, Symbol};
 
 declare_clippy_lint! {
@@ -18,7 +18,7 @@ declare_clippy_lint! {
     /// The inline attribute is ignored for trait methods without bodies.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// trait Animal {
     ///     #[inline]
     ///     fn name(&self) -> &'static str;
@@ -51,7 +51,7 @@ fn check_attrs(cx: &LateContext<'_>, name: Symbol, attrs: &[Attribute]) {
             cx,
             INLINE_FN_WITHOUT_BODY,
             attr.span,
-            &format!("use of `#[inline]` on trait method `{name}` which has no body"),
+            format!("use of `#[inline]` on trait method `{name}` which has no body"),
             |diag| {
                 diag.suggest_remove_item(cx, attr.span, "remove", Applicability::MachineApplicable);
             },

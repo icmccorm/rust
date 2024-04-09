@@ -85,6 +85,9 @@ impl AsRef<str> for Foo {
     }
 }
 
+/// <div id="doc-warning-0" class="warning">I have warnings!</div>
+pub struct WarningStruct;
+
 /// Just a normal enum.
 ///
 /// # title!
@@ -159,6 +162,33 @@ pub mod keyword {}
 
 /// Just some type alias.
 pub type SomeType = u32;
+
+/// Another type alias, this time with methods.
+pub type SomeOtherTypeWithMethodsAndInlining = Foo;
+
+impl SomeOtherTypeWithMethodsAndInlining {
+    pub fn some_other_method_directly(&self) {}
+}
+
+/// Another type alias, this time with methods.
+pub struct UnderlyingFooBarBaz;
+pub type SomeOtherTypeWithMethodsAndInliningAndTraits = UnderlyingFooBarBaz;
+
+impl AsRef<str> for UnderlyingFooBarBaz {
+    fn as_ref(&self) -> &str {
+        "hello"
+    }
+}
+
+impl UnderlyingFooBarBaz {
+    pub fn inherent_fn(&self) {}
+}
+
+impl AsRef<u8> for SomeOtherTypeWithMethodsAndInliningAndTraits {
+    fn as_ref(&self) -> &u8 {
+        b"hello"
+    }
+}
 
 pub mod huge_amount_of_consts {
     include!(concat!(env!("OUT_DIR"), "/huge_amount_of_consts.rs"));
@@ -528,4 +558,59 @@ pub mod cfgs {
     )))]
     /// Some docs.
     pub mod cfgs {}
+}
+
+pub struct ZyxwvutMethodDisambiguation;
+
+impl ZyxwvutMethodDisambiguation {
+    pub fn method_impl_disambiguation(&self) -> bool {
+        true
+    }
+}
+
+pub trait ZyxwvutTrait {
+    fn method_impl_disambiguation(&self, x: usize) -> usize;
+}
+
+impl ZyxwvutTrait for ZyxwvutMethodDisambiguation {
+    fn method_impl_disambiguation(&self, x: usize) -> usize {
+        x
+    }
+}
+
+pub mod foreign_impl_order {
+    pub trait Foo<const W: usize> {
+        fn f(&mut self, with: [u8; W]);
+    }
+
+    impl Foo<4> for [u8; 4] {
+        fn f(&mut self, fg: [u8; 4]) {}
+    }
+    impl Foo<2> for [u8; 2] {
+        fn f(&mut self, fg: [u8; 2]) {}
+    }
+    impl Foo<1> for [u8; 1] {
+        fn f(&mut self, fg: [u8; 1]) {}
+    }
+    impl Foo<3> for [u8; 3] {
+        fn f(&mut self, fg: [u8; 3]) {}
+    }
+}
+
+pub mod private {
+    pub struct Tuple(u32, u8);
+    pub struct Struct {
+        a: u8,
+    }
+
+    pub union Union {
+        a: u8,
+        b: u16,
+    }
+
+    pub enum Enum {
+        A,
+        #[doc(hidden)]
+        B,
+    }
 }

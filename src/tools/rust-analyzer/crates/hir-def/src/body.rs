@@ -1,19 +1,17 @@
 //! Defines `Body`: a lowered representation of bodies of functions, statics and
 //! consts.
 mod lower;
+mod pretty;
+pub mod scope;
 #[cfg(test)]
 mod tests;
-pub mod scope;
-mod pretty;
 
 use std::ops::Index;
 
 use base_db::CrateId;
 use cfg::{CfgExpr, CfgOptions};
-use either::Either;
 use hir_expand::{name::Name, HirFileId, InFile};
 use la_arena::{Arena, ArenaMap};
-use profile::Count;
 use rustc_hash::FxHashMap;
 use syntax::{ast, AstPtr, SyntaxNodePtr};
 use triomphe::Arc;
@@ -26,7 +24,7 @@ use crate::{
     },
     nameres::DefMap,
     path::{ModPath, Path},
-    src::{HasChildSource, HasSource},
+    src::HasSource,
     BlockId, DefWithBodyId, HasModule, Lookup,
 };
 
@@ -37,7 +35,7 @@ pub struct Body {
     pub pats: Arena<Pat>,
     pub bindings: Arena<Binding>,
     pub labels: Arena<Label>,
-    /// Id of the closure/generator that owns the corresponding binding. If a binding is owned by the
+    /// Id of the closure/coroutine that owns the corresponding binding. If a binding is owned by the
     /// top level expression, it will not be listed in here.
     pub binding_owners: FxHashMap<BindingId, ExprId>,
     /// The patterns for the function's parameters. While the parameter types are
@@ -46,18 +44,18 @@ pub struct Body {
     ///
     /// If this `Body` is for the body of a constant, this will just be
     /// empty.
-    pub params: Vec<PatId>,
+    pub params: Box<[PatId]>,
+    pub self_param: Option<BindingId>,
     /// The `ExprId` of the actual body expression.
     pub body_expr: ExprId,
     /// Block expressions in this body that may contain inner items.
     block_scopes: Vec<BlockId>,
-    _c: Count<Self>,
 }
 
 pub type ExprPtr = AstPtr<ast::Expr>;
 pub type ExprSource = InFile<ExprPtr>;
 
-pub type PatPtr = Either<AstPtr<ast::Pat>, AstPtr<ast::SelfParam>>;
+pub type PatPtr = AstPtr<ast::Pat>;
 pub type PatSource = InFile<PatPtr>;
 
 pub type LabelPtr = AstPtr<ast::Label>;
@@ -65,6 +63,7 @@ pub type LabelSource = InFile<LabelPtr>;
 
 pub type FieldPtr = AstPtr<ast::RecordExprField>;
 pub type FieldSource = InFile<FieldPtr>;
+
 pub type PatFieldPtr = AstPtr<ast::RecordPatField>;
 pub type PatFieldSource = InFile<PatFieldPtr>;
 
@@ -90,10 +89,14 @@ pub struct BodySourceMap {
     label_map: FxHashMap<LabelSource, LabelId>,
     label_map_back: ArenaMap<LabelId, LabelSource>,
 
+    self_param: Option<InFile<AstPtr<ast::SelfParam>>>,
+
     /// We don't create explicit nodes for record fields (`S { record_field: 92 }`).
     /// Instead, we use id of expression (`92`) to identify the field.
     field_map_back: FxHashMap<ExprId, FieldSource>,
     pat_field_map_back: FxHashMap<PatId, PatFieldSource>,
+
+    format_args_template_map: FxHashMap<ExprId, Vec<(syntax::TextRange, Name)>>,
 
     expansions: FxHashMap<InFile<AstPtr<ast::MacroCall>>, HirFileId>,
 
@@ -120,7 +123,7 @@ impl Body {
         db: &dyn DefDatabase,
         def: DefWithBodyId,
     ) -> (Arc<Body>, Arc<BodySourceMap>) {
-        let _p = profile::span("body_with_source_map_query");
+        let _p = tracing::span!(tracing::Level::INFO, "body_with_source_map_query").entered();
         let mut params = None;
 
         let mut is_async_fn = false;
@@ -158,8 +161,9 @@ impl Body {
                     src.map(|it| it.body())
                 }
                 DefWithBodyId::VariantId(v) => {
-                    let src = v.parent.child_source(db);
-                    src.map(|it| it[v.local_id].expr())
+                    let s = v.lookup(db);
+                    let src = s.source(db);
+                    src.map(|it| it.expr())
                 }
                 DefWithBodyId::InTypeConstId(c) => c.lookup(db).id.map(|_| c.source(db).expr()),
             }
@@ -213,12 +217,12 @@ impl Body {
 
     fn shrink_to_fit(&mut self) {
         let Self {
-            _c: _,
             body_expr: _,
+            params: _,
+            self_param: _,
             block_scopes,
             exprs,
             labels,
-            params,
             pats,
             bindings,
             binding_owners,
@@ -226,7 +230,6 @@ impl Body {
         block_scopes.shrink_to_fit();
         exprs.shrink_to_fit();
         labels.shrink_to_fit();
-        params.shrink_to_fit();
         pats.shrink_to_fit();
         bindings.shrink_to_fit();
         binding_owners.shrink_to_fit();
@@ -255,12 +258,12 @@ impl Body {
                 }
             }
             Pat::Or(args) | Pat::Tuple { args, .. } | Pat::TupleStruct { args, .. } => {
-                args.iter().copied().for_each(|p| f(p));
+                args.iter().copied().for_each(f);
             }
             Pat::Ref { pat, .. } => f(*pat),
             Pat::Slice { prefix, slice, suffix } => {
                 let total_iter = prefix.iter().chain(slice.iter()).chain(suffix.iter());
-                total_iter.copied().for_each(|p| f(p));
+                total_iter.copied().for_each(f);
             }
             Pat::Record { args, .. } => {
                 args.iter().for_each(|RecordFieldPat { pat, .. }| f(*pat));
@@ -297,7 +300,7 @@ impl Default for Body {
             params: Default::default(),
             block_scopes: Default::default(),
             binding_owners: Default::default(),
-            _c: Default::default(),
+            self_param: Default::default(),
         }
     }
 }
@@ -355,18 +358,16 @@ impl BodySourceMap {
         self.pat_map_back.get(pat).cloned().ok_or(SyntheticSyntax)
     }
 
-    pub fn node_pat(&self, node: InFile<&ast::Pat>) -> Option<PatId> {
-        let src = node.map(|it| Either::Left(AstPtr::new(it)));
-        self.pat_map.get(&src).cloned()
+    pub fn self_param_syntax(&self) -> Option<InFile<AstPtr<ast::SelfParam>>> {
+        self.self_param
     }
 
-    pub fn node_self_param(&self, node: InFile<&ast::SelfParam>) -> Option<PatId> {
-        let src = node.map(|it| Either::Right(AstPtr::new(it)));
-        self.pat_map.get(&src).cloned()
+    pub fn node_pat(&self, node: InFile<&ast::Pat>) -> Option<PatId> {
+        self.pat_map.get(&node.map(AstPtr::new)).cloned()
     }
 
     pub fn label_syntax(&self, label: LabelId) -> LabelSource {
-        self.label_map_back[label].clone()
+        self.label_map_back[label]
     }
 
     pub fn node_label(&self, node: InFile<&ast::Label>) -> Option<LabelId> {
@@ -375,16 +376,24 @@ impl BodySourceMap {
     }
 
     pub fn field_syntax(&self, expr: ExprId) -> FieldSource {
-        self.field_map_back[&expr].clone()
+        self.field_map_back[&expr]
     }
 
     pub fn pat_field_syntax(&self, pat: PatId) -> PatFieldSource {
-        self.pat_field_map_back[&pat].clone()
+        self.pat_field_map_back[&pat]
     }
 
     pub fn macro_expansion_expr(&self, node: InFile<&ast::MacroExpr>) -> Option<ExprId> {
         let src = node.map(AstPtr::new).map(AstPtr::upcast::<ast::MacroExpr>).map(AstPtr::upcast);
         self.expr_map.get(&src).copied()
+    }
+
+    pub fn implicit_format_args(
+        &self,
+        node: InFile<&ast::FormatArgsExpr>,
+    ) -> Option<&[(syntax::TextRange, Name)]> {
+        let src = node.map(AstPtr::new).map(AstPtr::upcast::<ast::Expr>);
+        self.format_args_template_map.get(self.expr_map.get(&src)?).map(std::ops::Deref::deref)
     }
 
     /// Get a reference to the body source map's diagnostics.
@@ -394,6 +403,7 @@ impl BodySourceMap {
 
     fn shrink_to_fit(&mut self) {
         let Self {
+            self_param: _,
             expr_map,
             expr_map_back,
             pat_map,
@@ -403,8 +413,10 @@ impl BodySourceMap {
             field_map_back,
             pat_field_map_back,
             expansions,
+            format_args_template_map,
             diagnostics,
         } = self;
+        format_args_template_map.shrink_to_fit();
         expr_map.shrink_to_fit();
         expr_map_back.shrink_to_fit();
         pat_map.shrink_to_fit();

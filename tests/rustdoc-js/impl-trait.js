@@ -1,3 +1,4 @@
+// exact-check
 // ignore-order
 
 const EXPECTED = [
@@ -20,9 +21,16 @@ const EXPECTED = [
     {
         'query': '-> Aaaaaaa',
         'others': [
-            { 'path': 'impl_trait::Ccccccc', 'name': 'fffffff' },
-            { 'path': 'impl_trait::Ccccccc', 'name': 'ddddddd' },
             { 'path': 'impl_trait', 'name': 'bbbbbbb' },
+            { 'path': 'impl_trait::Ccccccc', 'name': 'ddddddd' },
+            { 'path': 'impl_trait::Ccccccc', 'name': 'fffffff' },
+            { 'path': 'impl_trait::Ccccccc', 'name': 'ggggggg' },
+        ],
+    },
+    {
+        'query': '-> Bbbbbbb',
+        'others': [
+            { 'path': 'impl_trait::Ccccccc', 'name': 'ggggggg' },
         ],
     },
     {
@@ -35,9 +43,10 @@ const EXPECTED = [
             { 'path': 'impl_trait::Ccccccc', 'name': 'eeeeeee' },
         ],
         'returned': [
-            { 'path': 'impl_trait::Ccccccc', 'name': 'fffffff' },
-            { 'path': 'impl_trait::Ccccccc', 'name': 'ddddddd' },
             { 'path': 'impl_trait', 'name': 'bbbbbbb' },
+            { 'path': 'impl_trait::Ccccccc', 'name': 'ddddddd' },
+            { 'path': 'impl_trait::Ccccccc', 'name': 'fffffff' },
+            { 'path': 'impl_trait::Ccccccc', 'name': 'ggggggg' },
         ],
     },
 ];

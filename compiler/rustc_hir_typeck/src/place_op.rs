@@ -1,5 +1,5 @@
 use crate::method::MethodCallee;
-use crate::{has_expected_num_generic_args, FnCtxt, PlaceOp};
+use crate::{FnCtxt, PlaceOp};
 use rustc_ast as ast;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
@@ -38,7 +38,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             span_bug!(expr.span, "input to deref is not a ref?");
         }
         let ty = self.make_overloaded_place_return_type(method).ty;
-        self.write_method_call(expr.hir_id, method);
+        self.write_method_call_and_enforce_effects(expr.hir_id, expr.span, method);
         Some(ty)
     }
 
@@ -71,7 +71,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         base_expr: &hir::Expr<'_>,
     ) -> Option<(Ty<'tcx>, Ty<'tcx>)> {
         let ty = self.resolve_vars_if_possible(ty);
-        let mut err = self.tcx.sess.struct_span_err(
+        let mut err = self.dcx().struct_span_err(
             span,
             format!("negative integers cannot be used to index on a `{ty}`"),
         );
@@ -162,11 +162,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 if let ty::Ref(region, _, hir::Mutability::Not) = method.sig.inputs()[0].kind() {
                     adjustments.push(Adjustment {
                         kind: Adjust::Borrow(AutoBorrow::Ref(*region, AutoBorrowMutability::Not)),
-                        target: Ty::new_ref(
-                            self.tcx,
-                            *region,
-                            ty::TypeAndMut { mutbl: hir::Mutability::Not, ty: adjusted_ty },
-                        ),
+                        target: Ty::new_imm_ref(self.tcx, *region, adjusted_ty),
                     });
                 } else {
                     span_bug!(expr.span, "input to index is not a ref?");
@@ -179,7 +175,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 }
                 self.apply_adjustments(base_expr, adjustments);
 
-                self.write_method_call(expr.hir_id, method);
+                self.write_method_call_and_enforce_effects(expr.hir_id, expr.span, method);
 
                 return Some((input_ty, self.make_overloaded_place_return_type(method).ty));
             }
@@ -209,20 +205,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return None;
         };
 
-        // If the lang item was declared incorrectly, stop here so that we don't
-        // run into an ICE (#83893). The error is reported where the lang item is
-        // declared.
-        if !has_expected_num_generic_args(
-            self.tcx,
-            imm_tr,
-            match op {
-                PlaceOp::Deref => 0,
-                PlaceOp::Index => 1,
-            },
-        ) {
-            return None;
-        }
-
         self.lookup_method_in_trait(
             self.misc(span),
             Ident::with_dummy_span(imm_op),
@@ -249,20 +231,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return None;
         };
 
-        // If the lang item was declared incorrectly, stop here so that we don't
-        // run into an ICE (#83893). The error is reported where the lang item is
-        // declared.
-        if !has_expected_num_generic_args(
-            self.tcx,
-            mut_tr,
-            match op {
-                PlaceOp::Deref => 0,
-                PlaceOp::Index => 1,
-            },
-        ) {
-            return None;
-        }
-
         self.lookup_method_in_trait(
             self.misc(span),
             Ident::with_dummy_span(mut_op),
@@ -283,9 +251,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Gather up expressions we want to munge.
         let mut exprs = vec![expr];
 
-        while let hir::ExprKind::Field(ref expr, _)
-        | hir::ExprKind::Index(ref expr, _, _)
-        | hir::ExprKind::Unary(hir::UnOp::Deref, ref expr) = exprs.last().unwrap().kind
+        while let hir::ExprKind::Field(expr, _)
+        | hir::ExprKind::Index(expr, _, _)
+        | hir::ExprKind::Unary(hir::UnOp::Deref, expr) = exprs.last().unwrap().kind
         {
             exprs.push(expr);
         }
@@ -332,15 +300,15 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         if inside_union
                             && source.ty_adt_def().is_some_and(|adt| adt.is_manually_drop())
                         {
-                            let mut err = self.tcx.sess.struct_span_err(
+                            self.dcx().struct_span_err(
                                 expr.span,
                                 "not automatically applying `DerefMut` on `ManuallyDrop` union field",
-                            );
-                            err.help(
+                            )
+                            .with_help(
                                 "writing to this reference calls the destructor for the old value",
-                            );
-                            err.help("add an explicit `*` if that is desired, or call `ptr::write` to not run the destructor");
-                            err.emit();
+                            )
+                            .with_help("add an explicit `*` if that is desired, or call `ptr::write` to not run the destructor")
+                            .emit();
                         }
                     }
                     source = adjustment.target;
@@ -385,7 +353,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             PlaceOp::Deref => None,
             PlaceOp::Index => {
                 // We would need to recover the `T` used when we resolve `<_ as Index<T>>::index`
-                // in try_index_step. This is the subst at index 1.
+                // in try_index_step. This is the arg at index 1.
                 //
                 // Note: we should *not* use `expr_ty` of index_expr here because autoderef
                 // during coercions can cause type of index_expr to differ from `T` (#72002).
@@ -404,7 +372,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             None => return,
         };
         debug!("convert_place_op_to_mutable: method={:?}", method);
-        self.write_method_call(expr.hir_id, method);
+        self.write_method_call_and_enforce_effects(expr.hir_id, expr.span, method);
 
         let ty::Ref(region, _, hir::Mutability::Mut) = method.sig.inputs()[0].kind() else {
             span_bug!(expr.span, "input to mutable place op is not a mut ref?");
@@ -428,11 +396,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         allow_two_phase_borrow: AllowTwoPhase::No,
                     };
                     adjustment.kind = Adjust::Borrow(AutoBorrow::Ref(*region, mutbl));
-                    adjustment.target = Ty::new_ref(
-                        self.tcx,
-                        *region,
-                        ty::TypeAndMut { ty: source, mutbl: mutbl.into() },
-                    );
+                    adjustment.target = Ty::new_ref(self.tcx, *region, source, mutbl.into());
                 }
                 source = adjustment.target;
             }

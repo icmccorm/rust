@@ -12,15 +12,18 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-crossbeam-channel = "0.5.8"
-tracing = "0.1.37"
-cargo_metadata = "0.15.4"
-rustc-hash = "1.1.0"
+cargo_metadata.workspace = true
+crossbeam-channel.workspace = true
+tracing.workspace = true
+rustc-hash.workspace = true
 serde_json.workspace = true
 serde.workspace = true
-command-group = "2.0.1"
+command-group.workspace = true
 
 # local deps
 paths.workspace = true
 stdx.workspace = true
 toolchain.workspace = true
+
+[lints]
+workspace = true

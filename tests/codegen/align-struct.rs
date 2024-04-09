@@ -1,11 +1,10 @@
-// compile-flags: -C no-prepopulate-passes -Z mir-opt-level=0
+//@ compile-flags: -C no-prepopulate-passes -Z mir-opt-level=0
 //
 
 #![crate_type = "lib"]
 
 #[repr(align(64))]
 pub struct Align64(i32);
-// CHECK: %Align64 = type { i32, [15 x i32] }
 
 pub struct Nested64 {
     a: Align64,
@@ -13,20 +12,16 @@ pub struct Nested64 {
     c: i32,
     d: i8,
 }
-// CHECK: %Nested64 = type { %Align64, i32, i32, i8, [55 x i8] }
 
 pub enum Enum4 {
     A(i32),
     B(i32),
 }
-// No Aggregate type, and hence nothing in LLVM IR.
 
 pub enum Enum64 {
     A(Align64),
     B(i32),
 }
-// CHECK: %Enum64 = type { i32, [31 x i32] }
-// CHECK: %"Enum64::A" = type { [8 x i64], %Align64 }
 
 // CHECK-LABEL: @align64
 #[no_mangle]
@@ -57,7 +52,7 @@ pub fn nested64(a: Align64, b: i32, c: i32, d: i8) -> Nested64 {
 // CHECK-LABEL: @enum4
 #[no_mangle]
 pub fn enum4(a: i32) -> Enum4 {
-// CHECK: %e4 = alloca { i32, i32 }, align 4
+// CHECK: %e4 = alloca %Enum4, align 4
     let e4 = Enum4::A(a);
     e4
 }

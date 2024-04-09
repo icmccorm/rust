@@ -105,7 +105,6 @@ use rustc_hir::def_id::{DefId, DefIdSet, LOCAL_CRATE};
 use rustc_hir::definitions::DefPathDataName;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::middle::exported_symbols::{SymbolExportInfo, SymbolExportLevel};
-use rustc_middle::mir;
 use rustc_middle::mir::mono::{
     CodegenUnit, CodegenUnitNameBuilder, InstantiationMode, Linkage, MonoItem, MonoItemData,
     Visibility,
@@ -118,7 +117,7 @@ use rustc_session::CodegenUnits;
 use rustc_span::symbol::Symbol;
 
 use crate::collector::UsageMap;
-use crate::collector::{self, MonoItemCollectionMode};
+use crate::collector::{self, MonoItemCollectionStrategy};
 use crate::errors::{CouldntDumpMonoStats, SymbolAlreadyDefined, UnknownCguCollectionMode};
 
 struct PartitioningCx<'a, 'tcx> {
@@ -157,7 +156,7 @@ where
         placed
     };
 
-    // Merge until we have at most `max_cgu_count` codegen units.
+    // Merge until we don't exceed the max CGU count.
     // `merge_codegen_units` is responsible for updating the CGU size
     // estimates.
     {
@@ -176,14 +175,12 @@ where
     }
 
     // Mark one CGU for dead code, if necessary.
-    let instrument_dead_code =
-        tcx.sess.instrument_coverage() && !tcx.sess.instrument_coverage_except_unused_functions();
-    if instrument_dead_code {
+    if tcx.sess.instrument_coverage() {
         mark_code_coverage_dead_code_cgu(&mut codegen_units);
     }
 
     // Ensure CGUs are sorted by name, so that we get deterministic results.
-    if !codegen_units.is_sorted_by(|a, b| Some(a.name().as_str().cmp(b.name().as_str()))) {
+    if !codegen_units.is_sorted_by(|a, b| a.name().as_str() <= b.name().as_str()) {
         let mut names = String::new();
         for cgu in codegen_units.iter() {
             names += &format!("- {}\n", cgu.name());
@@ -213,11 +210,17 @@ where
     let cgu_name_cache = &mut FxHashMap::default();
 
     for mono_item in mono_items {
-        // Handle only root items directly here. Inlined items are handled at
-        // the bottom of the loop based on reachability.
+        // Handle only root (GloballyShared) items directly here. Inlined (LocalCopy) items
+        // are handled at the bottom of the loop based on reachability, with one exception.
+        // The #[lang = "start"] item is the program entrypoint, so there are no calls to it in MIR.
+        // So even if its mode is LocalCopy, we need to treat it like a root.
         match mono_item.instantiation_mode(cx.tcx) {
             InstantiationMode::GloballyShared { .. } => {}
-            InstantiationMode::LocalCopy => continue,
+            InstantiationMode::LocalCopy => {
+                if Some(mono_item.def_id()) != cx.tcx.lang_items().start_fn() {
+                    continue;
+                }
+            }
         }
 
         let characteristic_def_id = characteristic_def_id_of_mono_item(cx.tcx, mono_item);
@@ -312,7 +315,7 @@ fn merge_codegen_units<'tcx>(
     assert!(cx.tcx.sess.codegen_units().as_usize() >= 1);
 
     // A sorted order here ensures merging is deterministic.
-    assert!(codegen_units.is_sorted_by(|a, b| Some(a.name().as_str().cmp(b.name().as_str()))));
+    assert!(codegen_units.is_sorted_by(|a, b| a.name().as_str() <= b.name().as_str()));
 
     // This map keeps track of what got merged into what.
     let mut cgu_contents: FxHashMap<Symbol, Vec<Symbol>> =
@@ -363,7 +366,7 @@ fn merge_codegen_units<'tcx>(
         // Move the items from `cgu_src` to `cgu_dst`. Some of them may be
         // duplicate inlined items, in which case the destination CGU is
         // unaffected. Recalculate size estimates afterwards.
-        cgu_dst.items_mut().extend(cgu_src.items_mut().drain());
+        cgu_dst.items_mut().extend(cgu_src.items_mut().drain(..));
         cgu_dst.compute_size_estimate();
 
         // Record that `cgu_dst` now contains all the stuff that was in
@@ -402,7 +405,7 @@ fn merge_codegen_units<'tcx>(
         // Move the items from `smallest` to `second_smallest`. Some of them
         // may be duplicate inlined items, in which case the destination CGU is
         // unaffected. Recalculate size estimates afterwards.
-        second_smallest.items_mut().extend(smallest.items_mut().drain());
+        second_smallest.items_mut().extend(smallest.items_mut().drain(..));
         second_smallest.compute_size_estimate();
 
         // Don't update `cgu_contents`, that's only for incremental builds.
@@ -437,12 +440,12 @@ fn merge_codegen_units<'tcx>(
         for cgu in codegen_units.iter_mut() {
             if let Some(new_cgu_name) = new_cgu_names.get(&cgu.name()) {
                 if cx.tcx.sess.opts.unstable_opts.human_readable_cgu_names {
-                    cgu.set_name(Symbol::intern(&new_cgu_name));
+                    cgu.set_name(Symbol::intern(new_cgu_name));
                 } else {
                     // If we don't require CGU names to be human-readable,
                     // we use a fixed length hash of the composite CGU name
                     // instead.
-                    let new_cgu_name = CodegenUnit::mangle_name(&new_cgu_name);
+                    let new_cgu_name = CodegenUnit::mangle_name(new_cgu_name);
                     cgu.set_name(Symbol::intern(&new_cgu_name));
                 }
             }
@@ -615,6 +618,8 @@ fn characteristic_def_id_of_mono_item<'tcx>(
                 | ty::InstanceDef::ReifyShim(..)
                 | ty::InstanceDef::FnPtrShim(..)
                 | ty::InstanceDef::ClosureOnceShim { .. }
+                | ty::InstanceDef::ConstructCoroutineInClosureShim { .. }
+                | ty::InstanceDef::CoroutineKindShim { .. }
                 | ty::InstanceDef::Intrinsic(..)
                 | ty::InstanceDef::DropGlue(..)
                 | ty::InstanceDef::Virtual(..)
@@ -778,6 +783,8 @@ fn mono_item_visibility<'tcx>(
         | InstanceDef::Virtual(..)
         | InstanceDef::Intrinsic(..)
         | InstanceDef::ClosureOnceShim { .. }
+        | InstanceDef::ConstructCoroutineInClosureShim { .. }
+        | InstanceDef::CoroutineKindShim { .. }
         | InstanceDef::DropGlue(..)
         | InstanceDef::CloneShim(..)
         | InstanceDef::FnPtrAddrShim(..) => return Visibility::Hidden,
@@ -884,7 +891,7 @@ fn mono_item_visibility<'tcx>(
 }
 
 fn default_visibility(tcx: TyCtxt<'_>, id: DefId, is_generic: bool) -> Visibility {
-    if !tcx.sess.target.default_hidden_visibility {
+    if !tcx.sess.default_hidden_visibility() {
         return Visibility::Default;
     }
 
@@ -1074,38 +1081,41 @@ where
                 (span1, span2) => span1.or(span2),
             };
 
-            tcx.sess.emit_fatal(SymbolAlreadyDefined { span, symbol: sym1.to_string() });
+            tcx.dcx().emit_fatal(SymbolAlreadyDefined { span, symbol: sym1.to_string() });
         }
     }
 }
 
 fn collect_and_partition_mono_items(tcx: TyCtxt<'_>, (): ()) -> (&DefIdSet, &[CodegenUnit<'_>]) {
-    let collection_mode = match tcx.sess.opts.unstable_opts.print_mono_items {
+    let collection_strategy = match tcx.sess.opts.unstable_opts.print_mono_items {
         Some(ref s) => {
             let mode = s.to_lowercase();
             let mode = mode.trim();
             if mode == "eager" {
-                MonoItemCollectionMode::Eager
+                MonoItemCollectionStrategy::Eager
             } else {
                 if mode != "lazy" {
-                    tcx.sess.emit_warning(UnknownCguCollectionMode { mode });
+                    tcx.dcx().emit_warn(UnknownCguCollectionMode { mode });
                 }
 
-                MonoItemCollectionMode::Lazy
+                MonoItemCollectionStrategy::Lazy
             }
         }
         None => {
             if tcx.sess.link_dead_code() {
-                MonoItemCollectionMode::Eager
+                MonoItemCollectionStrategy::Eager
             } else {
-                MonoItemCollectionMode::Lazy
+                MonoItemCollectionStrategy::Lazy
             }
         }
     };
 
-    let (items, usage_map) = collector::collect_crate_mono_items(tcx, collection_mode);
+    let (items, usage_map) = collector::collect_crate_mono_items(tcx, collection_strategy);
 
-    tcx.sess.abort_if_errors();
+    // If there was an error during collection (e.g. from one of the constants we evaluated),
+    // then we stop here. This way codegen does not have to worry about failing constants.
+    // (codegen relies on this and ICEs will happen if this is violated.)
+    tcx.dcx().abort_if_errors();
 
     let (codegen_units, _) = tcx.sess.time("partition_and_assert_distinct_symbols", || {
         sync::join(
@@ -1141,9 +1151,9 @@ fn collect_and_partition_mono_items(tcx: TyCtxt<'_>, (): ()) -> (&DefIdSet, &[Co
     // Output monomorphization stats per def_id
     if let SwitchWithOptPath::Enabled(ref path) = tcx.sess.opts.unstable_opts.dump_mono_stats {
         if let Err(err) =
-            dump_mono_items_stats(tcx, &codegen_units, path, tcx.crate_name(LOCAL_CRATE))
+            dump_mono_items_stats(tcx, codegen_units, path, tcx.crate_name(LOCAL_CRATE))
         {
-            tcx.sess.emit_fatal(CouldntDumpMonoStats { error: err.to_string() });
+            tcx.dcx().emit_fatal(CouldntDumpMonoStats { error: err.to_string() });
         }
     }
 
@@ -1279,38 +1289,8 @@ fn dump_mono_items_stats<'tcx>(
     Ok(())
 }
 
-fn codegened_and_inlined_items(tcx: TyCtxt<'_>, (): ()) -> &DefIdSet {
-    let (items, cgus) = tcx.collect_and_partition_mono_items(());
-    let mut visited = DefIdSet::default();
-    let mut result = items.clone();
-
-    for cgu in cgus {
-        for item in cgu.items().keys() {
-            if let MonoItem::Fn(ref instance) = item {
-                let did = instance.def_id();
-                if !visited.insert(did) {
-                    continue;
-                }
-                let body = tcx.instance_mir(instance.def);
-                for block in body.basic_blocks.iter() {
-                    for statement in &block.statements {
-                        let mir::StatementKind::Coverage(_) = statement.kind else { continue };
-                        let scope = statement.source_info.scope;
-                        if let Some(inlined) = scope.inlined_instance(&body.source_scopes) {
-                            result.insert(inlined.def_id());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    tcx.arena.alloc(result)
-}
-
 pub fn provide(providers: &mut Providers) {
     providers.collect_and_partition_mono_items = collect_and_partition_mono_items;
-    providers.codegened_and_inlined_items = codegened_and_inlined_items;
 
     providers.is_codegened_item = |tcx, def_id| {
         let (all_mono_items, _) = tcx.collect_and_partition_mono_items(());

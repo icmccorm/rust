@@ -1,6 +1,4 @@
-// build-pass (FIXME(62277): could be check-pass?)
-
-#![feature(associated_type_bounds)]
+//@ build-pass (FIXME(62277): could be check-pass?)
 
 use std::iter::Once;
 use std::ops::Range;

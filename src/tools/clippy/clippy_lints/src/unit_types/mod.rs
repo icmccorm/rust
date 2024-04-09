@@ -3,9 +3,9 @@ mod unit_arg;
 mod unit_cmp;
 mod utils;
 
-use rustc_hir::{Expr, Local};
+use rustc_hir::{Expr, LetStmt};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -16,7 +16,7 @@ declare_clippy_lint! {
     /// binding one is kind of pointless.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let x = {
     ///     1;
     /// };
@@ -38,7 +38,7 @@ declare_clippy_lint! {
     /// adds semicolons at the end of the operands.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # fn foo() {};
     /// # fn bar() {};
     /// # fn baz() {};
@@ -51,7 +51,7 @@ declare_clippy_lint! {
     /// }
     /// ```
     /// is equal to
-    /// ```rust
+    /// ```no_run
     /// # fn foo() {};
     /// # fn bar() {};
     /// # fn baz() {};
@@ -63,7 +63,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// For asserts:
-    /// ```rust
+    /// ```no_run
     /// # fn foo() {};
     /// # fn bar() {};
     /// assert_eq!({ foo(); }, { bar(); });
@@ -99,7 +99,7 @@ declare_clippy_lint! {
 declare_lint_pass!(UnitTypes => [LET_UNIT_VALUE, UNIT_CMP, UNIT_ARG]);
 
 impl<'tcx> LateLintPass<'tcx> for UnitTypes {
-    fn check_local(&mut self, cx: &LateContext<'tcx>, local: &'tcx Local<'tcx>) {
+    fn check_local(&mut self, cx: &LateContext<'tcx>, local: &'tcx LetStmt<'tcx>) {
         let_unit_value::check(cx, local);
     }
 

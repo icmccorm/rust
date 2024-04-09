@@ -4,19 +4,17 @@
  */
 
 use crate::mir::*;
-use crate::ty::{self, Ty, TyCtxt};
 use rustc_hir as hir;
-use rustc_target::abi::{FieldIdx, VariantIdx};
 
 #[derive(Copy, Clone, Debug, TypeFoldable, TypeVisitable)]
 pub struct PlaceTy<'tcx> {
     pub ty: Ty<'tcx>,
-    /// Downcast to a particular variant of an enum or a generator, if included.
+    /// Downcast to a particular variant of an enum or a coroutine, if included.
     pub variant_index: Option<VariantIdx>,
 }
 
 // At least on 64 bit systems, `PlaceTy` should not be larger than two or three pointers.
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_pointer_width = "64"))]
 static_assert_size!(PlaceTy<'_>, 16);
 
 impl<'tcx> PlaceTy<'tcx> {
@@ -40,7 +38,7 @@ impl<'tcx> PlaceTy<'tcx> {
                     None => adt_def.non_enum_variant(),
                     Some(variant_index) => {
                         assert!(adt_def.is_enum());
-                        &adt_def.variant(variant_index)
+                        adt_def.variant(variant_index)
                     }
                 };
                 let field_def = &variant_def.fields[f];
@@ -69,7 +67,7 @@ impl<'tcx> PlaceTy<'tcx> {
         param_env: ty::ParamEnv<'tcx>,
         elem: &ProjectionElem<V, T>,
         mut handle_field: impl FnMut(&Self, FieldIdx, T) -> Ty<'tcx>,
-        mut handle_opaque_cast: impl FnMut(&Self, T) -> Ty<'tcx>,
+        mut handle_opaque_cast_and_subtype: impl FnMut(&Self, T) -> Ty<'tcx>,
     ) -> PlaceTy<'tcx>
     where
         V: ::std::fmt::Debug,
@@ -95,9 +93,7 @@ impl<'tcx> PlaceTy<'tcx> {
             ProjectionElem::Subslice { from, to, from_end } => {
                 PlaceTy::from_ty(match self.ty.kind() {
                     ty::Slice(..) => self.ty,
-                    ty::Array(inner, _) if !from_end => {
-                        Ty::new_array(tcx, *inner, (to - from) as u64)
-                    }
+                    ty::Array(inner, _) if !from_end => Ty::new_array(tcx, *inner, to - from),
                     ty::Array(inner, size) if from_end => {
                         let size = size.eval_target_usize(tcx, param_env);
                         let len = size - from - to;
@@ -110,7 +106,12 @@ impl<'tcx> PlaceTy<'tcx> {
                 PlaceTy { ty: self.ty, variant_index: Some(index) }
             }
             ProjectionElem::Field(f, fty) => PlaceTy::from_ty(handle_field(&self, f, fty)),
-            ProjectionElem::OpaqueCast(ty) => PlaceTy::from_ty(handle_opaque_cast(&self, ty)),
+            ProjectionElem::OpaqueCast(ty) => {
+                PlaceTy::from_ty(handle_opaque_cast_and_subtype(&self, ty))
+            }
+            ProjectionElem::Subtype(ty) => {
+                PlaceTy::from_ty(handle_opaque_cast_and_subtype(&self, ty))
+            }
         };
         debug!("projection_ty self: {:?} elem: {:?} yields: {:?}", self, elem, answer);
         answer
@@ -138,7 +139,7 @@ impl<'tcx> Place<'tcx> {
     where
         D: HasLocalDecls<'tcx>,
     {
-        Place::ty_from(self.local, &self.projection, local_decls, tcx)
+        Place::ty_from(self.local, self.projection, local_decls, tcx)
     }
 }
 
@@ -147,7 +148,7 @@ impl<'tcx> PlaceRef<'tcx> {
     where
         D: HasLocalDecls<'tcx>,
     {
-        Place::ty_from(self.local, &self.projection, local_decls, tcx)
+        Place::ty_from(self.local, self.projection, local_decls, tcx)
     }
 }
 
@@ -169,11 +170,11 @@ impl<'tcx> Rvalue<'tcx> {
             Rvalue::ThreadLocalRef(did) => tcx.thread_local_ptr_ty(did),
             Rvalue::Ref(reg, bk, ref place) => {
                 let place_ty = place.ty(local_decls, tcx).ty;
-                Ty::new_ref(tcx, reg, ty::TypeAndMut { ty: place_ty, mutbl: bk.to_mutbl_lossy() })
+                Ty::new_ref(tcx, reg, place_ty, bk.to_mutbl_lossy())
             }
             Rvalue::AddressOf(mutability, ref place) => {
                 let place_ty = place.ty(local_decls, tcx).ty;
-                Ty::new_ptr(tcx, ty::TypeAndMut { ty: place_ty, mutbl: mutability })
+                Ty::new_ptr(tcx, place_ty, mutability)
             }
             Rvalue::Len(..) => tcx.types.usize,
             Rvalue::Cast(.., ty) => ty,
@@ -193,6 +194,7 @@ impl<'tcx> Rvalue<'tcx> {
             Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf | NullOp::OffsetOf(..), _) => {
                 tcx.types.usize
             }
+            Rvalue::NullaryOp(NullOp::UbChecks, _) => tcx.types.bool,
             Rvalue::Aggregate(ref ak, ref ops) => match **ak {
                 AggregateKind::Array(ty) => Ty::new_array(tcx, ty, ops.len() as u64),
                 AggregateKind::Tuple => {
@@ -200,8 +202,9 @@ impl<'tcx> Rvalue<'tcx> {
                 }
                 AggregateKind::Adt(did, _, args, _, _) => tcx.type_of(did).instantiate(tcx, args),
                 AggregateKind::Closure(did, args) => Ty::new_closure(tcx, did, args),
-                AggregateKind::Generator(did, args, movability) => {
-                    Ty::new_generator(tcx, did, args, movability)
+                AggregateKind::Coroutine(did, args) => Ty::new_coroutine(tcx, did, args),
+                AggregateKind::CoroutineClosure(did, args) => {
+                    Ty::new_coroutine_closure(tcx, did, args)
                 }
             },
             Rvalue::ShallowInitBox(_, ty) => Ty::new_box(tcx, ty),
@@ -228,6 +231,18 @@ impl<'tcx> Operand<'tcx> {
         match self {
             &Operand::Copy(ref l) | &Operand::Move(ref l) => l.ty(local_decls, tcx).ty,
             Operand::Constant(c) => c.const_.ty(),
+        }
+    }
+
+    pub fn span<D: ?Sized>(&self, local_decls: &D) -> Span
+    where
+        D: HasLocalDecls<'tcx>,
+    {
+        match self {
+            &Operand::Copy(ref l) | &Operand::Move(ref l) => {
+                local_decls.local_decls()[l.local].source_info.span
+            }
+            Operand::Constant(c) => c.span,
         }
     }
 }
@@ -261,6 +276,11 @@ impl<'tcx> BinOp {
             &BinOp::Eq | &BinOp::Lt | &BinOp::Le | &BinOp::Ne | &BinOp::Ge | &BinOp::Gt => {
                 tcx.types.bool
             }
+            &BinOp::Cmp => {
+                // these should be integer-like types of the same size.
+                assert_eq!(lhs_ty, rhs_ty);
+                tcx.ty_ordering_enum(None)
+            }
         }
     }
 }
@@ -273,7 +293,7 @@ impl BorrowKind {
 
             // We have no type corresponding to a shallow borrow, so use
             // `&` as an approximation.
-            BorrowKind::Shallow => hir::Mutability::Not,
+            BorrowKind::Fake => hir::Mutability::Not,
         }
     }
 }
@@ -297,7 +317,8 @@ impl BinOp {
             BinOp::Gt => hir::BinOpKind::Gt,
             BinOp::Le => hir::BinOpKind::Le,
             BinOp::Ge => hir::BinOpKind::Ge,
-            BinOp::AddUnchecked
+            BinOp::Cmp
+            | BinOp::AddUnchecked
             | BinOp::SubUnchecked
             | BinOp::MulUnchecked
             | BinOp::ShlUnchecked

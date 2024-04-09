@@ -1,8 +1,8 @@
 //! Type inference-based diagnostics.
+mod decl_check;
 mod expr;
 mod match_check;
 mod unsafe_check;
-mod decl_check;
 
 pub use crate::diagnostics::{
     decl_check::{incorrect_case, CaseType, IncorrectCase},
@@ -11,9 +11,3 @@ pub use crate::diagnostics::{
     },
     unsafe_check::{missing_unsafe, unsafe_expressions, UnsafeExpr},
 };
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct IncoherentImpl {
-    pub file_id: hir_expand::HirFileId,
-    pub impl_: syntax::AstPtr<syntax::ast::Impl>,
-}

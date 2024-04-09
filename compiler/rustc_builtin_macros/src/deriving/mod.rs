@@ -40,7 +40,7 @@ pub mod partial_ord;
 pub mod generic;
 
 pub(crate) type BuiltinDeriveFn =
-    fn(&mut ExtCtxt<'_>, Span, &MetaItem, &Annotatable, &mut dyn FnMut(Annotatable), bool);
+    fn(&ExtCtxt<'_>, Span, &MetaItem, &Annotatable, &mut dyn FnMut(Annotatable), bool);
 
 pub(crate) struct BuiltinDerive(pub(crate) BuiltinDeriveFn);
 
@@ -117,12 +117,14 @@ fn call_unreachable(cx: &ExtCtxt<'_>, span: Span) -> P<ast::Expr> {
 }
 
 fn assert_ty_bounds(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     stmts: &mut ThinVec<ast::Stmt>,
     ty: P<ast::Ty>,
     span: Span,
     assert_path: &[Symbol],
 ) {
+    // Deny anonymous structs or unions to avoid wierd errors.
+    assert!(!ty.kind.is_anon_adt(), "Anonymous structs or unions cannot be type parameters");
     // Generate statement `let _: assert_path<ty>;`.
     let span = cx.with_def_site_ctxt(span);
     let assert_path = cx.path_all(span, true, cx.std_path(assert_path), vec![GenericArg::Type(ty)]);

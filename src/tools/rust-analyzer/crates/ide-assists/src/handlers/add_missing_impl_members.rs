@@ -105,7 +105,7 @@ fn add_missing_impl_members_inner(
     assist_id: &'static str,
     label: &'static str,
 ) -> Option<()> {
-    let _p = profile::span("add_missing_impl_members_inner");
+    let _p = tracing::span!(tracing::Level::INFO, "add_missing_impl_members_inner");
     let impl_def = ctx.find_node_at_offset::<ast::Impl>()?;
     let impl_ = ctx.sema.to_def(&impl_def)?;
 
@@ -370,17 +370,17 @@ impl<U> Foo<U> for S {
             add_missing_impl_members,
             r#"
 pub trait Trait<'a, 'b, A, B, C> {
-    fn foo(&self, one: &'a A, anoter: &'b B) -> &'a C;
+    fn foo(&self, one: &'a A, another: &'b B) -> &'a C;
 }
 
 impl<'x, 'y, T, V, U> Trait<'x, 'y, T, V, U> for () {$0}"#,
             r#"
 pub trait Trait<'a, 'b, A, B, C> {
-    fn foo(&self, one: &'a A, anoter: &'b B) -> &'a C;
+    fn foo(&self, one: &'a A, another: &'b B) -> &'a C;
 }
 
 impl<'x, 'y, T, V, U> Trait<'x, 'y, T, V, U> for () {
-    fn foo(&self, one: &'x T, anoter: &'y V) -> &'x U {
+    fn foo(&self, one: &'x T, another: &'y V) -> &'x U {
         ${0:todo!()}
     }
 }"#,
@@ -393,7 +393,7 @@ impl<'x, 'y, T, V, U> Trait<'x, 'y, T, V, U> for () {
             add_missing_default_members,
             r#"
 pub trait Trait<'a, 'b, A, B, C: Default> {
-    fn foo(&self, _one: &'a A, _anoter: &'b B) -> (C, &'a i32) {
+    fn foo(&self, _one: &'a A, _another: &'b B) -> (C, &'a i32) {
         let value: &'a i32 = &0;
         (C::default(), value)
     }
@@ -402,14 +402,14 @@ pub trait Trait<'a, 'b, A, B, C: Default> {
 impl<'x, 'y, T, V, U: Default> Trait<'x, 'y, T, V, U> for () {$0}"#,
             r#"
 pub trait Trait<'a, 'b, A, B, C: Default> {
-    fn foo(&self, _one: &'a A, _anoter: &'b B) -> (C, &'a i32) {
+    fn foo(&self, _one: &'a A, _another: &'b B) -> (C, &'a i32) {
         let value: &'a i32 = &0;
         (C::default(), value)
     }
 }
 
 impl<'x, 'y, T, V, U: Default> Trait<'x, 'y, T, V, U> for () {
-    $0fn foo(&self, _one: &'x T, _anoter: &'y V) -> (U, &'x i32) {
+    $0fn foo(&self, _one: &'x T, _another: &'y V) -> (U, &'x i32) {
         let value: &'x i32 = &0;
         (<U>::default(), value)
     }
@@ -2244,6 +2244,37 @@ impl b::LocalTrait for B {
 
     fn no_skip_default_2() -> Option<()> {
         todo!()
+    }
+}
+            "#,
+        )
+    }
+
+    #[test]
+    fn doc_hidden_nondefault_member() {
+        check_assist(
+            add_missing_impl_members,
+            r#"
+//- /lib.rs crate:b new_source_root:local
+trait LocalTrait {
+    #[doc(hidden)]
+    fn no_skip_non_default() -> Option<()>;
+
+    #[doc(hidden)]
+    fn skip_default() -> Option<()> {
+        todo!()
+    }
+}
+
+//- /main.rs crate:a deps:b
+struct B;
+impl b::Loc$0alTrait for B {}
+            "#,
+            r#"
+struct B;
+impl b::LocalTrait for B {
+    fn no_skip_non_default() -> Option<()> {
+        ${0:todo!()}
     }
 }
             "#,

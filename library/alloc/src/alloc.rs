@@ -3,7 +3,7 @@
 #![stable(feature = "alloc_module", since = "1.28.0")]
 
 #[cfg(not(test))]
-use core::intrinsics;
+use core::hint;
 
 #[cfg(not(test))]
 use core::ptr::{self, NonNull};
@@ -50,6 +50,8 @@ extern "Rust" {
 #[unstable(feature = "allocator_api", issue = "32838")]
 #[derive(Copy, Clone, Default, Debug)]
 #[cfg(not(test))]
+// the compiler needs to know when a Box uses the global allocator vs a custom one
+#[lang = "global_alloc_ty"]
 pub struct Global;
 
 #[cfg(test)]
@@ -208,7 +210,7 @@ impl Global {
                 let new_size = new_layout.size();
 
                 // `realloc` probably checks for `new_size >= old_layout.size()` or something similar.
-                intrinsics::assume(new_size >= old_layout.size());
+                hint::assert_unchecked(new_size >= old_layout.size());
 
                 let raw_ptr = realloc(ptr.as_ptr(), old_layout, new_size);
                 let ptr = NonNull::new(raw_ptr).ok_or(AllocError)?;
@@ -299,7 +301,7 @@ unsafe impl Allocator for Global {
             // SAFETY: `new_size` is non-zero. Other conditions must be upheld by the caller
             new_size if old_layout.align() == new_layout.align() => unsafe {
                 // `realloc` probably checks for `new_size <= old_layout.size()` or something similar.
-                intrinsics::assume(new_size <= old_layout.size());
+                hint::assert_unchecked(new_size <= old_layout.size());
 
                 let raw_ptr = realloc(ptr.as_ptr(), old_layout, new_size);
                 let ptr = NonNull::new(raw_ptr).ok_or(AllocError)?;
@@ -377,13 +379,20 @@ pub const fn handle_alloc_error(layout: Layout) -> ! {
         panic!("allocation failed");
     }
 
+    #[inline]
     fn rt_error(layout: Layout) -> ! {
         unsafe {
             __rust_alloc_error_handler(layout.size(), layout.align());
         }
     }
 
-    unsafe { core::intrinsics::const_eval_select((layout,), ct_error, rt_error) }
+    #[cfg(not(feature = "panic_immediate_abort"))]
+    {
+        core::intrinsics::const_eval_select((layout,), ct_error, rt_error)
+    }
+
+    #[cfg(feature = "panic_immediate_abort")]
+    ct_error(layout)
 }
 
 // For alloc test `std::alloc::handle_alloc_error` can be used directly.
@@ -416,12 +425,14 @@ pub mod __alloc_error_handler {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 /// Specialize clones into pre-allocated, uninitialized memory.
 /// Used by `Box::clone` and `Rc`/`Arc::make_mut`.
 pub(crate) trait WriteCloneIntoRaw: Sized {
     unsafe fn write_clone_into_raw(&self, target: *mut Self);
 }
 
+#[cfg(not(no_global_oom_handling))]
 impl<T: Clone> WriteCloneIntoRaw for T {
     #[inline]
     default unsafe fn write_clone_into_raw(&self, target: *mut Self) {
@@ -431,6 +442,7 @@ impl<T: Clone> WriteCloneIntoRaw for T {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 impl<T: Copy> WriteCloneIntoRaw for T {
     #[inline]
     unsafe fn write_clone_into_raw(&self, target: *mut Self) {

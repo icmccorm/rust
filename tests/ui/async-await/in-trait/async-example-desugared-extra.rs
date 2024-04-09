@@ -1,15 +1,14 @@
-// check-pass
-// edition: 2021
+//@ check-pass
+//@ edition: 2021
 
-#![feature(async_fn_in_trait)]
-#![feature(return_position_impl_trait_in_trait, lint_reasons)]
-#![allow(incomplete_features)]
+#![feature(lint_reasons)]
 
 use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
 
 pub trait MyTrait {
+    #[allow(async_fn_in_trait)]
     async fn foo(&self) -> i32;
 }
 

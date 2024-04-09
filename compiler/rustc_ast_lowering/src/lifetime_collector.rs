@@ -82,7 +82,8 @@ impl<'ast> Visitor<'ast> for LifetimeCollectVisitor<'ast> {
                 // We can sometimes encounter bare trait objects
                 // which are represented in AST as paths.
                 if let Some(partial_res) = self.resolver.get_partial_res(t.id)
-                    && let Some(Res::Def(DefKind::Trait | DefKind::TraitAlias, _)) = partial_res.full_res()
+                    && let Some(Res::Def(DefKind::Trait | DefKind::TraitAlias, _)) =
+                        partial_res.full_res()
                 {
                     self.current_binders.push(t.id);
                     visit::walk_ty(self, t);
@@ -107,7 +108,7 @@ impl<'ast> Visitor<'ast> for LifetimeCollectVisitor<'ast> {
     }
 }
 
-pub fn lifetimes_in_bounds(
+pub(crate) fn lifetimes_in_bounds(
     resolver: &ResolverAstLowering,
     bounds: &GenericBounds,
 ) -> Vec<Lifetime> {

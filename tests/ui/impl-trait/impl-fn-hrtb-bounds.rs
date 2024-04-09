@@ -2,17 +2,17 @@
 use std::fmt::Debug;
 
 fn a() -> impl Fn(&u8) -> (impl Debug + '_) {
-    //~^ ERROR higher kinded lifetime bounds on nested opaque types are not supported yet
+    //~^ ERROR `impl Trait` cannot capture higher-ranked lifetime from outer `impl Trait`
     |x| x
 }
 
 fn b() -> impl for<'a> Fn(&'a u8) -> (impl Debug + 'a) {
-    //~^ ERROR higher kinded lifetime bounds on nested opaque types are not supported yet
+    //~^ ERROR `impl Trait` cannot capture higher-ranked lifetime from outer `impl Trait`
     |x| x
 }
 
 fn c() -> impl for<'a> Fn(&'a u8) -> (impl Debug + '_) {
-    //~^ ERROR higher kinded lifetime bounds on nested opaque types are not supported yet
+    //~^ ERROR `impl Trait` cannot capture higher-ranked lifetime from outer `impl Trait`
     |x| x
 }
 

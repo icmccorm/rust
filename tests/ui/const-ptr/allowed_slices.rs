@@ -1,9 +1,7 @@
-// run-pass
+//@ run-pass
 #![feature(
     slice_from_ptr_range,
     const_slice_from_ptr_range,
-    pointer_byte_offsets,
-    const_pointer_byte_offsets
 )]
 use std::{
     mem::MaybeUninit,

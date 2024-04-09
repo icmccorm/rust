@@ -1,4 +1,4 @@
-use rustc_index::bit_set::{BitSet, ChunkedBitSet};
+use rustc_index::bit_set::BitSet;
 use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::{
     self, CallReturnPlaces, Local, Location, Place, StatementKind, TerminatorEdges,
@@ -23,18 +23,17 @@ use crate::{Analysis, AnalysisDomain, Backward, GenKill, GenKillAnalysis};
 /// [`MaybeBorrowedLocals`]: super::MaybeBorrowedLocals
 /// [flow-test]: https://github.com/rust-lang/rust/blob/a08c47310c7d49cbdc5d7afb38408ba519967ecd/src/test/ui/mir-dataflow/liveness-ptr.rs
 /// [liveness]: https://en.wikipedia.org/wiki/Live_variable_analysis
-#[derive(Clone, Copy)]
 pub struct MaybeLiveLocals;
 
 impl<'tcx> AnalysisDomain<'tcx> for MaybeLiveLocals {
-    type Domain = ChunkedBitSet<Local>;
+    type Domain = BitSet<Local>;
     type Direction = Backward;
 
     const NAME: &'static str = "liveness";
 
     fn bottom_value(&self, body: &mir::Body<'tcx>) -> Self::Domain {
         // bottom = not live
-        ChunkedBitSet::new_empty(body.local_decls.len())
+        BitSet::new_empty(body.local_decls.len())
     }
 
     fn initialize_start_block(&self, _: &mir::Body<'tcx>, _: &mut Self::Domain) {
@@ -70,7 +69,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeLiveLocals {
 
     fn call_return_effect(
         &mut self,
-        trans: &mut impl GenKill<Self::Idx>,
+        trans: &mut Self::Domain,
         _block: mir::BasicBlock,
         return_places: CallReturnPlaces<'_, 'tcx>,
     ) {
@@ -98,7 +97,7 @@ where
 {
     fn visit_place(&mut self, place: &mir::Place<'tcx>, context: PlaceContext, location: Location) {
         if let PlaceContext::MutatingUse(MutatingUseContext::Yield) = context {
-            // The resume place is evaluated and assigned to only after generator resumes, so its
+            // The resume place is evaluated and assigned to only after coroutine resumes, so its
             // effect is handled separately in `call_resume_effect`.
             return;
         }
@@ -201,7 +200,7 @@ impl DefUse {
                 | NonMutatingUseContext::Inspect
                 | NonMutatingUseContext::Move
                 | NonMutatingUseContext::PlaceMention
-                | NonMutatingUseContext::ShallowBorrow
+                | NonMutatingUseContext::FakeBorrow
                 | NonMutatingUseContext::SharedBorrow,
             ) => Some(DefUse::Use),
 
@@ -234,14 +233,14 @@ impl<'a> MaybeTransitiveLiveLocals<'a> {
 }
 
 impl<'a, 'tcx> AnalysisDomain<'tcx> for MaybeTransitiveLiveLocals<'a> {
-    type Domain = ChunkedBitSet<Local>;
+    type Domain = BitSet<Local>;
     type Direction = Backward;
 
     const NAME: &'static str = "transitive liveness";
 
     fn bottom_value(&self, body: &mir::Body<'tcx>) -> Self::Domain {
         // bottom = not live
-        ChunkedBitSet::new_empty(body.local_decls.len())
+        BitSet::new_empty(body.local_decls.len())
     }
 
     fn initialize_start_block(&self, _: &mir::Body<'tcx>, _: &mut Self::Domain) {

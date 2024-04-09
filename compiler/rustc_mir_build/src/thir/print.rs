@@ -31,8 +31,8 @@ const INDENT: &str = "    ";
 
 macro_rules! print_indented {
     ($writer:ident, $s:expr, $indent_lvl:expr) => {
-        let indent = (0..$indent_lvl).map(|_| INDENT).collect::<Vec<_>>().concat();
-        writeln!($writer, "{}{}", indent, $s).expect("unable to write to ThirPrinter");
+        $writer.indent($indent_lvl);
+        writeln!($writer, "{}", $s).expect("unable to write to ThirPrinter");
     };
 }
 
@@ -46,6 +46,12 @@ impl<'a, 'tcx> Write for ThirPrinter<'a, 'tcx> {
 impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
     fn new(thir: &'a Thir<'tcx>) -> Self {
         Self { thir, fmt: String::new() }
+    }
+
+    fn indent(&mut self, level: usize) {
+        for _ in 0..level {
+            self.fmt.push_str(INDENT);
+        }
     }
 
     fn print(&mut self) {
@@ -85,23 +91,11 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
     }
 
     fn print_block(&mut self, block_id: BlockId, depth_lvl: usize) {
-        let Block {
-            targeted_by_break,
-            opt_destruction_scope,
-            span,
-            region_scope,
-            stmts,
-            expr,
-            safety_mode,
-        } = &self.thir.blocks[block_id];
+        let Block { targeted_by_break, span, region_scope, stmts, expr, safety_mode } =
+            &self.thir.blocks[block_id];
 
         print_indented!(self, "Block {", depth_lvl);
         print_indented!(self, format!("targeted_by_break: {}", targeted_by_break), depth_lvl + 1);
-        print_indented!(
-            self,
-            format!("opt_destruction_scope: {:?}", opt_destruction_scope),
-            depth_lvl + 1
-        );
         print_indented!(self, format!("span: {:?}", span), depth_lvl + 1);
         print_indented!(self, format!("region_scope: {:?}", region_scope), depth_lvl + 1);
         print_indented!(self, format!("safety_mode: {:?}", safety_mode), depth_lvl + 1);
@@ -127,14 +121,9 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
     }
 
     fn print_stmt(&mut self, stmt_id: StmtId, depth_lvl: usize) {
-        let Stmt { kind, opt_destruction_scope } = &self.thir.stmts[stmt_id];
+        let Stmt { kind } = &self.thir.stmts[stmt_id];
 
         print_indented!(self, "Stmt {", depth_lvl);
-        print_indented!(
-            self,
-            format!("opt_destruction_scope: {:?}", opt_destruction_scope),
-            depth_lvl + 1
-        );
 
         match kind {
             StmtKind::Expr { scope, expr } => {
@@ -604,9 +593,9 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
         print_indented!(self, "pattern: ", depth_lvl + 1);
         self.print_pat(pattern, depth_lvl + 2);
 
-        if let Some(guard) = guard {
+        if let Some(guard) = *guard {
             print_indented!(self, "guard: ", depth_lvl + 1);
-            self.print_guard(guard, depth_lvl + 2);
+            self.print_expr(guard, depth_lvl + 2);
         } else {
             print_indented!(self, "guard: None", depth_lvl + 1);
         }
@@ -636,6 +625,9 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
             PatKind::Wild => {
                 print_indented!(self, "Wild", depth_lvl + 1);
             }
+            PatKind::Never => {
+                print_indented!(self, "Never", depth_lvl + 1);
+            }
             PatKind::AscribeUserType { ascription, subpattern } => {
                 print_indented!(self, "AscribeUserType: {", depth_lvl + 1);
                 print_indented!(self, format!("ascription: {:?}", ascription), depth_lvl + 2);
@@ -643,9 +635,8 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
                 self.print_pat(subpattern, depth_lvl + 3);
                 print_indented!(self, "}", depth_lvl + 1);
             }
-            PatKind::Binding { mutability, name, mode, var, ty, subpattern, is_primary } => {
+            PatKind::Binding { name, mode, var, ty, subpattern, is_primary } => {
                 print_indented!(self, "Binding {", depth_lvl + 1);
-                print_indented!(self, format!("mutability: {:?}", mutability), depth_lvl + 2);
                 print_indented!(self, format!("name: {:?}", name), depth_lvl + 2);
                 print_indented!(self, format!("mode: {:?}", mode), depth_lvl + 2);
                 print_indented!(self, format!("var: {:?}", var), depth_lvl + 2);
@@ -692,13 +683,26 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
             }
             PatKind::Deref { subpattern } => {
                 print_indented!(self, "Deref { ", depth_lvl + 1);
-                print_indented!(self, "subpattern: ", depth_lvl + 2);
+                print_indented!(self, "subpattern:", depth_lvl + 2);
+                self.print_pat(subpattern, depth_lvl + 2);
+                print_indented!(self, "}", depth_lvl + 1);
+            }
+            PatKind::DerefPattern { subpattern } => {
+                print_indented!(self, "DerefPattern { ", depth_lvl + 1);
+                print_indented!(self, "subpattern:", depth_lvl + 2);
                 self.print_pat(subpattern, depth_lvl + 2);
                 print_indented!(self, "}", depth_lvl + 1);
             }
             PatKind::Constant { value } => {
                 print_indented!(self, "Constant {", depth_lvl + 1);
                 print_indented!(self, format!("value: {:?}", value), depth_lvl + 2);
+                print_indented!(self, "}", depth_lvl + 1);
+            }
+            PatKind::InlineConstant { def, subpattern } => {
+                print_indented!(self, "InlineConstant {", depth_lvl + 1);
+                print_indented!(self, format!("def: {:?}", def), depth_lvl + 2);
+                print_indented!(self, "subpattern:", depth_lvl + 2);
+                self.print_pat(subpattern, depth_lvl + 2);
                 print_indented!(self, "}", depth_lvl + 1);
             }
             PatKind::Range(pat_range) => {
@@ -757,26 +761,8 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
                 print_indented!(self, "]", depth_lvl + 2);
                 print_indented!(self, "}", depth_lvl + 1);
             }
-        }
-
-        print_indented!(self, "}", depth_lvl);
-    }
-
-    fn print_guard(&mut self, guard: &Guard<'tcx>, depth_lvl: usize) {
-        print_indented!(self, "Guard {", depth_lvl);
-
-        match guard {
-            Guard::If(expr_id) => {
-                print_indented!(self, "If (", depth_lvl + 1);
-                self.print_expr(*expr_id, depth_lvl + 2);
-                print_indented!(self, ")", depth_lvl + 1);
-            }
-            Guard::IfLet(pat, expr_id) => {
-                print_indented!(self, "IfLet (", depth_lvl + 1);
-                self.print_pat(pat, depth_lvl + 2);
-                print_indented!(self, ",", depth_lvl + 1);
-                self.print_expr(*expr_id, depth_lvl + 2);
-                print_indented!(self, ")", depth_lvl + 1);
+            PatKind::Error(_) => {
+                print_indented!(self, "Error", depth_lvl + 1);
             }
         }
 
@@ -906,6 +892,12 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
             InlineAsmOperand::SymStatic { def_id } => {
                 print_indented!(self, "InlineAsmOperand::SymStatic {", depth_lvl);
                 print_indented!(self, format!("def_id: {:?}", def_id), depth_lvl + 1);
+                print_indented!(self, "}", depth_lvl + 1);
+            }
+            InlineAsmOperand::Label { block } => {
+                print_indented!(self, "InlineAsmOperand::Block {", depth_lvl);
+                print_indented!(self, "block:", depth_lvl + 1);
+                self.print_block(*block, depth_lvl + 2);
                 print_indented!(self, "}", depth_lvl + 1);
             }
         }

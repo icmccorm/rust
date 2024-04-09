@@ -1,6 +1,4 @@
-// run-pass
-
-use std::ops::FnMut;
+//@ run-pass
 
 fn call_f<F:FnMut()>(mut f: F) {
     f();

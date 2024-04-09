@@ -3,9 +3,9 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use crate::ascii;
+use crate::hint;
 use crate::intrinsics;
 use crate::mem;
-use crate::ops::{Add, Mul, Sub};
 use crate::str::FromStr;
 
 // Used because the `?` operator is not allowed in a const context.
@@ -44,10 +44,11 @@ mod uint_macros; // import uint_impl!
 mod error;
 mod int_log10;
 mod nonzero;
+mod overflow_panic;
 mod saturating;
 mod wrapping;
 
-#[stable(feature = "saturating_int_impl", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "saturating_int_impl", since = "1.74.0")]
 pub use saturating::Saturating;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use wrapping::Wrapping;
@@ -58,6 +59,16 @@ pub use dec2flt::ParseFloatError;
 
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use error::ParseIntError;
+
+#[unstable(
+    feature = "nonzero_internals",
+    reason = "implementation detail which may disappear or be replaced at any time",
+    issue = "none"
+)]
+pub use nonzero::ZeroablePrimitive;
+
+#[unstable(feature = "generic_nonzero", issue = "120257")]
+pub use nonzero::NonZero;
 
 #[stable(feature = "nonzero", since = "1.28.0")]
 pub use nonzero::{NonZeroU128, NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU8, NonZeroUsize};
@@ -114,7 +125,7 @@ macro_rules! midpoint_impl {
                       without modifying the original"]
         #[inline]
         pub const fn midpoint(self, rhs: $SelfT) -> $SelfT {
-            // Use the well known branchless algorthim from Hacker's Delight to compute
+            // Use the well known branchless algorithm from Hacker's Delight to compute
             // `(a + b) / 2` without overflowing: `((a ^ b) >> 1) + (a & b)`.
             ((self ^ rhs) >> 1) + (self & rhs)
         }
@@ -272,17 +283,6 @@ macro_rules! widening_impl {
             (wide as $SelfT, (wide >> $BITS) as $SelfT)
         }
     };
-}
-
-macro_rules! conv_rhs_for_unchecked_shift {
-    ($SelfT:ty, $x:expr) => {{
-        // If the `as` cast will truncate, ensure we still tell the backend
-        // that the pre-truncation value was also small.
-        if <$SelfT>::BITS < 32 {
-            intrinsics::assume($x <= (<$SelfT>::MAX as u32));
-        }
-        $x as $SelfT
-    }};
 }
 
 impl i8 {
@@ -474,7 +474,7 @@ impl isize {
     }
 }
 
-/// If 6th bit is set ascii is lower case.
+/// If the 6th bit is set ascii is lower case.
 const ASCII_CASE_MASK: u8 = 0b0010_0000;
 
 impl u8 {
@@ -482,7 +482,7 @@ impl u8 {
         Self = u8,
         ActualT = u8,
         SignedT = i8,
-        NonZeroT = NonZeroU8,
+        NonZeroT = NonZero<u8>,
         BITS = 8,
         MAX = 255,
         rot = 2,
@@ -549,7 +549,7 @@ impl u8 {
     #[rustc_const_stable(feature = "const_ascii_methods_on_intrinsics", since = "1.52.0")]
     #[inline]
     pub const fn to_ascii_uppercase(&self) -> u8 {
-        // Toggle the fifth bit if this is a lowercase letter
+        // Toggle the 6th bit if this is a lowercase letter
         *self ^ ((self.is_ascii_lowercase() as u8) * ASCII_CASE_MASK)
     }
 
@@ -574,7 +574,7 @@ impl u8 {
     #[rustc_const_stable(feature = "const_ascii_methods_on_intrinsics", since = "1.52.0")]
     #[inline]
     pub const fn to_ascii_lowercase(&self) -> u8 {
-        // Set the fifth bit if this is an uppercase letter
+        // Set the 6th bit if this is an uppercase letter
         *self | (self.is_ascii_uppercase() as u8 * ASCII_CASE_MASK)
     }
 
@@ -791,7 +791,7 @@ impl u8 {
     #[rustc_const_stable(feature = "const_ascii_ctype_on_intrinsics", since = "1.47.0")]
     #[inline]
     pub const fn is_ascii_alphanumeric(&self) -> bool {
-        matches!(*self, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
+        matches!(*self, b'0'..=b'9') | matches!(*self, b'A'..=b'Z') | matches!(*self, b'a'..=b'z')
     }
 
     /// Checks if the value is an ASCII decimal digit:
@@ -894,7 +894,7 @@ impl u8 {
     #[rustc_const_stable(feature = "const_ascii_ctype_on_intrinsics", since = "1.47.0")]
     #[inline]
     pub const fn is_ascii_hexdigit(&self) -> bool {
-        matches!(*self, b'0'..=b'9' | b'A'..=b'F' | b'a'..=b'f')
+        matches!(*self, b'0'..=b'9') | matches!(*self, b'A'..=b'F') | matches!(*self, b'a'..=b'f')
     }
 
     /// Checks if the value is an ASCII punctuation character:
@@ -932,7 +932,10 @@ impl u8 {
     #[rustc_const_stable(feature = "const_ascii_ctype_on_intrinsics", since = "1.47.0")]
     #[inline]
     pub const fn is_ascii_punctuation(&self) -> bool {
-        matches!(*self, b'!'..=b'/' | b':'..=b'@' | b'['..=b'`' | b'{'..=b'~')
+        matches!(*self, b'!'..=b'/')
+            | matches!(*self, b':'..=b'@')
+            | matches!(*self, b'['..=b'`')
+            | matches!(*self, b'{'..=b'~')
     }
 
     /// Checks if the value is an ASCII graphic character:
@@ -1094,7 +1097,7 @@ impl u16 {
         Self = u16,
         ActualT = u16,
         SignedT = i16,
-        NonZeroT = NonZeroU16,
+        NonZeroT = NonZero<u16>,
         BITS = 16,
         MAX = 65535,
         rot = 4,
@@ -1143,7 +1146,7 @@ impl u32 {
         Self = u32,
         ActualT = u32,
         SignedT = i32,
-        NonZeroT = NonZeroU32,
+        NonZeroT = NonZero<u32>,
         BITS = 32,
         MAX = 4294967295,
         rot = 8,
@@ -1167,7 +1170,7 @@ impl u64 {
         Self = u64,
         ActualT = u64,
         SignedT = i64,
-        NonZeroT = NonZeroU64,
+        NonZeroT = NonZero<u64>,
         BITS = 64,
         MAX = 18446744073709551615,
         rot = 12,
@@ -1191,7 +1194,7 @@ impl u128 {
         Self = u128,
         ActualT = u128,
         SignedT = i128,
-        NonZeroT = NonZeroU128,
+        NonZeroT = NonZero<u128>,
         BITS = 128,
         MAX = 340282366920938463463374607431768211455,
         rot = 16,
@@ -1217,7 +1220,7 @@ impl usize {
         Self = usize,
         ActualT = u16,
         SignedT = isize,
-        NonZeroT = NonZeroUsize,
+        NonZeroT = NonZero<usize>,
         BITS = 16,
         MAX = 65535,
         rot = 4,
@@ -1242,7 +1245,7 @@ impl usize {
         Self = usize,
         ActualT = u32,
         SignedT = isize,
-        NonZeroT = NonZeroUsize,
+        NonZeroT = NonZero<usize>,
         BITS = 32,
         MAX = 4294967295,
         rot = 8,
@@ -1267,7 +1270,7 @@ impl usize {
         Self = usize,
         ActualT = u64,
         SignedT = isize,
-        NonZeroT = NonZeroUsize,
+        NonZeroT = NonZero<usize>,
         BITS = 64,
         MAX = 18446744073709551615,
         rot = 12,
@@ -1371,50 +1374,18 @@ pub enum FpCategory {
     Normal,
 }
 
-#[doc(hidden)]
-trait FromStrRadixHelper:
-    PartialOrd + Copy + Add<Output = Self> + Sub<Output = Self> + Mul<Output = Self>
-{
-    const MIN: Self;
-    fn from_u32(u: u32) -> Self;
-    fn checked_mul(&self, other: u32) -> Option<Self>;
-    fn checked_sub(&self, other: u32) -> Option<Self>;
-    fn checked_add(&self, other: u32) -> Option<Self>;
-}
-
 macro_rules! from_str_radix_int_impl {
     ($($t:ty)*) => {$(
         #[stable(feature = "rust1", since = "1.0.0")]
         impl FromStr for $t {
             type Err = ParseIntError;
             fn from_str(src: &str) -> Result<Self, ParseIntError> {
-                from_str_radix(src, 10)
+                <$t>::from_str_radix(src, 10)
             }
         }
     )*}
 }
 from_str_radix_int_impl! { isize i8 i16 i32 i64 i128 usize u8 u16 u32 u64 u128 }
-
-macro_rules! impl_helper_for {
-    ($($t:ty)*) => ($(impl FromStrRadixHelper for $t {
-        const MIN: Self = Self::MIN;
-        #[inline]
-        fn from_u32(u: u32) -> Self { u as Self }
-        #[inline]
-        fn checked_mul(&self, other: u32) -> Option<Self> {
-            Self::checked_mul(*self, other as Self)
-        }
-        #[inline]
-        fn checked_sub(&self, other: u32) -> Option<Self> {
-            Self::checked_sub(*self, other as Self)
-        }
-        #[inline]
-        fn checked_add(&self, other: u32) -> Option<Self> {
-            Self::checked_add(*self, other as Self)
-        }
-    })*)
-}
-impl_helper_for! { i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize }
 
 /// Determines if a string of text of that length of that radix could be guaranteed to be
 /// stored in the given type T.
@@ -1423,92 +1394,198 @@ impl_helper_for! { i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize }
 #[doc(hidden)]
 #[inline(always)]
 #[unstable(issue = "none", feature = "std_internals")]
-pub fn can_not_overflow<T>(radix: u32, is_signed_ty: bool, digits: &[u8]) -> bool {
+pub const fn can_not_overflow<T>(radix: u32, is_signed_ty: bool, digits: &[u8]) -> bool {
     radix <= 16 && digits.len() <= mem::size_of::<T>() * 2 - is_signed_ty as usize
 }
 
-fn from_str_radix<T: FromStrRadixHelper>(src: &str, radix: u32) -> Result<T, ParseIntError> {
-    use self::IntErrorKind::*;
-    use self::ParseIntError as PIE;
-
-    assert!(
-        (2..=36).contains(&radix),
-        "from_str_radix_int: must lie in the range `[2, 36]` - found {}",
-        radix
-    );
-
-    if src.is_empty() {
-        return Err(PIE { kind: Empty });
-    }
-
-    let is_signed_ty = T::from_u32(0) > T::MIN;
-
-    // all valid digits are ascii, so we will just iterate over the utf8 bytes
-    // and cast them to chars. .to_digit() will safely return None for anything
-    // other than a valid ascii digit for the given radix, including the first-byte
-    // of multi-byte sequences
-    let src = src.as_bytes();
-
-    let (is_positive, digits) = match src[0] {
-        b'+' | b'-' if src[1..].is_empty() => {
-            return Err(PIE { kind: InvalidDigit });
-        }
-        b'+' => (true, &src[1..]),
-        b'-' if is_signed_ty => (false, &src[1..]),
-        _ => (true, src),
-    };
-
-    let mut result = T::from_u32(0);
-
-    if can_not_overflow::<T>(radix, is_signed_ty, digits) {
-        // If the len of the str is short compared to the range of the type
-        // we are parsing into, then we can be certain that an overflow will not occur.
-        // This bound is when `radix.pow(digits.len()) - 1 <= T::MAX` but the condition
-        // above is a faster (conservative) approximation of this.
-        //
-        // Consider radix 16 as it has the highest information density per digit and will thus overflow the earliest:
-        // `u8::MAX` is `ff` - any str of len 2 is guaranteed to not overflow.
-        // `i8::MAX` is `7f` - only a str of len 1 is guaranteed to not overflow.
-        macro_rules! run_unchecked_loop {
-            ($unchecked_additive_op:expr) => {
-                for &c in digits {
-                    result = result * T::from_u32(radix);
-                    let x = (c as char).to_digit(radix).ok_or(PIE { kind: InvalidDigit })?;
-                    result = $unchecked_additive_op(result, T::from_u32(x));
-                }
-            };
-        }
-        if is_positive {
-            run_unchecked_loop!(<T as core::ops::Add>::add)
-        } else {
-            run_unchecked_loop!(<T as core::ops::Sub>::sub)
-        };
-    } else {
-        macro_rules! run_checked_loop {
-            ($checked_additive_op:ident, $overflow_err:expr) => {
-                for &c in digits {
-                    // When `radix` is passed in as a literal, rather than doing a slow `imul`
-                    // the compiler can use shifts if `radix` can be expressed as a
-                    // sum of powers of 2 (x*10 can be written as x*8 + x*2).
-                    // When the compiler can't use these optimisations,
-                    // the latency of the multiplication can be hidden by issuing it
-                    // before the result is needed to improve performance on
-                    // modern out-of-order CPU as multiplication here is slower
-                    // than the other instructions, we can get the end result faster
-                    // doing multiplication first and let the CPU spends other cycles
-                    // doing other computation and get multiplication result later.
-                    let mul = result.checked_mul(radix);
-                    let x = (c as char).to_digit(radix).ok_or(PIE { kind: InvalidDigit })?;
-                    result = mul.ok_or_else($overflow_err)?;
-                    result = T::$checked_additive_op(&result, x).ok_or_else($overflow_err)?;
-                }
-            };
-        }
-        if is_positive {
-            run_checked_loop!(checked_add, || PIE { kind: PosOverflow })
-        } else {
-            run_checked_loop!(checked_sub, || PIE { kind: NegOverflow })
-        };
-    }
-    Ok(result)
+#[track_caller]
+const fn from_str_radix_panic_ct(_radix: u32) -> ! {
+    panic!("from_str_radix_int: must lie in the range `[2, 36]`");
 }
+
+#[track_caller]
+fn from_str_radix_panic_rt(radix: u32) -> ! {
+    panic!("from_str_radix_int: must lie in the range `[2, 36]` - found {}", radix);
+}
+
+#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never))]
+#[cfg_attr(feature = "panic_immediate_abort", inline)]
+#[cold]
+#[track_caller]
+const fn from_str_radix_assert(radix: u32) {
+    if 2 > radix || radix > 36 {
+        // The only difference between these two functions is their panic message.
+        intrinsics::const_eval_select((radix,), from_str_radix_panic_ct, from_str_radix_panic_rt);
+    }
+}
+
+macro_rules! from_str_radix {
+    ($($int_ty:ty)+) => {$(
+        impl $int_ty {
+            /// Converts a string slice in a given base to an integer.
+            ///
+            /// The string is expected to be an optional `+` sign
+            /// followed by digits.
+            /// Leading and trailing whitespace represent an error.
+            /// Digits are a subset of these characters, depending on `radix`:
+            ///
+            /// * `0-9`
+            /// * `a-z`
+            /// * `A-Z`
+            ///
+            /// # Panics
+            ///
+            /// This function panics if `radix` is not in the range from 2 to 36.
+            ///
+            /// # Examples
+            ///
+            /// Basic usage:
+            ///
+            /// ```
+            #[doc = concat!("assert_eq!(", stringify!($int_ty), "::from_str_radix(\"A\", 16), Ok(10));")]
+            /// ```
+            #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_from_str", issue = "59133")]
+            pub const fn from_str_radix(src: &str, radix: u32) -> Result<$int_ty, ParseIntError> {
+                use self::IntErrorKind::*;
+                use self::ParseIntError as PIE;
+
+                from_str_radix_assert(radix);
+
+                if src.is_empty() {
+                    return Err(PIE { kind: Empty });
+                }
+
+                #[allow(unused_comparisons)]
+                let is_signed_ty = 0 > <$int_ty>::MIN;
+
+                // all valid digits are ascii, so we will just iterate over the utf8 bytes
+                // and cast them to chars. .to_digit() will safely return None for anything
+                // other than a valid ascii digit for the given radix, including the first-byte
+                // of multi-byte sequences
+                let src = src.as_bytes();
+
+                let (is_positive, mut digits) = match src {
+                    [b'+' | b'-'] => {
+                        return Err(PIE { kind: InvalidDigit });
+                    }
+                    [b'+', rest @ ..] => (true, rest),
+                    [b'-', rest @ ..] if is_signed_ty => (false, rest),
+                    _ => (true, src),
+                };
+
+                let mut result = 0;
+
+                macro_rules! unwrap_or_PIE {
+                    ($option:expr, $kind:ident) => {
+                        match $option {
+                            Some(value) => value,
+                            None => return Err(PIE { kind: $kind }),
+                        }
+                    };
+                }
+
+                if can_not_overflow::<$int_ty>(radix, is_signed_ty, digits) {
+                    // If the len of the str is short compared to the range of the type
+                    // we are parsing into, then we can be certain that an overflow will not occur.
+                    // This bound is when `radix.pow(digits.len()) - 1 <= T::MAX` but the condition
+                    // above is a faster (conservative) approximation of this.
+                    //
+                    // Consider radix 16 as it has the highest information density per digit and will thus overflow the earliest:
+                    // `u8::MAX` is `ff` - any str of len 2 is guaranteed to not overflow.
+                    // `i8::MAX` is `7f` - only a str of len 1 is guaranteed to not overflow.
+                    macro_rules! run_unchecked_loop {
+                        ($unchecked_additive_op:tt) => {{
+                            while let [c, rest @ ..] = digits {
+                                result = result * (radix as $int_ty);
+                                let x = unwrap_or_PIE!((*c as char).to_digit(radix), InvalidDigit);
+                                result = result $unchecked_additive_op (x as $int_ty);
+                                digits = rest;
+                            }
+                        }};
+                    }
+                    if is_positive {
+                        run_unchecked_loop!(+)
+                    } else {
+                        run_unchecked_loop!(-)
+                    };
+                } else {
+                    macro_rules! run_checked_loop {
+                        ($checked_additive_op:ident, $overflow_err:ident) => {{
+                            while let [c, rest @ ..] = digits {
+                                // When `radix` is passed in as a literal, rather than doing a slow `imul`
+                                // the compiler can use shifts if `radix` can be expressed as a
+                                // sum of powers of 2 (x*10 can be written as x*8 + x*2).
+                                // When the compiler can't use these optimisations,
+                                // the latency of the multiplication can be hidden by issuing it
+                                // before the result is needed to improve performance on
+                                // modern out-of-order CPU as multiplication here is slower
+                                // than the other instructions, we can get the end result faster
+                                // doing multiplication first and let the CPU spends other cycles
+                                // doing other computation and get multiplication result later.
+                                let mul = result.checked_mul(radix as $int_ty);
+                                let x = unwrap_or_PIE!((*c as char).to_digit(radix), InvalidDigit) as $int_ty;
+                                result = unwrap_or_PIE!(mul, $overflow_err);
+                                result = unwrap_or_PIE!(<$int_ty>::$checked_additive_op(result, x), $overflow_err);
+                                digits = rest;
+                            }
+                        }};
+                    }
+                    if is_positive {
+                        run_checked_loop!(checked_add, PosOverflow)
+                    } else {
+                        run_checked_loop!(checked_sub, NegOverflow)
+                    };
+                }
+                Ok(result)
+            }
+        }
+    )+}
+}
+
+from_str_radix! { i8 u8 i16 u16 i32 u32 i64 u64 i128 u128 }
+
+// Re-use the relevant implementation of from_str_radix for isize and usize to avoid outputting two
+// identical functions.
+macro_rules! from_str_radix_size_impl {
+    ($($t:ident $size:ty),*) => {$(
+    impl $size {
+        /// Converts a string slice in a given base to an integer.
+        ///
+        /// The string is expected to be an optional `+` sign
+        /// followed by digits.
+        /// Leading and trailing whitespace represent an error.
+        /// Digits are a subset of these characters, depending on `radix`:
+        ///
+        /// * `0-9`
+        /// * `a-z`
+        /// * `A-Z`
+        ///
+        /// # Panics
+        ///
+        /// This function panics if `radix` is not in the range from 2 to 36.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        #[doc = concat!("assert_eq!(", stringify!($size), "::from_str_radix(\"A\", 16), Ok(10));")]
+        /// ```
+        #[stable(feature = "rust1", since = "1.0.0")]
+        #[rustc_const_unstable(feature = "const_int_from_str", issue = "59133")]
+        pub const fn from_str_radix(src: &str, radix: u32) -> Result<$size, ParseIntError> {
+            match <$t>::from_str_radix(src, radix) {
+                Ok(x) => Ok(x as $size),
+                Err(e) => Err(e),
+            }
+        }
+    })*}
+}
+
+#[cfg(target_pointer_width = "16")]
+from_str_radix_size_impl! { i16 isize, u16 usize }
+#[cfg(target_pointer_width = "32")]
+from_str_radix_size_impl! { i32 isize, u32 usize }
+#[cfg(target_pointer_width = "64")]
+from_str_radix_size_impl! { i64 isize, u64 usize }

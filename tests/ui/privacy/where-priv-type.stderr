@@ -41,8 +41,11 @@ LL | struct PrivTy;
 warning: type `PrivTy` is more private than the item `S`
   --> $DIR/where-priv-type.rs:39:1
    |
-LL | impl S
-   | ^^^^^^ implementation `S` is reachable at visibility `pub`
+LL | / impl S
+LL | |
+LL | | where
+LL | |     PrivTy:
+   | |___________^ implementation `S` is reachable at visibility `pub`
    |
 note: but type `PrivTy` is only usable at visibility `pub(crate)`
   --> $DIR/where-priv-type.rs:8:1
@@ -74,6 +77,6 @@ LL |     type AssocTy = Const<{ my_const_fn(U) }>;
 LL | const fn my_const_fn(val: u8) -> u8 {
    | ----------------------------------- `fn(u8) -> u8 {my_const_fn}` declared as private
 
-error: aborting due to previous error; 5 warnings emitted
+error: aborting due to 1 previous error; 5 warnings emitted
 
 For more information about this error, try `rustc --explain E0446`.

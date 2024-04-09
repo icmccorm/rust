@@ -1,5 +1,5 @@
-// run-pass
-#![allow(incomplete_features)]
+//@ run-pass
+#![allow(non_contiguous_range_endpoints)]
 #![feature(exclusive_range_pattern)]
 #![feature(inline_const_pat)]
 

@@ -1,5 +1,4 @@
-// no-system-llvm
-// compile-flags: -O
+//@ compile-flags: -O
 
 #![crate_type="lib"]
 

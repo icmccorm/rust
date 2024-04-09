@@ -2,6 +2,7 @@ use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::tcx::PlaceTy;
 use rustc_middle::ty::cast::mir_cast_kind;
 use rustc_middle::{mir::*, thir::*, ty};
+use rustc_span::source_map::Spanned;
 use rustc_span::Span;
 use rustc_target::abi::{FieldIdx, VariantIdx};
 
@@ -13,19 +14,23 @@ use super::{parse_by_kind, PResult, ParseCtxt};
 impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
     pub fn parse_statement(&self, expr_id: ExprId) -> PResult<StatementKind<'tcx>> {
         parse_by_kind!(self, expr_id, _, "statement",
-            @call("mir_storage_live", args) => {
+            @call(mir_storage_live, args) => {
                 Ok(StatementKind::StorageLive(self.parse_local(args[0])?))
             },
-            @call("mir_storage_dead", args) => {
+            @call(mir_storage_dead, args) => {
                 Ok(StatementKind::StorageDead(self.parse_local(args[0])?))
             },
-            @call("mir_deinit", args) => {
+            @call(mir_assume, args) => {
+                let op = self.parse_operand(args[0])?;
+                Ok(StatementKind::Intrinsic(Box::new(NonDivergingIntrinsic::Assume(op))))
+            },
+            @call(mir_deinit, args) => {
                 Ok(StatementKind::Deinit(Box::new(self.parse_place(args[0])?)))
             },
-            @call("mir_retag", args) => {
+            @call(mir_retag, args) => {
                 Ok(StatementKind::Retag(RetagKind::Default, Box::new(self.parse_place(args[0])?)))
             },
-            @call("mir_set_discriminant", args) => {
+            @call(mir_set_discriminant, args) => {
                 let place = self.parse_place(args[0])?;
                 let var = self.parse_integer_literal(args[1])? as u32;
                 Ok(StatementKind::SetDiscriminant {
@@ -43,29 +48,71 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
 
     pub fn parse_terminator(&self, expr_id: ExprId) -> PResult<TerminatorKind<'tcx>> {
         parse_by_kind!(self, expr_id, expr, "terminator",
-            @call("mir_return", _args) => {
+            @call(mir_return, _args) => {
                 Ok(TerminatorKind::Return)
             },
-            @call("mir_goto", args) => {
+            @call(mir_goto, args) => {
                 Ok(TerminatorKind::Goto { target: self.parse_block(args[0])? } )
             },
-            @call("mir_unreachable", _args) => {
+            @call(mir_unreachable, _args) => {
                 Ok(TerminatorKind::Unreachable)
             },
-            @call("mir_drop", args) => {
+            @call(mir_unwind_resume, _args) => {
+                Ok(TerminatorKind::UnwindResume)
+            },
+            @call(mir_unwind_terminate, args) => {
+                Ok(TerminatorKind::UnwindTerminate(self.parse_unwind_terminate_reason(args[0])?))
+            },
+            @call(mir_drop, args) => {
                 Ok(TerminatorKind::Drop {
                     place: self.parse_place(args[0])?,
-                    target: self.parse_block(args[1])?,
-                    unwind: UnwindAction::Continue,
+                    target: self.parse_return_to(args[1])?,
+                    unwind: self.parse_unwind_action(args[2])?,
                     replace: false,
                 })
             },
-            @call("mir_call", args) => {
+            @call(mir_call, args) => {
                 self.parse_call(args)
             },
             ExprKind::Match { scrutinee, arms, .. } => {
                 let discr = self.parse_operand(*scrutinee)?;
                 self.parse_match(arms, expr.span).map(|t| TerminatorKind::SwitchInt { discr, targets: t })
+            },
+        )
+    }
+
+    fn parse_unwind_terminate_reason(&self, expr_id: ExprId) -> PResult<UnwindTerminateReason> {
+        parse_by_kind!(self, expr_id, _, "unwind terminate reason",
+            @variant(mir_unwind_terminate_reason, Abi) => {
+                Ok(UnwindTerminateReason::Abi)
+            },
+            @variant(mir_unwind_terminate_reason, InCleanup) => {
+                Ok(UnwindTerminateReason::InCleanup)
+            },
+        )
+    }
+
+    fn parse_unwind_action(&self, expr_id: ExprId) -> PResult<UnwindAction> {
+        parse_by_kind!(self, expr_id, _, "unwind action",
+            @call(mir_unwind_continue, _args) => {
+                Ok(UnwindAction::Continue)
+            },
+            @call(mir_unwind_unreachable, _args) => {
+                Ok(UnwindAction::Unreachable)
+            },
+            @call(mir_unwind_terminate, args) => {
+                Ok(UnwindAction::Terminate(self.parse_unwind_terminate_reason(args[0])?))
+            },
+            @call(mir_unwind_cleanup, args) => {
+                Ok(UnwindAction::Cleanup(self.parse_block(args[0])?))
+            },
+        )
+    }
+
+    fn parse_return_to(&self, expr_id: ExprId) -> PResult<BasicBlock> {
+        parse_by_kind!(self, expr_id, _, "return block",
+            @call(mir_return_to, args) => {
+                self.parse_block(args[0])
             },
         )
     }
@@ -112,21 +159,24 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
             ExprKind::Assign { lhs, rhs } => (*lhs, *rhs),
         );
         let destination = self.parse_place(destination)?;
-        let target = self.parse_block(args[1])?;
+        let target = self.parse_return_to(args[1])?;
+        let unwind = self.parse_unwind_action(args[2])?;
 
         parse_by_kind!(self, call, _, "function call",
             ExprKind::Call { fun, args, from_hir_call, fn_span, .. } => {
                 let fun = self.parse_operand(*fun)?;
                 let args = args
                     .iter()
-                    .map(|arg| self.parse_operand(*arg))
+                    .map(|arg|
+                        Ok(Spanned { node: self.parse_operand(*arg)?, span: self.thir.exprs[*arg].span  } )
+                    )
                     .collect::<PResult<Vec<_>>>()?;
                 Ok(TerminatorKind::Call {
                     func: fun,
                     args,
                     destination,
                     target: Some(target),
-                    unwind: UnwindAction::Continue,
+                    unwind,
                     call_source: if *from_hir_call { CallSource::Normal } else {
                         CallSource::OverloadedOperator
                     },
@@ -138,25 +188,25 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
 
     fn parse_rvalue(&self, expr_id: ExprId) -> PResult<Rvalue<'tcx>> {
         parse_by_kind!(self, expr_id, expr, "rvalue",
-            @call("mir_discriminant", args) => self.parse_place(args[0]).map(Rvalue::Discriminant),
-            @call("mir_cast_transmute", args) => {
+            @call(mir_discriminant, args) => self.parse_place(args[0]).map(Rvalue::Discriminant),
+            @call(mir_cast_transmute, args) => {
                 let source = self.parse_operand(args[0])?;
                 Ok(Rvalue::Cast(CastKind::Transmute, source, expr.ty))
             },
-            @call("mir_checked", args) => {
+            @call(mir_checked, args) => {
                 parse_by_kind!(self, args[0], _, "binary op",
                     ExprKind::Binary { op, lhs, rhs } => Ok(Rvalue::CheckedBinaryOp(
                         *op, Box::new((self.parse_operand(*lhs)?, self.parse_operand(*rhs)?))
                     )),
                 )
             },
-            @call("mir_offset", args) => {
+            @call(mir_offset, args) => {
                 let ptr = self.parse_operand(args[0])?;
                 let offset = self.parse_operand(args[1])?;
                 Ok(Rvalue::BinaryOp(BinOp::Offset, Box::new((ptr, offset))))
             },
-            @call("mir_len", args) => Ok(Rvalue::Len(self.parse_place(args[0])?)),
-            @call("mir_copy_for_deref", args) => Ok(Rvalue::CopyForDeref(self.parse_place(args[0])?)),
+            @call(mir_len, args) => Ok(Rvalue::Len(self.parse_place(args[0])?)),
+            @call(mir_copy_for_deref, args) => Ok(Rvalue::CopyForDeref(self.parse_place(args[0])?)),
             ExprKind::Borrow { borrow_kind, arg } => Ok(
                 Rvalue::Ref(self.tcx.lifetimes.re_erased, *borrow_kind, self.parse_place(*arg)?)
             ),
@@ -206,9 +256,9 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
 
     pub fn parse_operand(&self, expr_id: ExprId) -> PResult<Operand<'tcx>> {
         parse_by_kind!(self, expr_id, expr, "operand",
-            @call("mir_move", args) => self.parse_place(args[0]).map(Operand::Move),
-            @call("mir_static", args) => self.parse_static(args[0]),
-            @call("mir_static_mut", args) => self.parse_static(args[0]),
+            @call(mir_move, args) => self.parse_place(args[0]).map(Operand::Move),
+            @call(mir_static, args) => self.parse_static(args[0]),
+            @call(mir_static_mut, args) => self.parse_static(args[0]),
             ExprKind::Literal { .. }
             | ExprKind::NamedConst { .. }
             | ExprKind::NonHirLiteral { .. }
@@ -229,7 +279,7 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
 
     fn parse_place_inner(&self, expr_id: ExprId) -> PResult<(Place<'tcx>, PlaceTy<'tcx>)> {
         let (parent, proj) = parse_by_kind!(self, expr_id, expr, "place",
-            @call("mir_field", args) => {
+            @call(mir_field, args) => {
                 let (parent, ty) = self.parse_place_inner(args[0])?;
                 let field = FieldIdx::from_u32(self.parse_integer_literal(args[1])? as u32);
                 let field_ty = ty.field_ty(self.tcx, field);
@@ -237,7 +287,7 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
                 let place = parent.project_deeper(&[proj], self.tcx);
                 return Ok((place, PlaceTy::from_ty(field_ty)));
             },
-            @call("mir_variant", args) => {
+            @call(mir_variant, args) => {
                 (args[0], PlaceElem::Downcast(
                     None,
                     VariantIdx::from_u32(self.parse_integer_literal(args[1])? as u32)
@@ -245,7 +295,7 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
             },
             ExprKind::Deref { arg } => {
                 parse_by_kind!(self, *arg, _, "does not matter",
-                    @call("mir_make_place", args) => return self.parse_place_inner(args[0]),
+                    @call(mir_make_place, args) => return self.parse_place_inner(args[0]),
                     _ => (*arg, PlaceElem::Deref),
                 )
             },

@@ -1,8 +1,11 @@
-// edition: 2021
-// check-pass
+//@ edition: 2021
+//@ check-pass
+//@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
+//@[next] compile-flags: -Znext-solver
 
 // This test verifies that we do not create a query cycle when typechecking has several inference
-// variables that point to the same generator interior type.
+// variables that point to the same coroutine interior type.
 
 use std::future::Future;
 use std::pin::Pin;

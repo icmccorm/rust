@@ -1,5 +1,6 @@
+// skip-filecheck
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
-// unit-test: CopyProp
+//@ unit-test: CopyProp
 
 #![feature(custom_mir, core_intrinsics)]
 #![allow(unused_assignments)]
@@ -21,11 +22,11 @@ fn f() -> bool {
             let b = a;
             // We cannot propagate the place `a`.
             let r2 = &b;
-            Call(RET = cmp_ref(r1, r2), next)
+            Call(RET = cmp_ref(r1, r2), ReturnTo(next), UnwindContinue())
         }
         next = {
             // But we can propagate the value `a`.
-            Call(RET = opaque(b), ret)
+            Call(RET = opaque(b), ReturnTo(ret), UnwindContinue())
         }
         ret = {
             Return()

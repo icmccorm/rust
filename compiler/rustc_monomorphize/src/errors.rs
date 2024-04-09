@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 
 use crate::fluent_generated as fluent;
-use rustc_errors::ErrorGuaranteed;
-use rustc_errors::IntoDiagnostic;
+use rustc_errors::{Diag, DiagCtxt, Diagnostic, EmissionGuarantee, Level};
 use rustc_macros::{Diagnostic, LintDiagnostic};
 use rustc_span::{Span, Symbol};
 
@@ -47,18 +46,16 @@ pub struct UnusedGenericParamsHint {
     pub param_names: Vec<String>,
 }
 
-impl IntoDiagnostic<'_> for UnusedGenericParamsHint {
+impl<G: EmissionGuarantee> Diagnostic<'_, G> for UnusedGenericParamsHint {
     #[track_caller]
-    fn into_diagnostic(
-        self,
-        handler: &'_ rustc_errors::Handler,
-    ) -> rustc_errors::DiagnosticBuilder<'_, ErrorGuaranteed> {
-        let mut diag = handler.struct_err(fluent::monomorphize_unused_generic_params);
-        diag.set_span(self.span);
+    fn into_diag(self, dcx: &'_ DiagCtxt, level: Level) -> Diag<'_, G> {
+        let mut diag = Diag::new(dcx, level, fluent::monomorphize_unused_generic_params);
+        diag.span(self.span);
         for (span, name) in self.param_spans.into_iter().zip(self.param_names) {
             // FIXME: I can figure out how to do a label with a fluent string with a fixed message,
             // or a label with a dynamic value in a hard-coded string, but I haven't figured out
             // how to combine the two. 😢
+            #[allow(rustc::untranslatable_diagnostic)]
             diag.span_label(span, format!("generic parameter `{name}` is unused"));
         }
         diag
@@ -74,10 +71,6 @@ pub struct LargeAssignmentsLint {
     pub size: u64,
     pub limit: u64,
 }
-
-#[derive(Diagnostic)]
-#[diag(monomorphize_unknown_partition_strategy)]
-pub struct UnknownPartitionStrategy;
 
 #[derive(Diagnostic)]
 #[diag(monomorphize_symbol_already_defined)]
@@ -100,6 +93,11 @@ pub struct EncounteredErrorWhileInstantiating {
     pub span: Span,
     pub formatted_item: String,
 }
+
+#[derive(Diagnostic)]
+#[diag(monomorphize_start_not_found)]
+#[help]
+pub struct StartNotFound;
 
 #[derive(Diagnostic)]
 #[diag(monomorphize_unknown_cgu_collection_mode)]

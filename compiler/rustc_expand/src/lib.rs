@@ -1,16 +1,19 @@
+#![doc(rust_logo)]
+#![feature(rustdoc_internals)]
 #![feature(array_windows)]
-#![feature(associated_type_bounds)]
+#![cfg_attr(bootstrap, feature(associated_type_bounds))]
 #![feature(associated_type_defaults)]
 #![feature(if_let_guard)]
 #![feature(let_chains)]
+#![feature(lint_reasons)]
 #![feature(macro_metavar_expr)]
+#![feature(map_try_insert)]
 #![feature(proc_macro_diagnostic)]
 #![feature(proc_macro_internals)]
 #![feature(proc_macro_span)]
-#![feature(rustc_attrs)]
 #![feature(try_blocks)]
-#![recursion_limit = "256"]
-#![deny(rustc::untranslatable_diagnostic)]
+#![feature(yeet_expr)]
+#![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(internal_features)]
 
 #[macro_use]
@@ -20,9 +23,6 @@ extern crate rustc_macros;
 extern crate tracing;
 
 extern crate proc_macro as pm;
-
-use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
-use rustc_fluent_macro::fluent_messages;
 
 mod placeholders;
 mod proc_macro_server;
@@ -65,4 +65,4 @@ mod mut_visit {
     mod tests;
 }
 
-fluent_messages! { "../messages.ftl" }
+rustc_fluent_macro::fluent_messages! { "../messages.ftl" }

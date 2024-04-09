@@ -1,6 +1,4 @@
-// run-pass
-
-#![feature(associated_type_bounds)]
+//@ run-pass
 
 #![allow(unused_assignments)]
 

@@ -1,6 +1,3 @@
-#![feature(return_position_impl_trait_in_trait)]
-#![allow(incomplete_features)]
-
 mod child {
     trait Main {
         fn main() -> impl std::process::Termination;

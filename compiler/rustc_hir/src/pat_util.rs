@@ -1,7 +1,6 @@
 use crate::def::{CtorOf, DefKind, Res};
-use crate::def_id::DefId;
+use crate::def_id::{DefId, DefIdSet};
 use crate::hir::{self, BindingAnnotation, ByRef, HirId, PatKind};
-use rustc_data_structures::fx::FxHashSet;
 use rustc_span::symbol::Ident;
 use rustc_span::Span;
 
@@ -72,14 +71,21 @@ impl hir::Pat<'_> {
     /// Call `f` on every "binding" in a pattern, e.g., on `a` in
     /// `match foo() { Some(a) => (), None => () }`.
     ///
-    /// When encountering an or-pattern `p_0 | ... | p_n` only `p_0` will be visited.
+    /// When encountering an or-pattern `p_0 | ... | p_n` only the first non-never pattern will be
+    /// visited. If they're all never patterns we visit nothing, which is ok since a never pattern
+    /// cannot have bindings.
     pub fn each_binding_or_first(
         &self,
         f: &mut impl FnMut(hir::BindingAnnotation, HirId, Span, Ident),
     ) {
         self.walk(|p| match &p.kind {
             PatKind::Or(ps) => {
-                ps[0].each_binding_or_first(f);
+                for p in *ps {
+                    if !p.is_never_pattern() {
+                        p.each_binding_or_first(f);
+                        break;
+                    }
+                }
                 false
             }
             PatKind::Binding(bm, _, ident, _) => {
@@ -114,9 +120,9 @@ impl hir::Pat<'_> {
             }
             _ => true,
         });
-        // We remove duplicates by inserting into a `FxHashSet` to avoid re-ordering
+        // We remove duplicates by inserting into a hash set to avoid re-ordering
         // the bounds
-        let mut duplicates = FxHashSet::default();
+        let mut duplicates = DefIdSet::default();
         variants.retain(|def_id| duplicates.insert(*def_id));
         variants
     }

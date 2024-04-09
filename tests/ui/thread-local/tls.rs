@@ -1,7 +1,7 @@
-// run-pass
-// ignore-emscripten no threads support
-// compile-flags: -O
-// ignore-nto Doesn't work without emulated TLS enabled (in LLVM)
+//@ run-pass
+//@ needs-threads
+//@ compile-flags: -O
+//@ ignore-nto Doesn't work without emulated TLS enabled (in LLVM)
 
 #![feature(thread_local)]
 

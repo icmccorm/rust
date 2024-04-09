@@ -1,5 +1,5 @@
-// run-rustfix
-mod a {
+//@ run-rustfix
+pub mod a {
     pub struct A(pub(self)String);
 }
 

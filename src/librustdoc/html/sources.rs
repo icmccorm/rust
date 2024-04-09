@@ -1,4 +1,5 @@
 use crate::clean;
+use crate::clean::utils::has_doc_flag;
 use crate::docfs::PathError;
 use crate::error::Error;
 use crate::html::format;
@@ -12,7 +13,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
-use rustc_span::source_map::FileName;
+use rustc_span::{sym, FileName};
 
 use std::cell::RefCell;
 use std::ffi::OsStr;
@@ -89,7 +90,9 @@ impl LocalSourcesCollector<'_, '_> {
         );
 
         let mut href = href.into_inner().to_string_lossy().into_owned();
-        if let Some(c) = href.as_bytes().last() && *c != b'/' {
+        if let Some(c) = href.as_bytes().last()
+            && *c != b'/'
+        {
             href.push('/');
         }
         let mut src_fname = p.file_name().expect("source has no filename").to_os_string();
@@ -143,7 +146,7 @@ impl DocVisitor for SourceCollector<'_, '_> {
             self.cx.include_sources = match self.emit_source(&filename, file_span) {
                 Ok(()) => true,
                 Err(e) => {
-                    self.cx.shared.tcx.sess.span_err(
+                    self.cx.shared.tcx.dcx().span_err(
                         span,
                         format!(
                             "failed to render source code for `{filename}`: {e}",
@@ -211,7 +214,9 @@ impl SourceCollector<'_, '_> {
 
         let root_path = PathBuf::from("../../").join(root_path.into_inner());
         let mut root_path = root_path.to_string_lossy();
-        if let Some(c) = root_path.as_bytes().last() && *c != b'/' {
+        if let Some(c) = root_path.as_bytes().last()
+            && *c != b'/'
+        {
             root_path += "/";
         }
         let mut cur = self.dst.join(cur.into_inner());
@@ -223,7 +228,8 @@ impl SourceCollector<'_, '_> {
         cur.push(&fname);
 
         let title = format!("{} - source", src_fname.to_string_lossy());
-        let desc = format!("Source of the Rust file `{}`.", filename.prefer_remapped());
+        let desc =
+            format!("Source of the Rust file `{}`.", filename.prefer_remapped_unconditionaly());
         let page = layout::Page {
             title: &title,
             css_class: "src",
@@ -231,6 +237,7 @@ impl SourceCollector<'_, '_> {
             static_root_path: shared.static_root_path.as_deref(),
             description: &desc,
             resource_suffix: &shared.resource_suffix,
+            rust_logo: has_doc_flag(self.cx.tcx(), LOCAL_CRATE.as_def_id(), sym::rust_logo),
         };
         let v = layout::render(
             &shared.layout,

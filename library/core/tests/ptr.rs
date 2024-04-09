@@ -1,6 +1,7 @@
 use core::cell::RefCell;
+use core::marker::Freeze;
 use core::mem::{self, MaybeUninit};
-use core::num::NonZeroUsize;
+use core::num::NonZero;
 use core::ptr;
 use core::ptr::*;
 use std::fmt::{Debug, Display};
@@ -350,9 +351,9 @@ fn align_offset_zst() {
     // all, because no amount of elements will align the pointer.
     let mut p = 1;
     while p < 1024 {
-        assert_eq!(ptr::invalid::<()>(p).align_offset(p), 0);
+        assert_eq!(ptr::without_provenance::<()>(p).align_offset(p), 0);
         if p != 1 {
-            assert_eq!(ptr::invalid::<()>(p + 1).align_offset(p), !0);
+            assert_eq!(ptr::without_provenance::<()>(p + 1).align_offset(p), !0);
         }
         p = (p + 1).next_power_of_two();
     }
@@ -365,9 +366,9 @@ fn align_offset_zst_const() {
         // all, because no amount of elements will align the pointer.
         let mut p = 1;
         while p < 1024 {
-            assert!(ptr::invalid::<()>(p).align_offset(p) == 0);
+            assert!(ptr::without_provenance::<()>(p).align_offset(p) == 0);
             if p != 1 {
-                assert!(ptr::invalid::<()>(p + 1).align_offset(p) == !0);
+                assert!(ptr::without_provenance::<()>(p + 1).align_offset(p) == !0);
             }
             p = (p + 1).next_power_of_two();
         }
@@ -384,7 +385,7 @@ fn align_offset_stride_one() {
             let expected = ptr % align;
             let offset = if expected == 0 { 0 } else { align - expected };
             assert_eq!(
-                ptr::invalid::<u8>(ptr).align_offset(align),
+                ptr::without_provenance::<u8>(ptr).align_offset(align),
                 offset,
                 "ptr = {}, align = {}, size = 1",
                 ptr,
@@ -406,7 +407,7 @@ fn align_offset_stride_one_const() {
             while ptr < 2 * align {
                 let expected = ptr % align;
                 let offset = if expected == 0 { 0 } else { align - expected };
-                assert!(ptr::invalid::<u8>(ptr).align_offset(align) == offset);
+                assert!(ptr::without_provenance::<u8>(ptr).align_offset(align) == offset);
                 ptr += 1;
             }
             align = (align + 1).next_power_of_two();
@@ -451,38 +452,42 @@ fn align_offset_various_strides() {
         for ptr in 1usize..4 * align {
             unsafe {
                 #[repr(packed)]
-                struct A3(u16, u8);
-                x |= test_stride::<A3>(ptr::invalid::<A3>(ptr), align);
+                struct A3(#[allow(dead_code)] u16, #[allow(dead_code)] u8);
+                x |= test_stride::<A3>(ptr::without_provenance::<A3>(ptr), align);
 
-                struct A4(u32);
-                x |= test_stride::<A4>(ptr::invalid::<A4>(ptr), align);
-
-                #[repr(packed)]
-                struct A5(u32, u8);
-                x |= test_stride::<A5>(ptr::invalid::<A5>(ptr), align);
+                struct A4(#[allow(dead_code)] u32);
+                x |= test_stride::<A4>(ptr::without_provenance::<A4>(ptr), align);
 
                 #[repr(packed)]
-                struct A6(u32, u16);
-                x |= test_stride::<A6>(ptr::invalid::<A6>(ptr), align);
+                struct A5(#[allow(dead_code)] u32, #[allow(dead_code)] u8);
+                x |= test_stride::<A5>(ptr::without_provenance::<A5>(ptr), align);
 
                 #[repr(packed)]
-                struct A7(u32, u16, u8);
-                x |= test_stride::<A7>(ptr::invalid::<A7>(ptr), align);
+                struct A6(#[allow(dead_code)] u32, #[allow(dead_code)] u16);
+                x |= test_stride::<A6>(ptr::without_provenance::<A6>(ptr), align);
 
                 #[repr(packed)]
-                struct A8(u32, u32);
-                x |= test_stride::<A8>(ptr::invalid::<A8>(ptr), align);
+                struct A7(#[allow(dead_code)] u32, #[allow(dead_code)] u16, #[allow(dead_code)] u8);
+                x |= test_stride::<A7>(ptr::without_provenance::<A7>(ptr), align);
 
                 #[repr(packed)]
-                struct A9(u32, u32, u8);
-                x |= test_stride::<A9>(ptr::invalid::<A9>(ptr), align);
+                struct A8(#[allow(dead_code)] u32, #[allow(dead_code)] u32);
+                x |= test_stride::<A8>(ptr::without_provenance::<A8>(ptr), align);
 
                 #[repr(packed)]
-                struct A10(u32, u32, u16);
-                x |= test_stride::<A10>(ptr::invalid::<A10>(ptr), align);
+                struct A9(#[allow(dead_code)] u32, #[allow(dead_code)] u32, #[allow(dead_code)] u8);
+                x |= test_stride::<A9>(ptr::without_provenance::<A9>(ptr), align);
 
-                x |= test_stride::<u32>(ptr::invalid::<u32>(ptr), align);
-                x |= test_stride::<u128>(ptr::invalid::<u128>(ptr), align);
+                #[repr(packed)]
+                struct A10(
+                    #[allow(dead_code)] u32,
+                    #[allow(dead_code)] u32,
+                    #[allow(dead_code)] u16,
+                );
+                x |= test_stride::<A10>(ptr::without_provenance::<A10>(ptr), align);
+
+                x |= test_stride::<u32>(ptr::without_provenance::<u32>(ptr), align);
+                x |= test_stride::<u128>(ptr::without_provenance::<u128>(ptr), align);
             }
         }
         align = (align + 1).next_power_of_two();
@@ -517,38 +522,50 @@ fn align_offset_various_strides_const() {
             while ptr < 4 * align {
                 unsafe {
                     #[repr(packed)]
-                    struct A3(u16, u8);
-                    test_stride::<A3>(ptr::invalid::<A3>(ptr), ptr, align);
+                    struct A3(#[allow(dead_code)] u16, #[allow(dead_code)] u8);
+                    test_stride::<A3>(ptr::without_provenance::<A3>(ptr), ptr, align);
 
-                    struct A4(u32);
-                    test_stride::<A4>(ptr::invalid::<A4>(ptr), ptr, align);
-
-                    #[repr(packed)]
-                    struct A5(u32, u8);
-                    test_stride::<A5>(ptr::invalid::<A5>(ptr), ptr, align);
+                    struct A4(#[allow(dead_code)] u32);
+                    test_stride::<A4>(ptr::without_provenance::<A4>(ptr), ptr, align);
 
                     #[repr(packed)]
-                    struct A6(u32, u16);
-                    test_stride::<A6>(ptr::invalid::<A6>(ptr), ptr, align);
+                    struct A5(#[allow(dead_code)] u32, #[allow(dead_code)] u8);
+                    test_stride::<A5>(ptr::without_provenance::<A5>(ptr), ptr, align);
 
                     #[repr(packed)]
-                    struct A7(u32, u16, u8);
-                    test_stride::<A7>(ptr::invalid::<A7>(ptr), ptr, align);
+                    struct A6(#[allow(dead_code)] u32, #[allow(dead_code)] u16);
+                    test_stride::<A6>(ptr::without_provenance::<A6>(ptr), ptr, align);
 
                     #[repr(packed)]
-                    struct A8(u32, u32);
-                    test_stride::<A8>(ptr::invalid::<A8>(ptr), ptr, align);
+                    struct A7(
+                        #[allow(dead_code)] u32,
+                        #[allow(dead_code)] u16,
+                        #[allow(dead_code)] u8,
+                    );
+                    test_stride::<A7>(ptr::without_provenance::<A7>(ptr), ptr, align);
 
                     #[repr(packed)]
-                    struct A9(u32, u32, u8);
-                    test_stride::<A9>(ptr::invalid::<A9>(ptr), ptr, align);
+                    struct A8(#[allow(dead_code)] u32, #[allow(dead_code)] u32);
+                    test_stride::<A8>(ptr::without_provenance::<A8>(ptr), ptr, align);
 
                     #[repr(packed)]
-                    struct A10(u32, u32, u16);
-                    test_stride::<A10>(ptr::invalid::<A10>(ptr), ptr, align);
+                    struct A9(
+                        #[allow(dead_code)] u32,
+                        #[allow(dead_code)] u32,
+                        #[allow(dead_code)] u8,
+                    );
+                    test_stride::<A9>(ptr::without_provenance::<A9>(ptr), ptr, align);
 
-                    test_stride::<u32>(ptr::invalid::<u32>(ptr), ptr, align);
-                    test_stride::<u128>(ptr::invalid::<u128>(ptr), ptr, align);
+                    #[repr(packed)]
+                    struct A10(
+                        #[allow(dead_code)] u32,
+                        #[allow(dead_code)] u32,
+                        #[allow(dead_code)] u16,
+                    );
+                    test_stride::<A10>(ptr::without_provenance::<A10>(ptr), ptr, align);
+
+                    test_stride::<u32>(ptr::without_provenance::<u32>(ptr), ptr, align);
+                    test_stride::<u128>(ptr::without_provenance::<u128>(ptr), ptr, align);
                 }
                 ptr += 1;
             }
@@ -672,8 +689,8 @@ fn align_offset_issue_103361() {
     const SIZE: usize = 1 << 30;
     #[cfg(target_pointer_width = "16")]
     const SIZE: usize = 1 << 13;
-    struct HugeSize([u8; SIZE - 1]);
-    let _ = ptr::invalid::<HugeSize>(SIZE).align_offset(SIZE);
+    struct HugeSize(#[allow(dead_code)] [u8; SIZE - 1]);
+    let _ = ptr::without_provenance::<HugeSize>(SIZE).align_offset(SIZE);
 }
 
 #[test]
@@ -684,12 +701,12 @@ fn align_offset_issue_103361_const() {
     const SIZE: usize = 1 << 30;
     #[cfg(target_pointer_width = "16")]
     const SIZE: usize = 1 << 13;
-    struct HugeSize([u8; SIZE - 1]);
+    struct HugeSize(#[allow(dead_code)] [u8; SIZE - 1]);
 
     const {
-        assert!(ptr::invalid::<HugeSize>(SIZE - 1).align_offset(SIZE) == SIZE - 1);
-        assert!(ptr::invalid::<HugeSize>(SIZE).align_offset(SIZE) == 0);
-        assert!(ptr::invalid::<HugeSize>(SIZE + 1).align_offset(SIZE) == 1);
+        assert!(ptr::without_provenance::<HugeSize>(SIZE - 1).align_offset(SIZE) == SIZE - 1);
+        assert!(ptr::without_provenance::<HugeSize>(SIZE).align_offset(SIZE) == 0);
+        assert!(ptr::without_provenance::<HugeSize>(SIZE + 1).align_offset(SIZE) == 1);
     }
 }
 
@@ -825,16 +842,24 @@ fn ptr_metadata_bounds() {
     fn static_assert_expected_bounds_for_metadata<Meta>()
     where
         // Keep this in sync with the associated type in `library/core/src/ptr/metadata.rs`
-        Meta: Copy + Send + Sync + Ord + std::hash::Hash + Unpin,
+        Meta: Debug + Copy + Send + Sync + Ord + std::hash::Hash + Unpin + Freeze,
     {
     }
+}
+
+#[test]
+fn pointee_metadata_debug() {
+    assert_eq!("()", format!("{:?}", metadata::<u32>(&17)));
+    assert_eq!("2", format!("{:?}", metadata::<[u32]>(&[19, 23])));
+    let for_dyn = format!("{:?}", metadata::<dyn Debug>(&29));
+    assert!(for_dyn.starts_with("DynMetadata(0x"), "{:?}", for_dyn);
 }
 
 #[test]
 fn dyn_metadata() {
     #[derive(Debug)]
     #[repr(align(32))]
-    struct Something([u8; 47]);
+    struct Something(#[allow(dead_code)] [u8; 47]);
 
     let value = Something([0; 47]);
     let trait_object: &dyn Debug = &value;
@@ -1034,9 +1059,8 @@ fn nonnull_tagged_pointer_with_provenance() {
         /// memory location.
         pub fn pointer(self) -> NonNull<T> {
             // SAFETY: The `addr` guaranteed to have bits set in the Self::ADDRESS_MASK, so the result will be non-null.
-            self.0.map_addr(|addr| unsafe {
-                NonZeroUsize::new_unchecked(addr.get() & Self::ADDRESS_MASK)
-            })
+            self.0
+                .map_addr(|addr| unsafe { NonZero::new_unchecked(addr.get() & Self::ADDRESS_MASK) })
         }
 
         /// Consume this tagged pointer and produce the data it carries.
@@ -1057,7 +1081,7 @@ fn nonnull_tagged_pointer_with_provenance() {
             // ADDRESS_MASK) will always be non-zero. This a property of the type and its
             // construction.
             self.0 = self.0.map_addr(|addr| unsafe {
-                NonZeroUsize::new_unchecked((addr.get() & Self::ADDRESS_MASK) | data)
+                NonZero::new_unchecked((addr.get() & Self::ADDRESS_MASK) | data)
             })
         }
     }
@@ -1125,4 +1149,17 @@ fn test_const_copy() {
         assert!(*ptr1 == 1);
         assert!(*ptr2 == 1);
     };
+}
+
+#[test]
+fn test_null_array_as_slice() {
+    let arr: *mut [u8; 4] = null_mut();
+    let ptr: *mut [u8] = arr.as_mut_slice();
+    assert!(ptr.is_null());
+    assert_eq!(ptr.len(), 4);
+
+    let arr: *const [u8; 4] = null();
+    let ptr: *const [u8] = arr.as_slice();
+    assert!(ptr.is_null());
+    assert_eq!(ptr.len(), 4);
 }

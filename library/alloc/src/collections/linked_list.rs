@@ -656,6 +656,7 @@ impl<T, A: Allocator> LinkedList<T, A> {
     #[inline]
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("length", "size")]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -740,6 +741,7 @@ impl<T, A: Allocator> LinkedList<T, A> {
     #[inline]
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("first")]
     pub fn front(&self) -> Option<&T> {
         unsafe { self.head.as_ref().map(|node| &node.as_ref().element) }
     }
@@ -890,6 +892,7 @@ impl<T, A: Allocator> LinkedList<T, A> {
     /// assert_eq!(3, *d.back().unwrap());
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("push", "append")]
     pub fn push_back(&mut self, elt: T) {
         let node = Box::new_in(Node::new(elt), &self.alloc);
         let node_ptr = NonNull::from(Box::leak(node));
@@ -1004,6 +1007,7 @@ impl<T, A: Allocator> LinkedList<T, A> {
     /// assert_eq!(d.remove(0), 1);
     /// ```
     #[unstable(feature = "linked_list_remove", issue = "69210")]
+    #[rustc_confusables("delete", "take")]
     pub fn remove(&mut self, at: usize) -> T {
         let len = self.len();
         assert!(at < len, "Cannot remove at an index outside of the list bounds");
@@ -1023,6 +1027,99 @@ impl<T, A: Allocator> LinkedList<T, A> {
                 cursor.move_prev();
             }
             cursor.remove_current().unwrap()
+        }
+    }
+
+    /// Retains only the elements specified by the predicate.
+    ///
+    /// In other words, remove all elements `e` for which `f(&e)` returns false.
+    /// This method operates in place, visiting each element exactly once in the
+    /// original order, and preserves the order of the retained elements.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(linked_list_retain)]
+    /// use std::collections::LinkedList;
+    ///
+    /// let mut d = LinkedList::new();
+    ///
+    /// d.push_front(1);
+    /// d.push_front(2);
+    /// d.push_front(3);
+    ///
+    /// d.retain(|&x| x % 2 == 0);
+    ///
+    /// assert_eq!(d.pop_front(), Some(2));
+    /// assert_eq!(d.pop_front(), None);
+    /// ```
+    ///
+    /// Because the elements are visited exactly once in the original order,
+    /// external state may be used to decide which elements to keep.
+    ///
+    /// ```
+    /// #![feature(linked_list_retain)]
+    /// use std::collections::LinkedList;
+    ///
+    /// let mut d = LinkedList::new();
+    ///
+    /// d.push_front(1);
+    /// d.push_front(2);
+    /// d.push_front(3);
+    ///
+    /// let keep = [false, true, false];
+    /// let mut iter = keep.iter();
+    /// d.retain(|_| *iter.next().unwrap());
+    /// assert_eq!(d.pop_front(), Some(2));
+    /// assert_eq!(d.pop_front(), None);
+    /// ```
+    #[unstable(feature = "linked_list_retain", issue = "114135")]
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&T) -> bool,
+    {
+        self.retain_mut(|elem| f(elem));
+    }
+
+    /// Retains only the elements specified by the predicate.
+    ///
+    /// In other words, remove all elements `e` for which `f(&e)` returns false.
+    /// This method operates in place, visiting each element exactly once in the
+    /// original order, and preserves the order of the retained elements.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(linked_list_retain)]
+    /// use std::collections::LinkedList;
+    ///
+    /// let mut d = LinkedList::new();
+    ///
+    /// d.push_front(1);
+    /// d.push_front(2);
+    /// d.push_front(3);
+    ///
+    /// d.retain_mut(|x| if *x % 2 == 0 {
+    ///     *x += 1;
+    ///     true
+    /// } else {
+    ///     false
+    /// });
+    /// assert_eq!(d.pop_front(), Some(3));
+    /// assert_eq!(d.pop_front(), None);
+    /// ```
+    #[unstable(feature = "linked_list_retain", issue = "114135")]
+    pub fn retain_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        let mut cursor = self.cursor_front_mut();
+        while let Some(node) = cursor.current() {
+            if !f(node) {
+                cursor.remove_current().unwrap();
+            } else {
+                cursor.move_next();
+            }
         }
     }
 
@@ -1385,6 +1482,7 @@ impl<'a, T, A: Allocator> Cursor<'a, T, A> {
     /// or None if the list is empty.
     #[must_use]
     #[unstable(feature = "linked_list_cursors", issue = "58533")]
+    #[rustc_confusables("first")]
     pub fn front(&self) -> Option<&'a T> {
         self.list.front()
     }
@@ -1393,6 +1491,7 @@ impl<'a, T, A: Allocator> Cursor<'a, T, A> {
     /// or None if the list is empty.
     #[must_use]
     #[unstable(feature = "linked_list_cursors", issue = "58533")]
+    #[rustc_confusables("last")]
     pub fn back(&self) -> Option<&'a T> {
         self.list.back()
     }
@@ -1695,6 +1794,7 @@ impl<'a, T, A: Allocator> CursorMut<'a, T, A> {
     ///
     /// This operation should compute in *O*(1) time.
     #[unstable(feature = "linked_list_cursors", issue = "58533")]
+    #[rustc_confusables("push", "append")]
     pub fn push_back(&mut self, elt: T) {
         // Safety: We know that `push_back` does not change the position in
         // memory of other nodes. This ensures that `self.current` remains
@@ -1741,6 +1841,7 @@ impl<'a, T, A: Allocator> CursorMut<'a, T, A> {
     ///
     /// This operation should compute in *O*(1) time.
     #[unstable(feature = "linked_list_cursors", issue = "58533")]
+    #[rustc_confusables("pop")]
     pub fn pop_back(&mut self) -> Option<T> {
         if self.list.is_empty() {
             None
@@ -1761,6 +1862,7 @@ impl<'a, T, A: Allocator> CursorMut<'a, T, A> {
     /// or None if the list is empty.
     #[must_use]
     #[unstable(feature = "linked_list_cursors", issue = "58533")]
+    #[rustc_confusables("first")]
     pub fn front(&self) -> Option<&T> {
         self.list.front()
     }
@@ -1777,6 +1879,7 @@ impl<'a, T, A: Allocator> CursorMut<'a, T, A> {
     /// or None if the list is empty.
     #[must_use]
     #[unstable(feature = "linked_list_cursors", issue = "58533")]
+    #[rustc_confusables("last")]
     pub fn back(&self) -> Option<&T> {
         self.list.back()
     }

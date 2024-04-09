@@ -1,4 +1,4 @@
-// run-pass
+//@ run-pass
 
 // This code used to produce the following ICE:
 //
@@ -9,8 +9,7 @@
 //
 // This is a regression test for issue #17021.
 //
-// compile-flags: -g
-// ignore-asmjs wasm2js does not support source maps yet
+//@ compile-flags: -g
 
 use std::ptr;
 

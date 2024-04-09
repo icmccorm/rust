@@ -1,14 +1,15 @@
 //! Various code related to computing outlives relations.
 use self::env::OutlivesEnvironment;
 use super::region_constraints::RegionConstraintData;
-use super::{InferCtxt, RegionResolutionError};
+use super::{InferCtxt, RegionResolutionError, SubregionOrigin};
 use crate::infer::free_regions::RegionRelations;
-use crate::infer::lexical_region_resolve::{self, LexicalRegionResolutions};
-use rustc_middle::traits::query::OutlivesBound;
+use crate::infer::lexical_region_resolve;
+use rustc_middle::traits::query::{NoSolution, OutlivesBound};
 use rustc_middle::ty;
 
 pub mod components;
 pub mod env;
+pub mod for_liveness;
 pub mod obligations;
 pub mod test_type_match;
 pub mod verify;
@@ -36,42 +37,29 @@ pub fn explicit_outlives_bounds<'tcx>(
 }
 
 impl<'tcx> InferCtxt<'tcx> {
-    pub fn skip_region_resolution(&self) {
-        let (var_infos, _) = {
-            let mut inner = self.inner.borrow_mut();
-            let inner = &mut *inner;
-            // Note: `inner.region_obligations` may not be empty, because we
-            // didn't necessarily call `process_registered_region_obligations`.
-            // This is okay, because that doesn't introduce new vars.
-            inner
-                .region_constraint_storage
-                .take()
-                .expect("regions already resolved")
-                .with_log(&mut inner.undo_log)
-                .into_infos_and_data()
-        };
-
-        let lexical_region_resolutions = LexicalRegionResolutions {
-            values: rustc_index::IndexVec::from_elem_n(
-                crate::infer::lexical_region_resolve::VarValue::Value(self.tcx.lifetimes.re_erased),
-                var_infos.len(),
-            ),
-        };
-
-        let old_value = self.lexical_region_resolutions.replace(Some(lexical_region_resolutions));
-        assert!(old_value.is_none());
-    }
-
     /// Process the region constraints and return any errors that
     /// result. After this, no more unification operations should be
     /// done -- or the compiler will panic -- but it is legal to use
     /// `resolve_vars_if_possible` as well as `fully_resolve`.
+    ///
+    /// If you are in a crate that has access to `rustc_trait_selection`,
+    /// then it's probably better to use `resolve_regions`,
+    /// which knows how to normalize registered region obligations.
     #[must_use]
-    pub fn resolve_regions(
+    pub fn resolve_regions_with_normalize(
         &self,
         outlives_env: &OutlivesEnvironment<'tcx>,
+        deeply_normalize_ty: impl Fn(
+            ty::PolyTypeOutlivesPredicate<'tcx>,
+            SubregionOrigin<'tcx>,
+        ) -> Result<ty::PolyTypeOutlivesPredicate<'tcx>, NoSolution>,
     ) -> Vec<RegionResolutionError<'tcx>> {
-        self.process_registered_region_obligations(outlives_env);
+        match self.process_registered_region_obligations(outlives_env, deeply_normalize_ty) {
+            Ok(()) => {}
+            Err((clause, origin)) => {
+                return vec![RegionResolutionError::CannotNormalize(clause, origin)];
+            }
+        };
 
         let (var_infos, data) = {
             let mut inner = self.inner.borrow_mut();
@@ -92,7 +80,7 @@ impl<'tcx> InferCtxt<'tcx> {
         let region_rels = &RegionRelations::new(self.tcx, outlives_env.free_region_map());
 
         let (lexical_region_resolutions, errors) =
-            lexical_region_resolve::resolve(outlives_env.param_env, region_rels, var_infos, data);
+            lexical_region_resolve::resolve(region_rels, var_infos, data);
 
         let old_value = self.lexical_region_resolutions.replace(Some(lexical_region_resolutions));
         assert!(old_value.is_none());

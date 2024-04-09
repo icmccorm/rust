@@ -1,11 +1,11 @@
 // When WF checking the hidden type in the ParamEnv of the opaque type,
-// one complication arises when the hidden type is a closure/generator:
+// one complication arises when the hidden type is a closure/coroutine:
 // the "parent_substs" of the type may reference lifetime parameters
 // not present in the opaque type.
 // These region parameters are not really useful in this check.
 // So here we ignore them and replace them with fresh region variables.
 
-// check-pass
+//@ check-pass
 
 #![feature(type_alias_impl_trait)]
 #![allow(dead_code)]

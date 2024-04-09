@@ -32,11 +32,25 @@ extern "C" fn f3_3(..., x: isize) {}
 //~^ ERROR only foreign or `unsafe extern "C"` functions may be C-variadic
 //~| ERROR `...` must be the last argument of a C-variadic function
 
+const unsafe extern "C" fn f4_1(x: isize, ...) {}
+//~^ ERROR functions cannot be both `const` and C-variadic
+//~| ERROR destructor of `VaListImpl<'_>` cannot be evaluated at compile-time
+
+const extern "C" fn f4_2(x: isize, ...) {}
+//~^ ERROR functions cannot be both `const` and C-variadic
+//~| ERROR only foreign or `unsafe extern "C"` functions may be C-variadic
+//~| ERROR destructor of `VaListImpl<'_>` cannot be evaluated at compile-time
+
+const extern "C" fn f4_3(..., x: isize, ...) {}
+//~^ ERROR functions cannot be both `const` and C-variadic
+//~| ERROR only foreign or `unsafe extern "C"` functions may be C-variadic
+//~| ERROR `...` must be the last argument of a C-variadic function
+
 extern "C" {
     fn e_f1(...);
     //~^ ERROR C-variadic function must be declared with at least one named argument
     fn e_f2(..., x: isize);
-//~^ ERROR `...` must be the last argument of a C-variadic function
+    //~^ ERROR `...` must be the last argument of a C-variadic function
 }
 
 struct X;
@@ -49,12 +63,14 @@ impl X {
     //~| ERROR C-variadic function must be declared with at least one named argument
     fn i_f3(..., x: isize, ...) {}
     //~^ ERROR only foreign or `unsafe extern "C"` functions may be C-variadic
-    //~| ERROR only foreign or `unsafe extern "C"` functions may be C-variadic
     //~| ERROR `...` must be the last argument of a C-variadic function
     fn i_f4(..., x: isize, ...) {}
     //~^ ERROR only foreign or `unsafe extern "C"` functions may be C-variadic
-    //~| ERROR only foreign or `unsafe extern "C"` functions may be C-variadic
     //~| ERROR `...` must be the last argument of a C-variadic function
+    const fn i_f5(x: isize, ...) {}
+    //~^ ERROR only foreign or `unsafe extern "C"` functions may be C-variadic
+    //~| ERROR functions cannot be both `const` and C-variadic
+    //~| ERROR destructor of `VaListImpl<'_>` cannot be evaluated at compile-time
 }
 
 trait T {

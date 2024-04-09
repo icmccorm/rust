@@ -1,10 +1,11 @@
-// run-pass
+//@ run-pass
 // `#[derive(Trait)]` works for empty structs/variants with braces or parens.
 
 #![feature(rustc_private)]
 
 extern crate rustc_macros;
 extern crate rustc_serialize;
+extern crate rustc_span;
 
 // Necessary to pull in object code as the rest of the rustc crates are shipped only as rmeta
 // files.

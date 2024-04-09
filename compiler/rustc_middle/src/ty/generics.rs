@@ -6,7 +6,7 @@ use rustc_hir::def_id::DefId;
 use rustc_span::symbol::{kw, Symbol};
 use rustc_span::Span;
 
-use super::{Clause, EarlyBoundRegion, InstantiatedPredicates, ParamConst, ParamTy, Ty, TyCtxt};
+use super::{Clause, InstantiatedPredicates, ParamConst, ParamTy, Ty, TyCtxt};
 
 #[derive(Clone, Debug, TyEncodable, TyDecodable, HashStable)]
 pub enum GenericParamDefKind {
@@ -62,9 +62,9 @@ pub struct GenericParamDef {
 }
 
 impl GenericParamDef {
-    pub fn to_early_bound_region_data(&self) -> ty::EarlyBoundRegion {
+    pub fn to_early_bound_region_data(&self) -> ty::EarlyParamRegion {
         if let GenericParamDefKind::Lifetime = self.kind {
-            ty::EarlyBoundRegion { def_id: self.def_id, index: self.index, name: self.name }
+            ty::EarlyParamRegion { def_id: self.def_id, index: self.index, name: self.name }
         } else {
             bug!("cannot convert a non-lifetime parameter def to an early bound region")
         }
@@ -77,6 +77,10 @@ impl GenericParamDef {
             }
             _ => false,
         }
+    }
+
+    pub fn is_host_effect(&self) -> bool {
+        matches!(self.kind, GenericParamDefKind::Const { is_host_effect: true, .. })
     }
 
     pub fn default_value<'tcx>(
@@ -121,7 +125,7 @@ pub struct GenericParamCount {
 /// Information about the formal type/lifetime parameters associated
 /// with an item or method. Analogous to `hir::Generics`.
 ///
-/// The ordering of parameters is the same as in `Subst` (excluding child generics):
+/// The ordering of parameters is the same as in [`ty::GenericArg`] (excluding child generics):
 /// `Self` (optionally), `Lifetime` params..., `Type` params...
 #[derive(Clone, Debug, TyEncodable, TyDecodable, HashStable)]
 pub struct Generics {
@@ -136,7 +140,7 @@ pub struct Generics {
     pub has_self: bool,
     pub has_late_bound_regions: Option<Span>,
 
-    // The index of the host effect when substituted. (i.e. might be index to parent args)
+    // The index of the host effect when instantiated. (i.e. might be index to parent args)
     pub host_effect_index: Option<usize>,
 }
 
@@ -233,6 +237,20 @@ impl<'tcx> Generics {
         }
     }
 
+    /// Returns the `GenericParamDef` with the given index if available.
+    pub fn opt_param_at(
+        &'tcx self,
+        param_index: usize,
+        tcx: TyCtxt<'tcx>,
+    ) -> Option<&'tcx GenericParamDef> {
+        if let Some(index) = param_index.checked_sub(self.parent_count) {
+            self.params.get(index)
+        } else {
+            tcx.generics_of(self.parent.expect("parent_count > 0 but no parent?"))
+                .opt_param_at(param_index, tcx)
+        }
+    }
+
     pub fn params_to(&'tcx self, param_index: usize, tcx: TyCtxt<'tcx>) -> &'tcx [GenericParamDef] {
         if let Some(index) = param_index.checked_sub(self.parent_count) {
             &self.params[..index]
@@ -242,10 +260,10 @@ impl<'tcx> Generics {
         }
     }
 
-    /// Returns the `GenericParamDef` associated with this `EarlyBoundRegion`.
+    /// Returns the `GenericParamDef` associated with this `EarlyParamRegion`.
     pub fn region_param(
         &'tcx self,
-        param: &EarlyBoundRegion,
+        param: &ty::EarlyParamRegion,
         tcx: TyCtxt<'tcx>,
     ) -> &'tcx GenericParamDef {
         let param = self.param_at(param.index as usize, tcx);
@@ -261,6 +279,20 @@ impl<'tcx> Generics {
         match param.kind {
             GenericParamDefKind::Type { .. } => param,
             _ => bug!("expected type parameter, but found another generic parameter"),
+        }
+    }
+
+    /// Returns the `GenericParamDef` associated with this `ParamTy` if it belongs to this
+    /// `Generics`.
+    pub fn opt_type_param(
+        &'tcx self,
+        param: &ParamTy,
+        tcx: TyCtxt<'tcx>,
+    ) -> Option<&'tcx GenericParamDef> {
+        let param = self.opt_param_at(param.index as usize, tcx)?;
+        match param.kind {
+            GenericParamDefKind::Type { .. } => Some(param),
+            _ => None,
         }
     }
 
@@ -294,6 +326,8 @@ impl<'tcx> Generics {
             own_params.start = 1;
         }
 
+        let verbose = tcx.sess.verbose_internals();
+
         // Filter the default arguments.
         //
         // This currently uses structural equality instead
@@ -308,6 +342,8 @@ impl<'tcx> Generics {
                 param.default_value(tcx).is_some_and(|default| {
                     default.instantiate(tcx, args) == args[param.index as usize]
                 })
+                // filter out trailing effect params, if we're not in `-Zverbose-internals`.
+                || (!verbose && matches!(param.kind, GenericParamDefKind::Const { is_host_effect: true, .. }))
             })
             .count();
 
@@ -322,7 +358,31 @@ impl<'tcx> Generics {
         args: &'tcx [ty::GenericArg<'tcx>],
     ) -> &'tcx [ty::GenericArg<'tcx>] {
         let own = &args[self.parent_count..][..self.params.len()];
-        if self.has_self && self.parent.is_none() { &own[1..] } else { &own }
+        if self.has_self && self.parent.is_none() { &own[1..] } else { own }
+    }
+
+    /// Returns true if a concrete type is specified after a default type.
+    /// For example, consider `struct T<W = usize, X = Vec<W>>(W, X)`
+    /// `T<usize, String>` will return true
+    /// `T<usize>` will return false
+    pub fn check_concrete_type_after_default(
+        &'tcx self,
+        tcx: TyCtxt<'tcx>,
+        args: &'tcx [ty::GenericArg<'tcx>],
+    ) -> bool {
+        let mut default_param_seen = false;
+        for param in self.params.iter() {
+            if let Some(inst) =
+                param.default_value(tcx).map(|default| default.instantiate(tcx, args))
+            {
+                if inst == args[param.index as usize] {
+                    default_param_seen = true;
+                } else if default_param_seen {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 

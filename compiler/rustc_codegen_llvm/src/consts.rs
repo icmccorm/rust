@@ -8,8 +8,8 @@ use crate::llvm::{self, True};
 use crate::type_::Type;
 use crate::type_of::LayoutLlvmExt;
 use crate::value::Value;
-use cstr::cstr;
 use rustc_codegen_ssa::traits::*;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs};
 use rustc_middle::mir::interpret::{
@@ -18,7 +18,7 @@ use rustc_middle::mir::interpret::{
 };
 use rustc_middle::mir::mono::MonoItem;
 use rustc_middle::ty::layout::LayoutOf;
-use rustc_middle::ty::{self, Instance, Ty};
+use rustc_middle::ty::{self, Instance};
 use rustc_middle::{bug, span_bug};
 use rustc_session::config::Lto;
 use rustc_target::abi::{
@@ -72,7 +72,7 @@ pub fn const_alloc_to_llvm<'ll>(cx: &CodegenCx<'ll, '_>, alloc: ConstAllocation<
     }
 
     let mut next_offset = 0;
-    for &(offset, alloc_id) in alloc.provenance().ptrs().iter() {
+    for &(offset, prov) in alloc.provenance().ptrs().iter() {
         let offset = offset.bytes();
         assert_eq!(offset as usize as u64, offset);
         let offset = offset as usize;
@@ -92,13 +92,10 @@ pub fn const_alloc_to_llvm<'ll>(cx: &CodegenCx<'ll, '_>, alloc: ConstAllocation<
         .expect("const_alloc_to_llvm: could not read relocation pointer")
             as u64;
 
-        let address_space = cx.tcx.global_alloc(alloc_id).address_space(cx);
+        let address_space = cx.tcx.global_alloc(prov.alloc_id()).address_space(cx);
 
         llvals.push(cx.scalar_to_backend(
-            InterpScalar::from_pointer(
-                Pointer::new(alloc_id, Size::from_bytes(ptr_offset)),
-                &cx.tcx,
-            ),
+            InterpScalar::from_pointer(Pointer::new(prov, Size::from_bytes(ptr_offset)), &cx.tcx),
             Scalar::Initialized {
                 value: Primitive::Pointer(address_space),
                 valid_range: WrappingRange::full(dl.pointer_size),
@@ -118,7 +115,7 @@ pub fn const_alloc_to_llvm<'ll>(cx: &CodegenCx<'ll, '_>, alloc: ConstAllocation<
     cx.const_struct(&llvals, true)
 }
 
-pub fn codegen_static_initializer<'ll, 'tcx>(
+fn codegen_static_initializer<'ll, 'tcx>(
     cx: &CodegenCx<'ll, 'tcx>,
     def_id: DefId,
 ) -> Result<(&'ll Value, ConstAllocation<'tcx>), ErrorHandled> {
@@ -135,10 +132,10 @@ fn set_global_alignment<'ll>(cx: &CodegenCx<'ll, '_>, gv: &'ll Value, mut align:
             Ok(min) => align = align.max(min),
             Err(err) => match err {
                 AlignFromBytesError::NotPowerOfTwo(align) => {
-                    cx.sess().emit_err(InvalidMinimumAlignmentNotPowerOfTwo { align });
+                    cx.sess().dcx().emit_err(InvalidMinimumAlignmentNotPowerOfTwo { align });
                 }
                 AlignFromBytesError::TooLarge(align) => {
-                    cx.sess().emit_err(InvalidMinimumAlignmentTooLarge { align });
+                    cx.sess().dcx().emit_err(InvalidMinimumAlignmentTooLarge { align });
                 }
             },
         }
@@ -151,11 +148,10 @@ fn set_global_alignment<'ll>(cx: &CodegenCx<'ll, '_>, gv: &'ll Value, mut align:
 fn check_and_apply_linkage<'ll, 'tcx>(
     cx: &CodegenCx<'ll, 'tcx>,
     attrs: &CodegenFnAttrs,
-    ty: Ty<'tcx>,
+    llty: &'ll Type,
     sym: &str,
     def_id: DefId,
 ) -> &'ll Value {
-    let llty = cx.layout_of(ty).llvm_type(cx);
     if let Some(linkage) = attrs.import_linkage {
         debug!("get_static: sym={} linkage={:?}", sym, linkage);
 
@@ -173,7 +169,7 @@ fn check_and_apply_linkage<'ll, 'tcx>(
             let mut real_name = "_rust_extern_with_linkage_".to_string();
             real_name.push_str(sym);
             let g2 = cx.define_global(&real_name, llty).unwrap_or_else(|| {
-                cx.sess().emit_fatal(SymbolAlreadyDefined {
+                cx.sess().dcx().emit_fatal(SymbolAlreadyDefined {
                     span: cx.tcx.def_span(def_id),
                     symbol_name: sym,
                 })
@@ -182,10 +178,17 @@ fn check_and_apply_linkage<'ll, 'tcx>(
             llvm::LLVMSetInitializer(g2, g1);
             g2
         }
-    } else if cx.tcx.sess.target.arch == "x86" &&
-        let Some(dllimport) = common::get_dllimport(cx.tcx, def_id, sym)
+    } else if cx.tcx.sess.target.arch == "x86"
+        && let Some(dllimport) = common::get_dllimport(cx.tcx, def_id, sym)
     {
-        cx.declare_global(&common::i686_decorated_name(&dllimport, common::is_mingw_gnu_toolchain(&cx.tcx.sess.target), true), llty)
+        cx.declare_global(
+            &common::i686_decorated_name(
+                dllimport,
+                common::is_mingw_gnu_toolchain(&cx.tcx.sess.target),
+                true,
+            ),
+            llty,
+        )
     } else {
         // Generate an external declaration.
         // FIXME(nagisa): investigate whether it can be changed into define_global
@@ -223,9 +226,28 @@ impl<'ll> CodegenCx<'ll, '_> {
         }
     }
 
+    #[instrument(level = "debug", skip(self))]
     pub(crate) fn get_static(&self, def_id: DefId) -> &'ll Value {
         let instance = Instance::mono(self.tcx, def_id);
-        if let Some(&g) = self.instances.borrow().get(&instance) {
+        trace!(?instance);
+
+        let DefKind::Static { nested, .. } = self.tcx.def_kind(def_id) else { bug!() };
+        // Nested statics do not have a type, so pick a dummy type and let `codegen_static` figure out
+        // the llvm type from the actual evaluated initializer.
+        let llty = if nested {
+            self.type_i8()
+        } else {
+            let ty = instance.ty(self.tcx, ty::ParamEnv::reveal_all());
+            trace!(?ty);
+            self.layout_of(ty).llvm_type(self)
+        };
+        self.get_static_inner(def_id, llty)
+    }
+
+    #[instrument(level = "debug", skip(self, llty))]
+    pub(crate) fn get_static_inner(&self, def_id: DefId, llty: &'ll Type) -> &'ll Value {
+        if let Some(&g) = self.instances.borrow().get(&Instance::mono(self.tcx, def_id)) {
+            trace!("used cached value");
             return g;
         }
 
@@ -237,14 +259,12 @@ impl<'ll> CodegenCx<'ll, '_> {
                  statics defined in the same CGU, but did not for `{def_id:?}`"
         );
 
-        let ty = instance.ty(self.tcx, ty::ParamEnv::reveal_all());
-        let sym = self.tcx.symbol_name(instance).name;
+        let sym = self.tcx.symbol_name(Instance::mono(self.tcx, def_id)).name;
         let fn_attrs = self.tcx.codegen_fn_attrs(def_id);
 
-        debug!("get_static: sym={} instance={:?} fn_attrs={:?}", sym, instance, fn_attrs);
+        debug!(?sym, ?fn_attrs);
 
         let g = if def_id.is_local() && !self.tcx.is_foreign_item(def_id) {
-            let llty = self.layout_of(ty).llvm_type(self);
             if let Some(g) = self.get_declared_value(sym) {
                 if self.val_ty(g) != self.type_ptr() {
                     span_bug!(self.tcx.def_span(def_id), "Conflicting types for static");
@@ -261,7 +281,7 @@ impl<'ll> CodegenCx<'ll, '_> {
 
             g
         } else {
-            check_and_apply_linkage(self, fn_attrs, ty, sym, def_id)
+            check_and_apply_linkage(self, fn_attrs, llty, sym, def_id)
         };
 
         // Thread-local statics in some other crate need to *always* be linked
@@ -329,34 +349,18 @@ impl<'ll> CodegenCx<'ll, '_> {
             }
         }
 
-        self.instances.borrow_mut().insert(instance, g);
+        self.instances.borrow_mut().insert(Instance::mono(self.tcx, def_id), g);
         g
     }
-}
 
-impl<'ll> StaticMethods for CodegenCx<'ll, '_> {
-    fn static_addr_of(&self, cv: &'ll Value, align: Align, kind: Option<&str>) -> &'ll Value {
-        if let Some(&gv) = self.const_globals.borrow().get(&cv) {
-            unsafe {
-                // Upgrade the alignment in cases where the same constant is used with different
-                // alignment requirements
-                let llalign = align.bytes() as u32;
-                if llalign > llvm::LLVMGetAlignment(gv) {
-                    llvm::LLVMSetAlignment(gv, llalign);
-                }
-            }
-            return gv;
-        }
-        let gv = self.static_addr_of_mut(cv, align, kind);
+    fn codegen_static_item(&self, def_id: DefId) {
         unsafe {
-            llvm::LLVMSetGlobalConstant(gv, True);
-        }
-        self.const_globals.borrow_mut().insert(cv, gv);
-        gv
-    }
-
-    fn codegen_static(&self, def_id: DefId, is_mutable: bool) {
-        unsafe {
+            assert!(
+                llvm::LLVMGetInitializer(
+                    self.instances.borrow().get(&Instance::mono(self.tcx, def_id)).unwrap()
+                )
+                .is_none()
+            );
             let attrs = self.tcx.codegen_fn_attrs(def_id);
 
             let Ok((v, alloc)) = codegen_static_initializer(self, def_id) else {
@@ -365,21 +369,11 @@ impl<'ll> StaticMethods for CodegenCx<'ll, '_> {
             };
             let alloc = alloc.inner();
 
-            let g = self.get_static(def_id);
+            let val_llty = self.val_ty(v);
 
-            // boolean SSA values are i1, but they have to be stored in i8 slots,
-            // otherwise some LLVM optimization passes don't work as expected
-            let mut val_llty = self.val_ty(v);
-            let v = if val_llty == self.type_i1() {
-                val_llty = self.type_i8();
-                llvm::LLVMConstZExt(v, val_llty)
-            } else {
-                v
-            };
+            let g = self.get_static_inner(def_id, val_llty);
+            let llty = self.val_ty(g);
 
-            let instance = Instance::mono(self.tcx, def_id);
-            let ty = instance.ty(self.tcx, ty::ParamEnv::reveal_all());
-            let llty = self.layout_of(ty).llvm_type(self);
             let g = if val_llty == llty {
                 g
             } else {
@@ -414,16 +408,15 @@ impl<'ll> StaticMethods for CodegenCx<'ll, '_> {
                 self.statics_to_rauw.borrow_mut().push((g, new_g));
                 new_g
             };
-            set_global_alignment(self, g, self.align_of(ty));
+            set_global_alignment(self, g, alloc.align);
             llvm::LLVMSetInitializer(g, v);
 
             if self.should_assume_dso_local(g, true) {
                 llvm::LLVMRustSetDSOLocal(g, true);
             }
 
-            // As an optimization, all shared statics which do not have interior
-            // mutability are placed into read-only memory.
-            if !is_mutable && self.type_is_freeze(ty) {
+            // Forward the allocation's mutability (picked by the const interner) to LLVM.
+            if alloc.mutability.is_not() {
                 llvm::LLVMSetGlobalConstant(g, llvm::True);
             }
 
@@ -477,9 +470,9 @@ impl<'ll> StaticMethods for CodegenCx<'ll, '_> {
                             .all(|&byte| byte == 0);
 
                     let sect_name = if all_bytes_are_zero {
-                        cstr!("__DATA,__thread_bss")
+                        c"__DATA,__thread_bss"
                     } else {
-                        cstr!("__DATA,__thread_data")
+                        c"__DATA,__thread_data"
                     };
                     llvm::LLVMSetSection(g, sect_name.as_ptr());
                 }
@@ -508,7 +501,7 @@ impl<'ll> StaticMethods for CodegenCx<'ll, '_> {
                     let val = llvm::LLVMMetadataAsValue(self.llcx, meta);
                     llvm::LLVMAddNamedMetadataOperand(
                         self.llmod,
-                        "wasm.custom_sections\0".as_ptr().cast(),
+                        c"wasm.custom_sections".as_ptr().cast(),
                         val,
                     );
                 }
@@ -545,6 +538,32 @@ impl<'ll> StaticMethods for CodegenCx<'ll, '_> {
                 self.add_used_global(g);
             }
         }
+    }
+}
+
+impl<'ll> StaticMethods for CodegenCx<'ll, '_> {
+    fn static_addr_of(&self, cv: &'ll Value, align: Align, kind: Option<&str>) -> &'ll Value {
+        if let Some(&gv) = self.const_globals.borrow().get(&cv) {
+            unsafe {
+                // Upgrade the alignment in cases where the same constant is used with different
+                // alignment requirements
+                let llalign = align.bytes() as u32;
+                if llalign > llvm::LLVMGetAlignment(gv) {
+                    llvm::LLVMSetAlignment(gv, llalign);
+                }
+            }
+            return gv;
+        }
+        let gv = self.static_addr_of_mut(cv, align, kind);
+        unsafe {
+            llvm::LLVMSetGlobalConstant(gv, True);
+        }
+        self.const_globals.borrow_mut().insert(cv, gv);
+        gv
+    }
+
+    fn codegen_static(&self, def_id: DefId) {
+        self.codegen_static_item(def_id)
     }
 
     /// Add a global value to a list to be stored in the `llvm.used` variable, an array of ptr.

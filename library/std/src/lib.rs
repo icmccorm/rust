@@ -84,7 +84,7 @@
 //!
 //! # Contributing changes to the documentation
 //!
-//! Check out the rust contribution guidelines [here](
+//! Check out the Rust contribution guidelines [here](
 //! https://rustc-dev-guide.rust-lang.org/contributing.html#writing-documentation).
 //! The source for this documentation can be found on
 //! [GitHub](https://github.com/rust-lang/rust).
@@ -212,21 +212,17 @@
 //! [rust-discord]: https://discord.gg/rust-lang
 //! [array]: prim@array
 //! [slice]: prim@slice
-// To run std tests without x.py without ending up with two copies of std, Miri needs to be
-// able to "empty" this crate. See <https://github.com/rust-lang/miri-test-libstd/issues/4>.
-// rustc itself never sets the feature, so this line has no effect there.
-#![cfg(any(not(feature = "miri-test-libstd"), test, doctest))]
-// miri-test-libstd also prefers to make std use the sysroot versions of the dependencies.
-#![cfg_attr(feature = "miri-test-libstd", feature(rustc_private))]
-//
+
 #![cfg_attr(not(feature = "restricted-std"), stable(feature = "rust1", since = "1.0.0"))]
 #![cfg_attr(feature = "restricted-std", unstable(feature = "restricted_std", issue = "none"))]
+#![cfg_attr(not(bootstrap), rustc_preserve_ub_checks)]
 #![doc(
     html_playground_url = "https://play.rust-lang.org/",
     issue_tracker_base_url = "https://github.com/rust-lang/rust/issues/",
     test(no_crate_inject, attr(deny(warnings))),
     test(attr(allow(dead_code, deprecated, unused_variables, unused_mut)))
 )]
+#![doc(rust_logo)]
 #![doc(cfg_hide(
     not(test),
     not(any(test, bootstrap)),
@@ -259,8 +255,13 @@
     all(target_vendor = "fortanix", target_env = "sgx"),
     feature(slice_index_methods, coerce_unsized, sgx_platform)
 )]
-#![cfg_attr(windows, feature(round_char_boundary))]
+#![cfg_attr(any(windows, target_os = "uefi"), feature(round_char_boundary))]
 #![cfg_attr(target_os = "xous", feature(slice_ptr_len))]
+#![cfg_attr(target_family = "wasm", feature(stdarch_wasm_atomic_wait))]
+#![cfg_attr(
+    all(any(target_arch = "x86_64", target_arch = "x86"), target_os = "uefi"),
+    feature(stdarch_x86_has_cpuid)
+)]
 //
 // Language features:
 // tidy-alphabetical-start
@@ -269,7 +270,9 @@
 #![feature(allow_internal_unsafe)]
 #![feature(allow_internal_unstable)]
 #![feature(c_unwind)]
+#![feature(cfg_sanitizer_cfi)]
 #![feature(cfg_target_thread_local)]
+#![feature(cfi_encoding)]
 #![feature(concat_idents)]
 #![feature(const_mut_refs)]
 #![feature(const_trait_impl)]
@@ -280,19 +283,19 @@
 #![feature(doc_masked)]
 #![feature(doc_notable_trait)]
 #![feature(dropck_eyepatch)]
-#![feature(exhaustive_patterns)]
 #![feature(if_let_guard)]
 #![feature(intra_doc_pointers)]
 #![feature(lang_items)]
 #![feature(let_chains)]
 #![feature(link_cfg)]
 #![feature(linkage)]
+#![feature(min_exhaustive_patterns)]
 #![feature(min_specialization)]
 #![feature(must_not_suspend)]
 #![feature(needs_panic_runtime)]
 #![feature(negative_impls)]
 #![feature(never_type)]
-#![feature(platform_intrinsics)]
+#![feature(no_sanitize)]
 #![feature(prelude_import)]
 #![feature(rustc_attrs)]
 #![feature(rustdoc_internals)]
@@ -305,41 +308,45 @@
 //
 // Library features (core):
 // tidy-alphabetical-start
+#![feature(c_str_module)]
 #![feature(char_internals)]
 #![feature(core_intrinsics)]
+#![feature(core_io_borrowed_buf)]
 #![feature(duration_constants)]
 #![feature(error_generic_member_access)]
 #![feature(error_in_core)]
 #![feature(error_iter)]
 #![feature(exact_size_is_empty)]
 #![feature(exclusive_wrapper)]
+#![feature(exposed_provenance)]
 #![feature(extend_one)]
 #![feature(float_gamma)]
 #![feature(float_minimum_maximum)]
 #![feature(float_next_up_down)]
+#![feature(fmt_internals)]
+#![feature(generic_nonzero)]
 #![feature(hasher_prefixfree_extras)]
 #![feature(hashmap_internals)]
+#![feature(hint_assert_unchecked)]
 #![feature(ip)]
-#![feature(ip_in_core)]
 #![feature(maybe_uninit_slice)]
 #![feature(maybe_uninit_uninit_array)]
 #![feature(maybe_uninit_write_slice)]
-#![feature(offset_of)]
 #![feature(panic_can_unwind)]
 #![feature(panic_info_message)]
 #![feature(panic_internals)]
-#![feature(pointer_byte_offsets)]
-#![feature(pointer_is_aligned)]
+#![feature(pointer_is_aligned_to)]
 #![feature(portable_simd)]
 #![feature(prelude_2024)]
 #![feature(ptr_as_uninit)]
-#![feature(raw_os_nonzero)]
-#![feature(round_ties_even)]
+#![feature(ptr_mask)]
 #![feature(slice_internals)]
 #![feature(slice_ptr_get)]
+#![feature(slice_range)]
 #![feature(std_internals)]
 #![feature(str_internals)]
 #![feature(strict_provenance)]
+#![feature(strict_provenance_atomic_ptr)]
 // tidy-alphabetical-end
 //
 // Library features (alloc):
@@ -360,6 +367,11 @@
 #![feature(panic_unwind)]
 // tidy-alphabetical-end
 //
+// Library features (std_detect):
+// tidy-alphabetical-start
+#![feature(stdarch_internal)]
+// tidy-alphabetical-end
+//
 // Only for re-exporting:
 // tidy-alphabetical-start
 #![feature(assert_matches)]
@@ -369,14 +381,12 @@
 #![feature(cfg_eval)]
 #![feature(concat_bytes)]
 #![feature(const_format_args)]
-#![feature(core_panic)]
 #![feature(custom_test_frameworks)]
 #![feature(edition_panic)]
 #![feature(format_args_nl)]
 #![feature(get_many_mut)]
 #![feature(lazy_cell)]
 #![feature(log_syntax)]
-#![feature(stdsimd)]
 #![feature(test)]
 #![feature(trace_macros)]
 // tidy-alphabetical-end
@@ -491,8 +501,6 @@ pub use core::convert;
 pub use core::default;
 #[stable(feature = "futures_api", since = "1.36.0")]
 pub use core::future;
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use core::hash;
 #[stable(feature = "core_hint", since = "1.27.0")]
 pub use core::hint;
 #[stable(feature = "i128", since = "1.26.0")]
@@ -562,6 +570,7 @@ pub mod env;
 pub mod error;
 pub mod ffi;
 pub mod fs;
+pub mod hash;
 pub mod io;
 pub mod net;
 pub mod num;
@@ -580,9 +589,10 @@ pub mod time;
 #[unstable(feature = "portable_simd", issue = "86656")]
 mod std_float;
 
-#[doc = include_str!("../../portable-simd/crates/core_simd/src/core_simd_docs.md")]
 #[unstable(feature = "portable_simd", issue = "86656")]
 pub mod simd {
+    #![doc = include_str!("../../portable-simd/crates/core_simd/src/core_simd_docs.md")]
+
     #[doc(inline)]
     pub use crate::std_float::StdFloat;
     #[doc(inline)]
@@ -615,13 +625,16 @@ pub mod arch {
 
     #[stable(feature = "simd_aarch64", since = "1.60.0")]
     pub use std_detect::is_aarch64_feature_detected;
+    #[unstable(feature = "stdarch_arm_feature_detection", issue = "111190")]
+    pub use std_detect::is_arm_feature_detected;
+    #[unstable(feature = "is_riscv_feature_detected", issue = "111192")]
+    pub use std_detect::is_riscv_feature_detected;
     #[stable(feature = "simd_x86", since = "1.27.0")]
     pub use std_detect::is_x86_feature_detected;
-    #[unstable(feature = "stdsimd", issue = "48556")]
-    pub use std_detect::{
-        is_arm_feature_detected, is_mips64_feature_detected, is_mips_feature_detected,
-        is_powerpc64_feature_detected, is_powerpc_feature_detected, is_riscv_feature_detected,
-    };
+    #[unstable(feature = "stdarch_mips_feature_detection", issue = "111188")]
+    pub use std_detect::{is_mips64_feature_detected, is_mips_feature_detected};
+    #[unstable(feature = "stdarch_powerpc_feature_detection", issue = "111191")]
+    pub use std_detect::{is_powerpc64_feature_detected, is_powerpc_feature_detected};
 }
 
 // This was stabilized in the crate root so we have to keep it there.
@@ -713,7 +726,7 @@ pub(crate) mod test_helpers {
     #[track_caller]
     pub(crate) fn test_rng() -> rand_xorshift::XorShiftRng {
         use core::hash::{BuildHasher, Hash, Hasher};
-        let mut hasher = crate::collections::hash_map::RandomState::new().build_hasher();
+        let mut hasher = crate::hash::RandomState::new().build_hasher();
         core::panic::Location::caller().hash(&mut hasher);
         let hc64 = hasher.finish();
         let seed_vec = hc64.to_le_bytes().into_iter().chain(0u8..8).collect::<Vec<u8>>();

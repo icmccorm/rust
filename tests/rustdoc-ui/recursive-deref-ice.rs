@@ -1,10 +1,13 @@
-// check-pass
+//@ check-pass
 
 // ICE found in https://github.com/rust-lang/rust/issues/83123
 
 pub struct Attribute;
 
-pub struct Map<'hir> {}
+pub struct Map<'hir> {
+    lt: &'hir (),
+}
+
 impl<'hir> Map<'hir> {
     pub fn attrs(&self) -> &'hir [Attribute] { &[] }
 }
