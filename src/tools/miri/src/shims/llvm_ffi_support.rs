@@ -9,7 +9,6 @@ use crate::Provenance;
 use crate::ThreadId;
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::{GenericValue, GenericValueRef};
-use log::debug;
 use rustc_const_eval::interpret::{InterpResult, OpTy, PlaceTy};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_span::Symbol;

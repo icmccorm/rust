@@ -8,7 +8,6 @@ use super::hooks::memory::{
 };
 use super::hooks::store::miri_memory_store;
 use crate::concurrency::thread::EvalContextExt;
-use crate::shims::either::Either;
 use crate::shims::llvm::convert::to_generic_value::convert_opty_to_generic_value;
 use crate::shims::llvm::convert::to_generic_value::LLVMArgumentConverter;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalContextExt;
@@ -25,7 +24,6 @@ use inkwell::module::Module;
 use inkwell::types::BasicTypeEnum;
 pub use inkwell::values::FunctionValue;
 use inkwell::values::GenericValue;
-use log::debug;
 use ouroboros::self_referencing;
 use parking_lot::ReentrantMutex;
 use rustc_const_eval::interpret::InterpResult;
@@ -37,6 +35,7 @@ use rustc_target::abi::Abi;
 use rustc_target::abi::Size;
 use std::cell::RefCell;
 use std::path::PathBuf;
+use either::Either;
 
 #[self_referencing]
 pub struct LLI /*<'mir, 'tcx>*/ {

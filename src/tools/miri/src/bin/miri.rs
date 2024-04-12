@@ -21,12 +21,11 @@ extern crate rustc_log;
 extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
-use std::num::NonZeroU64;
 use std::env::{self, VarError};
 use std::num::NonZero;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::{env, fs};
+use std::fs;
 
 use walkdir::WalkDir;
 
@@ -102,7 +101,7 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
                 if cwd.exists() && cwd.is_dir() {
                     config.external_bc_files.extend(collect_llvm_bytecode(cwd));
                 }else{
-                    tcx.sess.fatal("Unable to resolve CARGO_TARGET_DIR.");
+                    tcx.dcx().fatal("Unable to resolve CARGO_TARGET_DIR.");
                 }
                 if !config.external_bc_files.is_empty() {
                     config.provenance_mode = ProvenanceMode::Permissive;

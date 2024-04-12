@@ -11,7 +11,7 @@ use crate::throw_unsup_llvm_type;
 use crate::throw_unsup_shim_llvm_type;
 use crate::AlignmentCheck;
 use crate::MiriInterpCx;
-use crate::{intptrcast, BorTag, Provenance, ThreadId};
+use crate::{BorTag, Provenance, ThreadId};
 use either::Either::Right;
 use inkwell::miri::StackTrace;
 use inkwell::types::{AnyTypeEnum, BasicType, BasicTypeEnum};
@@ -20,18 +20,18 @@ use inkwell::values::GenericValueRef;
 use llvm_sys::execution_engine::LLVMGenericValueArrayRef;
 use llvm_sys::miri::{MiriPointer, MiriProvenance};
 use llvm_sys::prelude::LLVMTypeRef;
-use log::debug;
 use rustc_abi::Endian;
 use rustc_const_eval::interpret::{
     AllocId, CheckInAllocMsg, InterpErrorInfo, InterpResult, OpTy, Pointer, Scalar,
 };
 use rustc_middle::mir::Mutability;
 use rustc_middle::ty::layout::{HasTyCtxt, TyAndLayout};
-use rustc_middle::ty::{self, Ty, TypeAndMut};
+use rustc_middle::ty::{self, Ty};
 use rustc_span::FileNameDisplayPreference;
 use rustc_target::abi::Align;
 use rustc_target::abi::Size;
 use std::num::NonZeroU64;
+use crate::alloc_addresses::EvalContextExt as _;
 
 #[macro_export]
 macro_rules! throw_interop_format {
@@ -63,7 +63,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     {
                         let (size, _align, _) = this.get_alloc_info(alloc_id);
                         let base_address =
-                            intptrcast::GlobalStateInner::alloc_base_addr(this, alloc_id)?;
+                            this.addr_from_alloc_id(alloc_id)?;
 
                         #[allow(clippy::arithmetic_side_effects)]
                         let offset = mp.addr() - Size::from_bytes(base_address);
@@ -296,7 +296,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn is_pointer_convertible(&self, layout: &TyAndLayout<'tcx>) -> bool {
         let this = self.eval_context_ref();
         match layout.ty.kind() {
-            ty::FnPtr(_) | ty::RawPtr(_) | ty::Ref(_, _, _) => return true,
+            ty::FnPtr(_) | ty::RawPtr(_, _) | ty::Ref(_, _, _) => return true,
             _ =>
                 if layout.is_transparent::<MiriInterpCx<'_, 'tcx>>() {
                     if let Some((_, field)) = layout.non_1zst_field(this) {
@@ -307,6 +307,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         false
     }
 
+    #[allow(dead_code)]
     fn is_pointer_aligned(&self, ptr: Pointer<Option<crate::Provenance>>, align: Align) -> bool {
         let this = self.eval_context_ref();
         match this.ptr_try_get_alloc_id(ptr) {
@@ -337,7 +338,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 (prov, alloc_id)
             } else {
                 let resolved_alloc_id =
-                    intptrcast::GlobalStateInner::alloc_id_from_addr(this, mp.addr);
+                    this.alloc_id_from_addr(mp.addr);
                 if let Some(ref logger) = &this.machine.llvm_logger {
                     logger.log_flag(LLVMFlag::LLVMOnResolve)
                 }
@@ -356,7 +357,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     offset: Size::ZERO,
                 }
             } else {
-                let base_address = intptrcast::GlobalStateInner::alloc_base_addr(this, alloc_id)?;
+                let base_address = this.addr_from_alloc_id(alloc_id)?;
                 let alignment_offset_multiple = (mp.addr - base_address) / align.bytes();
                 let aligned_offset = alignment_offset_multiple * align.bytes();
                 let offset = Size::from_bytes((mp.addr - base_address) - aligned_offset);
@@ -384,10 +385,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             bug!("expected scalar, but got {:?}", opty.layout.ty)
         }
     }
+
     fn raw_pointer_to(&self, ty: Ty<'tcx>) -> InterpResult<'tcx, TyAndLayout<'tcx>> {
         let this = self.eval_context_ref();
         this.layout_of(
-            this.tcx.mk_ty_from_kind(ty::RawPtr(TypeAndMut { ty, mutbl: Mutability::Mut })),
+            this.tcx.mk_ty_from_kind(ty::RawPtr(ty, Mutability::Mut)),
         )
     }
     #[allow(clippy::arithmetic_side_effects)]
@@ -433,25 +435,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             } else {
                 layout.fields.offset(rust_field_idx + 1) - curr_offset
             }
-        }
-    }
-
-    fn validate_size_matches(
-        &self,
-        source_size: Size,
-        destination_value_size: Size,
-        destination_padded_size: Size,
-    ) -> bool {
-        source_size == destination_value_size || source_size == destination_padded_size
-    }
-
-    fn maybe_alloc_id(&self, mp: Pointer<Option<crate::Provenance>>) -> Option<AllocId> {
-        let this = self.eval_context_ref();
-        match mp.provenance {
-            Some(crate::Provenance::Concrete { alloc_id, .. }) => Some(alloc_id),
-            Some(crate::Provenance::Wildcard) =>
-                intptrcast::GlobalStateInner::alloc_id_from_addr(this, mp.addr().bytes()),
-            None => None,
         }
     }
 

@@ -1,11 +1,8 @@
 use std::cmp;
 use std::collections::BTreeSet;
 use std::iter;
-use std::num::NonZeroUsize;
 use crate::helpers::rustc_data_structures::fx::FxHashMap;
 use crate::helpers::ty::List;
-use log::debug;
-use log::trace;
 use std::num::NonZero;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -27,7 +24,6 @@ use rustc_middle::ty::{
 use rustc_span::{def_id::CrateNum, sym, Span, Symbol};
 use rustc_target::abi::{Align, FieldIdx, FieldsShape, Size, Variants};
 use rustc_target::spec::abi::Abi;
-use std::time::Duration;
 
 use crate::*;
 
@@ -817,7 +813,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let (underlying_size, place) = if let Some(Provenance::Concrete { alloc_id, .. }) =
             op_place.ptr().provenance
         {
-            let alloc_base_addr = intptrcast::GlobalStateInner::alloc_base_addr(this, alloc_id)?;
+            let alloc_base_addr = this.addr_from_alloc_id(alloc_id)?;
             debug!("Base address: {}", alloc_base_addr);
 
             let (size, _, _) = self.eval_context_ref().get_alloc_info(alloc_id);
@@ -830,7 +826,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
             let offset_pointer = op_place.ptr().offset(Size::from_bytes(offset), this)?;
 
-            (remaining_size, MPlaceTy::from_aligned_ptr(offset_pointer, value_layout))
+            (remaining_size, this.ptr_to_mplace(offset_pointer, value_layout))
         } else {
             (
                 op_place.layout.size.bytes(),
@@ -1286,7 +1282,7 @@ pub fn get_extern_functions(tcx: TyCtxt<'_>) -> FxHashMap<String, Instance<'_>> 
     let mut cxx_map = FxHashMap::default();
 
     tcx.hir().items().for_each(|id| {
-        let node = tcx.hir().get(id.hir_id());
+        let node = tcx.hir_node(id.hir_id());
         if let rustc_hir::Node::Item(it) = node {
             if let rustc_hir::ItemKind::Fn(..) = it.kind {
                 if let Some(cxx_name) = resolve_cxx_name(tcx, it.owner_id.to_def_id()) {

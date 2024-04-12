@@ -1,10 +1,11 @@
 extern crate rustc_abi;
-use crate::intptrcast;
 use crate::{shims::llvm::logging::LLVMFlag, Provenance};
 use rustc_abi::Abi;
 use rustc_const_eval::interpret::{InterpResult, OpTy, Scalar};
 use rustc_middle::ty::layout::TyAndLayout;
 use std::iter::repeat;
+use crate::alloc_addresses::EvalContextExt as _;
+
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
 
 pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
@@ -22,7 +23,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     if let Some(logger) = &mut this.machine.llvm_logger {
                         logger.log_flag(LLVMFlag::ExposedPointerFromRustAtBoundary);
                     }
-                    intptrcast::GlobalStateInner::expose_ptr(this, alloc_id, tag)?
+                    this.expose_ptr(alloc_id, tag)?
                 }
                 p.into_parts().1.bits().into()
             }

@@ -471,7 +471,6 @@ impl<'tcx> Stacks {
         perm: Permission,
         tag: BorTag,
         id: AllocId,
-        kind: MemoryKind<MiriMemoryKind>,
         machine: &MiriMachine<'_, '_>,
     ) -> Self {
         let item = Item::new(tag, perm, false);
@@ -523,7 +522,7 @@ impl Stacks {
             // Everything else is shared by default.
             _ => (state.base_ptr_tag(id, machine), Permission::SharedReadWrite),
         };
-        Stacks::new(size, perm, base_tag, id, kind, machine)
+        Stacks::new(size, perm, base_tag, id, machine)
     }
 
     #[inline(always)]

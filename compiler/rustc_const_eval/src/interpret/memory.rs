@@ -628,7 +628,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         size: Size,
     ) -> InterpResult<'tcx, Option<AllocRef<'a, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
     {
-        unsafe { self.get_ptr_alloc_range(ptr, size, alloc_range(Size::ZERO, size), align) }
+        unsafe { self.get_ptr_alloc_range(ptr, size, alloc_range(Size::ZERO, size)) }
     }
 
     /// "Safe" (bounds and align-checked) allocation access.
@@ -637,7 +637,6 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         ptr: Pointer<Option<M::Provenance>>,
         size: Size,
         access_range: AllocRange,
-        align: Align,
     ) -> InterpResult<'tcx, Option<AllocRef<'a, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
     {
         let ptr_and_alloc = self.check_and_deref_ptr(
@@ -721,7 +720,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         size: Size,
     ) -> InterpResult<'tcx, Option<AllocRefMut<'a, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
     {
-        unsafe { self.get_ptr_alloc_mut_range(ptr, size, alloc_range(Size::ZERO, size), align) }
+        unsafe { self.get_ptr_alloc_mut_range(ptr, size, alloc_range(Size::ZERO, size)) }
     }
 
     /// "Safe" (bounds and align-checked) allocation access.
@@ -730,7 +729,6 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         ptr: Pointer<Option<M::Provenance>>,
         size: Size,
         access_range: AllocRange,
-        align: Align,
     ) -> InterpResult<'tcx, Option<AllocRefMut<'a, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
     {
         let parts = self.get_ptr_access(ptr, size)?;

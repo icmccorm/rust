@@ -23,6 +23,8 @@ use rustc_target::{
     abi::{Align, Size},
     spec::abi::Abi,
 };
+use crate::shims::llvm::helpers::EvalContextExt as _;
+use crate::shims::llvm_ffi_support::EvalContextExt as _;
 
 #[derive(Eq, PartialEq, Copy, Clone, Debug)]
 #[repr(u32)]
@@ -139,7 +141,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         match this.emulate_foreign_item_inner(link_name, abi, args, dest)? {
             EmulateForeignItemResult::NeedsJumping => {
                 if let Some(ret) = ret && !is_in_llvm{
-                    trace!("{:?}", this.dump_place(dest));
+                    trace!("{:?}", this.dump_place(&PlaceTy::from(dest.clone())));
                     this.go_to_block(ret);
                 }
             }
@@ -894,8 +896,8 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let [ptr] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let ptr = this.read_pointer(ptr)?;
                 let (alloc_id, _, _) = this.ptr_get_alloc_id(ptr)?;
-                let base_address = Size::from_bytes(intptrcast::GlobalStateInner::alloc_base_addr(
-                    this, alloc_id,
+                let base_address = Size::from_bytes(this.addr_from_alloc_id(
+                    alloc_id,
                 )?);
                 if base_address != ptr.addr() {
                     this.write_scalar(Scalar::from_u64(0), dest)?;
@@ -980,21 +982,21 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 // FIXME: Using host floats.
                 let f_host = f.to_host();
                 let res = match link_name.as_str() {
-                    "cbrtf" => f.cbrt(),
-                    "coshf" => f.cosh(),
-                    "sinhf" => f.sinh(),
-                    "tanf" => f.tan(),
-                    "tanhf" => f.tanh(),
-                    "acosf" => f.acos(),
-                    "cosf" => f.cos(),
-                    "sinf" => f.sin(),
-                    "asinf" => f.asin(),
-                    "atanf" => f.atan(),
-                    "log1pf" => f.ln_1p(),
-                    "expm1f" => f.exp_m1(),
-                    "tgammaf" => f.gamma(),
-                    "logf" => f.ln(),
-                    "sqrtf" => f.sqrt(),
+                    "cbrtf" => f_host.cbrt(),
+                    "coshf" => f_host.cosh(),
+                    "sinhf" => f_host.sinh(),
+                    "tanf" => f_host.tan(),
+                    "tanhf" => f_host.tanh(),
+                    "acosf" => f_host.acos(),
+                    "cosf" => f_host.cos(),
+                    "sinf" => f_host.sin(),
+                    "asinf" => f_host.asin(),
+                    "atanf" => f_host.atan(),
+                    "log1pf" => f_host.ln_1p(),
+                    "expm1f" => f_host.exp_m1(),
+                    "tgammaf" => f_host.gamma(),
+                    "logf" => f_host.ln(),
+                    "sqrtf" => f_host.sqrt(),
                     _ => bug!(),
                 };
                 let res = res.to_soft();
@@ -1019,6 +1021,7 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     "atan2f" => f1.to_host().atan2(f2.to_host()).to_soft(),
                     #[allow(deprecated)]
                     "powf" => f1.to_host().powf(f2.to_host()).to_soft(),
+                    #[allow(deprecated)]
                     "fdimf" => f1.to_host().abs_sub(f2.to_host()).to_soft(),
                     _ => bug!(),
                 };
@@ -1052,26 +1055,26 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 // FIXME: Using host floats.
                 let f_host = f.to_host();
                 let res = match link_name.as_str() {
-                    "log" => f.ln(),
-                    "cbrt" => f.cbrt(),
-                    "cosh" => f.cosh(),
-                    "sinh" => f.sinh(),
-                    "tan" => f.tan(),
-                    "tanh" => f.tanh(),
-                    "acos" => f.acos(),
-                    "asin" => f.asin(),
-                    "atan" => f.atan(),
-                    "log1p" => f.ln_1p(),
-                    "exp" => f.exp(),
-                    "expm1" => f.exp_m1(),
-                    "tgamma" => f.gamma(),
-                    "sin" => f.sin(),
-                    "cos" => f.cos(),
-                    "log10" => f.log10(),
-                    "log2" => f.log2(),
-                    "sqrt" => f.sqrt(),
-                    "ceil" => f.ceil(),
-                    "floor" => f.floor(),
+                    "log" => f_host.ln(),
+                    "cbrt" => f_host.cbrt(),
+                    "cosh" => f_host.cosh(),
+                    "sinh" => f_host.sinh(),
+                    "tan" => f_host.tan(),
+                    "tanh" => f_host.tanh(),
+                    "acos" => f_host.acos(),
+                    "asin" => f_host.asin(),
+                    "atan" => f_host.atan(),
+                    "log1p" => f_host.ln_1p(),
+                    "exp" => f_host.exp(),
+                    "expm1" => f_host.exp_m1(),
+                    "tgamma" => f_host.gamma(),
+                    "sin" => f_host.sin(),
+                    "cos" => f_host.cos(),
+                    "log10" => f_host.log10(),
+                    "log2" => f_host.log2(),
+                    "sqrt" => f_host.sqrt(),
+                    "ceil" => f_host.ceil(),
+                    "floor" => f_host.floor(),
                     _ => bug!(),
                 };
                 let res = res.to_soft();
@@ -1239,7 +1242,7 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             // Platform-specific shims
             _ => {
                 let shim_result = match this.tcx.sess.target.os.as_ref() {
-                    target_os if target_os_is_unix(target_os) =>
+                    _ if this.target_os_is_unix() =>
                         shims::unix::foreign_items::EvalContextExt::emulate_foreign_item_inner(
                             this, link_name, abi, args, dest,
                         ),
@@ -1258,7 +1261,7 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     // we would end up with endless stack overflows in cases where a system call is
                     // exposed as an LLVM function, but implemented in terms of itself.
                     if this.has_llvm_interpreter() && !this.in_llvm()? {
-                        if this.call_external_llvm_fct(link_name, dest, args)? {
+                        if this.call_external_llvm_fct(link_name, &PlaceTy::from(dest.clone()), args)? {
                             return Ok(EmulateForeignItemResult::NeedsJumping);
                         }
                     }

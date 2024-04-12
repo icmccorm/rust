@@ -3,12 +3,11 @@ extern crate rustc_abi;
 use super::field_bytes::FieldBytes;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalExt;
 use crate::shims::llvm::logging::LLVMFlag;
-use crate::{intptrcast, MiriInterpCx, Provenance};
+use crate::{MiriInterpCx, Provenance};
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::GenericValueRef;
 use itertools::Itertools;
-use log::debug;
-use rustc_abi::{Endian, FieldIdx, Size, VariantIdx};
+use rustc_abi::{Endian, Size};
 use rustc_apfloat::{
     ieee::{Double, Single},
     Float,
@@ -22,6 +21,8 @@ use rustc_middle::{
 use rustc_target::abi::FIRST_VARIANT;
 use std::cell::Cell;
 use std::fmt::Formatter;
+use rustc_target::abi::{VariantIdx,FieldIdx};
+use crate::alloc_addresses::EvalContextExt as _;
 
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
 
@@ -189,7 +190,7 @@ fn convert_to_opty<'tcx, 'lli>(
         rustc_abi::Abi::Scalar(_) => {
             let scalar_op = OpTy::from(convert_to_immty(miri, ctx)?);
             if let Some(existing) = ctx.destination.get_mut() {
-                miri.copy_op(&scalar_op, existing, true)?;
+                miri.copy_op(&scalar_op, existing)?;
             }
             Ok((scalar_op, ctx.get_destination()))
         }
@@ -340,6 +341,9 @@ fn convert_to_immty<'tcx>(
                                 );
                                 return Ok(imm);
                             }
+                            _ => {
+                                throw_llvm_type_mismatch!(llvm_type, rust_type);
+                            }
                         }
                     },
                 BasicTypeEnum::IntType(_) => {
@@ -353,7 +357,7 @@ fn convert_to_immty<'tcx>(
                                 logger.log_flag(LLVMFlag::CastPointerFromLLVMAtBoundary);
                             }
                             let as_maybe_ptr =
-                                intptrcast::GlobalStateInner::ptr_from_addr_cast(miri, first_word)?;
+                                miri.ptr_from_addr_cast(first_word)?;
 
                             let scalar = match as_maybe_ptr.into_pointer_or_addr() {
                                 Ok(ptr) => Scalar::from_pointer(ptr, miri),
@@ -400,7 +404,7 @@ fn convert_to_immty<'tcx>(
                 }
                 let first_word = truncate_to_pointer_size(value);
                 let as_maybe_ptr =
-                    intptrcast::GlobalStateInner::ptr_from_addr_cast(miri, first_word)?;
+                    miri.ptr_from_addr_cast(first_word)?;
                 match as_maybe_ptr.into_pointer_or_addr() {
                     Ok(ptr) => Scalar::from_pointer(ptr, miri),
                     Err(addr) => Scalar::from_uint(addr.bytes(), miri.tcx.data_layout.pointer_size),

@@ -2,7 +2,6 @@ extern crate rustc_abi;
 use crate::machine::MiriInterpCxExt as _;
 use crate::shims::llvm::logging::LLVMFlag;
 use crate::{
-    intptrcast,
     shims::llvm::{
         helpers::EvalContextExt,
         hooks::access::{Destination, Source},
@@ -17,6 +16,7 @@ use rustc_apfloat::{
 use rustc_const_eval::interpret::{
     alloc_range, AllocId, AllocRange, AllocRef, AllocRefMut, InterpResult, Pointer, Scalar,
 };
+use crate::alloc_addresses::EvalContextExt as _;
 
 #[derive(Debug)]
 pub struct ResolvedPointer {
@@ -36,8 +36,8 @@ impl ResolvedPointer {
         'tcx,
         (AllocRef<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>>, AllocRange),
     > {
-        let (size, align, range) = self.get_access_size_range(ctx, access_size, align)?;
-        let alloc_reference = unsafe { ctx.get_ptr_alloc_range(self.ptr, size, range, align)? };
+        let (size, _align, range) = self.get_access_size_range(ctx, access_size, align)?;
+        let alloc_reference = unsafe { ctx.get_ptr_alloc_range(self.ptr, size, range)? };
         if let Some(ar) = alloc_reference {
             Ok((ar, range))
         } else {
@@ -55,8 +55,8 @@ impl ResolvedPointer {
         'tcx,
         (AllocRefMut<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>>, AllocRange),
     > {
-        let (size, align, range) = self.get_access_size_range(ctx, access_size, align)?;
-        let alloc_reference = unsafe { ctx.get_ptr_alloc_mut_range(self.ptr, size, range, align)? };
+        let (size, _align, range) = self.get_access_size_range(ctx, access_size, align)?;
+        let alloc_reference = unsafe { ctx.get_ptr_alloc_mut_range(self.ptr, size, range)? };
         if let Some(ar) = alloc_reference {
             Ok((ar, range))
         } else {
@@ -249,7 +249,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
         let int_value = if size == ctx.tcx.data_layout.pointer_size {
             let ptr_value = self.read_pointer(ctx, align)?;
             if let Some(crate::Provenance::Concrete { alloc_id, tag }) = ptr_value.provenance {
-                intptrcast::GlobalStateInner::expose_ptr(ctx, alloc_id, tag)?
+               ctx.expose_ptr(alloc_id, tag)?
             }
             u128::from(ptr_value.addr().bytes())
         } else {

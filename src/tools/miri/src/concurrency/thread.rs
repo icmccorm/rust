@@ -5,16 +5,12 @@ use inkwell::execution_engine::ExecutionEngine;
 use inkwell::types::AsTypeRef;
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::{FunctionValue, GenericValue};
-use log::{debug, trace};
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
 use std::num::TryFromIntError;
 use std::sync::atomic::Ordering::Relaxed;
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
-
-use either::Either;
-
 use rustc_const_eval::CTRL_C_RECEIVED;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
@@ -1052,8 +1048,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 .next()
                 .ok_or_else(|| err_ub_format!("callee has fewer arguments than expected"))?;
             this.storage_live(local)?;
-            let callee_arg = this.local_to_place(this.frame_idx(), local)?;
-            this.copy_op(arg, &callee_arg, true)?;
+            let callee_arg = this.local_to_place(local)?;
+            this.copy_op(arg, &callee_arg)?;
             if let Some(place) = mp {
                 link.take_ownership(place.assert_mem_place())
             }
@@ -1290,7 +1286,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                             if let ThreadKind::LLVM(link) =
                                 this.active_thread_mut().thread_kind.take()
                             {
-                                this.terminate_active_thread()?;
+                                this.terminate_active_thread(TlsAllocAction::Deallocate)?;
                                 link.finalize(this)?;
                                 this.terminate_lli_thread(id);
                             } else {

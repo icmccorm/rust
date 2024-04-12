@@ -5,12 +5,9 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::task::Poll;
 use std::thread;
-
-use crate::borrow_tracker::RetagFields;
 use crate::concurrency::thread::TlsAllocAction;
 use crate::diagnostics::report_leaks;
 use crate::shims::llvm_ffi_support::EvalContextExt;
-use log::info;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def::Namespace;
 use rustc_hir::def_id::DefId;
@@ -18,7 +15,7 @@ use rustc_middle::ty::Ty;
 use rustc_middle::ty::{
     self,
     layout::{LayoutCx, LayoutOf},
-    Ty, TyCtxt,
+    TyCtxt
 };
 use rustc_session::config::EntryFnType;
 use rustc_target::spec::abi::Abi;

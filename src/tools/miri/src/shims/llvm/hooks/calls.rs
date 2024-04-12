@@ -1,4 +1,3 @@
-extern crate rustc_abi;
 use super::memory::obtain_ctx_mut;
 use crate::concurrency::thread::EvalContextExt as ThreadEvalContextExt;
 use crate::helpers::EvalContextExt as HelperEvalContextExt;
@@ -19,17 +18,10 @@ use llvm_sys::execution_engine::LLVMGenericValueArrayRef;
 use llvm_sys::miri::MiriInterpCxOpaque;
 use llvm_sys::miri::MiriPointer;
 use llvm_sys::prelude::LLVMTypeRef;
-use log::debug;
 use rand::Rng;
 use rand::SeedableRng;
-use rustc_abi::Align;
-use rustc_const_eval::interpret::FnVal;
-use rustc_const_eval::interpret::InterpResult;
-use rustc_const_eval::interpret::MemoryKind;
-use rustc_const_eval::interpret::PlaceTy;
-use rustc_const_eval::interpret::Scalar;
-use rustc_middle::mir::UnwindAction;
-use rustc_middle::mir::UnwindTerminateReason;
+use rustc_const_eval::interpret::{FnVal, InterpResult, MemoryKind, PlaceTy, Scalar};
+use rustc_middle::mir::{UnwindAction, UnwindTerminateReason};
 use rustc_middle::ty;
 use rustc_middle::ty::layout::HasParamEnv;
 use rustc_middle::ty::layout::LayoutOf;
@@ -349,14 +341,7 @@ fn miri_call_by_name_result<'tcx>(
                         ctx.machine.lli_config.zero_init,
                         MiriMemoryKind::C,
                     )?;
-                    ctx.mem_copy(
-                        src_as_pointer,
-                        Align::ONE,
-                        allocation,
-                        Align::ONE,
-                        Size::from_bytes(src_len),
-                        true,
-                    )?;
+                    ctx.mem_copy(src_as_pointer, allocation, Size::from_bytes(src_len), true)?;
                     let as_miri_ptr = ctx.pointer_to_lli_wrapped_pointer(allocation);
                     unsafe { GenericValue::create_generic_value_of_miri_pointer(as_miri_ptr) }
                 },
@@ -419,7 +404,7 @@ fn miri_call_by_name_result<'tcx>(
                     name_symbol,
                     Abi::C { unwind: false },
                     args_slice,
-                    &rplace,
+                    &rplace.assert_mem_place(),
                     None,
                     UnwindAction::Terminate(UnwindTerminateReason::Abi),
                 )?;
@@ -440,14 +425,14 @@ fn miri_call_by_name_result<'tcx>(
         for place in places_to_deallocate {
             ctx.deallocate_ptr(
                 place.assert_mem_place().ptr(),
-                Some((place.layout.size, place.align)),
+                Some((place.layout.size, place.layout.layout.align().abi)),
                 MemoryKind::Machine(MiriMemoryKind::LLVMInterop),
             )?;
         }
         for place in callback_places {
             ctx.deallocate_ptr(
                 place.assert_mem_place().ptr(),
-                Some((place.layout.size, place.align)),
+                Some((place.layout.size, place.layout.layout.align().abi)),
                 MemoryKind::Machine(MiriMemoryKind::LLVMInterop),
             )?;
         }

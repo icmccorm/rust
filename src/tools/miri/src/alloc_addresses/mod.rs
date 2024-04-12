@@ -100,9 +100,10 @@ fn align_addr(addr: u64, align: u64) -> u64 {
     }
 }
 
-impl<'mir, 'tcx: 'mir> EvalContextExtPriv<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
-    // Returns the exposed `AllocId` that corresponds to the specified addr,
+impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
+pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
+
+        // Returns the exposed `AllocId` that corresponds to the specified addr,
     // or `None` if the addr is out of bounds
     fn alloc_id_from_addr(&self, addr: u64) -> Option<AllocId> {
         let ecx = self.eval_context_ref();
@@ -220,10 +221,7 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             }
         })
     }
-}
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn expose_ptr(&mut self, alloc_id: AllocId, tag: BorTag) -> InterpResult<'tcx> {
         let ecx = self.eval_context_mut();
         let global_state = ecx.machine.alloc_addresses.get_mut();

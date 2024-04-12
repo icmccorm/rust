@@ -3,7 +3,7 @@ use crate::helpers::EvalContextExt;
 use crate::shims::llvm::helpers::EvalContextExt as HelperEvalExt;
 use crate::MiriInterpCx;
 use inkwell::values::GenericValue;
-use rustc_abi::{Align, Size};
+use rustc_abi::Size;
 use rustc_const_eval::interpret::InterpResult;
 use rustc_const_eval::interpret::OpTy;
 
@@ -66,9 +66,7 @@ pub fn eval_memcpy<'tcx>(
         }
         ctx.mem_copy(
             src_as_pointer,
-            Align::ONE,
             dest_as_pointer,
-            Align::ONE,
             Size::from_bytes(length_value),
             nonoverlapping,
         )?;

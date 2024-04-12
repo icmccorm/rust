@@ -1,7 +1,6 @@
 use crate::eval::LLVMLoggingLevel;
 use core::cell::UnsafeCell;
 use inkwell::support::LLVMString;
-use log::debug;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::ty::Ty;
 use rustc_target::abi::TyAndLayout;
@@ -25,8 +24,6 @@ pub enum LLVMFlag {
     LLVMEngaged,
     LLVMIntToPtr,
     LLVMPtrToInt,
-    FromAddrCastRust,
-    FromAddrCastLLVM,
     LLVMOnResolve,
     LLVMMultithreading,
     SizeBasedTypeInference,
@@ -46,8 +43,6 @@ impl std::fmt::Display for LLVMFlag {
             LLVMFlag::LLVMEngaged => "LLVMEngaged",
             LLVMFlag::LLVMIntToPtr => "LLVMIntToPtr",
             LLVMFlag::LLVMPtrToInt => "LLVMPtrToInt",
-            LLVMFlag::FromAddrCastRust => "FromAddrCastRust",
-            LLVMFlag::FromAddrCastLLVM => "FromAddrCastLLVM",
             LLVMFlag::LLVMOnResolve => "LLVMOnResolve",
             LLVMFlag::LLVMMultithreading => "LLVMMultithreading",
             LLVMFlag::SizeBasedTypeInference => "SizeBasedTypeInference",

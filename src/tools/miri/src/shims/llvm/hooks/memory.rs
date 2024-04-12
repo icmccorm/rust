@@ -2,7 +2,6 @@ use crate::shims::foreign_items::EvalContextExt as ForeignEvalContextExt;
 use crate::shims::llvm::helpers::EvalContextExt;
 use crate::{MiriInterpCx, MiriMemoryKind};
 use inkwell::execution_engine::{MiriInterpCxOpaque, MiriPointer};
-use log::debug;
 use rustc_const_eval::interpret::InterpResult;
 use rustc_span::Symbol;
 use rustc_target::abi::Align;

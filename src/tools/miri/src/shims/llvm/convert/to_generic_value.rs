@@ -9,14 +9,13 @@ use either::Either::{Left, Right};
 use inkwell::values::FunctionValue;
 use inkwell::values::GenericValueRef;
 use inkwell::{types::BasicTypeEnum, values::GenericValue};
-use log::debug;
-use rustc_abi::{Size, VariantIdx};
+use rustc_abi::Size;
 use rustc_apfloat::Float;
 use rustc_const_eval::interpret::{alloc_range, InterpResult, OpTy, Scalar};
 use rustc_middle::ty::GenericArgsRef;
 use rustc_middle::ty::{self, AdtDef};
 use rustc_target::abi::call::HomogeneousAggregate;
-use rustc_target::abi::FieldsShape;
+use rustc_target::abi::{VariantIdx, FieldsShape};
 use std::iter::repeat;
 
 macro_rules! throw_llvm_argument_mismatch {
@@ -256,7 +255,7 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
                             let mp = arg.opty().assert_mem_place();
                             let ptr = mp.ptr();
                             let alloc =
-                                ctx.get_ptr_alloc(ptr, value.size(ctx), value.align(ctx).abi)?;
+                                ctx.get_ptr_alloc(ptr, value.size(ctx))?;
                             if let Some(a) = alloc {
                                 a.read_scalar(alloc_range(Size::ZERO, value.size(ctx)), true)?
                             } else {
@@ -408,6 +407,9 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
                         wrapped_pointer.prov.alloc_id, wrapped_pointer.addr
                     );
                     dest.set_miri_pointer_value(wrapped_pointer);
+                }
+                _ => {
+                    throw_unsup_var_arg!(arg.layout());
                 }
             }
         } else {

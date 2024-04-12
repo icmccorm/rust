@@ -1,16 +1,9 @@
 use super::memory::obtain_ctx_mut;
-use crate::machine::MiriInterpCxExt;
-use crate::rustc_const_eval::interpret::AllocMap;
 use crate::shims::llvm::logging::LLVMFlag;
-use crate::InterpResult;
-use crate::MiriInterpCx;
-use crate::Pointer;
 use crate::Provenance::*;
 use crate::*;
-use crate::{intptrcast, shims::llvm::helpers::EvalContextExt, BorTag};
+use crate::shims::llvm::helpers::EvalContextExt as _;
 use llvm_sys::miri::{MiriInterpCxOpaque, MiriPointer, MiriProvenance};
-use log::debug;
-use rustc_const_eval::interpret::AllocId;
 use rustc_target::abi::Size;
 use std::num::NonZeroU64;
 
@@ -21,7 +14,7 @@ pub extern "C-unwind" fn miri_ptrtoint(ctx_raw: *mut MiriInterpCxOpaque, mp: Mir
     } else {
         let alloc_id = AllocId(NonZeroU64::new(mp.prov.alloc_id).unwrap());
         let borrow_tag = BorTag::new(mp.prov.tag).unwrap();
-        if let Err(e) = intptrcast::GlobalStateInner::expose_ptr(ctx, alloc_id, borrow_tag) {
+        if let Err(e) = ctx.expose_ptr(alloc_id, borrow_tag) {
             debug!("Invalid pointer to int conversion occurred.");
             ctx.set_foreign_error(e);
             0
@@ -38,7 +31,7 @@ pub extern "C-unwind" fn miri_ptrtoint(ctx_raw: *mut MiriInterpCxOpaque, mp: Mir
 pub extern "C-unwind" fn miri_inttoptr(ctx_raw: *mut MiriInterpCxOpaque, addr: u64) -> MiriPointer {
     let ctx = obtain_ctx_mut(ctx_raw);
 
-    let as_ptr = intptrcast::GlobalStateInner::ptr_from_addr_cast(ctx, addr);
+    let as_ptr = ctx.ptr_from_addr_cast(addr);
 
     let as_miri_ptr = match as_ptr {
         Ok(p) => ctx.pointer_to_lli_wrapped_pointer(p),
@@ -79,7 +72,7 @@ fn miri_get_element_pointer_result<'tcx>(
     let (ptr_offset, _) = base_ptr.overflowing_offset(offset, this);
 
     let source_alloc_id = base_ptr.provenance.map_or(
-        intptrcast::GlobalStateInner::alloc_id_from_addr(this, base_ptr.addr().bytes()),
+        this.alloc_id_from_addr(base_ptr.addr().bytes()),
         |p| p.get_alloc_id(),
     );
     let source_allocation =
@@ -87,19 +80,19 @@ fn miri_get_element_pointer_result<'tcx>(
     let source_allocation_kind = source_allocation.map(|s| s.0);
 
     let dest_alloc_id =
-        intptrcast::GlobalStateInner::alloc_id_from_addr(this, ptr_offset.addr().bytes());
+        this.alloc_id_from_addr(ptr_offset.addr().bytes());
     let dest_allocation =
         dest_alloc_id.map(|alloc_id| this.memory.alloc_map().get(alloc_id)).flatten();
     let dest_allocation_kind = dest_allocation.map(|d| d.0);
 
     if let Some(Concrete { alloc_id, tag }) = base_ptr.provenance {
         let (size, _, _) = this.get_alloc_info(alloc_id);
-        let base_address = intptrcast::GlobalStateInner::alloc_base_addr(this, alloc_id)?;
+        let base_address = this.addr_from_alloc_id(alloc_id)?;
         let addr_upper_bound = base_address.checked_add(size.bytes());
         if source_allocation.is_some() {
             if let Some(addr_upper_bound) = addr_upper_bound {
                 if ptr_offset.addr().bytes() >= addr_upper_bound {
-                    intptrcast::GlobalStateInner::expose_ptr(this, alloc_id, tag)?;
+                    this.expose_ptr(alloc_id, tag)?;
                     return Ok(Pointer::new(Some(Wildcard), ptr_offset.addr()));
                 }
             }

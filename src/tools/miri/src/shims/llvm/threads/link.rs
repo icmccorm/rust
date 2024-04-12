@@ -8,7 +8,6 @@ use inkwell::types::BasicTypeEnum;
 use inkwell::values::GenericValue;
 use inkwell::values::GenericValueRef;
 use llvm_sys::prelude::LLVMTypeRef;
-use log::debug;
 use rustc_const_eval::interpret::InterpResult;
 use rustc_const_eval::interpret::MPlaceTy;
 use rustc_const_eval::interpret::MemoryKind;
@@ -88,7 +87,7 @@ impl<'tcx> ThreadLink<'tcx> {
                         });
                         ctx.deallocate_ptr(
                             place_src.ptr(),
-                            Some((place_src.layout.size, place_src.align)),
+                            Some((place_src.layout.size, place_src.layout.layout.align().abi)),
                             MemoryKind::Machine(crate::MiriMemoryKind::LLVMInterop),
                         )?;
                     }
@@ -103,11 +102,11 @@ impl<'tcx> ThreadLink<'tcx> {
                 let result_op = ctx.place_to_op(&mirrored_place)?;
                 debug!("[ThreadLink] Copying mirrored Miri place into local.");
 
-                ctx.copy_op(&result_op, &local, true)?;
+                ctx.copy_op(&result_op, &local)?;
 
                 ctx.deallocate_ptr(
                     mirror.ptr(),
-                    Some((mirror.layout.size, mirror.align)),
+                    Some((mirror.layout.size, mirror.layout.layout.align().abi)),
                     MemoryKind::Machine(crate::MiriMemoryKind::LLVMInterop),
                 )?;
                 ctx.set_active_thread(prev);
@@ -134,7 +133,7 @@ impl<'tcx> ThreadLink<'tcx> {
         self.lli_allocations.drain(0..).try_for_each(|mp| {
             ctx.deallocate_ptr(
                 mp.ptr(),
-                Some((mp.layout.size, mp.align)),
+                Some((mp.layout.size, mp.layout.layout.align().abi)),
                 MemoryKind::Machine(crate::MiriMemoryKind::LLVMInterop),
             )
         })?;

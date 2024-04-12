@@ -1,7 +1,7 @@
 use super::access::memory_access_core;
 use super::memory::obtain_ctx_mut;
 use crate::shims::llvm::helpers::EvalContextExt;
-use crate::shims::rustc_target::abi::{Align, Size};
+use rustc_target::abi::{Align, Size};
 use crate::MiriInterpCx;
 use inkwell::{types::BasicTypeEnum, values::GenericValueRef};
 use llvm_sys::{
