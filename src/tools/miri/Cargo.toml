@@ -18,8 +18,8 @@ test = false # we have no unit tests
 doctest = false # and no doc tests
 
 [dependencies]
-inkwell = { path = "../../mirilli-inkwell", features=["llvm18-0"] }
-llvm-sys = { path = "../../mirilli-llvm-sys", version = "181.0.0" }
+inkwell = { path = "../../inkwell", features=["llvm18-0"] }
+llvm-sys = { path = "../../llvm-sys", version = "181.0.0" }
 ouroboros = "0.15.6"
 getrandom = { version = "0.2", features = ["std"] }
 rand = "0.8"
