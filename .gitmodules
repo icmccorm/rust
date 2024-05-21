@@ -43,9 +43,9 @@
 	path = library/backtrace
 	url = https://github.com/rust-lang/backtrace-rs.git
 	shallow = true
-[submodule "src/mirilli-inkwell"]
-	path = src/mirilli-inkwell
-	url = https://github.com/icmccorm/mirilli-inkwell.git
-[submodule "src/mirilli-llvm-sys"]
-	path = src/mirilli-llvm-sys
-	url = https://github.com/icmccorm/mirilli-llvm-sys.git
+[submodule "src/inkwell"]
+	path = src/inkwell
+	url = https://github.com/icmccorm/inkwell.git
+[submodule "src/llvm-sys"]
+	path = src/llvm-sys
+	url = https://github.com/icmccorm/llvm-sys.git
