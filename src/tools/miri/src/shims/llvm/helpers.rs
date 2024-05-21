@@ -470,7 +470,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
     fn should_check_alignment_in_llvm(&self, alloc_id: Option<AllocId>) -> bool {
         let this = self.eval_context_ref();
-        match this.machine.lli_config.alignment_check {
+        match this.machine.lli_config.alignment_check_mode {
             ForeignAlignmentCheckMode::Skip => false,
             ForeignAlignmentCheckMode::Check => true,
             ForeignAlignmentCheckMode::CheckRustOnly =>

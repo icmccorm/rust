@@ -95,11 +95,24 @@ impl Default for ForeignAlignmentCheckMode {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ForeignMemoryMode {
+    Unchanged,
+    Zeroed,
+    Uninit
+}
+
+impl Default for ForeignMemoryMode {
+    fn default() -> Self {
+        ForeignMemoryMode::Uninit
+    }
+}
+
+
 #[derive(Clone, Default)]
 pub struct LLIConfig {
-    pub alignment_check: ForeignAlignmentCheckMode,
-    pub zero_init: bool,
-    pub read_uninit: bool,
+    pub alignment_check_mode: ForeignAlignmentCheckMode,
+    pub memory_mode: ForeignMemoryMode,
 }
 
 /// Configuration needed to spawn a Miri instance.

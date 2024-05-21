@@ -14,6 +14,8 @@ use shims::unix::freebsd::foreign_items as freebsd;
 use shims::unix::linux::foreign_items as linux;
 use shims::unix::macos::foreign_items as macos;
 
+use crate::shims::llvm::helpers::EvalContextExt as _;
+
 fn is_dyn_sym(name: &str, target_os: &str) -> bool {
     match name {
         // Used for tests.
@@ -260,7 +262,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                             Align::from_bytes(align).unwrap(),
                             MiriMemoryKind::C.into(),
                         )?;
-                        if this.machine.lli_config.zero_init {
+                        if matches!(this.machine.lli_config.memory_mode, ForeignMemoryMode::Zeroed) {
                             this.write_bytes_ptr(
                                 ptr.into(),
                                 std::iter::repeat(0).take(usize::try_from(size).unwrap()),
@@ -360,6 +362,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
             // Thread-local storage
             "pthread_key_create" => {
+                if this.in_llvm()? {
+                    this.handle_unsupported(format!(
+                        "can't call foreign function `{link_name}` on OS `{os}`",
+                        os = this.tcx.sess.target.os,
+                    ))?;
+                }   
                 let [key, dtor] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let key_place = this.deref_pointer_as(key, this.libc_ty_layout("pthread_key_t"))?;
                 let dtor = this.read_pointer(dtor)?;
@@ -525,13 +533,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             }
             // Threading
             "pthread_create" => {
-                let [thread, attr, start, arg] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                if this.active_thread_stack().is_empty() {
+                if this.in_llvm()? {
                     this.handle_unsupported(format!(
                         "can't call foreign function `{link_name}` on OS `{os}`",
                         os = this.tcx.sess.target.os,
                     ))?;
                 }
+                let [thread, attr, start, arg] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let result = this.pthread_create(thread, attr, start, arg)?;
                 this.write_scalar(Scalar::from_i32(result), dest)?;
             }

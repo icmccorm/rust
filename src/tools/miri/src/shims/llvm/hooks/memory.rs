@@ -1,3 +1,4 @@
+use crate::eval::ForeignMemoryMode;
 use crate::shims::foreign_items::EvalContextExt as ForeignEvalContextExt;
 use crate::shims::llvm::helpers::EvalContextExt;
 use crate::{MiriInterpCx, MiriMemoryKind};
@@ -26,7 +27,7 @@ pub extern "C-unwind" fn llvm_malloc(
     let (kind, zero) = if is_static {
         (MiriMemoryKind::LLVMStatic, is_static)
     } else {
-        (MiriMemoryKind::LLVMStack, ctx.machine.lli_config.zero_init)
+        (MiriMemoryKind::LLVMStack, matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Zeroed))
     };
     let allocation = ctx.malloc_align(bytes, Align::from_bytes(alignment).unwrap(), zero, kind);
     if let Ok(ptr) = allocation {

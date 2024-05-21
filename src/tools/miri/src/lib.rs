@@ -121,8 +121,8 @@ pub use crate::diagnostics::{
     report_error, EvalContextExt as _, NonHaltingDiagnostic, TerminationInfo,
 };
 pub use crate::eval::{
-    create_ecx, eval_entry, AlignmentCheck, BacktraceStyle, ForeignAlignmentCheckMode, IsolatedOp,
-    LLVMLoggingLevel, MiriConfig, RejectOpWith,
+    create_ecx, eval_entry, AlignmentCheck, BacktraceStyle, ForeignAlignmentCheckMode,
+    ForeignMemoryMode, IsolatedOp, LLVMLoggingLevel, MiriConfig, RejectOpWith,
 };
 pub use crate::helpers::{AccessKind, EvalContextExt as _};
 pub use crate::machine::{

@@ -22,10 +22,10 @@ extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
 use std::env::{self, VarError};
+use std::fs;
 use std::num::NonZero;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::fs;
 
 use walkdir::WalkDir;
 
@@ -45,7 +45,10 @@ use rustc_session::config::{CrateType, ErrorOutputType, OptLevel};
 use rustc_session::search_paths::PathKind;
 use rustc_session::{CtfeBacktrace, EarlyDiagCtxt};
 
-use miri::{BacktraceStyle, BorrowTrackerMethod, ProvenanceMode, RetagFields};
+use miri::{
+    BacktraceStyle, BorrowTrackerMethod, ForeignAlignmentCheckMode, ForeignMemoryMode,
+    ProvenanceMode, RetagFields,
+};
 
 struct MiriCompilerCalls {
     miri_config: miri::MiriConfig,
@@ -613,6 +616,14 @@ fn main() {
                 "full" => BacktraceStyle::Full,
                 _ => show_error!("-Zmiri-backtrace may only be 0, 1, or full"),
             };
+        } else if arg == "-Zmiri-llvm-enable-alignment-check-all" {
+            miri_config.lli_config.alignment_check_mode = ForeignAlignmentCheckMode::Check
+        } else if arg == "-Zmiri-llvm-enable-alignment-check-rust" {
+            miri_config.lli_config.alignment_check_mode = ForeignAlignmentCheckMode::CheckRustOnly
+        } else if arg == "-Zmiri-llvm-memory-zeroed" {
+            miri_config.lli_config.memory_mode = ForeignMemoryMode::Zeroed;
+        } else if arg == "-Zmiri-llvm-memory-unchanged" {
+            miri_config.lli_config.memory_mode = ForeignMemoryMode::Unchanged;
         } else if arg == "-Zmiri-disable-bc" {
             miri_config.disable_bc = true
         } else if let Some(param) = arg.strip_prefix("-Zmiri-extern-bc-file=") {

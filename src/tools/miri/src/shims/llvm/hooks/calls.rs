@@ -1,5 +1,6 @@
 use super::memory::obtain_ctx_mut;
 use crate::concurrency::thread::EvalContextExt as ThreadEvalContextExt;
+use crate::eval::ForeignMemoryMode;
 use crate::helpers::EvalContextExt as HelperEvalContextExt;
 use crate::shims::foreign_items::EvalContextExt as ForeignEvalContextExt;
 use crate::shims::llvm::convert::to_bytes::EvalContextExt as ToBytesEvalContextExt;
@@ -156,7 +157,7 @@ fn miri_call_by_name_result<'tcx>(
                     let size_value = size_as_scalar.to_u64()?;
                     let allocation = ctx.malloc(
                         size_value,
-                        ctx.machine.lli_config.zero_init,
+                        matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Zeroed),
                         MiriMemoryKind::C,
                     )?;
                     let as_miri_ptr = ctx.pointer_to_lli_wrapped_pointer(allocation);
@@ -203,7 +204,7 @@ fn miri_call_by_name_result<'tcx>(
                     let num_as_scalar = ctx.opty_as_scalar(&op_ty_args[1])?;
                     let num_value = num_as_scalar.to_u64()?;
                     let allocation = ctx.realloc(as_pointer, num_value, MiriMemoryKind::C)?;
-                    if ctx.machine.lli_config.zero_init {
+                    if matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Zeroed) {
                         ctx.write_bytes_ptr(
                             allocation,
                             std::iter::repeat(0).take(usize::try_from(num_value).unwrap()),
@@ -338,7 +339,7 @@ fn miri_call_by_name_result<'tcx>(
                     let src_len = ctx.read_c_str(src_as_pointer)?.len() + 1;
                     let allocation = ctx.malloc(
                         src_len.try_into().unwrap(),
-                        ctx.machine.lli_config.zero_init,
+                        matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Zeroed),
                         MiriMemoryKind::C,
                     )?;
                     ctx.mem_copy(src_as_pointer, allocation, Size::from_bytes(src_len), true)?;

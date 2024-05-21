@@ -16,6 +16,7 @@ use rustc_apfloat::{
 use rustc_const_eval::interpret::{
     alloc_range, AllocId, AllocRange, AllocRef, AllocRefMut, InterpResult, Pointer, Scalar,
 };
+use crate::eval::ForeignMemoryMode;
 use crate::alloc_addresses::EvalContextExt as _;
 
 #[derive(Debug)]
@@ -200,7 +201,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
     ) -> InterpResult<'tcx, f32> {
         let size = Size::from_bytes(std::mem::size_of::<f32>());
         let (alloc, range) = self.access_alloc(ctx, size, align)?;
-        let float_value = if ctx.machine.lli_config.read_uninit {
+        let float_value = if matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Uninit) {
             if alloc.is_uninit(range) {
                 if let Some(logger) = &ctx.machine.llvm_logger {
                     logger.log_flag(LLVMFlag::LLVMReadUninit);
@@ -223,7 +224,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
     ) -> InterpResult<'tcx, f64> {
         let size = Size::from_bytes(std::mem::size_of::<f64>());
         let (alloc, range) = self.access_alloc(ctx, size, align)?;
-        let double_value = if ctx.machine.lli_config.read_uninit {
+        let double_value = if matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Uninit) {
             if alloc.is_uninit(range) {
                 if let Some(logger) = &ctx.machine.llvm_logger {
                     logger.log_flag(LLVMFlag::LLVMReadUninit);
@@ -253,7 +254,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
             }
             u128::from(ptr_value.addr().bytes())
         } else {
-            let scalar_value = if ctx.machine.lli_config.read_uninit {
+            let scalar_value = if matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Uninit) {
                 if alloc.is_uninit(range) {
                     if let Some(logger) = &ctx.machine.llvm_logger {
                         logger.log_flag(LLVMFlag::LLVMReadUninit);
@@ -274,7 +275,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
         align: Align,
     ) -> InterpResult<'tcx, Pointer<Option<crate::Provenance>>> {
         let (alloc, range) = self.access_alloc(ctx, ctx.tcx.data_layout.pointer_size, align)?;
-        let pointer_val = if ctx.machine.lli_config.read_uninit {
+        let pointer_val = if matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Uninit) {
             if alloc.is_uninit(range) {
                 if let Some(logger) = &ctx.machine.llvm_logger {
                     logger.log_flag(LLVMFlag::LLVMReadUninit);
