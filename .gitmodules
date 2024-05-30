@@ -32,7 +32,7 @@
 	shallow = true
 [submodule "src/llvm-project"]
 	path = src/llvm-project
-	url = https://github.com/icmccorm/mirilli-llvm-project.git
+	url = https://github.com/icmccorm/llvm-project.git
 	branch = mirilli
 	shallow = true
 [submodule "src/doc/embedded-book"]
