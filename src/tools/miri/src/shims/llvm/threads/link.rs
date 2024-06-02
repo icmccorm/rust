@@ -97,7 +97,6 @@ impl<'tcx> ThreadLink<'tcx> {
                 },
             ThreadLinkDestination::ToMiriMirroredLocal(mirror, local) => {
                 let prev = ctx.set_active_thread(self.linked_id);
-
                 let mirrored_place = PlaceTy::from(mirror.clone());
                 let result_op = ctx.place_to_op(&mirrored_place)?;
                 debug!("[ThreadLink] Copying mirrored Miri place into local.");

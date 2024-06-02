@@ -12,10 +12,9 @@ use inkwell::{types::BasicTypeEnum, values::GenericValue};
 use rustc_abi::Size;
 use rustc_apfloat::Float;
 use rustc_const_eval::interpret::{alloc_range, InterpResult, OpTy, Scalar};
-use rustc_middle::ty::GenericArgsRef;
-use rustc_middle::ty::{self, AdtDef};
+use rustc_middle::ty::{self};
 use rustc_target::abi::call::HomogeneousAggregate;
-use rustc_target::abi::{VariantIdx, FieldsShape};
+use rustc_target::abi::FieldsShape;
 use std::iter::repeat;
 
 macro_rules! throw_llvm_argument_mismatch {
@@ -289,7 +288,7 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
                     if let Some(logger) = &ctx.machine.llvm_logger {
                         logger.log_flag(LLVMFlag::ADTAsPointerFromRust);
                     }
-                    if let Some(vidx) = is_enum_of_nonnullable_ptr(ctx, *adef, sr) {
+                    if let Some(vidx) = ctx.is_enum_of_nonnullable_ptr(*adef, sr) {
                         if let Some(logger) = &ctx.machine.llvm_logger {
                             logger.log_flag(LLVMFlag::EnumOfNonNullablePointer);
                         }
@@ -417,27 +416,6 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
         }
     }
     Ok(())
-}
-
-fn is_enum_of_nonnullable_ptr<'tcx>(
-    ctx: &MiriInterpCx<'_, 'tcx>,
-    adt_def: AdtDef<'tcx>,
-    substs: GenericArgsRef<'tcx>,
-) -> Option<VariantIdx> {
-    if adt_def.repr().inhibit_enum_layout_opt() {
-        return None;
-    }
-    let [var_one, var_two] = &adt_def.variants().raw[..] else {
-        return None;
-    };
-    let (([], [field]) | ([field], [])) = (&var_one.fields.raw[..], &var_two.fields.raw[..]) else {
-        return None;
-    };
-    matches!(field.ty(*ctx.tcx, substs).kind(), ty::FnPtr(..) | ty::Ref(..));
-    let vidx: u32 =
-        if let ([], [_field]) = (&var_one.fields.raw[..], &var_two.fields.raw[..]) { 1 } else { 0 };
-
-    Some(VariantIdx::from_u32(vidx))
 }
 
 fn convert_opty_to_aggregate<'lli, 'tcx>(

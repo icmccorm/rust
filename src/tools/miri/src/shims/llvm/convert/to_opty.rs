@@ -1,6 +1,7 @@
 extern crate itertools;
 extern crate rustc_abi;
 use super::field_bytes::FieldBytes;
+use crate::alloc_addresses::EvalContextExt as _;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalExt;
 use crate::shims::llvm::logging::LLVMFlag;
 use crate::{MiriInterpCx, Provenance};
@@ -19,10 +20,9 @@ use rustc_middle::{
     ty::{self, layout::TyAndLayout, AdtKind},
 };
 use rustc_target::abi::FIRST_VARIANT;
+use rustc_target::abi::{FieldIdx, VariantIdx};
 use std::cell::Cell;
 use std::fmt::Formatter;
-use rustc_target::abi::{VariantIdx,FieldIdx};
-use crate::alloc_addresses::EvalContextExt as _;
 
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
 
@@ -92,6 +92,34 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
         context
     }
 
+    fn resolve_fields(
+        &self,
+        miri: &mut MiriInterpCx<'_, 'tcx>,
+        destination: PlaceTy<'tcx, Provenance>,
+    ) -> InterpResult<'tcx, Vec<(PlaceTy<'tcx, Provenance>, Size)>> {
+        let (variant_dest, active_field_index) = if let Some(agk) = self.get_aggregate_kind(miri)? {
+            let (variant_index, active_field_index) = match agk {
+                mir::AggregateKind::Adt(_, variant_index, _, _, active_field_index) =>
+                    (variant_index, active_field_index),
+                _ => (FIRST_VARIANT, None),
+            };
+            let variant_dest = miri.project_downcast(&destination, variant_index)?;
+            miri.write_discriminant(variant_index, &variant_dest)?;
+            (variant_dest, active_field_index)
+        } else {
+            (destination.clone(), None)
+        };
+        Ok(self.rust_layout
+            .fields
+            .index_by_increasing_offset()
+            .map(|idx| {
+                let idx = if let Some(afidx) = active_field_index { afidx.as_usize() } else { idx };
+                let padded_size = miri.resolve_padded_size(&self.rust_layout, idx);
+                miri.project_field(&variant_dest, idx).map(|pt| (pt, padded_size))
+            })
+            .collect::<InterpResult<'tcx, Vec<_>>>()?)
+    }
+
     fn new_from_field(
         source: OpTySource<'lli>,
         destination: PlaceTy<'tcx, Provenance>,
@@ -148,6 +176,7 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
             Ok(0)
         }
     }
+
     fn get_aggregate_kind(
         &self,
         miri: &MiriInterpCx<'_, 'tcx>,
@@ -198,78 +227,79 @@ fn convert_to_opty<'tcx, 'lli>(
         | rustc_abi::Abi::Aggregate { sized: true }
         | rustc_abi::Abi::Vector { .. } => {
             let destination = ctx.get_or_create_destination(miri)?;
-
-            let (variant_dest, active_field_index) =
-                if let Some(agk) = ctx.get_aggregate_kind(miri)? {
-                    let (variant_index, active_field_index) = match agk {
-                        mir::AggregateKind::Adt(_, variant_index, _, _, active_field_index) =>
-                            (variant_index, active_field_index),
-                        _ => (FIRST_VARIANT, None),
-                    };
-                    let variant_dest = miri.project_downcast(&destination, variant_index)?;
-                    miri.write_discriminant(variant_index, &variant_dest)?;
-                    (variant_dest, active_field_index)
-                } else {
-                    (destination.clone(), None)
-                };
-
-            let mut rust_fields = ctx
-                .rust_layout
-                .fields
-                .index_by_increasing_offset()
-                .map(|idx| {
-                    let idx =
-                        if let Some(afidx) = active_field_index { afidx.as_usize() } else { idx };
-                    let padded_size = miri.resolve_padded_size(&ctx.rust_layout, idx);
-                    miri.project_field(&variant_dest, idx).map(|pt| (pt, padded_size))
-                })
-                .collect::<InterpResult<'tcx, Vec<_>>>()?;
-
             match &ctx.source {
                 OpTySource::Generic(generic) => {
-                    let mut llvm_fields = generic.assert_fields();
-                    let rust_field_count = ctx.rust_layout.fields.count();
-                    if rust_field_count == llvm_fields.len() {
-                        for (llvm_field, (rust_field, padded_size)) in
-                            llvm_fields.drain(0..).zip_eq(rust_fields)
-                        {
+                    let llvm_type = generic.assert_type_tag();
+                    let rust_type = ctx.rust_layout.ty;
+                    match llvm_type {
+                        BasicTypeEnum::PointerType(_) => {
+                            if let ty::Adt(adt_def, sr) = rust_type.kind() {
+                                if let Some(vidx) = miri.is_enum_of_nonnullable_ptr(*adt_def, sr) {
+                                    let variant_dest = miri.project_downcast(&destination, vidx)?;
+                                    let field = miri.project_field(&variant_dest, 0)?;
+                                    let mut new_context = ConversionContext::new_from_field(
+                                        ctx.source.clone(),
+                                        field,
+                                        ctx.padded_size,
+                                    );
+                                    convert_to_opty(miri, &mut new_context)?;
+                                }else{
+                                    throw_llvm_type_mismatch!(llvm_type, rust_type);
+                                }
+                            }else{
+                                throw_llvm_type_mismatch!(llvm_type, rust_type);
+                            }
+                        }
+                        BasicTypeEnum::IntType(_) => {
+                            let field_bytes = generic.as_int().to_ne_bytes();
+                            let field_width: usize =
+                                ctx.rust_layout.size.bytes().try_into().unwrap();
+                            let field_bytes = FieldBytes::new(field_bytes, field_width);
                             let mut new_context = ConversionContext::new_from_field(
-                                OpTySource::Generic(llvm_field),
-                                rust_field,
-                                padded_size,
+                                OpTySource::Bytes(field_bytes),
+                                destination.clone(),
+                                ctx.padded_size,
                             );
                             convert_to_opty(miri, &mut new_context)?;
                         }
-                    } else if miri.can_dereference_into_singular_field(&ctx.rust_layout)
-                        && llvm_fields.len() != rust_field_count
-                    {
-                        let mut field = miri.project_field(&destination, 0)?;
-                        while miri.can_dereference_into_singular_field(&field.layout) {
-                            field = miri.project_field(&field, 0)?;
+                        _ => {
+                            let mut llvm_fields = generic.assert_fields();
+                            let rust_field_count = ctx.rust_layout.fields.count();
+                            if rust_field_count == llvm_fields.len() {
+                                let rust_fields = ctx.resolve_fields(miri, destination.clone())?;
+                                for (llvm_field, (rust_field, padded_size)) in
+                                    llvm_fields.drain(0..).zip_eq(rust_fields)
+                                {
+                                    let mut new_context = ConversionContext::new_from_field(
+                                        OpTySource::Generic(llvm_field),
+                                        rust_field,
+                                        padded_size,
+                                    );
+                                    convert_to_opty(miri, &mut new_context)?;
+                                }
+                            } else if miri.can_dereference_into_singular_field(&ctx.rust_layout)
+                                && llvm_fields.len() != rust_field_count
+                            {
+                                let mut field = miri.project_field(&destination, 0)?;
+                                while miri.can_dereference_into_singular_field(&field.layout) {
+                                    field = miri.project_field(&field, 0)?;
+                                }
+                                let mut new_context = ConversionContext::new_from_field(
+                                    ctx.source.clone(),
+                                    field,
+                                    ctx.padded_size,
+                                );
+                                convert_to_opty(miri, &mut new_context)?;
+                            }else{
+                                throw_llvm_field_count_mismatch!(llvm_fields.len(), ctx.rust_layout);
+                            }
                         }
-                        let mut new_context = ConversionContext::new_from_field(
-                            ctx.source.clone(),
-                            field,
-                            ctx.padded_size,
-                        );
-                        convert_to_opty(miri, &mut new_context)?;
-                    } else if matches!(generic.get_type_tag(), Some(BasicTypeEnum::IntType(_)))
-                        && ctx.rust_layout.fields.count() > 0
-                    {
-                        let field_bytes = generic.as_int().to_ne_bytes();
-                        let field_width: usize = ctx.rust_layout.size.bytes().try_into().unwrap();
-                        let field_bytes = FieldBytes::new(field_bytes, field_width);
-                        let mut new_context = ConversionContext::new_from_field(
-                            OpTySource::Bytes(field_bytes),
-                            destination.clone(),
-                            ctx.padded_size,
-                        );
-                        convert_to_opty(miri, &mut new_context)?;
-                    } else {
-                        throw_llvm_field_count_mismatch!(llvm_fields.len(), ctx.rust_layout);
                     }
-                }
+                    let operand = miri.place_to_op(&destination)?;
+                    return Ok((operand, Some(destination)));
+                 }
                 OpTySource::Bytes(fieldbytes) => {
+                    let mut rust_fields = ctx.resolve_fields(miri, destination.clone())?;
                     if u64::try_from(fieldbytes.len()).unwrap() != ctx.rust_layout.size.bytes() {
                         throw_llvm_field_width_mismatch!(fieldbytes.len(), ctx.rust_layout);
                     } else {
@@ -282,11 +312,11 @@ fn convert_to_opty<'tcx, 'lli>(
                             );
                             convert_to_opty(miri, &mut new_context)?;
                         }
+                        let operand = miri.place_to_op(&destination)?;
+                        return Ok((operand, Some(destination)));
                     }
                 }
             }
-            let operand = miri.place_to_op(&destination)?;
-            Ok((operand, Some(destination)))
         }
         rustc_abi::Abi::Uninhabited => throw_unsup_abi!("Uninhabited"),
         rustc_abi::Abi::Aggregate { sized: false } => throw_unsup_abi!("unsized Aggregate"),
@@ -356,8 +386,7 @@ fn convert_to_immty<'tcx>(
                             if let Some(logger) = &miri.machine.llvm_logger {
                                 logger.log_flag(LLVMFlag::CastPointerFromLLVMAtBoundary);
                             }
-                            let as_maybe_ptr =
-                                miri.ptr_from_addr_cast(first_word)?;
+                            let as_maybe_ptr = miri.ptr_from_addr_cast(first_word)?;
 
                             let scalar = match as_maybe_ptr.into_pointer_or_addr() {
                                 Ok(ptr) => Scalar::from_pointer(ptr, miri),
@@ -403,8 +432,7 @@ fn convert_to_immty<'tcx>(
                     logger.log_flag(LLVMFlag::CastPointerFromLLVMAtBoundary);
                 }
                 let first_word = truncate_to_pointer_size(value);
-                let as_maybe_ptr =
-                    miri.ptr_from_addr_cast(first_word)?;
+                let as_maybe_ptr = miri.ptr_from_addr_cast(first_word)?;
                 match as_maybe_ptr.into_pointer_or_addr() {
                     Ok(ptr) => Scalar::from_pointer(ptr, miri),
                     Err(addr) => Scalar::from_uint(addr.bytes(), miri.tcx.data_layout.pointer_size),
