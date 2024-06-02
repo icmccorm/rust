@@ -952,7 +952,7 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     || wchar == Whitespace::VerticalTab as u32
                     || wchar == Whitespace::FormFeed as u32
                     || wchar == Whitespace::Space as u32;
-                this.write_scalar(Scalar::from_bool(is_ws), dest)?;
+                this.write_scalar(Scalar::from_i32(is_ws as i32), dest)?;
             }
             | "abs" => {
                 let [n] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
