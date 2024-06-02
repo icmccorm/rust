@@ -230,26 +230,7 @@ fn convert_to_opty<'tcx, 'lli>(
             match &ctx.source {
                 OpTySource::Generic(generic) => {
                     let llvm_type = generic.assert_type_tag();
-                    let rust_type = ctx.rust_layout.ty;
                     match llvm_type {
-                        BasicTypeEnum::PointerType(_) => {
-                            if let ty::Adt(adt_def, sr) = rust_type.kind() {
-                                if let Some(vidx) = miri.is_enum_of_nonnullable_ptr(*adt_def, sr) {
-                                    let variant_dest = miri.project_downcast(&destination, vidx)?;
-                                    let field = miri.project_field(&variant_dest, 0)?;
-                                    let mut new_context = ConversionContext::new_from_field(
-                                        ctx.source.clone(),
-                                        field,
-                                        ctx.padded_size,
-                                    );
-                                    convert_to_opty(miri, &mut new_context)?;
-                                }else{
-                                    throw_llvm_type_mismatch!(llvm_type, rust_type);
-                                }
-                            }else{
-                                throw_llvm_type_mismatch!(llvm_type, rust_type);
-                            }
-                        }
                         BasicTypeEnum::IntType(_) => {
                             let field_bytes = generic.as_int().to_ne_bytes();
                             let field_width: usize =

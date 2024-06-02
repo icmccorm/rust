@@ -27,14 +27,14 @@ use rustc_const_eval::interpret::{
 };
 use rustc_middle::mir::Mutability;
 use rustc_middle::ty::layout::{HasTyCtxt, TyAndLayout};
+use rustc_middle::ty::AdtDef;
+use rustc_middle::ty::GenericArgsRef;
 use rustc_middle::ty::{self, Ty};
 use rustc_span::FileNameDisplayPreference;
 use rustc_target::abi::Align;
 use rustc_target::abi::Size;
-use std::num::NonZeroU64;
-use rustc_middle::ty::AdtDef;
-use rustc_middle::ty::GenericArgsRef;
 use rustc_target::abi::VariantIdx;
+use std::num::NonZeroU64;
 #[macro_export]
 macro_rules! throw_interop_format {
     ($($tt:tt)*) => { throw_machine_stop!($crate::TerminationInfo::InteroperationError { msg: format!($($tt)*) }) };
@@ -122,18 +122,16 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     ) -> InterpResult<'tcx, Option<TyAndLayout<'tcx>>> {
         let ctx = self.eval_context_ref();
         let resolved_ty = match ty {
-            BasicTypeEnum::FloatType(_) => match ty.get_llvm_type_kind() {
-                llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind => {
-                    Some(ctx.layout_of(ctx.tcx.types.f64)?)
-                }
-                llvm_sys::LLVMTypeKind::LLVMFloatTypeKind => {
-                    Some(ctx.layout_of(ctx.tcx.types.f32)?)
-                }
-                _ => None,
-            },
-            BasicTypeEnum::IntType(it) => {
-                ctx.get_equivalent_rust_int_from_size(Size::from_bits(it.get_bit_width()))?
-            }
+            BasicTypeEnum::FloatType(_) =>
+                match ty.get_llvm_type_kind() {
+                    llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind =>
+                        Some(ctx.layout_of(ctx.tcx.types.f64)?),
+                    llvm_sys::LLVMTypeKind::LLVMFloatTypeKind =>
+                        Some(ctx.layout_of(ctx.tcx.types.f32)?),
+                    _ => None,
+                },
+            BasicTypeEnum::IntType(it) =>
+                ctx.get_equivalent_rust_int_from_size(Size::from_bits(it.get_bit_width()))?,
             BasicTypeEnum::PointerType(_) => Some(ctx.raw_pointer_to(ctx.tcx.types.u8)?),
             _ => None,
         };
@@ -164,38 +162,34 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         } else {
             let size = match bte {
                 #[allow(clippy::arithmetic_side_effects)]
-                BasicTypeEnum::ArrayType(at) => {
-                    u64::from(at.len()) * self.resolve_llvm_type_size(at.get_element_type())?
-                }
+                BasicTypeEnum::ArrayType(at) =>
+                    u64::from(at.len()) * self.resolve_llvm_type_size(at.get_element_type())?,
 
-                BasicTypeEnum::FloatType(_) => match bte.get_llvm_type_kind() {
-                    llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind => {
-                        this.layout_of(this.tcx.types.f64)?.size.bytes()
-                    }
-                    llvm_sys::LLVMTypeKind::LLVMFloatTypeKind => {
-                        this.layout_of(this.tcx.types.f32)?.size.bytes()
-                    }
-                    _ => throw_unsup_llvm_type!(bte),
-                },
+                BasicTypeEnum::FloatType(_) =>
+                    match bte.get_llvm_type_kind() {
+                        llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind =>
+                            this.layout_of(this.tcx.types.f64)?.size.bytes(),
+                        llvm_sys::LLVMTypeKind::LLVMFloatTypeKind =>
+                            this.layout_of(this.tcx.types.f32)?.size.bytes(),
+                        _ => throw_unsup_llvm_type!(bte),
+                    },
 
                 BasicTypeEnum::IntType(it) => u64::from(it.get_bit_width() / 8),
 
-                BasicTypeEnum::PointerType(_) => {
-                    self.eval_context_ref().tcx().data_layout.pointer_size.bytes()
-                }
+                BasicTypeEnum::PointerType(_) =>
+                    self.eval_context_ref().tcx().data_layout.pointer_size.bytes(),
 
-                BasicTypeEnum::StructType(st) => st
-                    .get_field_types()
-                    .iter()
-                    .map(|ft| self.resolve_llvm_type_size(*ft))
-                    .collect::<InterpResult<'_, Vec<_>>>()?
-                    .iter()
-                    .sum(),
+                BasicTypeEnum::StructType(st) =>
+                    st.get_field_types()
+                        .iter()
+                        .map(|ft| self.resolve_llvm_type_size(*ft))
+                        .collect::<InterpResult<'_, Vec<_>>>()?
+                        .iter()
+                        .sum(),
 
                 #[allow(clippy::arithmetic_side_effects)]
-                BasicTypeEnum::VectorType(vt) => {
-                    u64::from(vt.get_size()) * self.resolve_llvm_type_size(vt.get_element_type())?
-                }
+                BasicTypeEnum::VectorType(vt) =>
+                    u64::from(vt.get_size()) * self.resolve_llvm_type_size(vt.get_element_type())?,
             };
             debug!("Resolved LLVM type size: {} bytes", size);
             Ok(size)
@@ -329,14 +323,17 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let this = self.eval_context_ref();
         match layout.ty.kind() {
             ty::FnPtr(_) | ty::RawPtr(_, _) | ty::Ref(_, _, _) => return true,
-            _ => {
-                if layout.is_transparent::<MiriInterpCx<'_, 'tcx>>() {
-                    if let Some((_, field)) = layout.non_1zst_field(this) {
-                        return this.is_pointer_convertible(&field);
-                    }
-                }
+            ty::Adt(adt_def, sr) =>
+                if this.is_enum_of_nonnullable_ptr(*adt_def, sr).is_some() {
+                    return true;
+                },
+            _ => {}
+        }
+        if layout.is_transparent::<MiriInterpCx<'_, 'tcx>>() {
+            if let Some((_, field)) = layout.non_1zst_field(this) {
+                return this.is_pointer_convertible(&field);
             }
-        };
+        }
         false
     }
 
@@ -345,14 +342,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let this = self.eval_context_ref();
         match this.ptr_try_get_alloc_id(ptr) {
             Err(addr) => addr % align.bytes() == 0,
-            Ok((alloc_id, offset, _)) => {
+            Ok((alloc_id, offset, _)) =>
                 if this.machine.check_alignment == AlignmentCheck::Int {
                     ptr.addr().bytes() % align.bytes() == 0
                 } else {
                     let (_, alloc_align, _) = this.get_alloc_info(alloc_id);
                     alloc_align.bytes() >= align.bytes() && offset.bytes() % align.bytes() != 0
-                }
-            }
+                },
         }
     }
 
@@ -504,9 +500,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         match this.machine.lli_config.alignment_check_mode {
             ForeignAlignmentCheckMode::Skip => false,
             ForeignAlignmentCheckMode::Check => true,
-            ForeignAlignmentCheckMode::CheckRustOnly => {
-                alloc_id.map(|id| !this.is_foreign_allocation(id).unwrap_or(false)).unwrap_or(false)
-            }
+            ForeignAlignmentCheckMode::CheckRustOnly =>
+                alloc_id.map(|id| !this.is_foreign_allocation(id).unwrap_or(false)).unwrap_or(false),
         }
     }
 
