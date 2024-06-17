@@ -1,44 +1,49 @@
 extern crate rustc_abi;
+use crate::alloc_addresses::EvalContextExt as _;
+use crate::eval::ForeignMemoryMode;
 use crate::machine::MiriInterpCxExt as _;
 use crate::shims::llvm::logging::LLVMFlag;
-use crate::{
-    shims::llvm::{
-        helpers::EvalContextExt,
-        hooks::access::{Destination, Source},
-    },
-    MiriInterpCx,
+use crate::shims::llvm::{
+    helpers::EvalContextExt as _,
+    hooks::{Destination, Source},
 };
+use crate::*;
 use rustc_abi::{Align, Size};
 use rustc_apfloat::{
     ieee::{Double, Single},
     Float,
 };
 use rustc_const_eval::interpret::{
-    alloc_range, AllocId, AllocRange, AllocRef, AllocRefMut, InterpResult, Pointer, Scalar,
+    alloc_range, AllocId, AllocRange, AllocRef, AllocRefMut, InterpResult,
 };
-use crate::eval::ForeignMemoryMode;
-use crate::alloc_addresses::EvalContextExt as _;
 
 #[derive(Debug)]
 pub struct ResolvedPointer {
-    pub ptr: Pointer<Option<crate::Provenance>>,
-    pub alloc_id: Option<AllocId>,
+    pub ptr: Pointer,
     pub align: Align,
     pub offset: Size,
 }
 
 impl ResolvedPointer {
+    pub fn alloc_id(&self) -> Option<AllocId> {
+        self.ptr.provenance.map(|p| p.get_alloc_id())?
+    }
+
     pub fn access_alloc<'tcx, 'a>(
         &'a self,
-        ctx: &'a MiriInterpCx<'_, 'tcx>,
+        ctx: &'a MiriInterpCx<'tcx>,
         access_size: Size,
         align: Align,
     ) -> InterpResult<
         'tcx,
-        (AllocRef<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>>, AllocRange),
+        (
+            AllocRef<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>, crate::MiriAllocBytes>,
+            AllocRange,
+        ),
     > {
-        let (size, _align, range) = self.get_access_size_range(ctx, access_size, align)?;
-        let alloc_reference = unsafe { ctx.get_ptr_alloc_range(self.ptr, size, range)? };
+        let this = ctx.eval_context_ref();
+        let (size, _align, range) = self.get_access_size_range(this, access_size, align)?;
+        let alloc_reference = unsafe { this.get_ptr_alloc_range(self.ptr.into(), size, range)? };
         if let Some(ar) = alloc_reference {
             Ok((ar, range))
         } else {
@@ -49,15 +54,26 @@ impl ResolvedPointer {
 
     pub fn access_alloc_mut<'tcx, 'a>(
         &'a self,
-        ctx: &'a mut MiriInterpCx<'_, 'tcx>,
+        ctx: &'a mut MiriInterpCx<'tcx>,
         access_size: Size,
         align: Align,
     ) -> InterpResult<
         'tcx,
-        (AllocRefMut<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>>, AllocRange),
+        (
+            AllocRefMut<
+                'a,
+                'tcx,
+                crate::Provenance,
+                crate::AllocExtra<'tcx>,
+                crate::MiriAllocBytes,
+            >,
+            AllocRange,
+        ),
     > {
-        let (size, _align, range) = self.get_access_size_range(ctx, access_size, align)?;
-        let alloc_reference = unsafe { ctx.get_ptr_alloc_mut_range(self.ptr, size, range)? };
+        let this = ctx.eval_context_mut();
+        let (size, _align, range) = self.get_access_size_range(this, access_size, align)?;
+        let alloc_reference =
+            unsafe { this.get_ptr_alloc_mut_range(self.ptr.into(), size, range)? };
         if let Some(ar) = alloc_reference {
             Ok((ar, range))
         } else {
@@ -68,16 +84,15 @@ impl ResolvedPointer {
 
     pub fn null() -> Self {
         ResolvedPointer {
-            ptr: Pointer::null(),
-            alloc_id: None,
+            ptr: crate::Pointer::null(),
             align: Align::ONE,
             offset: Size::from_bytes(0),
         }
     }
 
-    pub fn with_provenance(&self) -> Option<Pointer<crate::Provenance>> {
+    pub fn with_provenance(&self) -> Option<StrictPointer> {
         if let Some(p) = self.ptr.provenance {
-            Some(Pointer::new(p, self.ptr.addr()))
+            Some(interpret::Pointer::new(p, self.ptr.addr()))
         } else {
             None
         }
@@ -86,12 +101,12 @@ impl ResolvedPointer {
     #[allow(clippy::arithmetic_side_effects)]
     pub fn get_access_size_range<'tcx>(
         &self,
-        ctx: &MiriInterpCx<'_, 'tcx>,
+        ctx: &MiriInterpCx<'tcx>,
         access_size: Size,
         access_align: Align,
     ) -> InterpResult<'tcx, (Size, Align, AllocRange)> {
         let this = ctx.eval_context_ref();
-        if this.should_check_alignment_in_llvm(self.alloc_id) {
+        if this.should_check_alignment_in_llvm(self.alloc_id()) {
             Ok((access_size, access_align, alloc_range(Size::ZERO, access_size)))
         } else {
             Ok((self.offset + access_size, self.align, alloc_range(self.offset, access_size)))
@@ -101,12 +116,12 @@ impl ResolvedPointer {
     #[allow(clippy::arithmetic_side_effects)]
     fn offset_to_field<'tcx>(
         &self,
-        ctx: &MiriInterpCx<'_, 'tcx>,
+        ctx: &MiriInterpCx<'tcx>,
         size: Size,
         index: u32,
     ) -> InterpResult<'tcx, ResolvedPointer> {
         let this = ctx.eval_context_ref();
-        let (ptr, offset) = if this.should_check_alignment_in_llvm(self.alloc_id) {
+        let (ptr, offset) = if this.should_check_alignment_in_llvm(self.alloc_id()) {
             let ptr = self.ptr.offset(Size::from_bytes(size.bytes() * u64::from(index)), ctx)?;
             (ptr, self.offset)
         } else {
@@ -121,14 +136,14 @@ impl ResolvedPointer {
                 (self.ptr, new_offset)
             }
         };
-        Ok(Self { ptr, alloc_id: self.alloc_id, align: self.align, offset })
+        Ok(Self { ptr, align: self.align, offset })
     }
 }
 
 impl Destination<ResolvedPointer> for ResolvedPointer {
     fn write_f32<'tcx>(
         &mut self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        ctx: &mut MiriInterpCx<'tcx>,
         value: f32,
         align: Align,
     ) -> InterpResult<'tcx> {
@@ -140,7 +155,7 @@ impl Destination<ResolvedPointer> for ResolvedPointer {
 
     fn write_f64<'tcx>(
         &mut self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        ctx: &mut MiriInterpCx<'tcx>,
         value: f64,
         align: Align,
     ) -> InterpResult<'tcx> {
@@ -152,7 +167,7 @@ impl Destination<ResolvedPointer> for ResolvedPointer {
 
     fn write_unsigned<'tcx>(
         &mut self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        ctx: &mut MiriInterpCx<'tcx>,
         value: u128,
         size: Size,
         align: Align,
@@ -164,12 +179,12 @@ impl Destination<ResolvedPointer> for ResolvedPointer {
 
     fn write_pointer<'tcx>(
         &mut self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
-        pointer: Pointer<Option<crate::Provenance>>,
+        ctx: &mut MiriInterpCx<'tcx>,
+        pointer: Pointer,
         align: Align,
     ) -> InterpResult<'tcx> {
         let pointer_size = ctx.tcx.data_layout.pointer_size;
-        let pointer = Scalar::from_maybe_pointer(pointer, &*ctx);
+        let pointer = Scalar::from_maybe_pointer(pointer.into(), &*ctx);
         let (mut alloc, range) = self.access_alloc_mut(ctx, pointer_size, align)?;
         alloc.write_ptr_sized(range.start, pointer)?;
         Ok(())
@@ -177,7 +192,7 @@ impl Destination<ResolvedPointer> for ResolvedPointer {
 
     fn resolve_field<'tcx>(
         &mut self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        ctx: &mut MiriInterpCx<'tcx>,
         field_size: Size,
         index: u32,
     ) -> InterpResult<'tcx, ResolvedPointer> {
@@ -186,7 +201,7 @@ impl Destination<ResolvedPointer> for ResolvedPointer {
 
     fn ensure_aggregate_size<'tcx>(
         &self,
-        _ctx: &MiriInterpCx<'_, 'tcx>,
+        _ctx: &MiriInterpCx<'tcx>,
         _aggregate_size: u32,
     ) -> InterpResult<'tcx> {
         Ok(())
@@ -194,14 +209,11 @@ impl Destination<ResolvedPointer> for ResolvedPointer {
 }
 
 impl Source<ResolvedPointer> for ResolvedPointer {
-    fn read_f32<'tcx>(
-        &self,
-        ctx: &MiriInterpCx<'_, 'tcx>,
-        align: Align,
-    ) -> InterpResult<'tcx, f32> {
+    fn read_f32<'tcx>(&self, ctx: &MiriInterpCx<'tcx>, align: Align) -> InterpResult<'tcx, f32> {
         let size = Size::from_bytes(std::mem::size_of::<f32>());
         let (alloc, range) = self.access_alloc(ctx, size, align)?;
-        let float_value = if matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Uninit) {
+        let float_value = if matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Uninit)
+        {
             if alloc.is_uninit(range) {
                 if let Some(logger) = &ctx.machine.llvm_logger {
                     logger.log_flag(LLVMFlag::LLVMReadUninit);
@@ -217,23 +229,20 @@ impl Source<ResolvedPointer> for ResolvedPointer {
         Ok(float_value)
     }
 
-    fn read_f64<'tcx>(
-        &self,
-        ctx: &MiriInterpCx<'_, 'tcx>,
-        align: Align,
-    ) -> InterpResult<'tcx, f64> {
+    fn read_f64<'tcx>(&self, ctx: &MiriInterpCx<'tcx>, align: Align) -> InterpResult<'tcx, f64> {
         let size = Size::from_bytes(std::mem::size_of::<f64>());
         let (alloc, range) = self.access_alloc(ctx, size, align)?;
-        let double_value = if matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Uninit) {
-            if alloc.is_uninit(range) {
-                if let Some(logger) = &ctx.machine.llvm_logger {
-                    logger.log_flag(LLVMFlag::LLVMReadUninit);
+        let double_value =
+            if matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Uninit) {
+                if alloc.is_uninit(range) {
+                    if let Some(logger) = &ctx.machine.llvm_logger {
+                        logger.log_flag(LLVMFlag::LLVMReadUninit);
+                    }
                 }
-            }
-            alloc.read_scalar_uninit(range, false)?.to_f64()?
-        } else {
-            alloc.read_scalar(range, false)?.to_f64()?
-        };
+                alloc.read_scalar_uninit(range, false)?.to_f64()?
+            } else {
+                alloc.read_scalar(range, false)?.to_f64()?
+            };
         let double_value = double_value.to_bits();
         let double_value = ctx.to_vec_endian(double_value, size.bytes_usize());
         let double_value = f64::from_ne_bytes(double_value.try_into().unwrap());
@@ -242,7 +251,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
 
     fn read_unsigned<'tcx>(
         &self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        ctx: &mut MiriInterpCx<'tcx>,
         size: Size,
         align: Align,
     ) -> InterpResult<'tcx, u128> {
@@ -250,20 +259,21 @@ impl Source<ResolvedPointer> for ResolvedPointer {
         let int_value = if size == ctx.tcx.data_layout.pointer_size {
             let ptr_value = self.read_pointer(ctx, align)?;
             if let Some(crate::Provenance::Concrete { alloc_id, tag }) = ptr_value.provenance {
-               ctx.expose_ptr(alloc_id, tag)?
+                ctx.expose_ptr(alloc_id, tag)?
             }
             u128::from(ptr_value.addr().bytes())
         } else {
-            let scalar_value = if matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Uninit) {
-                if alloc.is_uninit(range) {
-                    if let Some(logger) = &ctx.machine.llvm_logger {
-                        logger.log_flag(LLVMFlag::LLVMReadUninit);
+            let scalar_value =
+                if matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Uninit) {
+                    if alloc.is_uninit(range) {
+                        if let Some(logger) = &ctx.machine.llvm_logger {
+                            logger.log_flag(LLVMFlag::LLVMReadUninit);
+                        }
                     }
-                }
-                alloc.read_integer_uninit(range)?
-            } else {
-                alloc.read_integer(range)?
-            };
+                    alloc.read_integer_uninit(range)?
+                } else {
+                    alloc.read_integer(range)?
+                };
             scalar_value.to_bits(size)?
         };
         Ok(int_value)
@@ -271,11 +281,12 @@ impl Source<ResolvedPointer> for ResolvedPointer {
 
     fn read_pointer<'tcx>(
         &self,
-        ctx: &MiriInterpCx<'_, 'tcx>,
+        ctx: &MiriInterpCx<'tcx>,
         align: Align,
-    ) -> InterpResult<'tcx, Pointer<Option<crate::Provenance>>> {
+    ) -> InterpResult<'tcx, Pointer> {
         let (alloc, range) = self.access_alloc(ctx, ctx.tcx.data_layout.pointer_size, align)?;
-        let pointer_val = if matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Uninit) {
+        let pointer_val = if matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Uninit)
+        {
             if alloc.is_uninit(range) {
                 if let Some(logger) = &ctx.machine.llvm_logger {
                     logger.log_flag(LLVMFlag::LLVMReadUninit);
@@ -290,7 +301,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
 
     fn check_aggregate_size<'tcx>(
         &self,
-        _ctx: &MiriInterpCx<'_, 'tcx>,
+        _ctx: &MiriInterpCx<'tcx>,
         _aggregate_size: u32,
     ) -> InterpResult<'tcx> {
         Ok(())
@@ -299,7 +310,7 @@ impl Source<ResolvedPointer> for ResolvedPointer {
     #[allow(clippy::arithmetic_side_effects)]
     fn resolve_field<'tcx>(
         &self,
-        ctx: &MiriInterpCx<'_, 'tcx>,
+        ctx: &MiriInterpCx<'tcx>,
         size: Size,
         index: u32,
     ) -> InterpResult<'tcx, ResolvedPointer> {

@@ -1,2 +1,3 @@
-pub mod generic_value;
-pub mod resolved_ptr;
+mod generic_value;
+mod resolved_ptr;
+pub use resolved_ptr::{ResolvedPointer};

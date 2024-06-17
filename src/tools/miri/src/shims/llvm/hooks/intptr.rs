@@ -3,9 +3,12 @@ use crate::shims::llvm::logging::LLVMFlag;
 use crate::Provenance::*;
 use crate::*;
 use crate::shims::llvm::helpers::EvalContextExt as _;
+use crate::alloc_addresses::EvalContextExt as _;
 use llvm_sys::miri::{MiriInterpCxOpaque, MiriPointer, MiriProvenance};
 use rustc_target::abi::Size;
 use std::num::NonZeroU64;
+use tracing::debug;
+use crate::Pointer;
 
 pub extern "C-unwind" fn miri_ptrtoint(ctx_raw: *mut MiriInterpCxOpaque, mp: MiriPointer) -> u64 {
     let ctx = obtain_ctx_mut(ctx_raw);
@@ -64,10 +67,10 @@ pub extern "C-unwind" fn miri_get_element_pointer(
 }
 
 fn miri_get_element_pointer_result<'tcx>(
-    ctx: &mut MiriInterpCx<'_, 'tcx>,
-    base_ptr: Pointer<Option<crate::Provenance>>,
+    ctx: &mut MiriInterpCx<'tcx>,
+    base_ptr: Pointer,
     offset: Size,
-) -> InterpResult<'tcx, Pointer<Option<crate::Provenance>>> {
+) -> InterpResult<'tcx, Pointer> {
     let this = ctx.eval_context_mut();
     let (ptr_offset, _) = base_ptr.overflowing_offset(offset, this);
 
@@ -87,7 +90,7 @@ fn miri_get_element_pointer_result<'tcx>(
 
     if let Some(Concrete { alloc_id, tag }) = base_ptr.provenance {
         let (size, _, _) = this.get_alloc_info(alloc_id);
-        let base_address = this.addr_from_alloc_id(alloc_id)?;
+        let base_address = this.addr_from_alloc_id(alloc_id, source_allocation_kind.unwrap())?;
         let addr_upper_bound = base_address.checked_add(size.bytes());
         if source_allocation.is_some() {
             if let Some(addr_upper_bound) = addr_upper_bound {

@@ -1,14 +1,15 @@
+use crate::helpers::rustc_data_structures::fx::FxHashMap;
+use crate::helpers::ty::List;
 use std::cmp;
 use std::collections::BTreeSet;
 use std::iter;
-use crate::helpers::rustc_data_structures::fx::FxHashMap;
-use crate::helpers::ty::List;
 use std::num::NonZero;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use rand::RngCore;
 
+use crate::*;
 use rustc_apfloat::ieee::{Double, Half, Quad, Single};
 use rustc_apfloat::Float;
 use rustc_hir::{
@@ -29,8 +30,7 @@ use rustc_session::config::CrateType;
 use rustc_span::{sym, Span, Symbol};
 use rustc_target::abi::{Align, FieldIdx, FieldsShape, Size, Variants};
 use rustc_target::spec::abi::Abi;
-
-use crate::*;
+use tracing::debug;
 
 /// Indicates which kind of access is being performed.
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
@@ -853,40 +853,30 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
         let this = self.eval_context_ref();
         let op_place = this.deref_pointer_as(op, base_layout)?;
+
         debug!(
             "Deref operand, have {:?}, trying to access {:?} at offset {}",
             op_place.layout.ty, value_layout.ty, offset
         );
+
         let (underlying_size, place) = if let Some(Provenance::Concrete { alloc_id, .. }) =
             op_place.ptr().provenance
         {
-            let alloc_base_addr = this.addr_from_alloc_id(alloc_id)?;
-            debug!("Base address: {}", alloc_base_addr);
+            let (kind, _) = this.memory.alloc_map().get(alloc_id).unwrap();
+            let (size, _, _) = this.get_alloc_info(alloc_id);
+            let alloc_base_addr = this.addr_from_alloc_id(alloc_id, *kind)?;
+            let alloc_base_addr = Size::from_bytes(alloc_base_addr);
 
-            let (size, _, _) = self.eval_context_ref().get_alloc_info(alloc_id);
-            debug!("Alloc size: {}", size.bytes());
-
-            debug!("Current ptr: {}", op_place.ptr().addr().bytes());
-
-            let remaining_size = size.bytes() - (op_place.ptr().addr().bytes() - alloc_base_addr);
-            debug!("Remaining size: {}", remaining_size);
-
+            let remaining_size = size - (op_place.ptr().addr() - alloc_base_addr);
             let offset_pointer = op_place.ptr().offset(Size::from_bytes(offset), this)?;
 
             (remaining_size, this.ptr_to_mplace(offset_pointer, value_layout))
         } else {
-            (
-                op_place.layout.size.bytes(),
-                op_place.offset(Size::from_bytes(offset), value_layout, this)?,
-            )
+            (op_place.layout.size, op_place.offset(Size::from_bytes(offset), value_layout, this)?)
         };
-        debug!(
-            "Available underlying size: {}, required size: {}",
-            underlying_size,
-            offset + value_layout.size.bytes()
-        );
+
         // Ensure that the access is within bounds.
-        if underlying_size < offset + value_layout.size.bytes() {
+        if underlying_size.bytes() < offset + value_layout.size.bytes() {
             throw_unsup_format!(
                 "Required access to {} bytes with offset {} but place is only {} bytes long",
                 value_layout.size.bytes(),
@@ -894,6 +884,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 op_place.layout.size.bytes()
             );
         }
+
         Ok(place)
     }
 

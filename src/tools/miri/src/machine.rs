@@ -2,7 +2,6 @@
 //! `Machine` trait.
 use inkwell::miri::StackTrace;
 use inkwell::values::GenericValueRef;
-use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::fmt;
@@ -41,7 +40,7 @@ use crate::{
     },
     *,
 };
-use crate::{eval::LLIConfig, shims::llvm::logging::LLVMLogger};
+use crate::{eval::LLIConfig, shims::llvm::LLVMLogger};
 
 /// First real-time signal.
 /// `signal(7)` says this must be between 32 and 64 and specifies 34 or 35

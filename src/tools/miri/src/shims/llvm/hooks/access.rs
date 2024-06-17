@@ -2,33 +2,34 @@ use crate::shims::llvm::helpers::EvalContextExt;
 use crate::MiriInterpCx;
 use inkwell::types::BasicTypeEnum;
 use llvm_sys::LLVMTypeKind;
-use rustc_const_eval::interpret::{InterpResult, Pointer};
+use rustc_const_eval::interpret::InterpResult;
 use rustc_target::abi::{Align, Size};
+use crate::*;
 
 pub trait Source<T> {
-    fn read_f32<'tcx>(&self, ctx: &MiriInterpCx<'_, 'tcx>, align: Align)
+    fn read_f32<'tcx>(&self, ctx: &MiriInterpCx<'tcx>, align: Align)
     -> InterpResult<'tcx, f32>;
-    fn read_f64<'tcx>(&self, ctx: &MiriInterpCx<'_, 'tcx>, align: Align)
+    fn read_f64<'tcx>(&self, ctx: &MiriInterpCx<'tcx>, align: Align)
     -> InterpResult<'tcx, f64>;
     fn read_unsigned<'tcx>(
         &self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        ctx: &mut MiriInterpCx<'tcx>,
         size: Size,
         align: Align,
     ) -> InterpResult<'tcx, u128>;
     fn read_pointer<'tcx>(
         &self,
-        ctx: &MiriInterpCx<'_, 'tcx>,
+        ctx: &MiriInterpCx<'tcx>,
         align: Align,
-    ) -> InterpResult<'tcx, Pointer<Option<crate::Provenance>>>;
+    ) -> InterpResult<'tcx, Pointer>;
     fn check_aggregate_size<'tcx>(
         &self,
-        ctx: &MiriInterpCx<'_, 'tcx>,
+        ctx: &MiriInterpCx<'tcx>,
         aggregate_size: u32,
     ) -> InterpResult<'tcx>;
     fn resolve_field<'tcx>(
         &self,
-        ctx: &MiriInterpCx<'_, 'tcx>,
+        ctx: &MiriInterpCx<'tcx>,
         size: Size,
         index: u32,
     ) -> InterpResult<'tcx, T>;
@@ -36,45 +37,45 @@ pub trait Source<T> {
 pub trait Destination<T> {
     fn write_f32<'tcx>(
         &mut self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        ctx: &mut MiriInterpCx<'tcx>,
         value: f32,
         align: Align,
     ) -> InterpResult<'tcx>;
     fn write_f64<'tcx>(
         &mut self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        ctx: &mut MiriInterpCx<'tcx>,
         value: f64,
         align: Align,
     ) -> InterpResult<'tcx>;
     fn write_unsigned<'tcx>(
         &mut self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        ctx: &mut MiriInterpCx<'tcx>,
         value: u128,
         size: Size,
         align: Align,
     ) -> InterpResult<'tcx>;
     fn write_pointer<'tcx>(
         &mut self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
-        pointer: Pointer<Option<crate::Provenance>>,
+        ctx: &mut MiriInterpCx<'tcx>,
+        pointer: Pointer,
         align: Align,
     ) -> InterpResult<'tcx>;
     fn resolve_field<'tcx>(
         &mut self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        ctx: &mut MiriInterpCx<'tcx>,
         size: Size,
         index: u32,
     ) -> InterpResult<'tcx, T>;
     fn ensure_aggregate_size<'tcx>(
         &self,
-        ctx: &MiriInterpCx<'_, 'tcx>,
+        ctx: &MiriInterpCx<'tcx>,
         aggregate_size: u32,
     ) -> InterpResult<'tcx>;
 }
 
 #[allow(clippy::arithmetic_side_effects)]
 pub fn memory_access_core<'tcx, S, D>(
-    ctx: &mut MiriInterpCx<'_, 'tcx>,
+    ctx: &mut MiriInterpCx<'tcx>,
     source: &dyn Source<S>,
     destination: &mut dyn Destination<D>,
     value_type: BasicTypeEnum<'_>,
@@ -158,7 +159,7 @@ where
 
 #[allow(clippy::arithmetic_side_effects)]
 fn access_aggregate<'tcx, S, D>(
-    ctx: &mut MiriInterpCx<'_, 'tcx>,
+    ctx: &mut MiriInterpCx<'tcx>,
     source: &dyn Source<S>,
     destination: &mut dyn Destination<D>,
     value_type: BasicTypeEnum<'_>,

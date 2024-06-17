@@ -1,1 +1,2 @@
-pub mod link;
+mod link;
+pub use link::{ThreadLink, ThreadLinkDestination, ThreadLinkSource};

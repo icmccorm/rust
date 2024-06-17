@@ -1,44 +1,33 @@
 extern crate rustc_hash;
-use super::hooks::calls::{miri_call_by_name, miri_call_by_pointer};
-use super::hooks::errors::miri_error_trace_recorder;
-use super::hooks::intptr::{miri_get_element_pointer, miri_inttoptr, miri_ptrtoint};
-use super::hooks::load::miri_memory_load;
-use super::hooks::memory::{
-    llvm_free, llvm_malloc, miri_memcpy, miri_memset, miri_register_global,
-};
-use super::hooks::store::miri_memory_store;
+use super::hooks;
 use crate::concurrency::thread::EvalContextExt;
-use crate::shims::llvm::convert::to_generic_value::convert_opty_to_generic_value;
-use crate::shims::llvm::convert::to_generic_value::LLVMArgumentConverter;
-use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalContextExt;
-use crate::shims::llvm::logging::LLVMFlag;
-use crate::shims::llvm::threads::link::ThreadLinkDestination;
-use crate::MemoryKind;
-use crate::Provenance;
-use crate::{MiriInterpCx, MiriInterpCxExt};
-use inkwell::attributes::Attribute;
-use inkwell::attributes::AttributeLoc;
-use inkwell::context::Context;
-use inkwell::execution_engine::{ExecutionEngine, MiriInterpCxOpaque};
-use inkwell::module::Module;
-use inkwell::types::BasicTypeEnum;
-pub use inkwell::values::FunctionValue;
-use inkwell::values::GenericValue;
+use crate::shims::llvm::{
+    convert::to_generic_value::{convert_opty_to_generic_value, LLVMArgumentConverter},
+    helpers::EvalContextExt as _,
+    LLVMFlag,
+    threads::ThreadLinkDestination,
+};
+use crate::*;
+use either::Either;
+use inkwell::{
+    attributes::{Attribute, AttributeLoc},
+    context::Context,
+    execution_engine::{ExecutionEngine, MiriInterpCxOpaque},
+    module::Module,
+    types::BasicTypeEnum,
+    values::{FunctionValue, GenericValue},
+};
 use ouroboros::self_referencing;
 use parking_lot::ReentrantMutex;
 use rustc_const_eval::interpret::InterpResult;
-use rustc_const_eval::interpret::OpTy;
-use rustc_const_eval::interpret::PlaceTy;
 use rustc_hash::FxHashSet;
 use rustc_middle::ty::{layout::TyAndLayout, Ty};
-use rustc_target::abi::Abi;
-use rustc_target::abi::Size;
-use std::cell::RefCell;
-use std::path::PathBuf;
-use either::Either;
+use rustc_target::abi::{Abi, Size};
+use std::{cell::RefCell, path::PathBuf};
+use tracing::debug;
 
 #[self_referencing]
-pub struct LLI /*<'mir, 'tcx>*/ {
+pub struct LLI {
     pub context: Context,
     #[borrows(context)]
     #[not_covariant]
@@ -55,7 +44,7 @@ pub static LLVM_INTERPRETER: ReentrantMutex<RefCell<Option<LLI>>> =
     ReentrantMutex::new(RefCell::new(None));
 
 impl LLI {
-    pub fn create(miri: &mut MiriInterpCx<'_, '_>, paths: &FxHashSet<PathBuf>) -> Self {
+    pub fn create(miri: &mut MiriInterpCx<'_>, paths: &FxHashSet<PathBuf>) -> Self {
         LLITryBuilder {
             context: Context::create(),
             module_builder: |ctx| {
@@ -84,36 +73,33 @@ impl LLI {
         .try_build()
         .expect("Unable to initialize interpreter")
     }
-    pub fn initialize_engine<'tcx>(
-        &mut self,
-        miri: &mut MiriInterpCx<'_, 'tcx>,
-    ) -> InterpResult<'tcx> {
-        let initialization_result = self.with_mut(|n| {
-            let engine = match n.module.create_interpreter_execution_engine() {
+    pub fn initialize_engine<'tcx>(&mut self, miri: &mut MiriInterpCx<'tcx>) -> InterpResult<'tcx> {
+        let initialization_result = self.with_mut(|lli| {
+            let engine = match lli.module.create_interpreter_execution_engine() {
                 Ok(engine) => engine,
                 Err(err) => return Err(format!("Unable to initialize interpreter: {}", err)),
             };
-            engine.set_miri_free(Some(llvm_free));
-            engine.set_miri_malloc(Some(llvm_malloc));
-            engine.set_miri_load(Some(miri_memory_load));
-            engine.set_miri_store(Some(miri_memory_store));
-            engine.set_miri_call_by_name(Some(miri_call_by_name));
-            engine.set_miri_call_by_pointer(Some(miri_call_by_pointer));
-            engine.set_miri_stack_trace_recorder(Some(miri_error_trace_recorder));
-            engine.set_miri_memcpy(Some(miri_memcpy));
-            engine.set_miri_memset(Some(miri_memset));
-            engine.set_miri_inttoptr(Some(miri_inttoptr));
-            engine.set_miri_ptrtoint(Some(miri_ptrtoint));
-            engine.set_miri_get_element_pointer(Some(miri_get_element_pointer));
-            engine.set_miri_register_global(Some(miri_register_global));
+            engine.set_miri_free(Some(hooks::llvm_free));
+            engine.set_miri_malloc(Some(hooks::llvm_malloc));
+            engine.set_miri_load(Some(hooks::miri_memory_load));
+            engine.set_miri_store(Some(hooks::miri_memory_store));
+            engine.set_miri_call_by_name(Some(hooks::miri_call_by_name));
+            engine.set_miri_call_by_pointer(Some(hooks::miri_call_by_pointer));
+            engine.set_miri_stack_trace_recorder(Some(hooks::miri_error_trace_recorder));
+            engine.set_miri_memcpy(Some(hooks::miri_memcpy));
+            engine.set_miri_memset(Some(hooks::miri_memset));
+            engine.set_miri_inttoptr(Some(hooks::miri_inttoptr));
+            engine.set_miri_ptrtoint(Some(hooks::miri_ptrtoint));
+            engine.set_miri_get_element_pointer(Some(hooks::miri_get_element_pointer));
+            engine.set_miri_register_global(Some(hooks::miri_register_global));
             engine.set_miri_interpcx_wrapper(miri as *mut _ as *mut MiriInterpCxOpaque);
-            n.engine.replace(engine);
+            lli.engine.replace(engine);
             Ok(())
         });
         Ok(initialization_result.map_err(|s| err_unsup_format!("{}", s))?)
     }
 
-    pub fn run_constructors<'tcx>(&self, miri: &mut MiriInterpCx<'_, 'tcx>) -> InterpResult<'tcx> {
+    pub fn run_constructors<'tcx>(&self, miri: &mut MiriInterpCx<'tcx>) -> InterpResult<'tcx> {
         self.with_engine(|engine| {
             miri.active_thread_ref().set_llvm_thread(true);
             let engine = engine.as_ref().unwrap();
@@ -132,7 +118,7 @@ impl LLI {
             result
         })
     }
-    pub fn run_destructors<'tcx>(&self, miri: &mut MiriInterpCx<'_, 'tcx>) -> InterpResult<'tcx> {
+    pub fn run_destructors<'tcx>(&self, miri: &mut MiriInterpCx<'tcx>) -> InterpResult<'tcx> {
         self.with_engine(|engine| {
             miri.active_thread_ref().set_llvm_thread(true);
             let engine = engine.as_ref().unwrap();
@@ -155,10 +141,10 @@ impl LLI {
     #[allow(clippy::arithmetic_side_effects)]
     pub fn call_external_llvm_and_store_return<'lli, 'tcx>(
         &self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        ctx: &mut MiriInterpCx<'tcx>,
         function: FunctionValue<'lli>,
-        args: &[OpTy<'tcx, Provenance>],
-        dest: &PlaceTy<'tcx, Provenance>,
+        args: &[OpTy<'tcx>],
+        dest: &PlaceTy<'tcx>,
     ) -> InterpResult<'tcx> {
         debug!(
             "Calling {:?}: {:?}",
@@ -231,34 +217,28 @@ impl LLI {
     }
 }
 
-pub struct ResolvedRustArgument<'tcx> {
-    inner: ResolvedRustArgumentInner<'tcx>,
-}
-enum ResolvedRustArgumentInner<'tcx> {
-    Default(OpTy<'tcx, Provenance>),
-    Padded(OpTy<'tcx, Provenance>, Size),
+pub enum ResolvedRustArgument<'tcx> {
+    Default(OpTy<'tcx>),
+    Padded(OpTy<'tcx>, Size),
 }
 
 impl<'tcx> ResolvedRustArgument<'tcx> {
-    pub fn new(
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
-        arg: OpTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, Self> {
+    pub fn new(ctx: &mut MiriInterpCx<'tcx>, arg: OpTy<'tcx>) -> InterpResult<'tcx, Self> {
         let arg = ctx.dereference_into_singular_field(arg)?;
-        Ok(Self { inner: ResolvedRustArgumentInner::Default(arg) })
+        Ok(ResolvedRustArgument::Default(arg))
     }
     pub fn new_padded(
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
-        arg: OpTy<'tcx, Provenance>,
+        ctx: &mut MiriInterpCx<'tcx>,
+        arg: OpTy<'tcx>,
         padding: Size,
     ) -> InterpResult<'tcx, Self> {
         let arg = ctx.dereference_into_singular_field(arg)?;
-        Ok(Self { inner: ResolvedRustArgumentInner::Padded(arg, padding) })
+        Ok(ResolvedRustArgument::Padded(arg, padding))
     }
 
     pub fn to_generic_value<'lli>(
         self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        ctx: &mut MiriInterpCx<'tcx>,
         bte: ResolvedLLVMType<'lli>,
     ) -> InterpResult<'tcx, GenericValue<'lli>> {
         let this = ctx.eval_context_mut();
@@ -267,16 +247,16 @@ impl<'tcx> ResolvedRustArgument<'tcx> {
         Ok(value)
     }
 
-    pub fn opty(&self) -> &OpTy<'tcx, Provenance> {
-        match &self.inner {
-            ResolvedRustArgumentInner::Default(op) => op,
-            ResolvedRustArgumentInner::Padded(op, _) => op,
+    pub fn opty(&self) -> &OpTy<'tcx> {
+        match self {
+            ResolvedRustArgument::Default(op) => op,
+            ResolvedRustArgument::Padded(op, _) => op,
         }
     }
     pub fn padded_size(&self) -> Size {
-        match self.inner {
-            ResolvedRustArgumentInner::Default(_) => self.value_size(),
-            ResolvedRustArgumentInner::Padded(_, padding) => padding,
+        match self {
+            ResolvedRustArgument::Default(_) => self.value_size(),
+            ResolvedRustArgument::Padded(_, padding) => *padding,
         }
     }
 

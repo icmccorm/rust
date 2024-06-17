@@ -7,8 +7,7 @@ use std::task::Poll;
 use std::thread;
 use crate::concurrency::thread::TlsAllocAction;
 use crate::diagnostics::report_leaks;
-use crate::shims::llvm_ffi_support::EvalContextExt;
-use rustc_data_structures::fx::FxHashSet;
+use crate::shims::llvm::EvalContextExt as _;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::def::Namespace;
 use rustc_hir::def_id::DefId;
@@ -501,7 +500,7 @@ pub fn eval_entry<'tcx>(
         && (!config.external_bc_files.is_empty() || config.singular_llvm_bc_file.is_some())
     {
         ecx.init_llvm_interpreter(&config);
-        MiriInterpCx::<'_, '_>::with_lli_opt(|lli| lli.run_constructors(&mut ecx).err()).flatten()
+        MiriInterpCx::<'_>::with_lli_opt(|lli| lli.run_constructors(&mut ecx).err()).flatten()
     } else {
         None
     };
@@ -527,7 +526,7 @@ pub fn eval_entry<'tcx>(
     // might cause Stacked Borrows errors (https://github.com/rust-lang/miri/issues/2396).
     let destructor_error = if ecx.have_all_terminated() {
         let result =
-            MiriInterpCx::<'_, '_>::with_lli_opt(|ll| ll.run_destructors(&mut ecx).err()).flatten();
+            MiriInterpCx::<'_>::with_lli_opt(|ll| ll.run_destructors(&mut ecx).err()).flatten();
         // Even if all threads have terminated, we have to beware of data races since some threads
         // might not have joined the main thread (https://github.com/rust-lang/miri/issues/2020,
         // https://github.com/rust-lang/miri/issues/2508).

@@ -1,53 +1,44 @@
 extern crate either;
 extern crate rustc_abi;
-use super::values::resolved_ptr::ResolvedPointer;
+use super::values::ResolvedPointer;
 use crate::alloc_addresses::EvalContextExt as _;
-use crate::concurrency::thread::EvalContextExt as _;
 use crate::eval::ForeignAlignmentCheckMode;
 use crate::helpers::EvalContextExt as HelperEvalExt;
 use crate::rustc_const_eval::interpret::AllocMap;
-use crate::rustc_middle::ty::layout::LayoutOf;
 use crate::shims::llvm::logging::LLVMFlag;
-use crate::throw_unsup_llvm_type;
-use crate::throw_unsup_shim_llvm_type;
-use crate::AlignmentCheck;
-use crate::MiriInterpCx;
-use crate::{BorTag, Provenance, ThreadId};
-use either::Either::Right;
-use inkwell::miri::StackTrace;
-use inkwell::types::{AnyTypeEnum, BasicType, BasicTypeEnum};
-use inkwell::values::GenericValueArrayRef;
-use inkwell::values::GenericValueRef;
+use crate::*;
 use llvm_sys::execution_engine::LLVMGenericValueArrayRef;
-use llvm_sys::miri::{MiriPointer, MiriProvenance};
-use llvm_sys::prelude::LLVMTypeRef;
-use rustc_abi::Endian;
-use rustc_const_eval::interpret::{
-    AllocId, CheckInAllocMsg, InterpErrorInfo, InterpResult, OpTy, Pointer, Scalar,
+
+use inkwell::{
+    miri::StackTrace,
+    types::{AnyTypeEnum, BasicType, BasicTypeEnum},
+    values::{GenericValueArrayRef, GenericValueRef},
 };
-use rustc_middle::mir::Mutability;
-use rustc_middle::ty::layout::{HasTyCtxt, TyAndLayout};
-use rustc_middle::ty::AdtDef;
-use rustc_middle::ty::GenericArgsRef;
-use rustc_middle::ty::{self, Ty};
-use rustc_span::FileNameDisplayPreference;
-use rustc_target::abi::Align;
-use rustc_target::abi::Size;
-use rustc_target::abi::VariantIdx;
+
+use llvm_sys::{
+    miri::{MiriPointer, MiriProvenance},
+    prelude::LLVMTypeRef,
+};
+
+use either::Either::Right;
+
+use rustc_abi::Endian;
+use rustc_const_eval::interpret::{AllocId, CheckInAllocMsg, InterpErrorInfo, InterpResult};
+use rustc_middle::{
+    mir::Mutability,
+    ty::{
+        self,
+        layout::{HasTyCtxt, LayoutOf, TyAndLayout},
+        AdtDef, GenericArgsRef, Ty,
+    },
+};
+use rustc_target::abi::{Align, Size, VariantIdx};
 use std::num::NonZeroU64;
-#[macro_export]
-macro_rules! throw_interop_format {
-    ($($tt:tt)*) => { throw_machine_stop!($crate::TerminationInfo::InteroperationError { msg: format!($($tt)*) }) };
-}
+use tracing::debug;
 
-#[macro_export]
-macro_rules! err_interop_format {
-    ($($tt:tt)*) => { Err($crate::InterpErrorInfo::MachineStop($crate::TerminationInfo::InteroperationError { msg: format!($($tt)*) })) };
-}
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn get_equivalent_rust_layout_for_value(
         &self,
         generic_value_ref: &GenericValueRef<'_>,
@@ -57,14 +48,16 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         if let BasicTypeEnum::PointerType(_) = type_tag {
             let wrapped_pointer = generic_value_ref.as_miri_pointer();
             let mp = this.lli_wrapped_pointer_to_maybe_pointer(wrapped_pointer);
+
             if let Some(crate::Provenance::Concrete { alloc_id, .. }) = mp.provenance {
-                if let Some((kind, _)) = this.memory.alloc_map().get(alloc_id) {
+                let alloc_entry = this.memory.alloc_map().get(alloc_id);
+                let (size, _, _) = this.get_alloc_info(alloc_id);
+                if let Some((kind, _)) = alloc_entry {
                     if let rustc_const_eval::interpret::MemoryKind::Machine(
                         crate::MiriMemoryKind::LLVMStack | crate::MiriMemoryKind::LLVMStatic,
                     ) = kind
                     {
-                        let (size, _align, _) = this.get_alloc_info(alloc_id);
-                        let base_address = this.addr_from_alloc_id(alloc_id)?;
+                        let base_address = this.addr_from_alloc_id(alloc_id, *kind)?;
 
                         #[allow(clippy::arithmetic_side_effects)]
                         let offset = mp.addr() - Size::from_bytes(base_address);
@@ -112,7 +105,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         } else {
             0
         };
-
         Some(VariantIdx::from_u32(vidx))
     }
 
@@ -126,12 +118,15 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 match ty.get_llvm_type_kind() {
                     llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind =>
                         Some(ctx.layout_of(ctx.tcx.types.f64)?),
+
                     llvm_sys::LLVMTypeKind::LLVMFloatTypeKind =>
                         Some(ctx.layout_of(ctx.tcx.types.f32)?),
                     _ => None,
                 },
+
             BasicTypeEnum::IntType(it) =>
                 ctx.get_equivalent_rust_int_from_size(Size::from_bits(it.get_bit_width()))?,
+
             BasicTypeEnum::PointerType(_) => Some(ctx.raw_pointer_to(ctx.tcx.types.u8)?),
             _ => None,
         };
@@ -216,6 +211,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let args = (0..num_arguments_provided)
             .map(|idx| args.get_element_at(idx as u64).unwrap())
             .collect();
+
         Ok((args, ret_ty))
     }
 
@@ -231,10 +227,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         (args, ret_ty)
     }
 
-    fn lli_wrapped_pointer_to_maybe_pointer(
-        &self,
-        mp: MiriPointer,
-    ) -> Pointer<std::option::Option<crate::Provenance>> {
+    fn lli_wrapped_pointer_to_maybe_pointer(&self, mp: MiriPointer) -> crate::Pointer {
         if mp.addr == 0 {
             Pointer::null()
         } else {
@@ -251,10 +244,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
-    fn pointer_to_lli_wrapped_pointer(
-        &self,
-        ptr: Pointer<Option<crate::Provenance>>,
-    ) -> MiriPointer {
+    fn pointer_to_lli_wrapped_pointer(&self, ptr: Pointer) -> MiriPointer {
         let (prov, _) = ptr.into_parts();
         let (alloc_id, tag) = if let Some(crate::Provenance::Concrete { alloc_id, tag }) = prov {
             (alloc_id.0.get(), tag.get())
@@ -265,26 +255,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         MiriPointer { addr, prov: MiriProvenance { alloc_id, tag } }
     }
 
-    fn get_foreign_error(&self) -> Option<InterpErrorInfo<'tcx>> {
-        let this = self.eval_context_ref();
-        let err_opt = this.machine.foreign_error.take();
-        if err_opt.is_some() {
-            eprintln!("\n\n---- Foreign Error Trace ----");
-            if let Some(trace) = this.machine.foreign_error_trace.take() {
-                eprintln!("{}", trace);
-            }
-            if let Some(call_location) = this.machine.foreign_error_rust_call_location.take() {
-                let span_str = this
-                    .tcx()
-                    .sess
-                    .source_map()
-                    .span_to_string(call_location, FileNameDisplayPreference::Local);
-                eprintln!("{}", span_str);
-            }
-            eprintln!("-----------------------------\n");
-        }
-        err_opt
-    }
+
 
     fn set_pending_return_value(&mut self, id: ThreadId, val_ref: GenericValueRef<'static>) {
         let this = self.eval_context_mut();
@@ -293,15 +264,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         } else {
             this.machine.pending_return_values.try_insert(id, val_ref).unwrap();
         }
-    }
-
-    fn get_pending_return_value(
-        &mut self,
-        id: ThreadId,
-    ) -> InterpResult<'tcx, Option<GenericValueRef<'static>>> {
-        let this = self.eval_context_mut();
-        let pending_return = this.machine.pending_return_values.remove(&id);
-        Ok(pending_return)
     }
 
     fn update_last_rust_call_location(&self) {
@@ -329,7 +291,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 },
             _ => {}
         }
-        if layout.is_transparent::<MiriInterpCx<'_, 'tcx>>() {
+        if layout.is_transparent::<MiriInterpCx<'tcx>>() {
             if let Some((_, field)) = layout.non_1zst_field(this) {
                 return this.is_pointer_convertible(&field);
             }
@@ -338,7 +300,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     }
 
     #[allow(dead_code)]
-    fn is_pointer_aligned(&self, ptr: Pointer<Option<crate::Provenance>>, align: Align) -> bool {
+    fn is_pointer_aligned(&self, ptr: Pointer, align: Align) -> bool {
         let this = self.eval_context_ref();
         match this.ptr_try_get_alloc_id(ptr) {
             Err(addr) => addr % align.bytes() == 0,
@@ -381,19 +343,18 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             let pointer = if this.should_check_alignment_in_llvm(Some(alloc_id)) {
                 ResolvedPointer {
                     ptr: Pointer::new(Some(provenance), Size::from_bytes(mp.addr)),
-                    alloc_id: Some(alloc_id),
                     align,
                     offset: Size::ZERO,
                 }
             } else {
-                let base_address = this.addr_from_alloc_id(alloc_id)?;
+                let (kind, _) = this.memory.alloc_map().get(alloc_id).unwrap();
+                let base_address = this.addr_from_alloc_id(alloc_id, *kind)?;
                 let alignment_offset_multiple = (mp.addr - base_address) / align.bytes();
                 let aligned_offset = alignment_offset_multiple * align.bytes();
                 let offset = Size::from_bytes((mp.addr - base_address) - aligned_offset);
                 let aligned_addr = Size::from_bytes(base_address + aligned_offset);
                 ResolvedPointer {
                     ptr: Pointer::new(Some(provenance), aligned_addr),
-                    alloc_id: Some(alloc_id),
                     align,
                     offset,
                 }
@@ -404,10 +365,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
-    fn opty_as_scalar(
-        &self,
-        opty: &OpTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, Scalar<Provenance>> {
+    fn opty_as_scalar(&self, opty: &OpTy<'tcx>) -> InterpResult<'tcx, Scalar> {
         if let Right(imm) = opty.as_mplace_or_imm() {
             Ok(imm.to_scalar())
         } else {
@@ -419,6 +377,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let this = self.eval_context_ref();
         this.layout_of(this.tcx.mk_ty_from_kind(ty::RawPtr(ty, Mutability::Mut)))
     }
+
     #[allow(clippy::arithmetic_side_effects)]
     fn to_vec_endian(&self, bytes: u128, length: usize) -> Vec<u8> {
         let bytes = bytes.to_ne_bytes();
@@ -434,8 +393,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
     fn dereference_into_singular_field(
         &mut self,
-        arg: OpTy<'tcx, crate::Provenance>,
-    ) -> InterpResult<'tcx, OpTy<'tcx, crate::Provenance>> {
+        arg: OpTy<'tcx>,
+    ) -> InterpResult<'tcx, OpTy<'tcx>> {
         let this = self.eval_context_mut();
         let mut curr_arg = arg;
         while this.can_dereference_into_singular_field(&curr_arg.layout) {
@@ -505,16 +464,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
-    fn in_llvm(&self) -> InterpResult<'tcx, bool> {
-        let this = self.eval_context_ref();
-        Ok(this.active_thread_ref().is_llvm_thread())
-    }
 
     fn strcmp(
         &mut self,
-        left: &OpTy<'tcx, crate::Provenance>,
-        right: &OpTy<'tcx, crate::Provenance>,
-        n: Option<&OpTy<'tcx, crate::Provenance>>,
+        left: &OpTy<'tcx>,
+        right: &OpTy<'tcx>,
+        n: Option<&OpTy<'tcx>>,
     ) -> InterpResult<'tcx, i32> {
         let this = self.eval_context_mut();
         let left = this.read_pointer(left)?;

@@ -12,7 +12,7 @@ use llvm_sys::{
 use rustc_const_eval::interpret::InterpResult;
 
 fn memory_store_result<'tcx>(
-    ctx: &mut MiriInterpCx<'_, 'tcx>,
+    ctx: &mut MiriInterpCx<'tcx>,
     source_ref: LLVMGenericValueRef,
     destination_pointer: MiriPointer,
     value_type_ref: LLVMTypeRef,

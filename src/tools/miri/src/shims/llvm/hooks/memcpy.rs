@@ -5,7 +5,7 @@ use crate::MiriInterpCx;
 use inkwell::values::GenericValue;
 use rustc_abi::Size;
 use rustc_const_eval::interpret::InterpResult;
-use rustc_const_eval::interpret::OpTy;
+use crate::*;
 
 pub enum MemcpyMode {
     Disjoint,
@@ -15,11 +15,11 @@ pub enum MemcpyMode {
 
 #[allow(clippy::arithmetic_side_effects)]
 pub fn eval_memcpy<'tcx>(
-    ctx: &mut MiriInterpCx<'_, 'tcx>,
+    ctx: &mut MiriInterpCx<'tcx>,
     function: &str,
-    dest: &OpTy<'tcx, crate::Provenance>,
-    source: &OpTy<'tcx, crate::Provenance>,
-    source_length: Option<&OpTy<'tcx, crate::Provenance>>,
+    dest: &OpTy<'tcx>,
+    source: &OpTy<'tcx>,
+    source_length: Option<&OpTy<'tcx>>,
     mode: MemcpyMode,
 ) -> InterpResult<'tcx, GenericValue<'tcx>> {
     let dest = ctx.opty_as_scalar(dest)?;

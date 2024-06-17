@@ -4,6 +4,7 @@ use std::str;
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_span::Symbol;
 use rustc_target::spec::abi::Abi;
+use rustc_target::abi::{Size, Align};
 
 use crate::shims::alloc::EvalContextExt as _;
 use crate::shims::unix::*;
@@ -15,7 +16,7 @@ use shims::unix::linux::foreign_items as linux;
 use shims::unix::macos::foreign_items as macos;
 use shims::unix::solarish::foreign_items as solarish;
 
-use crate::shims::llvm::helpers::EvalContextExt as _;
+use crate::shims::llvm::EvalContextExt as _;
 
 pub fn is_dyn_sym(name: &str, target_os: &str) -> bool {
     match name {
@@ -379,7 +380,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // Thread-local storage
             "pthread_key_create" => {
                 if this.in_llvm()? {
-                    this.handle_unsupported(format!(
+                    this.handle_unsupported_foreign_item(format!(
                         "can't call foreign function `{link_name}` on OS `{os}`",
                         os = this.tcx.sess.target.os,
                     ))?;
@@ -557,7 +558,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // Threading
             "pthread_create" => {
                 if this.in_llvm()? {
-                    this.handle_unsupported(format!(
+                    this.handle_unsupported_foreign_item(format!(
                         "can't call foreign function `{link_name}` on OS `{os}`",
                         os = this.tcx.sess.target.os,
                     ))?;

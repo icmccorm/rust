@@ -1,15 +1,14 @@
 use crate::shims::llvm::helpers::EvalContextExt;
-use crate::shims::llvm::hooks::access::{Destination, Source};
-use crate::MiriInterpCx;
+use crate::shims::llvm::hooks::{Destination, Source};
+use crate::*;
 use inkwell::values::GenericValueRef;
-use rustc_const_eval::interpret::{InterpResult, Pointer};
-use rustc_target::abi::{Size, Align};
-
+use rustc_const_eval::interpret::InterpResult;
+use rustc_target::abi::{Align, Size};
 
 impl<'lli> Destination<GenericValueRef<'lli>> for GenericValueRef<'lli> {
     fn write_f32<'tcx>(
         &mut self,
-        _ctx: &mut MiriInterpCx<'_, 'tcx>,
+        _ctx: &mut MiriInterpCx<'tcx>,
         value: f32,
         _align: Align,
     ) -> InterpResult<'tcx> {
@@ -19,7 +18,7 @@ impl<'lli> Destination<GenericValueRef<'lli>> for GenericValueRef<'lli> {
 
     fn write_f64<'tcx>(
         &mut self,
-        _ctx: &mut MiriInterpCx<'_, 'tcx>,
+        _ctx: &mut MiriInterpCx<'tcx>,
         value: f64,
         _align: Align,
     ) -> InterpResult<'tcx> {
@@ -29,7 +28,7 @@ impl<'lli> Destination<GenericValueRef<'lli>> for GenericValueRef<'lli> {
 
     fn write_unsigned<'tcx>(
         &mut self,
-        _ctx: &mut MiriInterpCx<'_, 'tcx>,
+        _ctx: &mut MiriInterpCx<'tcx>,
         value: u128,
         size: Size,
         _align: Align,
@@ -40,8 +39,8 @@ impl<'lli> Destination<GenericValueRef<'lli>> for GenericValueRef<'lli> {
 
     fn write_pointer<'tcx>(
         &mut self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
-        pointer: Pointer<Option<crate::Provenance>>,
+        ctx: &mut MiriInterpCx<'tcx>,
+        pointer: Pointer,
         _align: Align,
     ) -> InterpResult<'tcx> {
         let pointer = ctx.pointer_to_lli_wrapped_pointer(pointer);
@@ -51,7 +50,7 @@ impl<'lli> Destination<GenericValueRef<'lli>> for GenericValueRef<'lli> {
 
     fn resolve_field<'tcx>(
         &mut self,
-        _ctx: &mut MiriInterpCx<'_, 'tcx>,
+        _ctx: &mut MiriInterpCx<'tcx>,
         _size: Size,
         index: u32,
     ) -> InterpResult<'tcx, GenericValueRef<'lli>> {
@@ -60,7 +59,7 @@ impl<'lli> Destination<GenericValueRef<'lli>> for GenericValueRef<'lli> {
 
     fn ensure_aggregate_size<'tcx>(
         &self,
-        _ctx: &MiriInterpCx<'_, 'tcx>,
+        _ctx: &MiriInterpCx<'tcx>,
         aggregate_size: u32,
     ) -> InterpResult<'tcx> {
         self.ensure_capacity(u64::from(aggregate_size));
@@ -69,25 +68,17 @@ impl<'lli> Destination<GenericValueRef<'lli>> for GenericValueRef<'lli> {
 }
 
 impl<'lli> Source<GenericValueRef<'lli>> for GenericValueRef<'lli> {
-    fn read_f32<'tcx>(
-        &self,
-        _ctx: &MiriInterpCx<'_, 'tcx>,
-        _align: Align,
-    ) -> InterpResult<'tcx, f32> {
+    fn read_f32<'tcx>(&self, _ctx: &MiriInterpCx<'tcx>, _align: Align) -> InterpResult<'tcx, f32> {
         Ok(self.as_f32())
     }
 
-    fn read_f64<'tcx>(
-        &self,
-        _ctx: &MiriInterpCx<'_, 'tcx>,
-        _align: Align,
-    ) -> InterpResult<'tcx, f64> {
+    fn read_f64<'tcx>(&self, _ctx: &MiriInterpCx<'tcx>, _align: Align) -> InterpResult<'tcx, f64> {
         Ok(self.as_f64())
     }
 
     fn read_unsigned<'tcx>(
         &self,
-        _ctx: &mut MiriInterpCx<'_, 'tcx>,
+        _ctx: &mut MiriInterpCx<'tcx>,
         _size: Size,
         _align: Align,
     ) -> InterpResult<'tcx, u128> {
@@ -96,9 +87,9 @@ impl<'lli> Source<GenericValueRef<'lli>> for GenericValueRef<'lli> {
 
     fn read_pointer<'tcx>(
         &self,
-        ctx: &MiriInterpCx<'_, 'tcx>,
+        ctx: &MiriInterpCx<'tcx>,
         _align: Align,
-    ) -> InterpResult<'tcx, Pointer<Option<crate::Provenance>>> {
+    ) -> InterpResult<'tcx, Pointer> {
         let pointer = self.as_miri_pointer();
         let pointer = ctx.lli_wrapped_pointer_to_maybe_pointer(pointer);
         Ok(pointer)
@@ -106,7 +97,7 @@ impl<'lli> Source<GenericValueRef<'lli>> for GenericValueRef<'lli> {
 
     fn check_aggregate_size<'tcx>(
         &self,
-        _ctx: &MiriInterpCx<'_, 'tcx>,
+        _ctx: &MiriInterpCx<'tcx>,
         aggregate_size: u32,
     ) -> InterpResult<'tcx> {
         if self.get_aggregate_size() != u64::from(aggregate_size) {
@@ -122,7 +113,7 @@ impl<'lli> Source<GenericValueRef<'lli>> for GenericValueRef<'lli> {
 
     fn resolve_field<'tcx>(
         &self,
-        _ctx: &MiriInterpCx<'_, 'tcx>,
+        _ctx: &MiriInterpCx<'tcx>,
         _size: Size,
         index: u32,
     ) -> InterpResult<'tcx, GenericValueRef<'lli>> {
