@@ -137,10 +137,13 @@
 //!
 //! [^extern_fn]: this remains true for any argument/return types and any other ABI: `extern "abi" fn` (_e.g._, `extern "system" fn`)
 //!
+//! Under some conditions the above types `T` are also null pointer optimized when wrapped in a [`Result`][result_repr].
+//!
 //! [`Box<U>`]: ../../std/boxed/struct.Box.html
 //! [`num::NonZero*`]: crate::num
 //! [`ptr::NonNull<U>`]: crate::ptr::NonNull
 //! [function call ABI]: ../primitive.fn.html#abi-compatibility
+//! [result_repr]: crate::result#representation
 //!
 //! This is called the "null pointer optimization" or NPO.
 //!
@@ -554,7 +557,7 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use crate::iter::{self, FusedIterator, TrustedLen};
-use crate::panicking::{panic, panic_str};
+use crate::panicking::{panic, panic_display};
 use crate::pin::Pin;
 use crate::{
     cmp, convert, hint, mem,
@@ -649,6 +652,32 @@ impl<T> Option<T> {
     #[rustc_const_stable(feature = "const_option_basics", since = "1.48.0")]
     pub const fn is_none(&self) -> bool {
         !self.is_some()
+    }
+
+    /// Returns `true` if the option is a [`None`] or the value inside of it matches a predicate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(is_none_or)]
+    ///
+    /// let x: Option<u32> = Some(2);
+    /// assert_eq!(x.is_none_or(|x| x > 1), true);
+    ///
+    /// let x: Option<u32> = Some(0);
+    /// assert_eq!(x.is_none_or(|x| x > 1), false);
+    ///
+    /// let x: Option<u32> = None;
+    /// assert_eq!(x.is_none_or(|x| x > 1), true);
+    /// ```
+    #[must_use]
+    #[inline]
+    #[unstable(feature = "is_none_or", issue = "126383")]
+    pub fn is_none_or(self, f: impl FnOnce(T) -> bool) -> bool {
+        match self {
+            None => true,
+            Some(x) => f(x),
+        }
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -1705,8 +1734,6 @@ impl<T> Option<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(option_take_if)]
-    ///
     /// let mut x = Some(42);
     ///
     /// let prev = x.take_if(|v| if *v == 42 {
@@ -1723,7 +1750,7 @@ impl<T> Option<T> {
     /// assert_eq!(prev, Some(43));
     /// ```
     #[inline]
-    #[unstable(feature = "option_take_if", issue = "98934")]
+    #[stable(feature = "option_take_if", since = "1.80.0")]
     pub fn take_if<P>(&mut self, predicate: P) -> Option<T>
     where
         P: FnOnce(&mut T) -> bool,
@@ -1991,7 +2018,7 @@ const fn unwrap_failed() -> ! {
 #[track_caller]
 #[rustc_const_unstable(feature = "const_option", issue = "67441")]
 const fn expect_failed(msg: &str) -> ! {
-    panic_str(msg)
+    panic_display(&msg)
 }
 
 /////////////////////////////////////////////////////////////////////////////

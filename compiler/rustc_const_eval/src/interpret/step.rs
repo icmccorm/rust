@@ -3,16 +3,20 @@
 //! The main entry point is the `step` method.
 
 use either::Either;
+use tracing::{info, instrument, trace};
 
 use rustc_index::IndexSlice;
 use rustc_middle::mir;
 use rustc_middle::ty::layout::LayoutOf;
+use rustc_middle::{bug, span_bug};
 use rustc_target::abi::{FieldIdx, FIRST_VARIANT};
 
-use super::{ImmTy, InterpCx, InterpResult, Machine, PlaceTy, Projectable, Scalar};
+use super::{
+    ImmTy, Immediate, InterpCx, InterpResult, Machine, MemPlaceMeta, PlaceTy, Projectable, Scalar,
+};
 use crate::util;
 
-impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
+impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// Returns `true` as long as there are more things to do.
     ///
     /// This is used by [priroda](https://github.com/oli-obk/priroda)
@@ -144,7 +148,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         use rustc_middle::mir::Rvalue::*;
         match *rvalue {
             ThreadLocalRef(did) => {
-                let ptr = M::thread_local_static_base_pointer(self, did)?;
+                let ptr = M::thread_local_static_pointer(self, did)?;
                 self.write_pointer(ptr, &dest)?;
             }
 
@@ -164,23 +168,17 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 let left = self.read_immediate(&self.eval_operand(left, layout)?)?;
                 let layout = util::binop_right_homogeneous(bin_op).then_some(left.layout);
                 let right = self.read_immediate(&self.eval_operand(right, layout)?)?;
-                self.binop_ignore_overflow(bin_op, &left, &right, &dest)?;
-            }
-
-            CheckedBinaryOp(bin_op, box (ref left, ref right)) => {
-                // Due to the extra boolean in the result, we can never reuse the `dest.layout`.
-                let left = self.read_immediate(&self.eval_operand(left, None)?)?;
-                let layout = util::binop_right_homogeneous(bin_op).then_some(left.layout);
-                let right = self.read_immediate(&self.eval_operand(right, layout)?)?;
-                self.binop_with_overflow(bin_op, &left, &right, &dest)?;
+                let result = self.binary_op(bin_op, &left, &right)?;
+                assert_eq!(result.layout, dest.layout, "layout mismatch for result of {bin_op:?}");
+                self.write_immediate(*result, &dest)?;
             }
 
             UnaryOp(un_op, ref operand) => {
                 // The operand always has the same type as the result.
                 let val = self.read_immediate(&self.eval_operand(operand, Some(dest.layout))?)?;
-                let val = self.wrapping_unary_op(un_op, &val)?;
-                assert_eq!(val.layout, dest.layout, "layout mismatch for result of {un_op:?}");
-                self.write_immediate(*val, &dest)?;
+                let result = self.unary_op(un_op, &val)?;
+                assert_eq!(result.layout, dest.layout, "layout mismatch for result of {un_op:?}");
+                self.write_immediate(*result, &dest)?;
             }
 
             Aggregate(box ref kind, ref operands) => {
@@ -255,10 +253,13 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                         Scalar::from_target_usize(val, self)
                     }
                     mir::NullOp::OffsetOf(fields) => {
-                        let val = layout.offset_of_subfield(self, fields.iter()).bytes();
+                        let val = self
+                            .tcx
+                            .offset_of_subfield(self.param_env, layout, fields.iter())
+                            .bytes();
                         Scalar::from_target_usize(val, self)
                     }
-                    mir::NullOp::UbChecks => Scalar::from_bool(self.tcx.sess.opts.debug_assertions),
+                    mir::NullOp::UbChecks => Scalar::from_bool(self.tcx.sess.ub_checks()),
                 };
                 self.write_scalar(val, &dest)?;
             }
@@ -302,6 +303,27 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             mir::AggregateKind::Adt(_, variant_index, _, _, active_field_index) => {
                 let variant_dest = self.project_downcast(dest, variant_index)?;
                 (variant_index, variant_dest, active_field_index)
+            }
+            mir::AggregateKind::RawPtr(..) => {
+                // Pointers don't have "fields" in the normal sense, so the
+                // projection-based code below would either fail in projection
+                // or in type mismatches. Instead, build an `Immediate` from
+                // the parts and write that to the destination.
+                let [data, meta] = &operands.raw else {
+                    bug!("{kind:?} should have 2 operands, had {operands:?}");
+                };
+                let data = self.eval_operand(data, None)?;
+                let data = self.read_pointer(&data)?;
+                let meta = self.eval_operand(meta, None)?;
+                let meta = if meta.layout.is_zst() {
+                    MemPlaceMeta::None
+                } else {
+                    MemPlaceMeta::Meta(self.read_scalar(&meta)?)
+                };
+                let ptr_imm = Immediate::new_pointer_with_meta(data, meta, self);
+                let ptr = ImmTy::from_immediate(ptr_imm, dest.layout);
+                self.copy_op(&ptr, dest)?;
+                return Ok(());
             }
             _ => (FIRST_VARIANT, dest.clone(), None),
         };

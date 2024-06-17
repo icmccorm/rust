@@ -13,9 +13,10 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use crate::core::build_steps::llvm;
 use crate::core::build_steps::tool::{self, SourceType};
-use crate::core::build_steps::{check, clean, compile, dist, doc, install, run, setup, test};
+use crate::core::build_steps::{
+    check, clean, clippy, compile, dist, doc, install, llvm, run, setup, test, vendor,
+};
 use crate::core::config::flags::{Color, Subcommand};
 use crate::core::config::{DryRun, SplitDebuginfo, TargetSelection};
 use crate::prepare_behaviour_dump_dir;
@@ -34,13 +35,34 @@ use once_cell::sync::Lazy;
 #[cfg(test)]
 mod tests;
 
+/// Builds and performs different [`Self::kind`]s of stuff and actions, taking
+/// into account build configuration from e.g. config.toml.
 pub struct Builder<'a> {
+    /// Build configuration from e.g. config.toml.
     pub build: &'a Build,
+
+    /// The stage to use. Either implicitly determined based on subcommand, or
+    /// explicitly specified with `--stage N`. Normally this is the stage we
+    /// use, but sometimes we want to run steps with a lower stage than this.
     pub top_stage: u32,
+
+    /// What to build or what action to perform.
     pub kind: Kind,
+
+    /// A cache of outputs of [`Step`]s so we can avoid running steps we already
+    /// ran.
     cache: Cache,
+
+    /// A stack of [`Step`]s to run before we can run this builder. The output
+    /// of steps is cached in [`Self::cache`].
     stack: RefCell<Vec<Box<dyn Any>>>,
+
+    /// The total amount of time we spent running [`Step`]s in [`Self::stack`].
     time_spent_on_dependencies: Cell<Duration>,
+
+    /// The paths passed on the command line. Used by steps to figure out what
+    /// to do. For example: with `./x check foo bar` we get `paths=["foo",
+    /// "bar"]`.
     pub paths: Vec<PathBuf>,
 }
 
@@ -66,6 +88,9 @@ pub trait Step: 'static + Clone + Debug + PartialEq + Eq + Hash {
 
     /// Primary function to execute this rule. Can call `builder.ensure()`
     /// with other steps to run those.
+    ///
+    /// This gets called twice during a normal `./x.py` execution: first
+    /// with `dry_run() == true`, and then for real.
     fn run(self, builder: &Builder<'_>) -> Self::Output;
 
     /// When bootstrap is passed a set of paths, this controls whether this rule
@@ -132,8 +157,7 @@ impl RunConfig<'_> {
             Alias::Compiler => self.builder.in_tree_crates("rustc-main", Some(self.target)),
         };
 
-        let crate_names = crates.into_iter().map(|krate| krate.name.to_string()).collect();
-        crate_names
+        crates.into_iter().map(|krate| krate.name.to_string()).collect()
     }
 }
 
@@ -296,17 +320,18 @@ const PATH_REMAP: &[(&str, &[&str])] = &[
     (
         "tests",
         &[
+            // tidy-alphabetical-start
             "tests/assembly",
             "tests/codegen",
             "tests/codegen-units",
             "tests/coverage",
             "tests/coverage-run-rustdoc",
+            "tests/crashes",
             "tests/debuginfo",
             "tests/incremental",
             "tests/mir-opt",
             "tests/pretty",
             "tests/run-make",
-            "tests/run-make-fulldeps",
             "tests/run-pass-valgrind",
             "tests/rustdoc",
             "tests/rustdoc-gui",
@@ -316,6 +341,7 @@ const PATH_REMAP: &[(&str, &[&str])] = &[
             "tests/rustdoc-ui",
             "tests/ui",
             "tests/ui-fulldeps",
+            // tidy-alphabetical-end
         ],
     ),
 ];
@@ -323,16 +349,13 @@ const PATH_REMAP: &[(&str, &[&str])] = &[
 fn remap_paths(paths: &mut Vec<&Path>) {
     let mut remove = vec![];
     let mut add = vec![];
-    for (i, path) in paths
-        .iter()
-        .enumerate()
-        .filter_map(|(i, path)| if let Some(s) = path.to_str() { Some((i, s)) } else { None })
+    for (i, path) in paths.iter().enumerate().filter_map(|(i, path)| path.to_str().map(|s| (i, s)))
     {
         for &(search, replace) in PATH_REMAP {
             // Remove leading and trailing slashes so `tests/` and `tests` are equivalent
             if path.trim_matches(std::path::is_separator) == search {
                 remove.push(i);
-                add.extend(replace.into_iter().map(Path::new));
+                add.extend(replace.iter().map(Path::new));
                 break;
             }
         }
@@ -642,30 +665,10 @@ pub enum Kind {
     Run,
     Setup,
     Suggest,
+    Vendor,
 }
 
 impl Kind {
-    pub fn parse(string: &str) -> Option<Kind> {
-        // these strings, including the one-letter aliases, must match the x.py help text
-        Some(match string {
-            "build" | "b" => Kind::Build,
-            "check" | "c" => Kind::Check,
-            "clippy" => Kind::Clippy,
-            "fix" => Kind::Fix,
-            "fmt" => Kind::Format,
-            "test" | "t" => Kind::Test,
-            "bench" => Kind::Bench,
-            "doc" | "d" => Kind::Doc,
-            "clean" => Kind::Clean,
-            "dist" => Kind::Dist,
-            "install" => Kind::Install,
-            "run" | "r" => Kind::Run,
-            "setup" => Kind::Setup,
-            "suggest" => Kind::Suggest,
-            _ => return None,
-        })
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             Kind::Build => "build",
@@ -683,6 +686,7 @@ impl Kind {
             Kind::Run => "run",
             Kind::Setup => "setup",
             Kind::Suggest => "suggest",
+            Kind::Vendor => "vendor",
         }
     }
 
@@ -693,6 +697,7 @@ impl Kind {
             Kind::Doc => "Documenting",
             Kind::Run => "Running",
             Kind::Suggest => "Suggesting",
+            Kind::Clippy => "Linting",
             _ => {
                 let title_letter = self.as_str()[0..1].to_ascii_uppercase();
                 return format!("{title_letter}{}ing", &self.as_str()[1..]);
@@ -747,7 +752,35 @@ impl<'a> Builder<'a> {
                 tool::CoverageDump,
                 tool::LlvmBitcodeLinker
             ),
-            Kind::Check | Kind::Clippy | Kind::Fix => describe!(
+            Kind::Clippy => describe!(
+                clippy::Std,
+                clippy::Rustc,
+                clippy::Bootstrap,
+                clippy::BuildHelper,
+                clippy::BuildManifest,
+                clippy::CargoMiri,
+                clippy::Clippy,
+                clippy::CollectLicenseMetadata,
+                clippy::Compiletest,
+                clippy::CoverageDump,
+                clippy::Jsondocck,
+                clippy::Jsondoclint,
+                clippy::LintDocs,
+                clippy::LlvmBitcodeLinker,
+                clippy::Miri,
+                clippy::MiroptTestTools,
+                clippy::OptDist,
+                clippy::RemoteTestClient,
+                clippy::RemoteTestServer,
+                clippy::Rls,
+                clippy::RustAnalyzer,
+                clippy::RustDemangler,
+                clippy::Rustdoc,
+                clippy::Rustfmt,
+                clippy::RustInstaller,
+                clippy::Tidy,
+            ),
+            Kind::Check | Kind::Fix => describe!(
                 check::Std,
                 check::Rustc,
                 check::Rustdoc,
@@ -763,9 +796,9 @@ impl<'a> Builder<'a> {
             ),
             Kind::Test => describe!(
                 crate::core::build_steps::toolstate::ToolStateCheck,
-                test::ExpandYamlAnchors,
                 test::Tidy,
                 test::Ui,
+                test::Crashes,
                 test::RunPassValgrind,
                 test::Coverage,
                 test::CoverageMap,
@@ -794,7 +827,6 @@ impl<'a> Builder<'a> {
                 test::RustAnalyzer,
                 test::ErrorIndex,
                 test::Distcheck,
-                test::RunMakeFullDeps,
                 test::Nomicon,
                 test::Reference,
                 test::RustdocBook,
@@ -812,6 +844,7 @@ impl<'a> Builder<'a> {
                 test::Clippy,
                 test::RustDemangler,
                 test::CompiletestTest,
+                test::CrateRunMakeSupport,
                 test::RustdocJSStd,
                 test::RustdocJSNotStd,
                 test::RustdocGUI,
@@ -853,6 +886,7 @@ impl<'a> Builder<'a> {
                 doc::Tidy,
                 doc::Bootstrap,
                 doc::Releases,
+                doc::RunMakeSupport,
             ),
             Kind::Dist => describe!(
                 dist::Docs,
@@ -873,6 +907,7 @@ impl<'a> Builder<'a> {
                 dist::Clippy,
                 dist::Miri,
                 dist::LlvmTools,
+                dist::LlvmBitcodeLinker,
                 dist::RustDev,
                 dist::Bootstrap,
                 dist::Extended,
@@ -902,7 +937,6 @@ impl<'a> Builder<'a> {
                 install::Src,
             ),
             Kind::Run => describe!(
-                run::ExpandYamlAnchors,
                 run::BuildManifest,
                 run::BumpStage0,
                 run::ReplaceVersionPlaceholder,
@@ -914,6 +948,7 @@ impl<'a> Builder<'a> {
             ),
             Kind::Setup => describe!(setup::Profile, setup::Hook, setup::Link, setup::Vscode),
             Kind::Clean => describe!(clean::CleanAll, clean::Rustc, clean::Std),
+            Kind::Vendor => describe!(vendor::Vendor),
             // special-cased in Build::build()
             Kind::Format | Kind::Suggest => vec![],
         }
@@ -986,6 +1021,7 @@ impl<'a> Builder<'a> {
                 Kind::Setup,
                 path.as_ref().map_or([].as_slice(), |path| std::slice::from_ref(path)),
             ),
+            Subcommand::Vendor { .. } => (Kind::Vendor, &paths[..]),
         };
 
         Self::new_internal(build, kind, paths.to_owned())
@@ -1000,14 +1036,26 @@ impl<'a> Builder<'a> {
     }
 
     pub fn doc_rust_lang_org_channel(&self) -> String {
-        let channel = match &*self.config.channel {
-            "stable" => &self.version,
-            "beta" => "beta",
-            "nightly" | "dev" => "nightly",
-            // custom build of rustdoc maybe? link to the latest stable docs just in case
-            _ => "stable",
+        // When using precompiled compiler from CI, we need to use CI rustc's channel and
+        // ignore `rust.channel` from the configuration. Otherwise most of the rustdoc tests
+        // will fail due to incompatible `DOC_RUST_LANG_ORG_CHANNEL`.
+        let channel = if let Some(commit) = self.config.download_rustc_commit() {
+            self.config
+                .read_file_by_commit(&PathBuf::from("src/ci/channel"), commit)
+                .trim()
+                .to_owned()
+        } else {
+            match &*self.config.channel {
+                "stable" => &self.version,
+                "beta" => "beta",
+                "nightly" | "dev" => "nightly",
+                // custom build of rustdoc maybe? link to the latest stable docs just in case
+                _ => "stable",
+            }
+            .to_owned()
         };
-        "https://doc.rust-lang.org/".to_owned() + channel
+
+        format!("https://doc.rust-lang.org/{channel}")
     }
 
     fn run_step_descriptions(&self, v: &[StepDescription], paths: &[PathBuf]) {
@@ -1308,7 +1356,7 @@ impl<'a> Builder<'a> {
         } else if let Some(subcmd) = cmd.strip_prefix("miri") {
             // Command must be "miri-X".
             let subcmd = subcmd
-                .strip_prefix("-")
+                .strip_prefix('-')
                 .unwrap_or_else(|| panic!("expected `miri-$subcommand`, but got {}", cmd));
             cargo = self.cargo_miri_cmd(compiler);
             cargo.arg("miri").arg(subcmd);
@@ -1428,7 +1476,7 @@ impl<'a> Builder<'a> {
             // rustc_llvm. But if LLVM is stale, that'll be a tiny amount
             // of work comparatively, and we'd likely need to rebuild it anyway,
             // so that's okay.
-            if crate::core::build_steps::llvm::prebuilt_llvm_config(self, target).is_err() {
+            if crate::core::build_steps::llvm::prebuilt_llvm_config(self, target).should_build() {
                 cargo.env("RUST_CHECK", "1");
             }
         }
@@ -1518,7 +1566,6 @@ impl<'a> Builder<'a> {
         // features but cargo isn't involved in the #[path] process and so cannot pass the
         // complete list of features, so for that reason we don't enable checking of
         // features for std crates.
-        cargo.arg("-Zcheck-cfg");
         if mode == Mode::Std {
             rustflags.arg("--check-cfg=cfg(feature,values(any()))");
         }
@@ -1530,7 +1577,7 @@ impl<'a> Builder<'a> {
         // `rustflags` without `cargo` making it required.
         rustflags.arg("-Zunstable-options");
         for (restricted_mode, name, values) in EXTRA_CHECK_CFGS {
-            if *restricted_mode == None || *restricted_mode == Some(mode) {
+            if restricted_mode.is_none() || *restricted_mode == Some(mode) {
                 rustflags.arg(&check_cfg_arg(name, *values));
             }
         }
@@ -2092,6 +2139,11 @@ impl<'a> Builder<'a> {
             // break when incremental compilation is enabled. So this overrides the "no inlining
             // during incremental builds" heuristic for the standard library.
             rustflags.arg("-Zinline-mir");
+
+            // Similarly, we need to keep debug info for functions inlined into other std functions,
+            // even if we're not going to output debuginfo for the crate we're currently building,
+            // so that it'll be available when downstream consumers of std try to use it.
+            rustflags.arg("-Zinline-mir-preserve-debug");
         }
 
         if self.config.rustc_parallel
@@ -2185,35 +2237,26 @@ impl<'a> Builder<'a> {
         out
     }
 
-    /// Return paths of all submodules managed by git.
-    /// If the current checkout is not managed by git, returns an empty slice.
+    /// Return paths of all submodules.
     pub fn get_all_submodules(&self) -> &[String] {
-        if !self.rust_info().is_managed_git_subrepository() {
-            return &[];
-        }
-
         static SUBMODULES_PATHS: OnceLock<Vec<String>> = OnceLock::new();
 
         let init_submodules_paths = |src: &PathBuf| {
             let file = File::open(src.join(".gitmodules")).unwrap();
 
             let mut submodules_paths = vec![];
-            for line in BufReader::new(file).lines() {
-                if let Ok(line) = line {
-                    let line = line.trim();
-
-                    if line.starts_with("path") {
-                        let actual_path =
-                            line.split(' ').last().expect("Couldn't get value of path");
-                        submodules_paths.push(actual_path.to_owned());
-                    }
+            for line in BufReader::new(file).lines().map_while(Result::ok) {
+                let line = line.trim();
+                if line.starts_with("path") {
+                    let actual_path = line.split(' ').last().expect("Couldn't get value of path");
+                    submodules_paths.push(actual_path.to_owned());
                 }
             }
 
             submodules_paths
         };
 
-        &SUBMODULES_PATHS.get_or_init(|| init_submodules_paths(&self.src))
+        SUBMODULES_PATHS.get_or_init(|| init_submodules_paths(&self.src))
     }
 
     /// Ensure that a given step is built *only if it's supposed to be built by default*, returning
@@ -2522,7 +2565,12 @@ impl Cargo {
         // FIXME: the guard against msvc shouldn't need to be here
         if target.is_msvc() {
             if let Some(ref cl) = builder.config.llvm_clang_cl {
-                self.command.env("CC", cl).env("CXX", cl);
+                // FIXME: There is a bug in Clang 18 when building for ARM64:
+                // https://github.com/llvm/llvm-project/pull/81849. This is
+                // fixed in LLVM 19, but can't be backported.
+                if !target.starts_with("aarch64") && !target.starts_with("arm64ec") {
+                    self.command.env("CC", cl).env("CXX", cl);
+                }
             }
         } else {
             let ccache = builder.config.ccache.as_ref();

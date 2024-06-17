@@ -7,6 +7,11 @@ use rustc_errors::{
 use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
 use rustc_middle::ty::Ty;
 use rustc_span::{symbol::Ident, Span, Symbol};
+mod pattern_types;
+pub use pattern_types::*;
+
+mod precise_captures;
+pub(crate) use precise_captures::*;
 
 #[derive(Diagnostic)]
 #[diag(hir_analysis_ambiguous_assoc_item)]
@@ -48,6 +53,18 @@ pub struct AssocKindMismatchWrapInBracesSugg {
     pub lo: Span,
     #[suggestion_part(code = " }}")]
     pub hi: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_assoc_item_is_private, code = E0624)]
+pub struct AssocItemIsPrivate {
+    #[primary_span]
+    #[label]
+    pub span: Span,
+    pub kind: &'static str,
+    pub name: Ident,
+    #[label(hir_analysis_defined_here_label)]
+    pub defined_here_label: Span,
 }
 
 #[derive(Diagnostic)]
@@ -285,8 +302,8 @@ pub struct AmbiguousLifetimeBound {
 }
 
 #[derive(Diagnostic)]
-#[diag(hir_analysis_assoc_type_binding_not_allowed, code = E0229)]
-pub struct AssocTypeBindingNotAllowed {
+#[diag(hir_analysis_assoc_item_constraints_not_allowed_here, code = E0229)]
+pub struct AssocItemConstraintsNotAllowedHere {
     #[primary_span]
     #[label]
     pub span: Span,
@@ -383,6 +400,17 @@ pub struct TaitForwardCompat {
     pub span: Span,
     #[note]
     pub item_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_tait_forward_compat2)]
+#[note]
+pub struct TaitForwardCompat2 {
+    #[primary_span]
+    pub span: Span,
+    #[note(hir_analysis_opaque)]
+    pub opaque_type_span: Span,
+    pub opaque_type: String,
 }
 
 pub struct MissingTypeParams {
@@ -1350,29 +1378,54 @@ pub struct CrossCrateTraitsDefined {
     pub traits: String,
 }
 
+// FIXME(fmease): Deduplicate:
+
 #[derive(Diagnostic)]
 #[diag(hir_analysis_ty_param_first_local, code = E0210)]
 #[note]
-pub struct TyParamFirstLocal<'a> {
+pub struct TyParamFirstLocal<'tcx> {
     #[primary_span]
     #[label]
     pub span: Span,
     #[note(hir_analysis_case_note)]
     pub note: (),
-    pub param_ty: Ty<'a>,
-    pub local_type: Ty<'a>,
+    pub param: Symbol,
+    pub local_type: Ty<'tcx>,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(hir_analysis_ty_param_first_local, code = E0210)]
+#[note]
+pub struct TyParamFirstLocalLint<'tcx> {
+    #[label]
+    pub span: Span,
+    #[note(hir_analysis_case_note)]
+    pub note: (),
+    pub param: Symbol,
+    pub local_type: Ty<'tcx>,
 }
 
 #[derive(Diagnostic)]
 #[diag(hir_analysis_ty_param_some, code = E0210)]
 #[note]
-pub struct TyParamSome<'a> {
+pub struct TyParamSome {
     #[primary_span]
     #[label]
     pub span: Span,
     #[note(hir_analysis_only_note)]
     pub note: (),
-    pub param_ty: Ty<'a>,
+    pub param: Symbol,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(hir_analysis_ty_param_some, code = E0210)]
+#[note]
+pub struct TyParamSomeLint {
+    #[label]
+    pub span: Span,
+    #[note(hir_analysis_only_note)]
+    pub note: (),
+    pub param: Symbol,
 }
 
 #[derive(Diagnostic)]
@@ -1628,4 +1681,21 @@ pub struct OpaqueCapturesHigherRankedLifetime {
     #[note]
     pub decl_span: Span,
     pub bad_place: &'static str,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_pattern_type_non_const_range)]
+pub struct NonConstRange {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_invalid_receiver_ty, code = E0307)]
+#[note]
+#[help(hir_analysis_invalid_receiver_ty_help)]
+pub struct InvalidReceiverTy<'tcx> {
+    #[primary_span]
+    pub span: Span,
+    pub receiver_ty: Ty<'tcx>,
 }

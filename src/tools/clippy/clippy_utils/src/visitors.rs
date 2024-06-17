@@ -6,7 +6,7 @@ use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::intravisit::{self, walk_block, walk_expr, Visitor};
 use rustc_hir::{
     AnonConst, Arm, Block, BlockCheckMode, Body, BodyId, Expr, ExprKind, HirId, ItemId, ItemKind, LetExpr, Pat, QPath,
-    Stmt, UnOp, UnsafeSource, Unsafety,
+    Safety, Stmt, UnOp, UnsafeSource,
 };
 use rustc_lint::LateContext;
 use rustc_middle::hir::nested_filter;
@@ -100,7 +100,7 @@ visitable_ref!(Stmt, visit_stmt);
 
 /// Calls the given function once for each expression contained. This does not enter any bodies or
 /// nested items.
-pub fn for_each_expr<'tcx, B, C: Continue>(
+pub fn for_each_expr_without_closures<'tcx, B, C: Continue>(
     node: impl Visitable<'tcx>,
     f: impl FnMut(&'tcx Expr<'tcx>) -> ControlFlow<B, C>,
 ) -> Option<B> {
@@ -134,7 +134,7 @@ pub fn for_each_expr<'tcx, B, C: Continue>(
 
 /// Calls the given function once for each expression contained. This will enter bodies, but not
 /// nested items.
-pub fn for_each_expr_with_closures<'tcx, B, C: Continue>(
+pub fn for_each_expr<'tcx, B, C: Continue>(
     cx: &LateContext<'tcx>,
     node: impl Visitable<'tcx>,
     f: impl FnMut(&'tcx Expr<'tcx>) -> ControlFlow<B, C>,
@@ -181,7 +181,7 @@ pub fn for_each_expr_with_closures<'tcx, B, C: Continue>(
 
 /// returns `true` if expr contains match expr desugared from try
 fn contains_try(expr: &Expr<'_>) -> bool {
-    for_each_expr(expr, |e| {
+    for_each_expr_without_closures(expr, |e| {
         if matches!(e.kind, ExprKind::Match(_, _, hir::MatchSource::TryDesugar(_))) {
             ControlFlow::Break(())
         } else {
@@ -286,7 +286,7 @@ where
 
 /// Checks if the given resolved path is used in the given body.
 pub fn is_res_used(cx: &LateContext<'_>, res: Res, body: BodyId) -> bool {
-    for_each_expr_with_closures(cx, cx.tcx.hir().body(body).value, |e| {
+    for_each_expr(cx, cx.tcx.hir().body(body).value, |e| {
         if let ExprKind::Path(p) = &e.kind {
             if cx.qpath_res(p, e.hir_id) == res {
                 return ControlFlow::Break(());
@@ -299,7 +299,7 @@ pub fn is_res_used(cx: &LateContext<'_>, res: Res, body: BodyId) -> bool {
 
 /// Checks if the given local is used.
 pub fn is_local_used<'tcx>(cx: &LateContext<'tcx>, visitable: impl Visitable<'tcx>, id: HirId) -> bool {
-    for_each_expr_with_closures(cx, visitable, |e| {
+    for_each_expr(cx, visitable, |e| {
         if path_to_local_id(e, id) {
             ControlFlow::Break(())
         } else {
@@ -421,16 +421,16 @@ pub fn is_expr_unsafe<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) -> bool {
                         .typeck_results()
                         .type_dependent_def_id(e.hir_id)
                         .map_or(false, |id| {
-                            self.cx.tcx.fn_sig(id).skip_binder().unsafety() == Unsafety::Unsafe
+                            self.cx.tcx.fn_sig(id).skip_binder().safety() == Safety::Unsafe
                         }) =>
                 {
                     self.is_unsafe = true;
                 },
                 ExprKind::Call(func, _) => match *self.cx.typeck_results().expr_ty(func).peel_refs().kind() {
-                    ty::FnDef(id, _) if self.cx.tcx.fn_sig(id).skip_binder().unsafety() == Unsafety::Unsafe => {
+                    ty::FnDef(id, _) if self.cx.tcx.fn_sig(id).skip_binder().safety() == Safety::Unsafe => {
                         self.is_unsafe = true;
                     },
-                    ty::FnPtr(sig) if sig.unsafety() == Unsafety::Unsafe => self.is_unsafe = true,
+                    ty::FnPtr(sig) if sig.safety() == Safety::Unsafe => self.is_unsafe = true,
                     _ => walk_expr(self, e),
                 },
                 ExprKind::Path(ref p)
@@ -452,7 +452,7 @@ pub fn is_expr_unsafe<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) -> bool {
         }
         fn visit_nested_item(&mut self, id: ItemId) {
             if let ItemKind::Impl(i) = &self.cx.tcx.hir().item(id).kind {
-                self.is_unsafe = i.unsafety == Unsafety::Unsafe;
+                self.is_unsafe = i.safety == Safety::Unsafe;
             }
         }
     }
@@ -757,7 +757,7 @@ pub fn for_each_local_assignment<'tcx, B>(
 }
 
 pub fn contains_break_or_continue(expr: &Expr<'_>) -> bool {
-    for_each_expr(expr, |e| {
+    for_each_expr_without_closures(expr, |e| {
         if matches!(e.kind, ExprKind::Break(..) | ExprKind::Continue(..)) {
             ControlFlow::Break(())
         } else {
@@ -776,7 +776,7 @@ pub fn local_used_once<'tcx>(
 ) -> Option<&'tcx Expr<'tcx>> {
     let mut expr = None;
 
-    let cf = for_each_expr_with_closures(cx, visitable, |e| {
+    let cf = for_each_expr(cx, visitable, |e| {
         if path_to_local_id(e, id) && expr.replace(e).is_some() {
             ControlFlow::Break(())
         } else {

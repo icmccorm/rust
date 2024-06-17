@@ -104,10 +104,10 @@ infer_compare_impl_item_obligation = ...so that the definition in impl matches t
 infer_consider_specifying_length = consider specifying the actual array length
 infer_data_flows = ...but data{$label_var1_exists ->
     [true] {" "}from `{$label_var1}`
-    *[false] -> {""}
+    *[false] {""}
 } flows{$label_var2_exists ->
     [true] {" "}into `{$label_var2}`
-    *[false] -> {""}
+    *[false] {""}
 } here
 
 infer_data_lifetime_flow = ...but data with one lifetime flows into the other here
@@ -144,6 +144,9 @@ infer_fps_items_are_distinct = fn items are distinct from fn pointers
 infer_fps_remove_ref = consider removing the reference
 infer_fps_use_ref = consider using a reference
 infer_fulfill_req_lifetime = the type `{$ty}` does not fulfill the required lifetime
+
+infer_full_type_written = the full type name has been written to '{$path}'
+
 infer_implicit_static_lifetime_note = this has an implicit `'static` lifetime requirement
 infer_implicit_static_lifetime_suggestion = consider relaxing the implicit `'static` requirement
 infer_label_bad = {$bad_kind ->
@@ -161,7 +164,10 @@ infer_label_bad = {$bad_kind ->
 infer_lf_bound_not_satisfied = lifetime bound not satisfied
 infer_lifetime_mismatch = lifetime mismatch
 
-infer_lifetime_param_suggestion = consider introducing a named lifetime parameter{$is_impl ->
+infer_lifetime_param_suggestion = consider {$is_reuse ->
+    [true] reusing
+    *[false] introducing
+} a named lifetime parameter{$is_impl ->
     [true] {" "}and update trait if needed
     *[false] {""}
 }

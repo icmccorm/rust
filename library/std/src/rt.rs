@@ -74,7 +74,7 @@ macro_rules! rtunwrap {
 //
 // Since 2014, the Rust runtime on Unix has set the `SIGPIPE` handler to
 // `SIG_IGN`. Applications have good reasons to want a different behavior
-// though, so there is a `#[unix_sigpipe = "..."]` attribute on `fn main()` that
+// though, so there is a `-Zon-broken-pipe` compiler flag that
 // can be used to select how `SIGPIPE` shall be setup (if changed at all) before
 // `fn main()` is called. See <https://github.com/rust-lang/rust/issues/97889>
 // for more info.
@@ -156,7 +156,7 @@ fn lang_start<T: crate::process::Termination + 'static>(
     sigpipe: u8,
 ) -> isize {
     let Ok(v) = lang_start_internal(
-        &move || crate::sys_common::backtrace::__rust_begin_short_backtrace(main).report().to_i32(),
+        &move || crate::sys::backtrace::__rust_begin_short_backtrace(main).report().to_i32(),
         argc,
         argv,
         sigpipe,

@@ -212,6 +212,10 @@ pub(crate) fn default_configuration(sess: &Session) -> Cfg {
         ins_none!(sym::test);
     }
 
+    if sess.ub_checks() {
+        ins_none!(sym::ub_checks);
+    }
+
     ret
 }
 
@@ -253,18 +257,20 @@ impl CheckCfg {
         // `tests/ui/check-cfg/well-known-values.rs` (in order to test the
         // expected values of the new config) and bless the all directory.
         //
-        // Don't forget to update `src/doc/unstable-book/src/compiler-flags/check-cfg.md`
+        // Don't forget to update `src/doc/rustc/src/check-cfg.md`
         // in the unstable book as well!
 
         ins!(sym::debug_assertions, no_values);
 
-        // These four are never set by rustc, but we set them anyway: they
-        // should not trigger a lint because `cargo clippy`, `cargo doc`,
-        // `cargo test` and `cargo miri run` (respectively) can set them.
+        // These four are never set by rustc, but we set them anyway; they
+        // should not trigger the lint because `cargo clippy`, `cargo doc`,
+        // `cargo test`, `cargo miri run` and `cargo fmt` (respectively)
+        // can set them.
         ins!(sym::clippy, no_values);
         ins!(sym::doc, no_values);
         ins!(sym::doctest, no_values);
         ins!(sym::miri, no_values);
+        ins!(sym::rustfmt, no_values);
 
         ins!(sym::overflow_checks, no_values);
 
@@ -366,6 +372,8 @@ impl CheckCfg {
         ins!(sym::target_thread_local, no_values);
 
         ins!(sym::test, no_values);
+
+        ins!(sym::ub_checks, no_values);
 
         ins!(sym::unix, no_values);
         ins!(sym::windows, no_values);

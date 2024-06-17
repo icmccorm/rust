@@ -34,6 +34,9 @@ libc = "0.2"
 parking_lot = "0.12.1"
 serde_json = "1.0.107"
 serde = { version = "1.0.185", features = ["derive"] }
+chrono = { version = "0.4.38", default-features = false }
+chrono-tz = "0.9"
+directories = "5"
 
 # Copied from `compiler/rustc/Cargo.toml`.
 # But only for some targets, it fails for others. Rustc configures this in its CI, but we can't
@@ -54,7 +57,6 @@ colored = "2"
 ui_test = "0.21.1"
 rustc_version = "0.4"
 regex = "1.5.5"
-lazy_static = "1.4.0"
 tempfile = "3"
 
 [package.metadata.rust-analyzer]

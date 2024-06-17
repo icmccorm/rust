@@ -20,14 +20,11 @@
 #[cfg(test)]
 mod tests;
 
-pub mod backtrace;
 pub mod fs;
 pub mod io;
 pub mod lazy_box;
 pub mod process;
-pub mod thread;
 pub mod thread_local_dtor;
-pub mod thread_parking;
 pub mod wstr;
 pub mod wtf8;
 

@@ -8,10 +8,13 @@ use rustc_hir::def::Namespace;
 use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_hir::lang_items::LangItem;
 use rustc_index::bit_set::FiniteBitSet;
-use rustc_macros::HashStable;
+use rustc_macros::{
+    Decodable, Encodable, HashStable, Lift, TyDecodable, TyEncodable, TypeVisitable,
+};
 use rustc_middle::ty::normalize_erasing_regions::NormalizationError;
 use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::Symbol;
+use tracing::{debug, instrument};
 
 use std::assert_matches::assert_matches;
 use std::fmt;
@@ -168,6 +171,12 @@ pub enum InstanceDef<'tcx> {
     ///
     /// The `DefId` is for `FnPtr::addr`, the `Ty` is the type `T`.
     FnPtrAddrShim(DefId, Ty<'tcx>),
+
+    /// `core::future::async_drop::async_drop_in_place::<'_, T>`.
+    ///
+    /// The `DefId` is for `core::future::async_drop::async_drop_in_place`, the `Ty`
+    /// is the type `T`.
+    AsyncDropGlueCtorShim(DefId, Option<Ty<'tcx>>),
 }
 
 impl<'tcx> Instance<'tcx> {
@@ -210,7 +219,9 @@ impl<'tcx> Instance<'tcx> {
             InstanceDef::Item(def) => tcx
                 .upstream_monomorphizations_for(def)
                 .and_then(|monos| monos.get(&self.args).cloned()),
-            InstanceDef::DropGlue(_, Some(_)) => tcx.upstream_drop_glue_for(self.args),
+            InstanceDef::DropGlue(_, Some(_)) | InstanceDef::AsyncDropGlueCtorShim(_, _) => {
+                tcx.upstream_drop_glue_for(self.args)
+            }
             _ => None,
         }
     }
@@ -235,7 +246,8 @@ impl<'tcx> InstanceDef<'tcx> {
             | ty::InstanceDef::CoroutineKindShim { coroutine_def_id: def_id }
             | InstanceDef::DropGlue(def_id, _)
             | InstanceDef::CloneShim(def_id, _)
-            | InstanceDef::FnPtrAddrShim(def_id, _) => def_id,
+            | InstanceDef::FnPtrAddrShim(def_id, _)
+            | InstanceDef::AsyncDropGlueCtorShim(def_id, _) => def_id,
         }
     }
 
@@ -243,9 +255,9 @@ impl<'tcx> InstanceDef<'tcx> {
     pub fn def_id_if_not_guaranteed_local_codegen(self) -> Option<DefId> {
         match self {
             ty::InstanceDef::Item(def) => Some(def),
-            ty::InstanceDef::DropGlue(def_id, Some(_)) | InstanceDef::ThreadLocalShim(def_id) => {
-                Some(def_id)
-            }
+            ty::InstanceDef::DropGlue(def_id, Some(_))
+            | InstanceDef::AsyncDropGlueCtorShim(def_id, _)
+            | InstanceDef::ThreadLocalShim(def_id) => Some(def_id),
             InstanceDef::VTableShim(..)
             | InstanceDef::ReifyShim(..)
             | InstanceDef::FnPtrShim(..)
@@ -279,6 +291,7 @@ impl<'tcx> InstanceDef<'tcx> {
         let def_id = match *self {
             ty::InstanceDef::Item(def) => def,
             ty::InstanceDef::DropGlue(_, Some(_)) => return false,
+            ty::InstanceDef::AsyncDropGlueCtorShim(_, Some(_)) => return false,
             ty::InstanceDef::ThreadLocalShim(_) => return false,
             _ => return true,
         };
@@ -347,11 +360,13 @@ impl<'tcx> InstanceDef<'tcx> {
             | InstanceDef::ThreadLocalShim(..)
             | InstanceDef::FnPtrAddrShim(..)
             | InstanceDef::FnPtrShim(..)
-            | InstanceDef::DropGlue(_, Some(_)) => false,
+            | InstanceDef::DropGlue(_, Some(_))
+            | InstanceDef::AsyncDropGlueCtorShim(_, Some(_)) => false,
             InstanceDef::ClosureOnceShim { .. }
             | InstanceDef::ConstructCoroutineInClosureShim { .. }
             | InstanceDef::CoroutineKindShim { .. }
             | InstanceDef::DropGlue(..)
+            | InstanceDef::AsyncDropGlueCtorShim(..)
             | InstanceDef::Item(_)
             | InstanceDef::Intrinsic(..)
             | InstanceDef::ReifyShim(..)
@@ -396,6 +411,8 @@ fn fmt_instance(
         InstanceDef::DropGlue(_, Some(ty)) => write!(f, " - shim(Some({ty}))"),
         InstanceDef::CloneShim(_, ty) => write!(f, " - shim({ty})"),
         InstanceDef::FnPtrAddrShim(_, ty) => write!(f, " - shim({ty})"),
+        InstanceDef::AsyncDropGlueCtorShim(_, None) => write!(f, " - shim(None)"),
+        InstanceDef::AsyncDropGlueCtorShim(_, Some(ty)) => write!(f, " - shim(Some({ty}))"),
     }
 }
 
@@ -520,7 +537,10 @@ impl<'tcx> Instance<'tcx> {
                 // Reify `Trait::method` implementations if KCFI is enabled
                 // FIXME(maurer) only reify it if it is a vtable-safe function
                 _ if tcx.sess.is_sanitizer_kcfi_enabled()
-                    && tcx.associated_item(def_id).trait_item_def_id.is_some() =>
+                    && tcx
+                        .opt_associated_item(def_id)
+                        .and_then(|assoc| assoc.trait_item_def_id)
+                        .is_some() =>
                 {
                     // If this function could also go in a vtable, we need to `ReifyShim` it with
                     // KCFI because it can only attach one type per function.
@@ -635,6 +655,12 @@ impl<'tcx> Instance<'tcx> {
         Instance::expect_resolve(tcx, ty::ParamEnv::reveal_all(), def_id, args)
     }
 
+    pub fn resolve_async_drop_in_place(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> ty::Instance<'tcx> {
+        let def_id = tcx.require_lang_item(LangItem::AsyncDropInPlace, None);
+        let args = tcx.mk_args(&[ty.into()]);
+        Instance::expect_resolve(tcx, ty::ParamEnv::reveal_all(), def_id, args)
+    }
+
     #[instrument(level = "debug", skip(tcx), ret)]
     pub fn fn_once_adapter_instance(
         tcx: TyCtxt<'tcx>,
@@ -673,26 +699,25 @@ impl<'tcx> Instance<'tcx> {
         };
         let coroutine_kind = tcx.coroutine_kind(coroutine_def_id).unwrap();
 
-        let lang_items = tcx.lang_items();
-        let coroutine_callable_item = if Some(trait_id) == lang_items.future_trait() {
+        let coroutine_callable_item = if tcx.is_lang_item(trait_id, LangItem::Future) {
             assert_matches!(
                 coroutine_kind,
                 hir::CoroutineKind::Desugared(hir::CoroutineDesugaring::Async, _)
             );
             hir::LangItem::FuturePoll
-        } else if Some(trait_id) == lang_items.iterator_trait() {
+        } else if tcx.is_lang_item(trait_id, LangItem::Iterator) {
             assert_matches!(
                 coroutine_kind,
                 hir::CoroutineKind::Desugared(hir::CoroutineDesugaring::Gen, _)
             );
             hir::LangItem::IteratorNext
-        } else if Some(trait_id) == lang_items.async_iterator_trait() {
+        } else if tcx.is_lang_item(trait_id, LangItem::AsyncIterator) {
             assert_matches!(
                 coroutine_kind,
                 hir::CoroutineKind::Desugared(hir::CoroutineDesugaring::AsyncGen, _)
             );
             hir::LangItem::AsyncIteratorPollNext
-        } else if Some(trait_id) == lang_items.coroutine_trait() {
+        } else if tcx.is_lang_item(trait_id, LangItem::Coroutine) {
             assert_matches!(coroutine_kind, hir::CoroutineKind::Coroutine(_));
             hir::LangItem::CoroutineResume
         } else {
@@ -738,7 +763,7 @@ impl<'tcx> Instance<'tcx> {
         self.def.has_polymorphic_mir_body().then_some(self.args)
     }
 
-    pub fn instantiate_mir<T>(&self, tcx: TyCtxt<'tcx>, v: EarlyBinder<&T>) -> T
+    pub fn instantiate_mir<T>(&self, tcx: TyCtxt<'tcx>, v: EarlyBinder<'tcx, &T>) -> T
     where
         T: TypeFoldable<TyCtxt<'tcx>> + Copy,
     {
@@ -756,7 +781,7 @@ impl<'tcx> Instance<'tcx> {
         &self,
         tcx: TyCtxt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
-        v: EarlyBinder<T>,
+        v: EarlyBinder<'tcx, T>,
     ) -> T
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
@@ -774,7 +799,7 @@ impl<'tcx> Instance<'tcx> {
         &self,
         tcx: TyCtxt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
-        v: EarlyBinder<T>,
+        v: EarlyBinder<'tcx, T>,
     ) -> Result<T, NormalizationError<'tcx>>
     where
         T: TypeFoldable<TyCtxt<'tcx>>,

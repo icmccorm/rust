@@ -29,7 +29,7 @@ macro_rules! submodule_helper {
 }
 
 macro_rules! book {
-    ($($name:ident, $path:expr, $book_name:expr $(, submodule $(= $submodule:literal)? )? ;)+) => {
+    ($($name:ident, $path:expr, $book_name:expr, $lang:expr $(, submodule $(= $submodule:literal)? )? ;)+) => {
         $(
             #[derive(Debug, Clone, Hash, PartialEq, Eq)]
         pub struct $name {
@@ -61,6 +61,7 @@ macro_rules! book {
                     name: $book_name.to_owned(),
                     src: builder.src.join($path),
                     parent: Some(self),
+                    languages: $lang.into(),
                 })
             }
         }
@@ -74,15 +75,15 @@ macro_rules! book {
 // FIXME: Make checking for a submodule automatic somehow (maybe by having a list of all submodules
 // and checking against it?).
 book!(
-    CargoBook, "src/tools/cargo/src/doc", "cargo", submodule = "src/tools/cargo";
-    ClippyBook, "src/tools/clippy/book", "clippy";
-    EditionGuide, "src/doc/edition-guide", "edition-guide", submodule;
-    EmbeddedBook, "src/doc/embedded-book", "embedded-book", submodule;
-    Nomicon, "src/doc/nomicon", "nomicon", submodule;
-    Reference, "src/doc/reference", "reference", submodule;
-    RustByExample, "src/doc/rust-by-example", "rust-by-example", submodule;
-    RustdocBook, "src/doc/rustdoc", "rustdoc";
-    StyleGuide, "src/doc/style-guide", "style-guide";
+    CargoBook, "src/tools/cargo/src/doc", "cargo", &[], submodule = "src/tools/cargo";
+    ClippyBook, "src/tools/clippy/book", "clippy", &[];
+    EditionGuide, "src/doc/edition-guide", "edition-guide", &[], submodule;
+    EmbeddedBook, "src/doc/embedded-book", "embedded-book", &[], submodule;
+    Nomicon, "src/doc/nomicon", "nomicon", &[], submodule;
+    Reference, "src/doc/reference", "reference", &[], submodule;
+    RustByExample, "src/doc/rust-by-example", "rust-by-example", &["ja"], submodule;
+    RustdocBook, "src/doc/rustdoc", "rustdoc", &[];
+    StyleGuide, "src/doc/style-guide", "style-guide", &[];
 );
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -110,6 +111,7 @@ impl Step for UnstableBook {
             name: "unstable-book".to_owned(),
             src: builder.md_doc_out(self.target).join("unstable-book"),
             parent: Some(self),
+            languages: vec![],
         })
     }
 }
@@ -120,6 +122,7 @@ struct RustbookSrc<P: Step> {
     name: String,
     src: PathBuf,
     parent: Option<P>,
+    languages: Vec<&'static str>,
 }
 
 impl<P: Step> Step for RustbookSrc<P> {
@@ -151,7 +154,19 @@ impl<P: Step> Step for RustbookSrc<P> {
             builder.info(&format!("Rustbook ({target}) - {name}"));
             let _ = fs::remove_dir_all(&out);
 
-            builder.run(rustbook_cmd.arg("build").arg(src).arg("-d").arg(out));
+            builder.run(rustbook_cmd.arg("build").arg(&src).arg("-d").arg(&out));
+
+            for lang in &self.languages {
+                let out = out.join(lang);
+
+                builder.info(&format!("Rustbook ({target}) - {name} - {lang}"));
+                let _ = fs::remove_dir_all(&out);
+
+                let mut rustbook_cmd = builder.tool_cmd(Tool::Rustbook);
+                builder.run(
+                    rustbook_cmd.arg("build").arg(&src).arg("-d").arg(&out).arg("-l").arg(lang),
+                );
+            }
         }
 
         if self.parent.is_some() {
@@ -214,6 +229,7 @@ impl Step for TheBook {
             name: "book".to_owned(),
             src: absolute_path.clone(),
             parent: Some(self),
+            languages: vec![],
         });
 
         // building older edition redirects
@@ -225,6 +241,7 @@ impl Step for TheBook {
                 // There should only be one book that is marked as the parent for each target, so
                 // treat the other editions as not having a parent.
                 parent: Option::<Self>::None,
+                languages: vec![],
             });
         }
 
@@ -361,7 +378,7 @@ impl Step for Standalone {
                 .arg(&favicon)
                 .arg("--markdown-no-toc")
                 .arg("--index-page")
-                .arg(&builder.src.join("src/doc/index.md"))
+                .arg(builder.src.join("src/doc/index.md"))
                 .arg("--markdown-playground-url")
                 .arg("https://play.rust-lang.org/")
                 .arg("-o")
@@ -465,7 +482,7 @@ impl Step for Releases {
                 .arg("--markdown-css")
                 .arg("rust.css")
                 .arg("--index-page")
-                .arg(&builder.src.join("src/doc/index.md"))
+                .arg(builder.src.join("src/doc/index.md"))
                 .arg("--markdown-playground-url")
                 .arg("https://play.rust-lang.org/")
                 .arg("-o")
@@ -506,7 +523,7 @@ impl Step for SharedAssets {
         run.never()
     }
 
-    // Generate shared resources used by other pieces of documentation.
+    /// Generate shared resources used by other pieces of documentation.
     fn run(self, builder: &Builder<'_>) -> Self::Output {
         let out = builder.doc_out(self.target);
 
@@ -567,9 +584,9 @@ impl Step for Std {
             stage: run.builder.top_stage,
             target: run.target,
             format: if run.builder.config.cmd.json() {
-                DocumentationFormat::JSON
+                DocumentationFormat::Json
             } else {
-                DocumentationFormat::HTML
+                DocumentationFormat::Html
             },
             crates: run.make_run_crates(Alias::Library),
         });
@@ -583,13 +600,13 @@ impl Step for Std {
         let stage = self.stage;
         let target = self.target;
         let out = match self.format {
-            DocumentationFormat::HTML => builder.doc_out(target),
-            DocumentationFormat::JSON => builder.json_doc_out(target),
+            DocumentationFormat::Html => builder.doc_out(target),
+            DocumentationFormat::Json => builder.json_doc_out(target),
         };
 
         t!(fs::create_dir_all(&out));
 
-        if self.format == DocumentationFormat::HTML {
+        if self.format == DocumentationFormat::Html {
             builder.ensure(SharedAssets { target: self.target });
         }
 
@@ -600,10 +617,10 @@ impl Step for Std {
             .into_string()
             .expect("non-utf8 paths are unsupported");
         let mut extra_args = match self.format {
-            DocumentationFormat::HTML => {
+            DocumentationFormat::Html => {
                 vec!["--markdown-css", "rust.css", "--markdown-no-toc", "--index-page", &index_page]
             }
-            DocumentationFormat::JSON => vec!["--output-format", "json"],
+            DocumentationFormat::Json => vec!["--output-format", "json"],
         };
 
         if !builder.config.docs_minification {
@@ -613,7 +630,7 @@ impl Step for Std {
         doc_std(builder, self.format, stage, target, &out, &extra_args, &self.crates);
 
         // Don't open if the format is json
-        if let DocumentationFormat::JSON = self.format {
+        if let DocumentationFormat::Json = self.format {
             return;
         }
 
@@ -646,15 +663,15 @@ const STD_PUBLIC_CRATES: [&str; 5] = ["core", "alloc", "std", "proc_macro", "tes
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DocumentationFormat {
-    HTML,
-    JSON,
+    Html,
+    Json,
 }
 
 impl DocumentationFormat {
     fn as_str(&self) -> &str {
         match self {
-            DocumentationFormat::HTML => "HTML",
-            DocumentationFormat::JSON => "JSON",
+            DocumentationFormat::Html => "HTML",
+            DocumentationFormat::Json => "JSON",
         }
     }
 }
@@ -678,7 +695,7 @@ fn doc_std(
 
     let compiler = builder.compiler(stage, builder.config.build);
 
-    let target_doc_dir_name = if format == DocumentationFormat::JSON { "json-doc" } else { "doc" };
+    let target_doc_dir_name = if format == DocumentationFormat::Json { "json-doc" } else { "doc" };
     let target_dir =
         builder.stage_out(compiler, Mode::Std).join(target.triple).join(target_doc_dir_name);
 
@@ -804,7 +821,7 @@ impl Step for Rustc {
         // see https://github.com/rust-lang/rust/pull/122066#issuecomment-1983049222
         // cargo.rustdocflag("--generate-link-to-definition");
 
-        compile::rustc_cargo(builder, &mut cargo, target, compiler.stage);
+        compile::rustc_cargo(builder, &mut cargo, target, &compiler);
         cargo.arg("-Zunstable-options");
         cargo.arg("-Zskip-rustdoc-fingerprint");
 
@@ -1028,6 +1045,14 @@ tool_doc!(
     is_library = true,
     crates = ["bootstrap"]
 );
+tool_doc!(
+    RunMakeSupport,
+    "run_make_support",
+    "src/tools/run-make-support",
+    rustc_tool = false,
+    is_library = true,
+    crates = ["run_make_support"]
+);
 
 #[derive(Ord, PartialOrd, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ErrorIndex {
@@ -1200,6 +1225,7 @@ impl Step for RustcBook {
             name: "rustc".to_owned(),
             src: out_base,
             parent: Some(self),
+            languages: vec![],
         });
     }
 }

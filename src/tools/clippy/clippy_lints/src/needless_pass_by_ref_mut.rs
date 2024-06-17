@@ -1,7 +1,7 @@
 use super::needless_pass_by_value::requires_exact_signature;
 use clippy_utils::diagnostics::span_lint_hir_and_then;
 use clippy_utils::source::snippet;
-use clippy_utils::visitors::for_each_expr_with_closures;
+use clippy_utils::visitors::for_each_expr;
 use clippy_utils::{inherits_cfg, is_from_proc_macro, is_self};
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_errors::Applicability;
@@ -11,7 +11,6 @@ use rustc_hir::{
     PatKind,
 };
 use rustc_hir_typeck::expr_use_visitor as euv;
-use rustc_infer::infer::{InferCtxt, TyCtxtInferExt};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::mir::FakeReadCause;
 use rustc_middle::ty::{self, Ty, TyCtxt, UpvarId, UpvarPath};
@@ -83,7 +82,9 @@ fn should_skip<'tcx>(
     }
 
     if is_self(arg) {
-        return true;
+        // Interestingly enough, `self` arguments make `is_from_proc_macro` return `true`, hence why
+        // we return early here.
+        return false;
     }
 
     if let PatKind::Binding(.., name, _) = arg.pat.kind {
@@ -100,7 +101,6 @@ fn should_skip<'tcx>(
 fn check_closures<'tcx>(
     ctx: &mut MutablyUsedVariablesCtxt<'tcx>,
     cx: &LateContext<'tcx>,
-    infcx: &InferCtxt<'tcx>,
     checked_closures: &mut FxHashSet<LocalDefId>,
     closures: FxHashSet<LocalDefId>,
 ) {
@@ -117,7 +117,9 @@ fn check_closures<'tcx>(
             .associated_body()
             .map(|(_, body_id)| hir.body(body_id))
         {
-            euv::ExprUseVisitor::new(ctx, infcx, closure, cx.param_env, cx.typeck_results()).consume_body(body);
+            euv::ExprUseVisitor::for_clippy(cx, closure, &mut *ctx)
+                .consume_body(body)
+                .into_ok();
         }
     }
 }
@@ -185,7 +187,7 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByRefMut<'tcx> {
         }
         // Collect variables mutably used and spans which will need dereferencings from the
         // function body.
-        let MutablyUsedVariablesCtxt { mutably_used_vars, .. } = {
+        let mutably_used_vars = {
             let mut ctx = MutablyUsedVariablesCtxt {
                 mutably_used_vars: HirIdSet::default(),
                 prev_bind: None,
@@ -194,30 +196,31 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByRefMut<'tcx> {
                 async_closures: FxHashSet::default(),
                 tcx: cx.tcx,
             };
-            let infcx = cx.tcx.infer_ctxt().build();
-            euv::ExprUseVisitor::new(&mut ctx, &infcx, fn_def_id, cx.param_env, cx.typeck_results()).consume_body(body);
+            euv::ExprUseVisitor::for_clippy(cx, fn_def_id, &mut ctx)
+                .consume_body(body)
+                .into_ok();
 
             let mut checked_closures = FxHashSet::default();
 
             // We retrieve all the closures declared in the function because they will not be found
             // by `euv::Delegate`.
             let mut closures: FxHashSet<LocalDefId> = FxHashSet::default();
-            for_each_expr_with_closures(cx, body, |expr| {
+            for_each_expr(cx, body, |expr| {
                 if let ExprKind::Closure(closure) = expr.kind {
                     closures.insert(closure.def_id);
                 }
                 ControlFlow::<()>::Continue(())
             });
-            check_closures(&mut ctx, cx, &infcx, &mut checked_closures, closures);
+            check_closures(&mut ctx, cx, &mut checked_closures, closures);
 
             if is_async {
                 while !ctx.async_closures.is_empty() {
                     let async_closures = ctx.async_closures.clone();
                     ctx.async_closures.clear();
-                    check_closures(&mut ctx, cx, &infcx, &mut checked_closures, async_closures);
+                    check_closures(&mut ctx, cx, &mut checked_closures, async_closures);
                 }
             }
-            ctx
+            ctx.generate_mutably_used_ids_from_aliases()
         };
         for ((&input, &_), arg) in it {
             // Only take `&mut` arguments.
@@ -309,12 +312,22 @@ struct MutablyUsedVariablesCtxt<'tcx> {
 }
 
 impl<'tcx> MutablyUsedVariablesCtxt<'tcx> {
-    fn add_mutably_used_var(&mut self, mut used_id: HirId) {
-        while let Some(id) = self.aliases.get(&used_id) {
-            self.mutably_used_vars.insert(used_id);
-            used_id = *id;
-        }
+    fn add_mutably_used_var(&mut self, used_id: HirId) {
         self.mutably_used_vars.insert(used_id);
+    }
+
+    // Because the alias may come after the mutable use of a variable, we need to fill the map at
+    // the end.
+    fn generate_mutably_used_ids_from_aliases(mut self) -> HirIdSet {
+        let all_ids = self.mutably_used_vars.iter().copied().collect::<Vec<_>>();
+        for mut used_id in all_ids {
+            while let Some(id) = self.aliases.get(&used_id) {
+                self.mutably_used_vars.insert(used_id);
+                used_id = *id;
+            }
+            self.mutably_used_vars.insert(used_id);
+        }
+        self.mutably_used_vars
     }
 
     fn would_be_alias_cycle(&self, alias: HirId, mut target: HirId) -> bool {

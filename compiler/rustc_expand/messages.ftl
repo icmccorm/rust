@@ -10,6 +10,11 @@ expand_attribute_meta_item =
 expand_attribute_single_word =
     attribute must only be a single word
 
+expand_attributes_on_expressions_experimental =
+    attributes on expressions are experimental
+    .help_outer_doc = `///` is used for outer documentation comments; for a plain comment, use `//`
+    .help_inner_doc = `//!` is used for inner documentation comments; for a plain comment, use `//` by removing the `!` or inserting a space in between them: `// !`
+
 expand_attributes_wrong_form =
     attribute must be of form: `attributes(foo, bar)`
 
@@ -30,8 +35,8 @@ expand_duplicate_matcher_binding = duplicate matcher binding
     .label = duplicate binding
     .label2 = previous binding
 
-expand_expected_comma_in_list =
-    expected token: `,`
+expand_empty_delegation_list =
+    empty list delegation is not supported
 
 expand_expected_paren_or_brace =
     expected `(` or `{"{"}`, found `{$token}`
@@ -116,11 +121,11 @@ expand_must_repeat_once =
 expand_not_a_meta_item =
     not a meta item
 
-expand_only_one_argument =
-    {$name} takes 1 argument
-
 expand_only_one_word =
     must only be one word
+
+expand_proc_macro_back_compat = using an old version of `{$crate_name}`
+    .note = older versions of the `{$crate_name}` crate no longer compile; please update to `{$crate_name}` v{$fixed_version}, or switch to one of the `{$crate_name}` alternatives
 
 expand_proc_macro_derive_panicked =
     proc-macro derive panicked
@@ -146,16 +151,13 @@ expand_remove_node_not_supported =
 expand_resolve_relative_path =
     cannot resolve relative path in non-file source `{$path}`
 
-expand_takes_no_arguments =
-    {$name} takes no arguments
-
 expand_trace_macro = trace_macro
 
 expand_unsupported_key_value =
     key-value macro attributes are not supported
 
 expand_var_still_repeating =
-    variable '{$ident}' is still repeating at this depth
+    variable `{$ident}` is still repeating at this depth
 
 expand_wrong_fragment_kind =
     non-{$kind} macro in {$kind} position: {$name}

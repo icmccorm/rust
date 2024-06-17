@@ -17,8 +17,7 @@
 //!
 //! [lattices]: https://en.wikipedia.org/wiki/Lattice_(order)
 
-use super::combine::ObligationEmittingRelation;
-use crate::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
+use super::combine::PredicateEmittingRelation;
 use crate::infer::{DefineOpaqueTypes, InferCtxt};
 use crate::traits::ObligationCause;
 
@@ -31,7 +30,7 @@ use rustc_middle::ty::{self, Ty};
 ///
 /// GLB moves "down" the lattice (to smaller values); LUB moves
 /// "up" the lattice (to bigger values).
-pub trait LatticeDir<'f, 'tcx>: ObligationEmittingRelation<'tcx> {
+pub trait LatticeDir<'f, 'tcx>: PredicateEmittingRelation<'tcx> {
     fn infcx(&self) -> &'f InferCtxt<'tcx>;
 
     fn cause(&self) -> &ObligationCause<'tcx>;
@@ -65,8 +64,8 @@ where
 
     let infcx = this.infcx();
 
-    let a = infcx.inner.borrow_mut().type_variables().replace_if_possible(a);
-    let b = infcx.inner.borrow_mut().type_variables().replace_if_possible(b);
+    let a = infcx.shallow_resolve(a);
+    let b = infcx.shallow_resolve(b);
 
     match (a.kind(), b.kind()) {
         // If one side is known to be a variable and one is not,
@@ -88,18 +87,12 @@ where
         // iterate on the subtype obligations that are returned, but I
         // think this suffices. -nmatsakis
         (&ty::Infer(TyVar(..)), _) => {
-            let v = infcx.next_ty_var(TypeVariableOrigin {
-                kind: TypeVariableOriginKind::LatticeVariable,
-                span: this.cause().span,
-            });
+            let v = infcx.next_ty_var(this.cause().span);
             this.relate_bound(v, b, a)?;
             Ok(v)
         }
         (_, &ty::Infer(TyVar(..))) => {
-            let v = infcx.next_ty_var(TypeVariableOrigin {
-                kind: TypeVariableOriginKind::LatticeVariable,
-                span: this.cause().span,
-            });
+            let v = infcx.next_ty_var(this.cause().span);
             this.relate_bound(v, a, b)?;
             Ok(v)
         }
@@ -115,9 +108,7 @@ where
                 && def_id.is_local()
                 && !this.infcx().next_trait_solver() =>
         {
-            this.register_obligations(
-                infcx.handle_opaque_type(a, b, this.cause(), this.param_env())?.obligations,
-            );
+            this.register_goals(infcx.handle_opaque_type(a, b, this.span(), this.param_env())?);
             Ok(a)
         }
 

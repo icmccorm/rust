@@ -2,6 +2,7 @@ use std::iter;
 
 use super::MirPass;
 use rustc_middle::{
+    bug,
     mir::{
         interpret::Scalar, BasicBlock, BinOp, Body, Operand, Place, Rvalue, Statement,
         StatementKind, SwitchTargets, TerminatorKind,
@@ -48,7 +49,7 @@ impl<'tcx> MirPass<'tcx> for SimplifyComparisonIntegral {
                     let layout = tcx
                         .layout_of(param_env.and(opt.branch_value_ty))
                         .expect("if we have an evaluated constant we must know the layout");
-                    int.assert_bits(layout.size)
+                    int.to_bits(layout.size)
                 }
                 Scalar::Ptr(..) => continue,
             };

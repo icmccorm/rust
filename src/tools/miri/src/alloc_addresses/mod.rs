@@ -13,8 +13,9 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_span::Span;
 use rustc_target::abi::{Align, HasDataLayout, Size};
 
-use crate::*;
-use reuse_pool::ReusePool;
+use crate::{concurrency::VClock, *};
+
+use self::reuse_pool::ReusePool;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProvenanceMode {
@@ -77,14 +78,14 @@ impl GlobalStateInner {
         GlobalStateInner {
             int_to_ptr_map: Vec::default(),
             base_addr: FxHashMap::default(),
-            reuse: ReusePool::new(),
+            reuse: ReusePool::new(config),
             exposed: FxHashSet::default(),
             next_base_addr: stack_addr,
             provenance_mode: config.provenance_mode,
         }
     }
 
-    pub fn remove_unreachable_allocs(&mut self, allocs: &LiveAllocs<'_, '_, '_>) {
+    pub fn remove_unreachable_allocs(&mut self, allocs: &LiveAllocs<'_, '_>) {
         // `exposed` and `int_to_ptr_map` are cleared immediately when an allocation
         // is freed, so `base_addr` is the only one we have to clean up based on the GC.
         self.base_addr.retain(|id, _| allocs.is_live(*id));
@@ -100,10 +101,9 @@ fn align_addr(addr: u64, align: u64) -> u64 {
     }
 }
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
-
-        // Returns the exposed `AllocId` that corresponds to the specified addr,
+impl<'tcx> EvalContextExtPriv<'tcx> for crate::MiriInterpCx<'tcx> {}
+trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
+    // Returns the exposed `AllocId` that corresponds to the specified addr,
     // or `None` if the addr is out of bounds
     fn alloc_id_from_addr(&self, addr: u64) -> Option<AllocId> {
         let ecx = self.eval_context_ref();
@@ -142,7 +142,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
-    fn addr_from_alloc_id(&self, alloc_id: AllocId) -> InterpResult<'tcx, u64> {
+    fn addr_from_alloc_id(
+        &self,
+        alloc_id: AllocId,
+        memory_kind: MemoryKind,
+    ) -> InterpResult<'tcx, u64> {
         let ecx = self.eval_context_ref();
         let mut global_state = ecx.machine.alloc_addresses.borrow_mut();
         let global_state = &mut *global_state;
@@ -160,9 +164,16 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 assert!(!matches!(kind, AllocKind::Dead));
 
                 // This allocation does not have a base address yet, pick or reuse one.
-                let base_addr = if let Some(reuse_addr) =
-                    global_state.reuse.take_addr(&mut *rng, size, align)
-                {
+                let base_addr = if let Some((reuse_addr, clock)) = global_state.reuse.take_addr(
+                    &mut *rng,
+                    size,
+                    align,
+                    memory_kind,
+                    ecx.active_thread(),
+                ) {
+                    if let Some(clock) = clock {
+                        ecx.acquire_clock(&clock);
+                    }
                     reuse_addr
                 } else {
                     // We have to pick a fresh address.
@@ -222,6 +233,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         })
     }
 
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn expose_ptr(&mut self, alloc_id: AllocId, tag: BorTag) -> InterpResult<'tcx> {
         let ecx = self.eval_context_mut();
         let global_state = ecx.machine.alloc_addresses.get_mut();
@@ -243,7 +256,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         Ok(())
     }
 
-    fn ptr_from_addr_cast(&self, addr: u64) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
+    fn ptr_from_addr_cast(&self, addr: u64) -> InterpResult<'tcx, Pointer> {
         trace!("Casting {:#x} to a pointer", addr);
 
         let ecx = self.eval_context_ref();
@@ -281,26 +294,30 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     }
 
     /// Convert a relative (tcx) pointer to a Miri pointer.
-    fn ptr_from_rel_ptr(
+    fn adjust_alloc_root_pointer(
         &self,
-        ptr: Pointer<CtfeProvenance>,
+        ptr: interpret::Pointer<CtfeProvenance>,
         tag: BorTag,
-    ) -> InterpResult<'tcx, Pointer<Provenance>> {
+        kind: MemoryKind,
+    ) -> InterpResult<'tcx, interpret::Pointer<Provenance>> {
         let ecx = self.eval_context_ref();
 
         let (prov, offset) = ptr.into_parts(); // offset is relative (AllocId provenance)
         let alloc_id = prov.alloc_id();
-        let base_addr = ecx.addr_from_alloc_id(alloc_id)?;
+        let base_addr = ecx.addr_from_alloc_id(alloc_id, kind)?;
 
         // Add offset with the right kind of pointer-overflowing arithmetic.
         let dl = ecx.data_layout();
         let absolute_addr = dl.overflowing_offset(base_addr, offset.bytes()).0;
-        Ok(Pointer::new(Provenance::Concrete { alloc_id, tag }, Size::from_bytes(absolute_addr)))
+        Ok(interpret::Pointer::new(
+            Provenance::Concrete { alloc_id, tag },
+            Size::from_bytes(absolute_addr),
+        ))
     }
 
     /// When a pointer is used for a memory access, this computes where in which allocation the
     /// access is going.
-    fn ptr_get_alloc(&self, ptr: Pointer<Provenance>) -> Option<(AllocId, Size)> {
+    fn ptr_get_alloc(&self, ptr: interpret::Pointer<Provenance>) -> Option<(AllocId, Size)> {
         let ecx = self.eval_context_ref();
 
         let (tag, addr) = ptr.into_parts(); // addr is absolute (Tag provenance)
@@ -312,9 +329,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             ecx.alloc_id_from_addr(addr.bytes())?
         };
 
-        // This cannot fail: since we already have a pointer with that provenance, rel_ptr_to_addr
+        // This cannot fail: since we already have a pointer with that provenance, adjust_alloc_root_pointer
         // must have been called in the past, so we can just look up the address in the map.
-        let base_addr = ecx.addr_from_alloc_id(alloc_id).unwrap();
+        let base_addr = *ecx.machine.alloc_addresses.borrow().base_addr.get(&alloc_id).unwrap();
 
         // Wrapping "addr - base_addr"
         #[allow(clippy::cast_possible_wrap)] // we want to wrap here
@@ -326,14 +343,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     }
 }
 
-impl GlobalStateInner {
-    pub fn free_alloc_id(
-        &mut self,
-        rng: &mut impl Rng,
-        dead_id: AllocId,
-        size: Size,
-        align: Align,
-    ) {
+impl<'tcx> MiriMachine<'tcx> {
+    pub fn free_alloc_id(&mut self, dead_id: AllocId, size: Size, align: Align, kind: MemoryKind) {
+        let global_state = self.alloc_addresses.get_mut();
+        let rng = self.rng.get_mut();
+
         // We can *not* remove this from `base_addr`, since the interpreter design requires that we
         // be able to retrieve an AllocId + offset for any memory access *before* we check if the
         // access is valid. Specifically, `ptr_get_alloc` is called on each attempt at a memory
@@ -346,15 +360,23 @@ impl GlobalStateInner {
         // returns a dead allocation.
         // To avoid a linear scan we first look up the address in `base_addr`, and then find it in
         // `int_to_ptr_map`.
-        let addr = *self.base_addr.get(&dead_id).unwrap();
-        let pos = self.int_to_ptr_map.binary_search_by_key(&addr, |(addr, _)| *addr).unwrap();
-        let removed = self.int_to_ptr_map.remove(pos);
+        let addr = *global_state.base_addr.get(&dead_id).unwrap();
+        let pos =
+            global_state.int_to_ptr_map.binary_search_by_key(&addr, |(addr, _)| *addr).unwrap();
+        let removed = global_state.int_to_ptr_map.remove(pos);
         assert_eq!(removed, (addr, dead_id)); // double-check that we removed the right thing
         // We can also remove it from `exposed`, since this allocation can anyway not be returned by
         // `alloc_id_from_addr` any more.
-        self.exposed.remove(&dead_id);
+        global_state.exposed.remove(&dead_id);
         // Also remember this address for future reuse.
-        self.reuse.add_addr(rng, addr, size, align)
+        let thread = self.threads.active_thread();
+        global_state.reuse.add_addr(rng, addr, size, align, kind, thread, || {
+            if let Some(data_race) = &self.data_race {
+                data_race.release_clock(&self.threads).clone()
+            } else {
+                VClock::default()
+            }
+        })
     }
 }
 

@@ -3,16 +3,16 @@
 //! This code is *a bit* of a mess and can hopefully be
 //! mostly ignored. For a general overview of how it works,
 //! see the comment on [ProofTreeBuilder].
+use std::marker::PhantomData;
 use std::mem;
 
-use rustc_middle::traits::query::NoSolution;
-use rustc_middle::traits::solve::{
+use crate::solve::eval_ctxt::canonical;
+use crate::solve::{self, inspect, GenerateProofTree};
+use rustc_middle::bug;
+use rustc_next_trait_solver::solve::{
     CanonicalInput, Certainty, Goal, GoalSource, QueryInput, QueryResult,
 };
-use rustc_middle::ty::{self, TyCtxt};
-use rustc_session::config::DumpSolverProofTree;
-
-use crate::solve::{self, inspect, EvalCtxt, GenerateProofTree};
+use rustc_type_ir::{self as ty, InferCtxtLike, Interner};
 
 /// The core data structure when building proof trees.
 ///
@@ -34,114 +34,102 @@ use crate::solve::{self, inspect, EvalCtxt, GenerateProofTree};
 /// trees. At the end of trait solving `ProofTreeBuilder::finalize`
 /// is called to recursively convert the whole structure to a
 /// finished proof tree.
-pub(in crate::solve) struct ProofTreeBuilder<'tcx> {
-    state: Option<Box<DebugSolver<'tcx>>>,
+pub(in crate::solve) struct ProofTreeBuilder<Infcx, I = <Infcx as InferCtxtLike>::Interner>
+where
+    Infcx: InferCtxtLike<Interner = I>,
+    I: Interner,
+{
+    _infcx: PhantomData<Infcx>,
+    state: Option<Box<DebugSolver<I>>>,
 }
 
 /// The current state of the proof tree builder, at most places
 /// in the code, only one or two variants are actually possible.
 ///
 /// We simply ICE in case that assumption is broken.
-#[derive(Debug)]
-enum DebugSolver<'tcx> {
+#[derive(derivative::Derivative)]
+#[derivative(Debug(bound = ""))]
+enum DebugSolver<I: Interner> {
     Root,
-    GoalEvaluation(WipGoalEvaluation<'tcx>),
-    CanonicalGoalEvaluation(WipCanonicalGoalEvaluation<'tcx>),
-    AddedGoalsEvaluation(WipAddedGoalsEvaluation<'tcx>),
-    GoalEvaluationStep(WipGoalEvaluationStep<'tcx>),
-    Probe(WipProbe<'tcx>),
+    GoalEvaluation(WipGoalEvaluation<I>),
+    CanonicalGoalEvaluation(WipCanonicalGoalEvaluation<I>),
+    CanonicalGoalEvaluationStep(WipCanonicalGoalEvaluationStep<I>),
 }
 
-impl<'tcx> From<WipGoalEvaluation<'tcx>> for DebugSolver<'tcx> {
-    fn from(g: WipGoalEvaluation<'tcx>) -> DebugSolver<'tcx> {
+impl<I: Interner> From<WipGoalEvaluation<I>> for DebugSolver<I> {
+    fn from(g: WipGoalEvaluation<I>) -> DebugSolver<I> {
         DebugSolver::GoalEvaluation(g)
     }
 }
 
-impl<'tcx> From<WipCanonicalGoalEvaluation<'tcx>> for DebugSolver<'tcx> {
-    fn from(g: WipCanonicalGoalEvaluation<'tcx>) -> DebugSolver<'tcx> {
+impl<I: Interner> From<WipCanonicalGoalEvaluation<I>> for DebugSolver<I> {
+    fn from(g: WipCanonicalGoalEvaluation<I>) -> DebugSolver<I> {
         DebugSolver::CanonicalGoalEvaluation(g)
     }
 }
 
-impl<'tcx> From<WipAddedGoalsEvaluation<'tcx>> for DebugSolver<'tcx> {
-    fn from(g: WipAddedGoalsEvaluation<'tcx>) -> DebugSolver<'tcx> {
-        DebugSolver::AddedGoalsEvaluation(g)
+impl<I: Interner> From<WipCanonicalGoalEvaluationStep<I>> for DebugSolver<I> {
+    fn from(g: WipCanonicalGoalEvaluationStep<I>) -> DebugSolver<I> {
+        DebugSolver::CanonicalGoalEvaluationStep(g)
     }
 }
 
-impl<'tcx> From<WipGoalEvaluationStep<'tcx>> for DebugSolver<'tcx> {
-    fn from(g: WipGoalEvaluationStep<'tcx>) -> DebugSolver<'tcx> {
-        DebugSolver::GoalEvaluationStep(g)
-    }
+#[derive(derivative::Derivative)]
+#[derivative(PartialEq(bound = ""), Eq(bound = ""), Debug(bound = ""))]
+struct WipGoalEvaluation<I: Interner> {
+    pub uncanonicalized_goal: Goal<I, I::Predicate>,
+    pub orig_values: Vec<I::GenericArg>,
+    pub evaluation: Option<WipCanonicalGoalEvaluation<I>>,
 }
 
-impl<'tcx> From<WipProbe<'tcx>> for DebugSolver<'tcx> {
-    fn from(p: WipProbe<'tcx>) -> DebugSolver<'tcx> {
-        DebugSolver::Probe(p)
-    }
-}
-
-#[derive(Eq, PartialEq, Debug)]
-struct WipGoalEvaluation<'tcx> {
-    pub uncanonicalized_goal: Goal<'tcx, ty::Predicate<'tcx>>,
-    pub kind: WipGoalEvaluationKind<'tcx>,
-    pub evaluation: Option<WipCanonicalGoalEvaluation<'tcx>>,
-}
-
-impl<'tcx> WipGoalEvaluation<'tcx> {
-    fn finalize(self) -> inspect::GoalEvaluation<'tcx> {
+impl<I: Interner> WipGoalEvaluation<I> {
+    fn finalize(self) -> inspect::GoalEvaluation<I> {
         inspect::GoalEvaluation {
             uncanonicalized_goal: self.uncanonicalized_goal,
-            kind: match self.kind {
-                WipGoalEvaluationKind::Root { orig_values } => {
-                    inspect::GoalEvaluationKind::Root { orig_values }
-                }
-                WipGoalEvaluationKind::Nested => inspect::GoalEvaluationKind::Nested,
-            },
+            orig_values: self.orig_values,
             evaluation: self.evaluation.unwrap().finalize(),
         }
     }
 }
 
-#[derive(Eq, PartialEq, Debug)]
-pub(in crate::solve) enum WipGoalEvaluationKind<'tcx> {
-    Root { orig_values: Vec<ty::GenericArg<'tcx>> },
-    Nested,
-}
-
-#[derive(Eq, PartialEq)]
-pub(in crate::solve) enum WipCanonicalGoalEvaluationKind<'tcx> {
+#[derive(derivative::Derivative)]
+#[derivative(PartialEq(bound = ""), Eq(bound = ""))]
+pub(in crate::solve) enum WipCanonicalGoalEvaluationKind<I: Interner> {
     Overflow,
     CycleInStack,
     ProvisionalCacheHit,
-    Interned { revisions: &'tcx [inspect::GoalEvaluationStep<'tcx>] },
+    Interned { final_revision: I::CanonicalGoalEvaluationStepRef },
 }
 
-impl std::fmt::Debug for WipCanonicalGoalEvaluationKind<'_> {
+impl<I: Interner> std::fmt::Debug for WipCanonicalGoalEvaluationKind<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Overflow => write!(f, "Overflow"),
             Self::CycleInStack => write!(f, "CycleInStack"),
             Self::ProvisionalCacheHit => write!(f, "ProvisionalCacheHit"),
-            Self::Interned { revisions: _ } => f.debug_struct("Interned").finish_non_exhaustive(),
+            Self::Interned { final_revision: _ } => {
+                f.debug_struct("Interned").finish_non_exhaustive()
+            }
         }
     }
 }
 
-#[derive(Eq, PartialEq, Debug)]
-struct WipCanonicalGoalEvaluation<'tcx> {
-    goal: CanonicalInput<'tcx>,
-    kind: Option<WipCanonicalGoalEvaluationKind<'tcx>>,
+#[derive(derivative::Derivative)]
+#[derivative(PartialEq(bound = ""), Eq(bound = ""), Debug(bound = ""))]
+struct WipCanonicalGoalEvaluation<I: Interner> {
+    goal: CanonicalInput<I>,
+    kind: Option<WipCanonicalGoalEvaluationKind<I>>,
     /// Only used for uncached goals. After we finished evaluating
     /// the goal, this is interned and moved into `kind`.
-    revisions: Vec<WipGoalEvaluationStep<'tcx>>,
-    result: Option<QueryResult<'tcx>>,
+    final_revision: Option<WipCanonicalGoalEvaluationStep<I>>,
+    result: Option<QueryResult<I>>,
 }
 
-impl<'tcx> WipCanonicalGoalEvaluation<'tcx> {
-    fn finalize(self) -> inspect::CanonicalGoalEvaluation<'tcx> {
-        assert!(self.revisions.is_empty());
+impl<I: Interner> WipCanonicalGoalEvaluation<I> {
+    fn finalize(self) -> inspect::CanonicalGoalEvaluation<I> {
+        // We've already interned the final revision in
+        // `fn finalize_canonical_goal_evaluation`.
+        assert!(self.final_revision.is_none());
         let kind = match self.kind.unwrap() {
             WipCanonicalGoalEvaluationKind::Overflow => {
                 inspect::CanonicalGoalEvaluationKind::Overflow
@@ -152,8 +140,8 @@ impl<'tcx> WipCanonicalGoalEvaluation<'tcx> {
             WipCanonicalGoalEvaluationKind::ProvisionalCacheHit => {
                 inspect::CanonicalGoalEvaluationKind::ProvisionalCacheHit
             }
-            WipCanonicalGoalEvaluationKind::Interned { revisions } => {
-                inspect::CanonicalGoalEvaluationKind::Evaluation { revisions }
+            WipCanonicalGoalEvaluationKind::Interned { final_revision } => {
+                inspect::CanonicalGoalEvaluationKind::Evaluation { final_revision }
             }
         };
 
@@ -161,91 +149,119 @@ impl<'tcx> WipCanonicalGoalEvaluation<'tcx> {
     }
 }
 
-#[derive(Eq, PartialEq, Debug)]
-struct WipAddedGoalsEvaluation<'tcx> {
-    evaluations: Vec<Vec<WipGoalEvaluation<'tcx>>>,
-    result: Option<Result<Certainty, NoSolution>>,
+#[derive(derivative::Derivative)]
+#[derivative(PartialEq(bound = ""), Eq(bound = ""), Debug(bound = ""))]
+struct WipCanonicalGoalEvaluationStep<I: Interner> {
+    /// Unlike `EvalCtxt::var_values`, we append a new
+    /// generic arg here whenever we create a new inference
+    /// variable.
+    ///
+    /// This is necessary as we otherwise don't unify these
+    /// vars when instantiating multiple `CanonicalState`.
+    var_values: Vec<I::GenericArg>,
+    instantiated_goal: QueryInput<I, I::Predicate>,
+    probe_depth: usize,
+    evaluation: WipProbe<I>,
 }
 
-impl<'tcx> WipAddedGoalsEvaluation<'tcx> {
-    fn finalize(self) -> inspect::AddedGoalsEvaluation<'tcx> {
-        inspect::AddedGoalsEvaluation {
-            evaluations: self
-                .evaluations
-                .into_iter()
-                .map(|evaluations| {
-                    evaluations.into_iter().map(WipGoalEvaluation::finalize).collect()
-                })
-                .collect(),
-            result: self.result.unwrap(),
+impl<I: Interner> WipCanonicalGoalEvaluationStep<I> {
+    fn current_evaluation_scope(&mut self) -> &mut WipProbe<I> {
+        let mut current = &mut self.evaluation;
+        for _ in 0..self.probe_depth {
+            match current.steps.last_mut() {
+                Some(WipProbeStep::NestedProbe(p)) => current = p,
+                _ => bug!(),
+            }
         }
+        current
     }
-}
 
-#[derive(Eq, PartialEq, Debug)]
-struct WipGoalEvaluationStep<'tcx> {
-    instantiated_goal: QueryInput<'tcx, ty::Predicate<'tcx>>,
-
-    evaluation: WipProbe<'tcx>,
-}
-
-impl<'tcx> WipGoalEvaluationStep<'tcx> {
-    fn finalize(self) -> inspect::GoalEvaluationStep<'tcx> {
+    fn finalize(self) -> inspect::CanonicalGoalEvaluationStep<I> {
         let evaluation = self.evaluation.finalize();
         match evaluation.kind {
             inspect::ProbeKind::Root { .. } => (),
             _ => unreachable!("unexpected root evaluation: {evaluation:?}"),
         }
-        inspect::GoalEvaluationStep { instantiated_goal: self.instantiated_goal, evaluation }
+        inspect::CanonicalGoalEvaluationStep {
+            instantiated_goal: self.instantiated_goal,
+            evaluation,
+        }
     }
 }
 
-#[derive(Eq, PartialEq, Debug)]
-struct WipProbe<'tcx> {
-    pub steps: Vec<WipProbeStep<'tcx>>,
-    pub kind: Option<inspect::ProbeKind<'tcx>>,
+#[derive(derivative::Derivative)]
+#[derivative(PartialEq(bound = ""), Eq(bound = ""), Debug(bound = ""))]
+struct WipProbe<I: Interner> {
+    initial_num_var_values: usize,
+    steps: Vec<WipProbeStep<I>>,
+    kind: Option<inspect::ProbeKind<I>>,
+    final_state: Option<inspect::CanonicalState<I, ()>>,
 }
 
-impl<'tcx> WipProbe<'tcx> {
-    fn finalize(self) -> inspect::Probe<'tcx> {
+impl<I: Interner> WipProbe<I> {
+    fn finalize(self) -> inspect::Probe<I> {
         inspect::Probe {
             steps: self.steps.into_iter().map(WipProbeStep::finalize).collect(),
             kind: self.kind.unwrap(),
+            final_state: self.final_state.unwrap(),
         }
     }
 }
 
-#[derive(Eq, PartialEq, Debug)]
-enum WipProbeStep<'tcx> {
-    AddGoal(GoalSource, inspect::CanonicalState<'tcx, Goal<'tcx, ty::Predicate<'tcx>>>),
-    EvaluateGoals(WipAddedGoalsEvaluation<'tcx>),
-    NestedProbe(WipProbe<'tcx>),
+#[derive(derivative::Derivative)]
+#[derivative(PartialEq(bound = ""), Eq(bound = ""), Debug(bound = ""))]
+enum WipProbeStep<I: Interner> {
+    AddGoal(GoalSource, inspect::CanonicalState<I, Goal<I, I::Predicate>>),
+    NestedProbe(WipProbe<I>),
+    MakeCanonicalResponse { shallow_certainty: Certainty },
+    RecordImplArgs { impl_args: inspect::CanonicalState<I, I::GenericArgs> },
 }
 
-impl<'tcx> WipProbeStep<'tcx> {
-    fn finalize(self) -> inspect::ProbeStep<'tcx> {
+impl<I: Interner> WipProbeStep<I> {
+    fn finalize(self) -> inspect::ProbeStep<I> {
         match self {
             WipProbeStep::AddGoal(source, goal) => inspect::ProbeStep::AddGoal(source, goal),
-            WipProbeStep::EvaluateGoals(eval) => inspect::ProbeStep::EvaluateGoals(eval.finalize()),
             WipProbeStep::NestedProbe(probe) => inspect::ProbeStep::NestedProbe(probe.finalize()),
+            WipProbeStep::RecordImplArgs { impl_args } => {
+                inspect::ProbeStep::RecordImplArgs { impl_args }
+            }
+            WipProbeStep::MakeCanonicalResponse { shallow_certainty } => {
+                inspect::ProbeStep::MakeCanonicalResponse { shallow_certainty }
+            }
         }
     }
 }
 
-impl<'tcx> ProofTreeBuilder<'tcx> {
-    fn new(state: impl Into<DebugSolver<'tcx>>) -> ProofTreeBuilder<'tcx> {
-        ProofTreeBuilder { state: Some(Box::new(state.into())) }
+impl<Infcx: InferCtxtLike<Interner = I>, I: Interner> ProofTreeBuilder<Infcx> {
+    fn new(state: impl Into<DebugSolver<I>>) -> ProofTreeBuilder<Infcx> {
+        ProofTreeBuilder { state: Some(Box::new(state.into())), _infcx: PhantomData }
     }
 
-    fn nested<T: Into<DebugSolver<'tcx>>>(&self, state: impl FnOnce() -> T) -> Self {
-        ProofTreeBuilder { state: self.state.as_ref().map(|_| Box::new(state().into())) }
+    fn opt_nested<T: Into<DebugSolver<I>>>(&self, state: impl FnOnce() -> Option<T>) -> Self {
+        ProofTreeBuilder {
+            state: self.state.as_ref().and_then(|_| Some(state()?.into())).map(Box::new),
+            _infcx: PhantomData,
+        }
     }
 
-    fn as_mut(&mut self) -> Option<&mut DebugSolver<'tcx>> {
+    fn nested<T: Into<DebugSolver<I>>>(&self, state: impl FnOnce() -> T) -> Self {
+        ProofTreeBuilder {
+            state: self.state.as_ref().map(|_| Box::new(state().into())),
+            _infcx: PhantomData,
+        }
+    }
+
+    fn as_mut(&mut self) -> Option<&mut DebugSolver<I>> {
         self.state.as_deref_mut()
     }
 
-    pub fn finalize(self) -> Option<inspect::GoalEvaluation<'tcx>> {
+    pub fn take_and_enter_probe(&mut self) -> ProofTreeBuilder<Infcx> {
+        let mut nested = ProofTreeBuilder { state: self.state.take(), _infcx: PhantomData };
+        nested.enter_probe();
+        nested
+    }
+
+    pub fn finalize(self) -> Option<inspect::GoalEvaluation<I>> {
         match *self.state? {
             DebugSolver::GoalEvaluation(wip_goal_evaluation) => {
                 Some(wip_goal_evaluation.finalize())
@@ -254,33 +270,19 @@ impl<'tcx> ProofTreeBuilder<'tcx> {
         }
     }
 
-    pub fn new_maybe_root(
-        tcx: TyCtxt<'tcx>,
-        generate_proof_tree: GenerateProofTree,
-    ) -> ProofTreeBuilder<'tcx> {
+    pub fn new_maybe_root(generate_proof_tree: GenerateProofTree) -> ProofTreeBuilder<Infcx> {
         match generate_proof_tree {
-            GenerateProofTree::Never => ProofTreeBuilder::new_noop(),
-            GenerateProofTree::IfEnabled => {
-                let opts = &tcx.sess.opts.unstable_opts;
-                match opts.next_solver.map(|c| c.dump_tree).unwrap_or_default() {
-                    DumpSolverProofTree::Always => ProofTreeBuilder::new_root(),
-                    // `OnError` is handled by reevaluating goals in error
-                    // reporting with `GenerateProofTree::Yes`.
-                    DumpSolverProofTree::OnError | DumpSolverProofTree::Never => {
-                        ProofTreeBuilder::new_noop()
-                    }
-                }
-            }
+            GenerateProofTree::No => ProofTreeBuilder::new_noop(),
             GenerateProofTree::Yes => ProofTreeBuilder::new_root(),
         }
     }
 
-    pub fn new_root() -> ProofTreeBuilder<'tcx> {
+    pub fn new_root() -> ProofTreeBuilder<Infcx> {
         ProofTreeBuilder::new(DebugSolver::Root)
     }
 
-    pub fn new_noop() -> ProofTreeBuilder<'tcx> {
-        ProofTreeBuilder { state: None }
+    pub fn new_noop() -> ProofTreeBuilder<Infcx> {
+        ProofTreeBuilder { state: None, _infcx: PhantomData }
     }
 
     pub fn is_noop(&self) -> bool {
@@ -289,65 +291,68 @@ impl<'tcx> ProofTreeBuilder<'tcx> {
 
     pub(in crate::solve) fn new_goal_evaluation(
         &mut self,
-        goal: Goal<'tcx, ty::Predicate<'tcx>>,
-        orig_values: &[ty::GenericArg<'tcx>],
+        goal: Goal<I, I::Predicate>,
+        orig_values: &[I::GenericArg],
         kind: solve::GoalEvaluationKind,
-    ) -> ProofTreeBuilder<'tcx> {
-        self.nested(|| WipGoalEvaluation {
-            uncanonicalized_goal: goal,
-            kind: match kind {
-                solve::GoalEvaluationKind::Root => {
-                    WipGoalEvaluationKind::Root { orig_values: orig_values.to_vec() }
-                }
-                solve::GoalEvaluationKind::Nested => WipGoalEvaluationKind::Nested,
-            },
-            evaluation: None,
+    ) -> ProofTreeBuilder<Infcx> {
+        self.opt_nested(|| match kind {
+            solve::GoalEvaluationKind::Root => Some(WipGoalEvaluation {
+                uncanonicalized_goal: goal,
+                orig_values: orig_values.to_vec(),
+                evaluation: None,
+            }),
+            solve::GoalEvaluationKind::Nested => None,
         })
     }
 
     pub fn new_canonical_goal_evaluation(
         &mut self,
-        goal: CanonicalInput<'tcx>,
-    ) -> ProofTreeBuilder<'tcx> {
+        goal: CanonicalInput<I>,
+    ) -> ProofTreeBuilder<Infcx> {
         self.nested(|| WipCanonicalGoalEvaluation {
             goal,
             kind: None,
-            revisions: vec![],
+            final_revision: None,
             result: None,
         })
     }
 
-    pub fn finalize_evaluation(
+    pub fn finalize_canonical_goal_evaluation(
         &mut self,
-        tcx: TyCtxt<'tcx>,
-    ) -> Option<&'tcx [inspect::GoalEvaluationStep<'tcx>]> {
+        tcx: I,
+    ) -> Option<I::CanonicalGoalEvaluationStepRef> {
         self.as_mut().map(|this| match this {
             DebugSolver::CanonicalGoalEvaluation(evaluation) => {
-                let revisions = mem::take(&mut evaluation.revisions)
-                    .into_iter()
-                    .map(WipGoalEvaluationStep::finalize);
-                let revisions = &*tcx.arena.alloc_from_iter(revisions);
-                let kind = WipCanonicalGoalEvaluationKind::Interned { revisions };
+                let final_revision = mem::take(&mut evaluation.final_revision).unwrap();
+                let final_revision =
+                    tcx.intern_canonical_goal_evaluation_step(final_revision.finalize());
+                let kind = WipCanonicalGoalEvaluationKind::Interned { final_revision };
                 assert_eq!(evaluation.kind.replace(kind), None);
-                revisions
+                final_revision
             }
             _ => unreachable!(),
         })
     }
 
-    pub fn canonical_goal_evaluation(&mut self, canonical_goal_evaluation: ProofTreeBuilder<'tcx>) {
+    pub fn canonical_goal_evaluation(
+        &mut self,
+        canonical_goal_evaluation: ProofTreeBuilder<Infcx>,
+    ) {
         if let Some(this) = self.as_mut() {
             match (this, *canonical_goal_evaluation.state.unwrap()) {
                 (
                     DebugSolver::GoalEvaluation(goal_evaluation),
                     DebugSolver::CanonicalGoalEvaluation(canonical_goal_evaluation),
-                ) => goal_evaluation.evaluation = Some(canonical_goal_evaluation),
+                ) => {
+                    let prev = goal_evaluation.evaluation.replace(canonical_goal_evaluation);
+                    assert_eq!(prev, None);
+                }
                 _ => unreachable!(),
             }
         }
     }
 
-    pub fn goal_evaluation_kind(&mut self, kind: WipCanonicalGoalEvaluationKind<'tcx>) {
+    pub fn canonical_goal_evaluation_kind(&mut self, kind: WipCanonicalGoalEvaluationKind<I>) {
         if let Some(this) = self.as_mut() {
             match this {
                 DebugSolver::CanonicalGoalEvaluation(canonical_goal_evaluation) => {
@@ -358,16 +363,13 @@ impl<'tcx> ProofTreeBuilder<'tcx> {
         }
     }
 
-    pub fn goal_evaluation(&mut self, goal_evaluation: ProofTreeBuilder<'tcx>) {
+    pub fn goal_evaluation(&mut self, goal_evaluation: ProofTreeBuilder<Infcx>) {
         if let Some(this) = self.as_mut() {
-            match (this, *goal_evaluation.state.unwrap()) {
-                (
-                    DebugSolver::AddedGoalsEvaluation(WipAddedGoalsEvaluation {
-                        evaluations, ..
-                    }),
-                    DebugSolver::GoalEvaluation(goal_evaluation),
-                ) => evaluations.last_mut().unwrap().push(goal_evaluation),
-                (this @ DebugSolver::Root, goal_evaluation) => *this = goal_evaluation,
+            match this {
+                DebugSolver::Root => *this = *goal_evaluation.state.unwrap(),
+                DebugSolver::CanonicalGoalEvaluationStep(_) => {
+                    assert!(goal_evaluation.state.is_none())
+                }
                 _ => unreachable!(),
             }
         }
@@ -375,143 +377,186 @@ impl<'tcx> ProofTreeBuilder<'tcx> {
 
     pub fn new_goal_evaluation_step(
         &mut self,
-        instantiated_goal: QueryInput<'tcx, ty::Predicate<'tcx>>,
-    ) -> ProofTreeBuilder<'tcx> {
-        self.nested(|| WipGoalEvaluationStep {
+        var_values: ty::CanonicalVarValues<I>,
+        instantiated_goal: QueryInput<I, I::Predicate>,
+    ) -> ProofTreeBuilder<Infcx> {
+        self.nested(|| WipCanonicalGoalEvaluationStep {
+            var_values: var_values.var_values.to_vec(),
             instantiated_goal,
-            evaluation: WipProbe { steps: vec![], kind: None },
+            evaluation: WipProbe {
+                initial_num_var_values: var_values.len(),
+                steps: vec![],
+                kind: None,
+                final_state: None,
+            },
+            probe_depth: 0,
         })
     }
-    pub fn goal_evaluation_step(&mut self, goal_evaluation_step: ProofTreeBuilder<'tcx>) {
+
+    pub fn goal_evaluation_step(&mut self, goal_evaluation_step: ProofTreeBuilder<Infcx>) {
         if let Some(this) = self.as_mut() {
             match (this, *goal_evaluation_step.state.unwrap()) {
                 (
                     DebugSolver::CanonicalGoalEvaluation(canonical_goal_evaluations),
-                    DebugSolver::GoalEvaluationStep(goal_evaluation_step),
+                    DebugSolver::CanonicalGoalEvaluationStep(goal_evaluation_step),
                 ) => {
-                    canonical_goal_evaluations.revisions.push(goal_evaluation_step);
+                    canonical_goal_evaluations.final_revision = Some(goal_evaluation_step);
                 }
                 _ => unreachable!(),
             }
         }
     }
 
-    pub fn new_probe(&mut self) -> ProofTreeBuilder<'tcx> {
-        self.nested(|| WipProbe { steps: vec![], kind: None })
+    pub fn add_var_value<T: Into<I::GenericArg>>(&mut self, arg: T) {
+        match self.as_mut() {
+            None => {}
+            Some(DebugSolver::CanonicalGoalEvaluationStep(state)) => {
+                state.var_values.push(arg.into());
+            }
+            Some(s) => bug!("tried to add var values to {s:?}"),
+        }
     }
 
-    pub fn probe_kind(&mut self, probe_kind: inspect::ProbeKind<'tcx>) {
-        if let Some(this) = self.as_mut() {
-            match this {
-                DebugSolver::Probe(this) => {
-                    assert_eq!(this.kind.replace(probe_kind), None)
-                }
-                _ => unreachable!(),
+    pub fn enter_probe(&mut self) {
+        match self.as_mut() {
+            None => {}
+            Some(DebugSolver::CanonicalGoalEvaluationStep(state)) => {
+                let initial_num_var_values = state.var_values.len();
+                state.current_evaluation_scope().steps.push(WipProbeStep::NestedProbe(WipProbe {
+                    initial_num_var_values,
+                    steps: vec![],
+                    kind: None,
+                    final_state: None,
+                }));
+                state.probe_depth += 1;
             }
+            Some(s) => bug!("tried to start probe to {s:?}"),
+        }
+    }
+
+    pub fn probe_kind(&mut self, probe_kind: inspect::ProbeKind<I>) {
+        match self.as_mut() {
+            None => {}
+            Some(DebugSolver::CanonicalGoalEvaluationStep(state)) => {
+                let prev = state.current_evaluation_scope().kind.replace(probe_kind);
+                assert_eq!(prev, None);
+            }
+            _ => bug!(),
+        }
+    }
+
+    pub fn probe_final_state(&mut self, infcx: &Infcx, max_input_universe: ty::UniverseIndex) {
+        match self.as_mut() {
+            None => {}
+            Some(DebugSolver::CanonicalGoalEvaluationStep(state)) => {
+                let final_state = canonical::make_canonical_state(
+                    infcx,
+                    &state.var_values,
+                    max_input_universe,
+                    (),
+                );
+                let prev = state.current_evaluation_scope().final_state.replace(final_state);
+                assert_eq!(prev, None);
+            }
+            _ => bug!(),
         }
     }
 
     pub fn add_normalizes_to_goal(
-        ecx: &mut EvalCtxt<'_, 'tcx>,
-        goal: Goal<'tcx, ty::NormalizesTo<'tcx>>,
+        &mut self,
+        infcx: &Infcx,
+        max_input_universe: ty::UniverseIndex,
+        goal: Goal<I, ty::NormalizesTo<I>>,
     ) {
-        if ecx.inspect.is_noop() {
-            return;
-        }
-
-        Self::add_goal(ecx, GoalSource::Misc, goal.with(ecx.tcx(), goal.predicate));
+        self.add_goal(
+            infcx,
+            max_input_universe,
+            GoalSource::Misc,
+            goal.with(infcx.interner(), goal.predicate),
+        );
     }
 
     pub fn add_goal(
-        ecx: &mut EvalCtxt<'_, 'tcx>,
+        &mut self,
+        infcx: &Infcx,
+        max_input_universe: ty::UniverseIndex,
         source: GoalSource,
-        goal: Goal<'tcx, ty::Predicate<'tcx>>,
+        goal: Goal<I, I::Predicate>,
     ) {
-        // Can't use `if let Some(this) = ecx.inspect.as_mut()` here because
-        // we have to immutably use the `EvalCtxt` for `make_canonical_state`.
-        if ecx.inspect.is_noop() {
-            return;
-        }
-
-        let goal = Self::make_canonical_state(ecx, goal);
-
-        match ecx.inspect.as_mut().unwrap() {
-            DebugSolver::GoalEvaluationStep(WipGoalEvaluationStep {
-                evaluation: WipProbe { steps, .. },
-                ..
-            })
-            | DebugSolver::Probe(WipProbe { steps, .. }) => {
-                steps.push(WipProbeStep::AddGoal(source, goal))
+        match self.as_mut() {
+            None => {}
+            Some(DebugSolver::CanonicalGoalEvaluationStep(state)) => {
+                let goal = canonical::make_canonical_state(
+                    infcx,
+                    &state.var_values,
+                    max_input_universe,
+                    goal,
+                );
+                state.current_evaluation_scope().steps.push(WipProbeStep::AddGoal(source, goal))
             }
-            s => unreachable!("tried to add {goal:?} to {s:?}"),
+            _ => bug!(),
         }
     }
 
-    pub fn finish_probe(&mut self, probe: ProofTreeBuilder<'tcx>) {
-        if let Some(this) = self.as_mut() {
-            match (this, *probe.state.unwrap()) {
-                (
-                    DebugSolver::Probe(WipProbe { steps, .. })
-                    | DebugSolver::GoalEvaluationStep(WipGoalEvaluationStep {
-                        evaluation: WipProbe { steps, .. },
-                        ..
-                    }),
-                    DebugSolver::Probe(probe),
-                ) => steps.push(WipProbeStep::NestedProbe(probe)),
-                _ => unreachable!(),
+    pub(crate) fn record_impl_args(
+        &mut self,
+        infcx: &Infcx,
+        max_input_universe: ty::UniverseIndex,
+        impl_args: I::GenericArgs,
+    ) {
+        match self.as_mut() {
+            Some(DebugSolver::CanonicalGoalEvaluationStep(state)) => {
+                let impl_args = canonical::make_canonical_state(
+                    infcx,
+                    &state.var_values,
+                    max_input_universe,
+                    impl_args,
+                );
+                state
+                    .current_evaluation_scope()
+                    .steps
+                    .push(WipProbeStep::RecordImplArgs { impl_args });
             }
+            None => {}
+            _ => bug!(),
         }
     }
 
-    pub fn new_evaluate_added_goals(&mut self) -> ProofTreeBuilder<'tcx> {
-        self.nested(|| WipAddedGoalsEvaluation { evaluations: vec![], result: None })
-    }
-
-    pub fn evaluate_added_goals_loop_start(&mut self) {
-        if let Some(this) = self.as_mut() {
-            match this {
-                DebugSolver::AddedGoalsEvaluation(this) => {
-                    this.evaluations.push(vec![]);
-                }
-                _ => unreachable!(),
+    pub fn make_canonical_response(&mut self, shallow_certainty: Certainty) {
+        match self.as_mut() {
+            Some(DebugSolver::CanonicalGoalEvaluationStep(state)) => {
+                state
+                    .current_evaluation_scope()
+                    .steps
+                    .push(WipProbeStep::MakeCanonicalResponse { shallow_certainty });
             }
+            None => {}
+            _ => bug!(),
         }
     }
 
-    pub fn eval_added_goals_result(&mut self, result: Result<Certainty, NoSolution>) {
-        if let Some(this) = self.as_mut() {
-            match this {
-                DebugSolver::AddedGoalsEvaluation(this) => {
-                    assert_eq!(this.result.replace(result), None);
-                }
-                _ => unreachable!(),
+    pub fn finish_probe(mut self) -> ProofTreeBuilder<Infcx> {
+        match self.as_mut() {
+            None => {}
+            Some(DebugSolver::CanonicalGoalEvaluationStep(state)) => {
+                assert_ne!(state.probe_depth, 0);
+                let num_var_values = state.current_evaluation_scope().initial_num_var_values;
+                state.var_values.truncate(num_var_values);
+                state.probe_depth -= 1;
             }
+            _ => bug!(),
         }
+
+        self
     }
 
-    pub fn added_goals_evaluation(&mut self, added_goals_evaluation: ProofTreeBuilder<'tcx>) {
-        if let Some(this) = self.as_mut() {
-            match (this, *added_goals_evaluation.state.unwrap()) {
-                (
-                    DebugSolver::GoalEvaluationStep(WipGoalEvaluationStep {
-                        evaluation: WipProbe { steps, .. },
-                        ..
-                    })
-                    | DebugSolver::Probe(WipProbe { steps, .. }),
-                    DebugSolver::AddedGoalsEvaluation(added_goals_evaluation),
-                ) => steps.push(WipProbeStep::EvaluateGoals(added_goals_evaluation)),
-                _ => unreachable!(),
-            }
-        }
-    }
-
-    pub fn query_result(&mut self, result: QueryResult<'tcx>) {
+    pub fn query_result(&mut self, result: QueryResult<I>) {
         if let Some(this) = self.as_mut() {
             match this {
                 DebugSolver::CanonicalGoalEvaluation(canonical_goal_evaluation) => {
                     assert_eq!(canonical_goal_evaluation.result.replace(result), None);
                 }
-                DebugSolver::GoalEvaluationStep(evaluation_step) => {
+                DebugSolver::CanonicalGoalEvaluationStep(evaluation_step) => {
                     assert_eq!(
                         evaluation_step
                             .evaluation

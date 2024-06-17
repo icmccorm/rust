@@ -42,6 +42,7 @@ use std::cell::OnceCell;
 use std::cell::RefCell;
 use std::iter;
 use std::ops::Range;
+use tracing::debug;
 
 mod create_scope_map;
 pub mod gdb;
@@ -110,7 +111,7 @@ impl<'ll, 'tcx> CodegenUnitDebugContext<'ll, 'tcx> {
                     .unstable_opts
                     .dwarf_version
                     .unwrap_or(sess.target.default_dwarf_version);
-                llvm::LLVMRustAddModuleFlag(
+                llvm::LLVMRustAddModuleFlagU32(
                     self.llmod,
                     llvm::LLVMModFlagBehavior::Warning,
                     c"Dwarf Version".as_ptr().cast(),
@@ -118,7 +119,7 @@ impl<'ll, 'tcx> CodegenUnitDebugContext<'ll, 'tcx> {
                 );
             } else {
                 // Indicate that we want CodeView debug information on MSVC
-                llvm::LLVMRustAddModuleFlag(
+                llvm::LLVMRustAddModuleFlagU32(
                     self.llmod,
                     llvm::LLVMModFlagBehavior::Warning,
                     c"CodeView".as_ptr().cast(),
@@ -127,7 +128,7 @@ impl<'ll, 'tcx> CodegenUnitDebugContext<'ll, 'tcx> {
             }
 
             // Prevent bitcode readers from deleting the debug info.
-            llvm::LLVMRustAddModuleFlag(
+            llvm::LLVMRustAddModuleFlagU32(
                 self.llmod,
                 llvm::LLVMModFlagBehavior::Warning,
                 c"Debug Info Version".as_ptr().cast(),
@@ -512,7 +513,7 @@ impl<'ll, 'tcx> DebugInfoMethods<'tcx> for CodegenCx<'ll, 'tcx> {
             let mut names = generics.parent.map_or_else(Vec::new, |def_id| {
                 get_parameter_names(cx, cx.tcx.generics_of(def_id))
             });
-            names.extend(generics.params.iter().map(|param| param.name));
+            names.extend(generics.own_params.iter().map(|param| param.name));
             names
         }
 

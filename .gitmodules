@@ -49,3 +49,7 @@
 [submodule "src/llvm-sys"]
 	path = src/llvm-sys
 	url = https://github.com/icmccorm/llvm-sys.git
+[submodule "src/tools/rustc-perf"]
+	path = src/tools/rustc-perf
+	url = https://github.com/rust-lang/rustc-perf.git
+	shallow = true

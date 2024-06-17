@@ -14,9 +14,9 @@ mod generics {
         fn foo3<'a: 'a>(_: &'a u32) {}
 
         reuse GenericTrait::bar;
-        //~^ delegation with early bound generics is not supported yet
+        //~^ ERROR delegation with early bound generics is not supported yet
         reuse GenericTrait::bar1;
-        //~^ delegation with early bound generics is not supported yet
+        //~^ ERROR delegation with early bound generics is not supported yet
     }
 
     struct F;
@@ -70,29 +70,25 @@ mod opaque {
 
         pub fn opaque_arg(_: impl Trait) -> i32 { 0 }
         pub fn opaque_ret() -> impl Trait { unimplemented!() }
+        //~^ warn: this function depends on never type fallback being `()`
+        //~| warn: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
     }
     reuse to_reuse::opaque_arg;
     //~^ ERROR delegation with early bound generics is not supported yet
-    reuse to_reuse::opaque_ret;
-    //~^ ERROR delegation to a function with opaque type is not supported yet
-}
 
-mod fn_header {
-    mod to_reuse {
-        pub unsafe fn unsafe_fn() {}
-        pub extern "C" fn extern_fn() {}
-        pub unsafe extern "C" fn variadic_fn(n: usize, mut args: ...) {}
-        pub const fn const_fn() {}
+    trait ToReuse {
+        fn opaque_ret() -> impl Trait { unimplemented!() }
+        //~^ warn: this function depends on never type fallback being `()`
+        //~| warn: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
     }
 
-    reuse to_reuse::unsafe_fn;
-    //~^ ERROR delegation to unsafe functions is not supported yet
-    reuse to_reuse::extern_fn;
-    //~^ ERROR delegation to non Rust ABI functions is not supported yet
-    reuse to_reuse::variadic_fn;
-    //~^ ERROR delegation to variadic functions is not supported yet
-    reuse to_reuse::const_fn;
-    //~^ ERROR delegation to const functions is not supported yet
+    // FIXME: Inherited `impl Trait`s create query cycles when used inside trait impls.
+    impl ToReuse for u8 {
+        reuse to_reuse::opaque_ret; //~ ERROR cycle detected when computing type
+    }
+    impl ToReuse for u16 {
+        reuse ToReuse::opaque_ret; //~ ERROR cycle detected when computing type
+    }
 }
 
 mod recursive {

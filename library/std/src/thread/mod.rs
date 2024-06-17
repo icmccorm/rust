@@ -160,6 +160,7 @@ mod tests;
 
 use crate::any::Any;
 use crate::cell::{OnceCell, UnsafeCell};
+use crate::env;
 use crate::ffi::{CStr, CString};
 use crate::fmt;
 use crate::io;
@@ -171,10 +172,10 @@ use crate::panicking;
 use crate::pin::Pin;
 use crate::ptr::addr_of_mut;
 use crate::str;
+use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::Arc;
+use crate::sys::sync::Parker;
 use crate::sys::thread as imp;
-use crate::sys_common::thread;
-use crate::sys_common::thread_parking::Parker;
 use crate::sys_common::{AsInner, IntoInner};
 use crate::time::{Duration, Instant};
 
@@ -204,7 +205,7 @@ cfg_if::cfg_if! {
         #[doc(hidden)]
         #[unstable(feature = "thread_local_internals", issue = "none")]
         pub mod local_impl {
-            pub use crate::sys::thread_local::{thread_local_inner, Key, abort_on_dtor_unwind};
+            pub use crate::sys::thread_local::*;
         }
     }
 }
@@ -468,11 +469,29 @@ impl Builder {
     {
         let Builder { name, stack_size } = self;
 
-        let stack_size = stack_size.unwrap_or_else(thread::min_stack);
+        let stack_size = stack_size.unwrap_or_else(|| {
+            static MIN: AtomicUsize = AtomicUsize::new(0);
 
-        let my_thread = Thread::new(name.map(|name| {
-            CString::new(name).expect("thread name may not contain interior null bytes")
-        }));
+            match MIN.load(Ordering::Relaxed) {
+                0 => {}
+                n => return n - 1,
+            }
+
+            let amt = env::var_os("RUST_MIN_STACK")
+                .and_then(|s| s.to_str().and_then(|s| s.parse().ok()))
+                .unwrap_or(imp::DEFAULT_MIN_STACK_SIZE);
+
+            // 0 is our sentinel value, so ensure that we'll never see 0 after
+            // initialization has run
+            MIN.store(amt + 1, Ordering::Relaxed);
+            amt
+        });
+
+        let my_thread = name.map_or_else(Thread::new_unnamed, |name| unsafe {
+            Thread::new(
+                CString::new(name).expect("thread name may not contain interior null bytes"),
+            )
+        });
         let their_thread = my_thread.clone();
 
         let my_packet: Arc<Packet<'scope, T>> = Arc::new(Packet {
@@ -520,7 +539,7 @@ impl Builder {
             let f = f.into_inner();
             set_current(their_thread);
             let try_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                crate::sys_common::backtrace::__rust_begin_short_backtrace(f)
+                crate::sys::backtrace::__rust_begin_short_backtrace(f)
             }));
             // SAFETY: `their_packet` as been built just above and moved by the
             // closure (it is an Arc<...>) and `my_packet` will be stored in the
@@ -542,7 +561,8 @@ impl Builder {
         let main = Box::new(main);
         // SAFETY: dynamic size and alignment of the Box remain the same. See below for why the
         // lifetime change is justified.
-        let main = unsafe { Box::from_raw(Box::into_raw(main) as *mut (dyn FnOnce() + 'static)) };
+        let main =
+            unsafe { Box::from_raw(Box::into_raw(main) as *mut (dyn FnOnce() + Send + 'static)) };
 
         Ok(JoinInner {
             // SAFETY:
@@ -684,9 +704,14 @@ thread_local! {
 
 /// Sets the thread handle for the current thread.
 ///
-/// Panics if the handle has been set already or when called from a TLS destructor.
+/// Aborts if the handle has been set already to reduce code size.
 pub(crate) fn set_current(thread: Thread) {
-    CURRENT.with(|current| current.set(thread).unwrap());
+    // Using `unwrap` here can add ~3kB to the binary size. We have complete
+    // control over where this is called, so just abort if there is a bug.
+    CURRENT.with(|current| match current.set(thread) {
+        Ok(()) => {}
+        Err(_) => rtabort!("thread::set_current should only be called once per thread"),
+    });
 }
 
 /// Gets a handle to the thread that invokes it.
@@ -694,7 +719,7 @@ pub(crate) fn set_current(thread: Thread) {
 /// In contrast to the public `current` function, this will not panic if called
 /// from inside a TLS destructor.
 pub(crate) fn try_current() -> Option<Thread> {
-    CURRENT.try_with(|current| current.get_or_init(|| Thread::new(None)).clone()).ok()
+    CURRENT.try_with(|current| current.get_or_init(|| Thread::new_unnamed()).clone()).ok()
 }
 
 /// Gets a handle to the thread that invokes it.
@@ -1191,17 +1216,17 @@ impl ThreadId {
 
         cfg_if::cfg_if! {
             if #[cfg(target_has_atomic = "64")] {
-                use crate::sync::atomic::{AtomicU64, Ordering::Relaxed};
+                use crate::sync::atomic::AtomicU64;
 
                 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-                let mut last = COUNTER.load(Relaxed);
+                let mut last = COUNTER.load(Ordering::Relaxed);
                 loop {
                     let Some(id) = last.checked_add(1) else {
                         exhausted();
                     };
 
-                    match COUNTER.compare_exchange_weak(last, id, Relaxed, Relaxed) {
+                    match COUNTER.compare_exchange_weak(last, id, Ordering::Relaxed, Ordering::Relaxed) {
                         Ok(_) => return ThreadId(NonZero::new(id).unwrap()),
                         Err(id) => last = id,
                     }
@@ -1290,21 +1315,26 @@ pub struct Thread {
 }
 
 impl Thread {
-    // Used only internally to construct a thread object without spawning
-    pub(crate) fn new(name: Option<CString>) -> Thread {
-        if let Some(name) = name {
-            Self::new_inner(ThreadName::Other(name))
-        } else {
-            Self::new_inner(ThreadName::Unnamed)
-        }
+    /// Used only internally to construct a thread object without spawning.
+    ///
+    /// # Safety
+    /// `name` must be valid UTF-8.
+    pub(crate) unsafe fn new(name: CString) -> Thread {
+        unsafe { Self::new_inner(ThreadName::Other(name)) }
+    }
+
+    pub(crate) fn new_unnamed() -> Thread {
+        unsafe { Self::new_inner(ThreadName::Unnamed) }
     }
 
     // Used in runtime to construct main thread
     pub(crate) fn new_main() -> Thread {
-        Self::new_inner(ThreadName::Main)
+        unsafe { Self::new_inner(ThreadName::Main) }
     }
 
-    fn new_inner(name: ThreadName) -> Thread {
+    /// # Safety
+    /// If `name` is `ThreadName::Other(_)`, the contained string must be valid UTF-8.
+    unsafe fn new_inner(name: ThreadName) -> Thread {
         // We have to use `unsafe` here to construct the `Parker` in-place,
         // which is required for the UNIX implementation.
         //
@@ -1515,7 +1545,7 @@ struct Packet<'scope, T> {
 // The type `T` should already always be Send (otherwise the thread could not
 // have been created) and the Packet is Sync because all access to the
 // `UnsafeCell` synchronized (by the `join()` boundary), and `ScopeData` is Sync.
-unsafe impl<'scope, T: Sync> Sync for Packet<'scope, T> {}
+unsafe impl<'scope, T: Send> Sync for Packet<'scope, T> {}
 
 impl<'scope, T> Drop for Packet<'scope, T> {
     fn drop(&mut self) {

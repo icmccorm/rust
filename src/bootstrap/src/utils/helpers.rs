@@ -150,6 +150,21 @@ pub fn symlink_dir(config: &Config, original: &Path, link: &Path) -> io::Result<
     }
 }
 
+/// Rename a file if from and to are in the same filesystem or
+/// copy and remove the file otherwise
+pub fn move_file<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
+    match fs::rename(&from, &to) {
+        // FIXME: Once `ErrorKind::CrossesDevices` is stabilized use
+        // if e.kind() == io::ErrorKind::CrossesDevices {
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            std::fs::copy(&from, &to)?;
+            std::fs::remove_file(&from)
+        }
+        r => r,
+    }
+}
+
 pub fn forcing_clang_based_tests() -> bool {
     if let Some(var) = env::var_os("RUSTBUILD_FORCE_CLANG_BASED_TESTS") {
         match &var.to_string_lossy().to_lowercase()[..] {
@@ -296,6 +311,15 @@ pub fn up_to_date(src: &Path, dst: &Path) -> bool {
     }
 }
 
+/// Returns the filename without the hash prefix added by the cc crate.
+///
+/// Since v1.0.78 of the cc crate, object files are prefixed with a 16-character hash
+/// to avoid filename collisions.
+pub fn unhashed_basename(obj: &Path) -> &str {
+    let basename = obj.file_stem().unwrap().to_str().expect("UTF-8 file name");
+    basename.split_once('-').unwrap().1
+}
+
 fn dir_up_to_date(src: &Path, threshold: SystemTime) -> bool {
     t!(fs::read_dir(src)).map(|e| t!(e)).all(|e| {
         let meta = t!(e.metadata());
@@ -305,115 +329,6 @@ fn dir_up_to_date(src: &Path, threshold: SystemTime) -> bool {
             meta.modified().unwrap_or(UNIX_EPOCH) < threshold
         }
     })
-}
-
-/// Copied from `std::path::absolute` until it stabilizes.
-///
-/// FIXME: this shouldn't exist.
-pub(crate) fn absolute(path: &Path) -> PathBuf {
-    if path.as_os_str().is_empty() {
-        panic!("can't make empty path absolute");
-    }
-    #[cfg(unix)]
-    {
-        t!(absolute_unix(path), format!("could not make path absolute: {}", path.display()))
-    }
-    #[cfg(windows)]
-    {
-        t!(absolute_windows(path), format!("could not make path absolute: {}", path.display()))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        println!("WARNING: bootstrap is not supported on non-unix platforms");
-        t!(std::fs::canonicalize(t!(std::env::current_dir()))).join(path)
-    }
-}
-
-#[cfg(unix)]
-/// Make a POSIX path absolute without changing its semantics.
-fn absolute_unix(path: &Path) -> io::Result<PathBuf> {
-    // This is mostly a wrapper around collecting `Path::components`, with
-    // exceptions made where this conflicts with the POSIX specification.
-    // See 4.13 Pathname Resolution, IEEE Std 1003.1-2017
-    // https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap04.html#tag_04_13
-
-    use std::os::unix::prelude::OsStrExt;
-    let mut components = path.components();
-    let path_os = path.as_os_str().as_bytes();
-
-    let mut normalized = if path.is_absolute() {
-        // "If a pathname begins with two successive <slash> characters, the
-        // first component following the leading <slash> characters may be
-        // interpreted in an implementation-defined manner, although more than
-        // two leading <slash> characters shall be treated as a single <slash>
-        // character."
-        if path_os.starts_with(b"//") && !path_os.starts_with(b"///") {
-            components.next();
-            PathBuf::from("//")
-        } else {
-            PathBuf::new()
-        }
-    } else {
-        env::current_dir()?
-    };
-    normalized.extend(components);
-
-    // "Interfaces using pathname resolution may specify additional constraints
-    // when a pathname that does not name an existing directory contains at
-    // least one non- <slash> character and contains one or more trailing
-    // <slash> characters".
-    // A trailing <slash> is also meaningful if "a symbolic link is
-    // encountered during pathname resolution".
-
-    if path_os.ends_with(b"/") {
-        normalized.push("");
-    }
-
-    Ok(normalized)
-}
-
-#[cfg(windows)]
-fn absolute_windows(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
-    use std::ffi::OsString;
-    use std::io::Error;
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use std::ptr::null_mut;
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetFullPathNameW(
-            lpFileName: *const u16,
-            nBufferLength: u32,
-            lpBuffer: *mut u16,
-            lpFilePart: *mut *const u16,
-        ) -> u32;
-    }
-
-    unsafe {
-        // encode the path as UTF-16
-        let path: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-        let mut buffer = Vec::new();
-        // Loop until either success or failure.
-        loop {
-            // Try to get the absolute path
-            let len = GetFullPathNameW(
-                path.as_ptr(),
-                buffer.len().try_into().unwrap(),
-                buffer.as_mut_ptr(),
-                null_mut(),
-            );
-            match len as usize {
-                // Failure
-                0 => return Err(Error::last_os_error()),
-                // Buffer is too small, resize.
-                len if len > buffer.len() => buffer.resize(len, 0),
-                // Success!
-                len => {
-                    buffer.truncate(len);
-                    return Ok(OsString::from_wide(&buffer).into());
-                }
-            }
-        }
-    }
 }
 
 /// Adapted from <https://github.com/llvm/llvm-project/blob/782e91224601e461c019e0a4573bbccc6094fbcd/llvm/cmake/modules/HandleLLVMOptions.cmake#L1058-L1079>
@@ -549,7 +464,12 @@ pub fn hex_encode<T>(input: T) -> String
 where
     T: AsRef<[u8]>,
 {
-    input.as_ref().iter().map(|x| format!("{:02x}", x)).collect()
+    use std::fmt::Write;
+
+    input.as_ref().iter().fold(String::with_capacity(input.as_ref().len() * 2), |mut acc, &byte| {
+        write!(&mut acc, "{:02x}", byte).expect("Failed to write byte to the hex String.");
+        acc
+    })
 }
 
 /// Create a `--check-cfg` argument invocation for a given name
@@ -568,4 +488,20 @@ pub fn check_cfg_arg(name: &str, values: Option<&[&str]>) -> String {
         None => "".to_string(),
     };
     format!("--check-cfg=cfg({name}{next})")
+}
+
+/// Prepares `Command` that runs git inside the source directory if given.
+///
+/// Whenever a git invocation is needed, this function should be preferred over
+/// manually building a git `Command`. This approach allows us to manage bootstrap-specific
+/// needs/hacks from a single source, rather than applying them on next to every `Command::new("git")`,
+/// which is painful to ensure that the required change is applied on each one of them correctly.
+pub fn git(source_dir: Option<&Path>) -> Command {
+    let mut git = Command::new("git");
+
+    if let Some(source_dir) = source_dir {
+        git.current_dir(source_dir);
+    }
+
+    git
 }

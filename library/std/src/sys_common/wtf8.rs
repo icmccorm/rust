@@ -325,6 +325,11 @@ impl Wtf8Buf {
         self.bytes.shrink_to(min_capacity)
     }
 
+    #[inline]
+    pub fn leak<'a>(self) -> &'a mut Wtf8 {
+        unsafe { Wtf8::from_mut_bytes_unchecked(self.bytes.leak()) }
+    }
+
     /// Returns the number of bytes that this string buffer can hold without reallocating.
     #[inline]
     pub fn capacity(&self) -> usize {
@@ -467,6 +472,15 @@ impl Wtf8Buf {
     pub fn from_box(boxed: Box<Wtf8>) -> Wtf8Buf {
         let bytes: Box<[u8]> = unsafe { mem::transmute(boxed) };
         Wtf8Buf { bytes: bytes.into_vec(), is_known_utf8: false }
+    }
+
+    /// Part of a hack to make PathBuf::push/pop more efficient.
+    #[inline]
+    pub(crate) fn as_mut_vec_for_path_buf(&mut self) -> &mut Vec<u8> {
+        // FIXME: this function should not even exist, as it implies violating Wtf8Buf invariants
+        // For now, simply assume that is about to happen.
+        self.is_known_utf8 = false;
+        &mut self.bytes
     }
 }
 

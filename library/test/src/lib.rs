@@ -17,7 +17,6 @@
 #![unstable(feature = "test", issue = "50297")]
 #![doc(test(attr(deny(warnings))))]
 #![doc(rust_logo)]
-#![feature(generic_nonzero)]
 #![feature(rustdoc_internals)]
 #![feature(internal_output_capture)]
 #![feature(staged_api)]
@@ -59,7 +58,7 @@ use std::{
     env, io,
     io::prelude::Write,
     mem::ManuallyDrop,
-    panic::{self, catch_unwind, AssertUnwindSafe, PanicInfo},
+    panic::{self, catch_unwind, AssertUnwindSafe, PanicHookInfo},
     process::{self, Command, Termination},
     sync::mpsc::{channel, Sender},
     sync::{Arc, Mutex},
@@ -124,7 +123,7 @@ pub fn test_main(args: &[String], tests: Vec<TestDescAndFn>, options: Option<Opt
             // from interleaving with the panic message or appearing after it.
             let builtin_panic_hook = panic::take_hook();
             let hook = Box::new({
-                move |info: &'_ PanicInfo<'_>| {
+                move |info: &'_ PanicHookInfo<'_>| {
                     if !info.can_unwind() {
                         std::mem::forget(std::io::stderr().lock());
                         let mut stdout = ManuallyDrop::new(std::io::stdout().lock());
@@ -140,7 +139,10 @@ pub fn test_main(args: &[String], tests: Vec<TestDescAndFn>, options: Option<Opt
             });
             panic::set_hook(hook);
         }
-        match console::run_tests_console(&opts, tests) {
+        let res = console::run_tests_console(&opts, tests);
+        // Prevent Valgrind from reporting reachable blocks in users' unit tests.
+        drop(panic::take_hook());
+        match res {
             Ok(true) => {}
             Ok(false) => process::exit(ERROR_EXIT_CODE),
             Err(e) => {
@@ -587,7 +589,9 @@ pub fn run_test(
             // If the platform is single-threaded we're just going to run
             // the test synchronously, regardless of the concurrency
             // level.
-            let supports_threads = !cfg!(target_os = "emscripten") && !cfg!(target_family = "wasm");
+            let supports_threads = !cfg!(target_os = "emscripten")
+                && !cfg!(target_family = "wasm")
+                && !cfg!(target_os = "zkvm");
             if supports_threads {
                 let cfg = thread::Builder::new().name(name.as_slice().to_owned());
                 let mut runtest = Arc::new(Mutex::new(Some(runtest)));
@@ -722,7 +726,7 @@ fn spawn_test_subprocess(
 
 fn run_test_in_spawned_subprocess(desc: TestDesc, runnable_test: RunnableTest) -> ! {
     let builtin_panic_hook = panic::take_hook();
-    let record_result = Arc::new(move |panic_info: Option<&'_ PanicInfo<'_>>| {
+    let record_result = Arc::new(move |panic_info: Option<&'_ PanicHookInfo<'_>>| {
         let test_result = match panic_info {
             Some(info) => calc_result(&desc, Err(info.payload()), &None, &None),
             None => calc_result(&desc, Ok(()), &None, &None),

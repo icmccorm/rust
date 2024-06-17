@@ -139,6 +139,11 @@ impl Buf {
     }
 
     #[inline]
+    pub fn leak<'a>(self) -> &'a mut Slice {
+        unsafe { mem::transmute(self.inner.leak()) }
+    }
+
+    #[inline]
     pub fn into_box(self) -> Box<Slice> {
         unsafe { mem::transmute(self.inner.into_box()) }
     }
@@ -157,6 +162,12 @@ impl Buf {
     #[inline]
     pub fn into_rc(&self) -> Rc<Slice> {
         self.as_slice().into_rc()
+    }
+
+    /// Part of a hack to make PathBuf::push/pop more efficient.
+    #[inline]
+    pub(crate) fn as_mut_vec_for_path_buf(&mut self) -> &mut Vec<u8> {
+        self.inner.as_mut_vec_for_path_buf()
     }
 }
 

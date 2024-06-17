@@ -37,6 +37,31 @@ fn main() {
     } else {
         Vec::default()
     };
+
+    // Issue #12564
+    // No error as &Vec<_> doesn't implement std::default::Default
+    let mut map = std::collections::HashMap::from([(0, vec![0; 3]), (1, vec![1; 3]), (2, vec![2])]);
+    let x: &[_] = if let Some(x) = map.get(&0) { x } else { &[] };
+    // Same code as above written using match.
+    let x: &[_] = match map.get(&0) {
+        Some(x) => x,
+        None => &[],
+    };
+
+    let x: Result<String, i64> = Ok(String::new());
+    match x {
+        //~^ ERROR: match can be simplified with `.unwrap_or_default()`
+        Ok(v) => v,
+        Err(_) => String::new(),
+    };
+
+    let x: Result<String, i64> = Ok(String::new());
+    if let Ok(v) = x {
+        //~^ ERROR: if let can be simplified with `.unwrap_or_default()`
+        v
+    } else {
+        String::new()
+    };
 }
 
 // Issue #12531

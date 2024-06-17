@@ -26,6 +26,7 @@ use rustc_incremental::{
 };
 use rustc_metadata::fs::copy_to_stdout;
 use rustc_metadata::EncodedMetadata;
+use rustc_middle::bug;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::middle::exported_symbols::SymbolExportInfo;
 use rustc_middle::ty::TyCtxt;
@@ -48,6 +49,7 @@ use std::str;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
+use tracing::debug;
 
 const PRE_LTO_BC_EXT: &str = "pre-lto.bc";
 
@@ -106,6 +108,7 @@ pub struct ModuleConfig {
     pub emit_asm: bool,
     pub emit_obj: EmitObj,
     pub emit_thin_lto: bool,
+    pub emit_thin_lto_summary: bool,
     pub bc_cmdline: String,
 
     // Miscellaneous flags. These are mostly copied from command-line
@@ -230,6 +233,10 @@ impl ModuleConfig {
             ),
             emit_obj,
             emit_thin_lto: sess.opts.unstable_opts.emit_thin_lto,
+            emit_thin_lto_summary: if_regular!(
+                sess.opts.output_types.contains_key(&OutputType::ThinLinkBitcode),
+                false
+            ),
             bc_cmdline: sess.target.bitcode_llvm_cmdline.to_string(),
 
             verify_llvm_ir: sess.verify_llvm_ir(),
@@ -281,6 +288,7 @@ impl ModuleConfig {
 
     pub fn bitcode_needed(&self) -> bool {
         self.emit_bc
+            || self.emit_thin_lto_summary
             || self.emit_obj == EmitObj::Bitcode
             || self.emit_obj == EmitObj::ObjectCode(BitcodeSection::Full)
     }
@@ -528,12 +536,20 @@ fn copy_all_cgu_workproducts_to_incr_comp_cache_dir(
     for module in compiled_modules.modules.iter().filter(|m| m.kind == ModuleKind::Regular) {
         let mut files = Vec::new();
         if let Some(object_file_path) = &module.object {
-            files.push(("o", object_file_path.as_path()));
+            files.push((OutputType::Object.extension(), object_file_path.as_path()));
         }
         if let Some(dwarf_object_file_path) = &module.dwarf_object {
             files.push(("dwo", dwarf_object_file_path.as_path()));
         }
-
+        if let Some(path) = &module.assembly {
+            files.push((OutputType::Assembly.extension(), path.as_path()));
+        }
+        if let Some(path) = &module.llvm_ir {
+            files.push((OutputType::LlvmAssembly.extension(), path.as_path()));
+        }
+        if let Some(path) = &module.bytecode {
+            files.push((OutputType::Bitcode.extension(), path.as_path()));
+        }
         if let Some((id, product)) =
             copy_cgu_workproduct_to_incr_comp_cache_dir(sess, &module.name, files.as_slice())
         {
@@ -620,6 +636,9 @@ fn produce_final_output_artifacts(
                 // them for making an rlib.
                 copy_if_one_unit(OutputType::Bitcode, true);
             }
+            OutputType::ThinLinkBitcode => {
+                copy_if_one_unit(OutputType::ThinLinkBitcode, false);
+            }
             OutputType::LlvmAssembly => {
                 copy_if_one_unit(OutputType::LlvmAssembly, false);
             }
@@ -694,6 +713,29 @@ fn produce_final_output_artifacts(
                 if let Some(ref path) = allocator_module.bytecode {
                     ensure_removed(sess.dcx(), path);
                 }
+            }
+        }
+    }
+
+    if sess.opts.json_artifact_notifications {
+        if compiled_modules.modules.len() == 1 {
+            compiled_modules.modules[0].for_each_output(|_path, ty| {
+                if sess.opts.output_types.contains_key(&ty) {
+                    let descr = ty.shorthand();
+                    // for single cgu file is renamed to drop cgu specific suffix
+                    // so we regenerate it the same way
+                    let path = crate_output.path(ty);
+                    sess.dcx().emit_artifact_notification(path.as_path(), descr);
+                }
+            });
+        } else {
+            for module in &compiled_modules.modules {
+                module.for_each_output(|path, ty| {
+                    if sess.opts.output_types.contains_key(&ty) {
+                        let descr = ty.shorthand();
+                        sess.dcx().emit_artifact_notification(&path, descr);
+                    }
+                });
             }
         }
     }
@@ -873,7 +915,7 @@ fn execute_optimize_work_item<B: ExtraBackendMethods>(
     match lto_type {
         ComputedLtoType::No => finish_intra_module_work(cgcx, module, module_config),
         ComputedLtoType::Thin => {
-            let (name, thin_buffer) = B::prepare_thin(module);
+            let (name, thin_buffer) = B::prepare_thin(module, false);
             if let Some(path) = bitcode {
                 fs::write(&path, thin_buffer.data()).unwrap_or_else(|e| {
                     panic!("Error writing pre-lto-bitcode file `{}`: {}", path.display(), e);
@@ -899,8 +941,6 @@ fn execute_copy_from_cache_work_item<B: ExtraBackendMethods>(
     module: CachedModuleCodegen,
     module_config: &ModuleConfig,
 ) -> WorkItemResult<B> {
-    assert!(module_config.emit_obj != EmitObj::None);
-
     let incr_comp_session_dir = cgcx.incr_comp_session_dir.as_ref().unwrap();
 
     let load_from_incr_comp_dir = |output_path: PathBuf, saved_path: &str| {
@@ -920,12 +960,6 @@ fn execute_copy_from_cache_work_item<B: ExtraBackendMethods>(
         }
     };
 
-    let object = load_from_incr_comp_dir(
-        cgcx.output_filenames.temp_path(OutputType::Object, Some(&module.name)),
-        module.source.saved_files.get("o").unwrap_or_else(|| {
-            cgcx.create_dcx().emit_fatal(errors::NoSavedObjectFile { cgu_name: &module.name })
-        }),
-    );
     let dwarf_object =
         module.source.saved_files.get("dwo").as_ref().and_then(|saved_dwarf_object_file| {
             let dwarf_obj_out = cgcx
@@ -937,12 +971,33 @@ fn execute_copy_from_cache_work_item<B: ExtraBackendMethods>(
             load_from_incr_comp_dir(dwarf_obj_out, saved_dwarf_object_file)
         });
 
+    let load_from_incr_cache = |perform, output_type: OutputType| {
+        if perform {
+            let saved_file = module.source.saved_files.get(output_type.extension())?;
+            let output_path = cgcx.output_filenames.temp_path(output_type, Some(&module.name));
+            load_from_incr_comp_dir(output_path, &saved_file)
+        } else {
+            None
+        }
+    };
+
+    let should_emit_obj = module_config.emit_obj != EmitObj::None;
+    let assembly = load_from_incr_cache(module_config.emit_asm, OutputType::Assembly);
+    let llvm_ir = load_from_incr_cache(module_config.emit_ir, OutputType::LlvmAssembly);
+    let bytecode = load_from_incr_cache(module_config.emit_bc, OutputType::Bitcode);
+    let object = load_from_incr_cache(should_emit_obj, OutputType::Object);
+    if should_emit_obj && object.is_none() {
+        cgcx.create_dcx().emit_fatal(errors::NoSavedObjectFile { cgu_name: &module.name })
+    }
+
     WorkItemResult::Finished(CompiledModule {
         name: module.name,
         kind: ModuleKind::Regular,
         object,
         dwarf_object,
-        bytecode: None,
+        bytecode,
+        assembly,
+        llvm_ir,
     })
 }
 

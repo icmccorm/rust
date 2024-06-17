@@ -7,11 +7,17 @@ use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 
+// This code is very hot and uses lots of arithmetic, avoid overflow checks for performance.
+// See https://github.com/rust-lang/rust/pull/119440#issuecomment-1874255727
+use crate::int_overflow::DebugStrictAdd;
+
 // -----------------------------------------------------------------------------
 // Encoder
 // -----------------------------------------------------------------------------
 
 pub type FileEncodeResult = Result<usize, (PathBuf, io::Error)>;
+
+pub const MAGIC_END_BYTES: &[u8] = b"rust-end-file";
 
 /// The size of the buffer in `FileEncoder`.
 const BUF_SIZE: usize = 8192;
@@ -65,7 +71,7 @@ impl FileEncoder {
         // Tracking position this way instead of having a `self.position` field
         // means that we only need to update `self.buffered` on a write call,
         // as opposed to updating `self.position` and `self.buffered`.
-        self.flushed + self.buffered
+        self.flushed.debug_strict_add(self.buffered)
     }
 
     #[cold]
@@ -119,7 +125,7 @@ impl FileEncoder {
         }
         if let Some(dest) = self.buffer_empty().get_mut(..buf.len()) {
             dest.copy_from_slice(buf);
-            self.buffered += buf.len();
+            self.buffered = self.buffered.debug_strict_add(buf.len());
         } else {
             self.write_all_cold_path(buf);
         }
@@ -158,7 +164,7 @@ impl FileEncoder {
         if written > N {
             Self::panic_invalid_write::<N>(written);
         }
-        self.buffered += written;
+        self.buffered = self.buffered.debug_strict_add(written);
     }
 
     #[cold]
@@ -177,6 +183,7 @@ impl FileEncoder {
     }
 
     pub fn finish(&mut self) -> FileEncodeResult {
+        self.write_all(MAGIC_END_BYTES);
         self.flush();
         #[cfg(debug_assertions)]
         {
@@ -257,15 +264,18 @@ pub struct MemDecoder<'a> {
 
 impl<'a> MemDecoder<'a> {
     #[inline]
-    pub fn new(data: &'a [u8], position: usize) -> MemDecoder<'a> {
+    pub fn new(data: &'a [u8], position: usize) -> Result<MemDecoder<'a>, ()> {
+        let data = data.strip_suffix(MAGIC_END_BYTES).ok_or(())?;
         let Range { start, end } = data.as_ptr_range();
-        MemDecoder { start, current: data[position..].as_ptr(), end, _marker: PhantomData }
+        Ok(MemDecoder { start, current: data[position..].as_ptr(), end, _marker: PhantomData })
     }
 
     #[inline]
-    pub fn data(&self) -> &'a [u8] {
-        // SAFETY: This recovers the original slice, only using members we never modify.
-        unsafe { std::slice::from_raw_parts(self.start, self.len()) }
+    pub fn split_at(&self, position: usize) -> MemDecoder<'a> {
+        assert!(position <= self.len());
+        // SAFETY: We checked above that this offset is within the original slice
+        let current = unsafe { self.start.add(position) };
+        MemDecoder { start: self.start, current, end: self.end, _marker: PhantomData }
     }
 
     #[inline]

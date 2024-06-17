@@ -90,7 +90,7 @@
 ))]
 #![no_core]
 #![rustc_coherence_is_core]
-#![cfg_attr(not(bootstrap), rustc_preserve_ub_checks)]
+#![rustc_preserve_ub_checks]
 //
 // Lints:
 #![deny(rust_2021_incompatible_or_patterns)]
@@ -109,8 +109,8 @@
 //
 // Library features:
 // tidy-alphabetical-start
-#![cfg_attr(bootstrap, feature(associated_type_bounds))]
 #![feature(array_ptr_get)]
+#![feature(asm_experimental_arch)]
 #![feature(char_indices_offset)]
 #![feature(const_align_of_val)]
 #![feature(const_align_of_val_raw)]
@@ -158,7 +158,6 @@
 #![feature(const_slice_from_raw_parts_mut)]
 #![feature(const_slice_from_ref)]
 #![feature(const_slice_index)]
-#![feature(const_slice_ptr_len)]
 #![feature(const_slice_split_at_mut)]
 #![feature(const_str_from_utf8_unchecked_mut)]
 #![feature(const_strict_overflow_ops)]
@@ -175,11 +174,10 @@
 #![feature(duration_consts_float)]
 #![feature(internal_impls_macro)]
 #![feature(ip)]
-#![feature(ip_bits)]
 #![feature(is_ascii_octdigit)]
 #![feature(isqrt)]
+#![feature(link_cfg)]
 #![feature(maybe_uninit_uninit_array)]
-#![feature(non_null_convenience)]
 #![feature(offset_of_enum)]
 #![feature(offset_of_nested)]
 #![feature(panic_internals)]
@@ -187,11 +185,12 @@
 #![feature(ptr_metadata)]
 #![feature(set_ptr_value)]
 #![feature(slice_ptr_get)]
-#![feature(split_at_checked)]
 #![feature(str_internals)]
 #![feature(str_split_inclusive_remainder)]
 #![feature(str_split_remainder)]
 #![feature(strict_provenance)]
+#![feature(ub_checks)]
+#![feature(unchecked_neg)]
 #![feature(unchecked_shifts)]
 #![feature(utf16_extra)]
 #![feature(utf16_extra_const)]
@@ -200,8 +199,6 @@
 //
 // Language features:
 // tidy-alphabetical-start
-#![cfg_attr(not(bootstrap), feature(f128))]
-#![cfg_attr(not(bootstrap), feature(f16))]
 #![feature(abi_unadjusted)]
 #![feature(adt_const_params)]
 #![feature(allow_internal_unsafe)]
@@ -226,11 +223,12 @@
 #![feature(doc_notable_trait)]
 #![feature(effects)]
 #![feature(extern_types)]
+#![feature(f128)]
+#![feature(f16)]
 #![feature(freeze_impls)]
 #![feature(fundamental)]
 #![feature(generic_arg_infer)]
 #![feature(if_let_guard)]
-#![feature(inline_const)]
 #![feature(intra_doc_pointers)]
 #![feature(intrinsics)]
 #![feature(lang_items)]
@@ -347,6 +345,10 @@ pub mod u8;
 #[path = "num/shells/usize.rs"]
 pub mod usize;
 
+#[path = "num/f128.rs"]
+pub mod f128;
+#[path = "num/f16.rs"]
+pub mod f16;
 #[path = "num/f32.rs"]
 pub mod f32;
 #[path = "num/f64.rs"]
@@ -365,7 +367,8 @@ pub mod hint;
 pub mod intrinsics;
 pub mod mem;
 pub mod ptr;
-mod ub_checks;
+#[unstable(feature = "ub_checks", issue = "none")]
+pub mod ub_checks;
 
 /* Core language traits */
 
@@ -396,6 +399,8 @@ pub mod net;
 pub mod option;
 pub mod panic;
 pub mod panicking;
+#[unstable(feature = "core_pattern_types", issue = "none")]
+pub mod pat;
 pub mod pin;
 pub mod result;
 pub mod sync;

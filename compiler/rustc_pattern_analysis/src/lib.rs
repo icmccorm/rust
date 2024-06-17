@@ -1,7 +1,9 @@
 //! Analysis of patterns, notably match exhaustiveness checking.
 
-#![allow(rustc::untranslatable_diagnostic)]
+// tidy-alphabetical-start
 #![allow(rustc::diagnostic_outside_of_impl)]
+#![allow(rustc::untranslatable_diagnostic)]
+// tidy-alphabetical-end
 
 pub mod constructor;
 #[cfg(feature = "rustc")]
@@ -13,12 +15,6 @@ pub mod pat_column;
 #[cfg(feature = "rustc")]
 pub mod rustc;
 pub mod usefulness;
-
-#[macro_use]
-extern crate tracing;
-#[cfg(feature = "rustc")]
-#[macro_use]
-extern crate rustc_middle;
 
 #[cfg(feature = "rustc")]
 rustc_fluent_macro::fluent_messages! { "../messages.ftl" }

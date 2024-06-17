@@ -1,13 +1,15 @@
 // Check that linking frameworks on Apple platforms works.
-//@ only-macos
+//@ only-apple
 //@ revisions: omit link weak both
 //@ [omit]build-fail
 //@ [link]run-pass
 //@ [weak]run-pass
 //@ [both]run-pass
 
-// The linker's exact error output changes between Xcode versions.
+// The linker's exact error output changes between Xcode versions, depends on
+// linker invocation details, and the linker sometimes outputs more warnings.
 //@ compare-output-lines-by-subset
+//@ normalize-stderr-test: "linking with `.*` failed" -> "linking with `LINKER` failed"
 //@ normalize-stderr-test: "Undefined symbols for architecture .*" -> "ld: Undefined symbols:"
 //@ normalize-stderr-test: "._CFRunLoopGetTypeID.," -> "_CFRunLoopGetTypeID,"
 

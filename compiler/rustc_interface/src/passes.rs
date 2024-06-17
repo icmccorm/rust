@@ -4,7 +4,6 @@ use crate::proc_macro_decls;
 use crate::util;
 
 use rustc_ast::{self as ast, visit};
-use rustc_borrowck as mir_borrowck;
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_data_structures::parallel;
 use rustc_data_structures::steal::Steal;
@@ -20,8 +19,9 @@ use rustc_middle::arena::Arena;
 use rustc_middle::dep_graph::DepGraph;
 use rustc_middle::ty::{self, GlobalCtxt, RegisteredTools, TyCtxt};
 use rustc_middle::util::Providers;
-use rustc_mir_build as mir_build;
-use rustc_parse::{parse_crate_from_file, parse_crate_from_source_str, validate_attr};
+use rustc_parse::{
+    new_parser_from_file, new_parser_from_source_str, unwrap_or_emit_fatal, validate_attr,
+};
 use rustc_passes::{abi_test, hir_stats, layout_test};
 use rustc_resolve::Resolver;
 use rustc_session::code_stats::VTableSizeInfo;
@@ -41,13 +41,17 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::{env, fs, iter};
+use tracing::{info, instrument};
 
 pub fn parse<'a>(sess: &'a Session) -> PResult<'a, ast::Crate> {
-    let krate = sess.time("parse_crate", || match &sess.io.input {
-        Input::File(file) => parse_crate_from_file(file, &sess.psess),
-        Input::Str { input, name } => {
-            parse_crate_from_source_str(name.clone(), input.clone(), &sess.psess)
-        }
+    let krate = sess.time("parse_crate", || {
+        let mut parser = unwrap_or_emit_fatal(match &sess.io.input {
+            Input::File(file) => new_parser_from_file(&sess.psess, file, None),
+            Input::Str { input, name } => {
+                new_parser_from_source_str(&sess.psess, name.clone(), input.clone())
+            }
+        });
+        parser.parse_crate_mod()
     })?;
 
     if sess.opts.unstable_opts.input_stats {
@@ -170,7 +174,9 @@ fn configure_and_expand(
         let mut old_path = OsString::new();
         if cfg!(windows) {
             old_path = env::var_os("PATH").unwrap_or(old_path);
-            let mut new_path = sess.host_filesearch(PathKind::All).search_path_dirs();
+            let mut new_path = Vec::from_iter(
+                sess.host_filesearch(PathKind::All).search_paths().map(|p| p.dir.clone()),
+            );
             for path in env::split_paths(&old_path) {
                 if !new_path.contains(&path) {
                     new_path.push(path);
@@ -614,8 +620,8 @@ pub static DEFAULT_QUERY_PROVIDERS: LazyLock<Providers> = LazyLock::new(|| {
     proc_macro_decls::provide(providers);
     rustc_const_eval::provide(providers);
     rustc_middle::hir::provide(providers);
-    mir_borrowck::provide(providers);
-    mir_build::provide(providers);
+    rustc_borrowck::provide(providers);
+    rustc_mir_build::provide(providers);
     rustc_mir_transform::provide(providers);
     rustc_monomorphize::provide(providers);
     rustc_privacy::provide(providers);
@@ -686,18 +692,15 @@ pub fn create_global_ctxt<'tcx>(
     })
 }
 
-/// Runs the type-checking, region checking and other miscellaneous analysis
-/// passes on the crate.
-fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
+/// Runs all analyses that we guarantee to run, even if errors were reported in earlier analyses.
+/// This function never fails.
+fn run_required_analyses(tcx: TyCtxt<'_>) {
     if tcx.sess.opts.unstable_opts.hir_stats {
         rustc_passes::hir_stats::print_hir_stats(tcx);
     }
-
     #[cfg(debug_assertions)]
     rustc_passes::hir_id_validator::check_crate(tcx);
-
     let sess = tcx.sess;
-
     sess.time("misc_checking_1", || {
         parallel!(
             {
@@ -733,10 +736,7 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
             }
         );
     });
-
-    // passes are timed inside typeck
-    rustc_hir_analysis::check_crate(tcx)?;
-
+    rustc_hir_analysis::check_crate(tcx);
     sess.time("MIR_borrow_checking", || {
         tcx.hir().par_body_owners(|def_id| {
             // Run unsafety check because it's responsible for stealing and
@@ -745,7 +745,6 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
             tcx.ensure().mir_borrowck(def_id)
         });
     });
-
     sess.time("MIR_effect_checking", || {
         for def_id in tcx.hir().body_owners() {
             tcx.ensure().has_ffi_unwind_calls(def_id);
@@ -761,16 +760,24 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
             }
         }
     });
-
     tcx.hir().par_body_owners(|def_id| {
         if tcx.is_coroutine(def_id.to_def_id()) {
             tcx.ensure().mir_coroutine_witnesses(def_id);
-            tcx.ensure().check_coroutine_obligations(def_id);
+            tcx.ensure().check_coroutine_obligations(
+                tcx.typeck_root_def_id(def_id.to_def_id()).expect_local(),
+            );
         }
     });
-
     sess.time("layout_testing", || layout_test::test_layout(tcx));
     sess.time("abi_testing", || abi_test::test_abi(tcx));
+}
+
+/// Runs the type-checking, region checking and other miscellaneous analysis
+/// passes on the crate.
+fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
+    run_required_analyses(tcx);
+
+    let sess = tcx.sess;
 
     // Avoid overwhelming user with errors if borrow checking failed.
     // I'm not sure how helpful this is, to be honest, but it avoids a
@@ -830,7 +837,7 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
         let traits = tcx.traits(LOCAL_CRATE);
 
         for &tr in traits {
-            if !tcx.check_is_object_safe(tr) {
+            if !tcx.is_object_safe(tr) {
                 continue;
             }
 

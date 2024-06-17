@@ -1,4 +1,4 @@
-//! Detecting language items.
+//! Detecting lang items.
 //!
 //! Language items are items that represent concepts intrinsic to the language
 //! itself. Examples are:
@@ -21,6 +21,10 @@ impl<'tcx> TyCtxt<'tcx> {
         self.lang_items().get(lang_item).unwrap_or_else(|| {
             self.dcx().emit_fatal(crate::error::RequiresLangItem { span, name: lang_item.name() });
         })
+    }
+
+    pub fn is_lang_item(self, def_id: DefId, lang_item: LangItem) -> bool {
+        self.lang_items().get(lang_item) == Some(def_id)
     }
 
     /// Given a [`DefId`] of one of the [`Fn`], [`FnMut`] or [`FnOnce`] traits,

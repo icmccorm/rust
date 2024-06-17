@@ -1,10 +1,12 @@
 //! This library is used to gather all error codes into one place, to make
 //! their maintenance easier.
 
+// tidy-alphabetical-start
 #![allow(internal_features)]
-#![feature(rustdoc_internals)]
-#![doc(rust_logo)]
 #![deny(rustdoc::invalid_codeblock_attributes)]
+#![doc(rust_logo)]
+#![feature(rustdoc_internals)]
+// tidy-alphabetical-end
 
 // This higher-order macro defines the error codes that are in use. It is used
 // in the `rustc_errors` crate. Removed error codes are listed in the comment
@@ -441,7 +443,7 @@ E0695: 0695,
 E0696: 0696,
 E0697: 0697,
 E0698: 0698,
-E0699: 0699,
+E0699: 0699, // REMOVED: merged into generic inference var error
 E0700: 0700,
 E0701: 0701,
 E0703: 0703,

@@ -1,9 +1,8 @@
+// tidy-alphabetical-start
+#![allow(unused_variables)]
 #![feature(alloc_layout_extra)]
 #![feature(never_type)]
-#![allow(dead_code, unused_variables)]
-
-#[macro_use]
-extern crate tracing;
+// tidy-alphabetical-end
 
 pub(crate) use rustc_data_structures::fx::{FxIndexMap as Map, FxIndexSet as Set};
 
@@ -49,6 +48,8 @@ pub enum Reason<T> {
     DstIsNotYetSupported,
     /// The layout of the destination type is bit-incompatible with the source type.
     DstIsBitIncompatible,
+    /// The destination type is uninhabited.
+    DstUninhabited,
     /// The destination type may carry safety invariants.
     DstMayHaveSafetyInvariants,
     /// `Dst` is larger than `Src`, and the excess bytes were not exclusively uninitialized.
@@ -136,7 +137,7 @@ mod rustc {
             use rustc_middle::ty::ScalarInt;
             use rustc_span::symbol::sym;
 
-            let Ok(cv) = c.eval(tcx, param_env, DUMMY_SP) else {
+            let Ok((ty, cv)) = c.eval(tcx, param_env, DUMMY_SP) else {
                 return Some(Self {
                     alignment: true,
                     lifetimes: true,
@@ -145,7 +146,7 @@ mod rustc {
                 });
             };
 
-            let adt_def = c.ty().ty_adt_def()?;
+            let adt_def = ty.ty_adt_def()?;
 
             assert_eq!(
                 tcx.require_lang_item(LangItem::TransmuteOpts, None),

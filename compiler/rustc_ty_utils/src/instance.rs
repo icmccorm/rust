@@ -1,13 +1,17 @@
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::DefId;
+use rustc_hir::LangItem;
 use rustc_infer::infer::TyCtxtInferExt;
+use rustc_middle::bug;
 use rustc_middle::query::Providers;
 use rustc_middle::traits::{BuiltinImplSource, CodegenObligationError};
+use rustc_middle::ty::util::AsyncDropGlueMorphology;
 use rustc_middle::ty::GenericArgsRef;
 use rustc_middle::ty::{self, Instance, TyCtxt, TypeVisitableExt};
 use rustc_span::sym;
 use rustc_trait_selection::traits;
 use rustc_type_ir::ClosureKind;
+use tracing::debug;
 use traits::{translate_args, Reveal};
 
 use crate::errors::UnexpectedFnPtrAssociatedItem;
@@ -31,7 +35,7 @@ fn resolve_instance<'tcx>(
         let def = if tcx.intrinsic(def_id).is_some() {
             debug!(" => intrinsic");
             ty::InstanceDef::Intrinsic(def_id)
-        } else if Some(def_id) == tcx.lang_items().drop_in_place_fn() {
+        } else if tcx.is_lang_item(def_id, LangItem::DropInPlace) {
             let ty = args.type_at(0);
 
             if ty.needs_drop(tcx, param_env) {
@@ -53,6 +57,28 @@ fn resolve_instance<'tcx>(
             } else {
                 debug!(" => trivial drop glue");
                 ty::InstanceDef::DropGlue(def_id, None)
+            }
+        } else if tcx.is_lang_item(def_id, LangItem::AsyncDropInPlace) {
+            let ty = args.type_at(0);
+
+            if ty.async_drop_glue_morphology(tcx) != AsyncDropGlueMorphology::Noop {
+                match *ty.kind() {
+                    ty::Closure(..)
+                    | ty::CoroutineClosure(..)
+                    | ty::Coroutine(..)
+                    | ty::Tuple(..)
+                    | ty::Adt(..)
+                    | ty::Dynamic(..)
+                    | ty::Array(..)
+                    | ty::Slice(..) => {}
+                    // Async destructor ctor shims can only be built from ADTs.
+                    _ => return Ok(None),
+                }
+                debug!(" => nontrivial async drop glue ctor");
+                ty::InstanceDef::AsyncDropGlueCtorShim(def_id, Some(ty))
+            } else {
+                debug!(" => trivial async drop glue ctor");
+                ty::InstanceDef::AsyncDropGlueCtorShim(def_id, None)
             }
         } else {
             debug!(" => free item");
@@ -79,18 +105,11 @@ fn resolve_associated_item<'tcx>(
 
     let vtbl = match tcx.codegen_select_candidate((param_env, trait_ref)) {
         Ok(vtbl) => vtbl,
-        Err(CodegenObligationError::Ambiguity) => {
-            let reported = tcx.dcx().span_delayed_bug(
-                tcx.def_span(trait_item_id),
-                format!(
-                    "encountered ambiguity selecting `{trait_ref:?}` during codegen, presuming due to \
-                     overflow or prior type error",
-                ),
-            );
-            return Err(reported);
-        }
-        Err(CodegenObligationError::Unimplemented) => return Ok(None),
-        Err(CodegenObligationError::FulfillmentError) => return Ok(None),
+        Err(
+            CodegenObligationError::Ambiguity
+            | CodegenObligationError::Unimplemented
+            | CodegenObligationError::FulfillmentError,
+        ) => return Ok(None),
     };
 
     // Now that we know which impl is being used, we can dispatch to
@@ -194,17 +213,26 @@ fn resolve_associated_item<'tcx>(
 
             Some(ty::Instance::new(leaf_def.item.def_id, args))
         }
-        traits::ImplSource::Builtin(BuiltinImplSource::Object { vtable_base }, _) => {
-            traits::get_vtable_index_of_object_method(tcx, *vtable_base, trait_item_id).map(
-                |index| Instance {
-                    def: ty::InstanceDef::Virtual(trait_item_id, index),
+        traits::ImplSource::Builtin(BuiltinImplSource::Object(_), _) => {
+            let trait_ref = ty::TraitRef::from_method(tcx, trait_id, rcvr_args);
+            if trait_ref.has_non_region_infer() || trait_ref.has_non_region_param() {
+                // We only resolve totally substituted vtable entries.
+                None
+            } else {
+                let vtable_base = tcx.first_method_vtable_slot(trait_ref);
+                let offset = tcx
+                    .own_existential_vtable_entries(trait_id)
+                    .iter()
+                    .copied()
+                    .position(|def_id| def_id == trait_item_id);
+                offset.map(|offset| Instance {
+                    def: ty::InstanceDef::Virtual(trait_item_id, vtable_base + offset),
                     args: rcvr_args,
-                },
-            )
+                })
+            }
         }
         traits::ImplSource::Builtin(BuiltinImplSource::Misc, _) => {
-            let lang_items = tcx.lang_items();
-            if Some(trait_ref.def_id) == lang_items.clone_trait() {
+            if tcx.is_lang_item(trait_ref.def_id, LangItem::Clone) {
                 // FIXME(eddyb) use lang items for methods instead of names.
                 let name = tcx.item_name(trait_item_id);
                 if name == sym::clone {
@@ -230,8 +258,8 @@ fn resolve_associated_item<'tcx>(
                     let args = tcx.erase_regions(rcvr_args);
                     Some(ty::Instance::new(trait_item_id, args))
                 }
-            } else if Some(trait_ref.def_id) == lang_items.fn_ptr_trait() {
-                if lang_items.fn_ptr_addr() == Some(trait_item_id) {
+            } else if tcx.is_lang_item(trait_ref.def_id, LangItem::FnPtrTrait) {
+                if tcx.is_lang_item(trait_item_id, LangItem::FnPtrAddr) {
                     let self_ty = trait_ref.self_ty();
                     if !matches!(self_ty.kind(), ty::FnPtr(..)) {
                         return Ok(None);

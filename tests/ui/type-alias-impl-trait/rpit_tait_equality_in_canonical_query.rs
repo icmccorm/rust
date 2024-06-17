@@ -8,29 +8,23 @@
 //@ revisions: current next
 //@ ignore-compare-mode-next-solver (explicit revisions)
 //@[next] compile-flags: -Znext-solver
-//@[next] check-pass
-
-//@[current] known-bug: #108498
-//@[current] failure-status: 101
-//@[current] normalize-stderr-test: "DefId\(.*?\]::" -> "DefId("
-//@[current] normalize-stderr-test: "(?m)note: we would appreciate a bug report.*\n\n" -> ""
-//@[current] normalize-stderr-test: "(?m)note: rustc.*running on.*\n\n" -> ""
-//@[current] normalize-stderr-test: "(?m)note: compiler flags.*\n\n" -> ""
-//@[current] normalize-stderr-test: "(?m)note: delayed at.*$" -> ""
-//@[current] normalize-stderr-test: "(?m)^ *\d+: .*\n" -> ""
-//@[current] normalize-stderr-test: "(?m)^ *at .*\n" -> ""
+//@ check-pass
 
 #![feature(type_alias_impl_trait)]
 
-type Opaque = impl Sized;
+mod helper {
+    pub type Opaque = impl Sized;
 
-fn get_rpit() -> impl Clone {}
+    pub fn get_rpit() -> impl Clone {}
+
+    fn test() -> Opaque {
+        super::query(get_rpit);
+        get_rpit()
+    }
+}
+
+use helper::*;
 
 fn query(_: impl FnOnce() -> Opaque) {}
-
-fn test() -> Opaque {
-    query(get_rpit);
-    get_rpit()
-}
 
 fn main() {}

@@ -9,17 +9,17 @@ use rustc_data_structures::sorted_map::SortedIndexMultiMap;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::{self as hir, BindingAnnotation, ByRef, Node};
+use rustc_hir::{self as hir, BindingMode, ByRef, HirId, Node};
 use rustc_index::bit_set::GrowableBitSet;
 use rustc_index::{Idx, IndexSlice, IndexVec};
 use rustc_infer::infer::{InferCtxt, TyCtxtInferExt};
 use rustc_middle::hir::place::PlaceBase as HirPlaceBase;
 use rustc_middle::middle::region;
-use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::*;
 use rustc_middle::query::TyCtxtAt;
 use rustc_middle::thir::{self, ExprId, LintLevel, LocalVarId, Param, ParamId, PatKind, Thir};
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{self, ScalarInt, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::{bug, span_bug};
 use rustc_span::symbol::sym;
 use rustc_span::Span;
 use rustc_span::Symbol;
@@ -158,7 +158,7 @@ struct Builder<'a, 'tcx> {
     cfg: CFG<'tcx>,
 
     def_id: LocalDefId,
-    hir_id: hir::HirId,
+    hir_id: HirId,
     parent_module: DefId,
     check_overflow: bool,
     fn_span: Span,
@@ -222,7 +222,7 @@ struct Builder<'a, 'tcx> {
     coverage_branch_info: Option<coverageinfo::BranchInfoBuilder>,
 }
 
-type CaptureMap<'tcx> = SortedIndexMultiMap<usize, hir::HirId, Capture<'tcx>>;
+type CaptureMap<'tcx> = SortedIndexMultiMap<usize, HirId, Capture<'tcx>>;
 
 #[derive(Debug)]
 struct Capture<'tcx> {
@@ -451,7 +451,7 @@ fn construct_fn<'tcx>(
     assert_eq!(expr.as_usize(), thir.exprs.len() - 1);
 
     // Figure out what primary body this item has.
-    let body_id = tcx.hir().body_owned_by(fn_def);
+    let body = tcx.hir().body_owned_by(fn_def);
     let span_with_body = tcx.hir().span_with_body(fn_id);
     let return_ty_span = tcx
         .hir()
@@ -511,9 +511,9 @@ fn construct_fn<'tcx>(
     );
 
     let call_site_scope =
-        region::Scope { id: body_id.hir_id.local_id, data: region::ScopeData::CallSite };
+        region::Scope { id: body.id().hir_id.local_id, data: region::ScopeData::CallSite };
     let arg_scope =
-        region::Scope { id: body_id.hir_id.local_id, data: region::ScopeData::Arguments };
+        region::Scope { id: body.id().hir_id.local_id, data: region::ScopeData::Arguments };
     let source_info = builder.source_info(span);
     let call_site_s = (call_site_scope, source_info);
     unpack!(builder.in_scope(call_site_s, LintLevel::Inherited, |builder| {
@@ -566,7 +566,8 @@ fn construct_const<'a, 'tcx>(
             span,
             ..
         }) => (*span, ty.span),
-        Node::AnonConst(_) | Node::ConstBlock(_) => {
+        Node::AnonConst(ct) => (ct.span, ct.span),
+        Node::ConstBlock(_) => {
             let span = tcx.def_span(def);
             (span, span)
         }
@@ -721,7 +722,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         thir: &'a Thir<'tcx>,
         infcx: InferCtxt<'tcx>,
         def: LocalDefId,
-        hir_id: hir::HirId,
+        hir_id: HirId,
         span: Span,
         arg_count: usize,
         return_ty: Ty<'tcx>,
@@ -931,7 +932,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // Don't introduce extra copies for simple bindings
                 PatKind::Binding {
                     var,
-                    mode: BindingAnnotation(ByRef::No, mutability),
+                    mode: BindingMode(ByRef::No, mutability),
                     subpattern: None,
                     ..
                 } => {
@@ -941,7 +942,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         if let Some(kind) = param.self_kind {
                             LocalInfo::User(BindingForm::ImplicitSelf(kind))
                         } else {
-                            let binding_mode = BindingAnnotation(ByRef::No, mutability);
+                            let binding_mode = BindingMode(ByRef::No, mutability);
                             LocalInfo::User(BindingForm::Var(VarBindingForm {
                                 binding_mode,
                                 opt_ty_info: param.ty_span,
@@ -981,7 +982,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
     fn set_correct_source_scope_for_arg(
         &mut self,
-        arg_hir_id: hir::HirId,
+        arg_hir_id: HirId,
         original_source_scope: SourceScope,
         pattern_span: Span,
     ) {
@@ -997,7 +998,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         match self.unit_temp {
             Some(tmp) => tmp,
             None => {
-                let ty = Ty::new_unit(self.tcx);
+                let ty = self.tcx.types.unit;
                 let fn_span = self.fn_span;
                 let tmp = self.temp(ty, fn_span);
                 self.unit_temp = Some(tmp);
@@ -1012,18 +1013,24 @@ fn parse_float_into_constval<'tcx>(
     float_ty: ty::FloatTy,
     neg: bool,
 ) -> Option<ConstValue<'tcx>> {
-    parse_float_into_scalar(num, float_ty, neg).map(ConstValue::Scalar)
+    parse_float_into_scalar(num, float_ty, neg).map(|s| ConstValue::Scalar(s.into()))
 }
 
 pub(crate) fn parse_float_into_scalar(
     num: Symbol,
     float_ty: ty::FloatTy,
     neg: bool,
-) -> Option<Scalar> {
+) -> Option<ScalarInt> {
     let num = num.as_str();
     match float_ty {
         // FIXME(f16_f128): When available, compare to the library parser as with `f32` and `f64`
-        ty::FloatTy::F16 => num.parse::<Half>().ok().map(Scalar::from_f16),
+        ty::FloatTy::F16 => {
+            let mut f = num.parse::<Half>().ok()?;
+            if neg {
+                f = -f;
+            }
+            Some(ScalarInt::from(f))
+        }
         ty::FloatTy::F32 => {
             let Ok(rust_f) = num.parse::<f32>() else { return None };
             let mut f = num
@@ -1045,7 +1052,7 @@ pub(crate) fn parse_float_into_scalar(
                 f = -f;
             }
 
-            Some(Scalar::from_f32(f))
+            Some(ScalarInt::from(f))
         }
         ty::FloatTy::F64 => {
             let Ok(rust_f) = num.parse::<f64>() else { return None };
@@ -1068,10 +1075,16 @@ pub(crate) fn parse_float_into_scalar(
                 f = -f;
             }
 
-            Some(Scalar::from_f64(f))
+            Some(ScalarInt::from(f))
         }
         // FIXME(f16_f128): When available, compare to the library parser as with `f32` and `f64`
-        ty::FloatTy::F128 => num.parse::<Quad>().ok().map(Scalar::from_f128),
+        ty::FloatTy::F128 => {
+            let mut f = num.parse::<Quad>().ok()?;
+            if neg {
+                f = -f;
+            }
+            Some(ScalarInt::from(f))
+        }
     }
 }
 

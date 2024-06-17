@@ -20,14 +20,15 @@ use rustc_data_structures::sync::{join, Lrc};
 use rustc_hir as hir;
 use rustc_hir::def_id::{LocalDefId, LocalModDefId};
 use rustc_hir::intravisit as hir_visit;
+use rustc_hir::HirId;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_session::lint::LintPass;
 use rustc_session::Session;
 use rustc_span::Span;
-
 use std::any::Any;
 use std::cell::Cell;
+use tracing::debug;
 
 /// Extract the [`LintStore`] from [`Session`].
 ///
@@ -53,7 +54,7 @@ impl<'tcx, T: LateLintPass<'tcx>> LateContextAndPass<'tcx, T> {
     /// Merge the lints specified by any lint attributes into the
     /// current lint context, call the provided function, then reset the
     /// lints in effect to their previous state.
-    fn with_lint_attrs<F>(&mut self, id: hir::HirId, f: F)
+    fn with_lint_attrs<F>(&mut self, id: HirId, f: F)
     where
         F: FnOnce(&mut Self),
     {
@@ -81,7 +82,7 @@ impl<'tcx, T: LateLintPass<'tcx>> LateContextAndPass<'tcx, T> {
         self.context.param_env = old_param_env;
     }
 
-    fn process_mod(&mut self, m: &'tcx hir::Mod<'tcx>, n: hir::HirId) {
+    fn process_mod(&mut self, m: &'tcx hir::Mod<'tcx>, n: HirId) {
         lint_callback!(self, check_mod, m, n);
         hir_visit::walk_mod(self, m, n);
     }
@@ -124,7 +125,7 @@ impl<'tcx, T: LateLintPass<'tcx>> hir_visit::Visitor<'tcx> for LateContextAndPas
         });
     }
 
-    fn visit_body(&mut self, body: &'tcx hir::Body<'tcx>) {
+    fn visit_body(&mut self, body: &hir::Body<'tcx>) {
         lint_callback!(self, check_body, body);
         hir_visit::walk_body(self, body);
         lint_callback!(self, check_body_post, body);
@@ -231,7 +232,7 @@ impl<'tcx, T: LateLintPass<'tcx>> hir_visit::Visitor<'tcx> for LateContextAndPas
         hir_visit::walk_inf(self, inf);
     }
 
-    fn visit_mod(&mut self, m: &'tcx hir::Mod<'tcx>, _: Span, n: hir::HirId) {
+    fn visit_mod(&mut self, m: &'tcx hir::Mod<'tcx>, _: Span, n: HirId) {
         if !self.context.only_module {
             self.process_mod(m, n);
         }
@@ -305,7 +306,7 @@ impl<'tcx, T: LateLintPass<'tcx>> hir_visit::Visitor<'tcx> for LateContextAndPas
         hir_visit::walk_lifetime(self, lt);
     }
 
-    fn visit_path(&mut self, p: &hir::Path<'tcx>, id: hir::HirId) {
+    fn visit_path(&mut self, p: &hir::Path<'tcx>, id: HirId) {
         lint_callback!(self, check_path, p, id);
         hir_visit::walk_path(self, p);
     }

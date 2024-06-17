@@ -2,15 +2,17 @@ use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_hir_and_then};
 use clippy_utils::source::{snippet_with_applicability, snippet_with_context};
 use clippy_utils::sugg::has_enclosing_paren;
 use clippy_utils::ty::{implements_trait, is_manually_drop, peel_mid_ty_refs};
-use clippy_utils::{expr_use_ctxt, get_parent_expr, is_lint_allowed, path_to_local, DefinedTy, ExprUseNode};
+use clippy_utils::{
+    expr_use_ctxt, get_parent_expr, is_block_like, is_lint_allowed, path_to_local, DefinedTy, ExprUseNode,
+};
 use core::mem;
 use rustc_ast::util::parser::{PREC_POSTFIX, PREC_PREFIX};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::Applicability;
 use rustc_hir::intravisit::{walk_ty, Visitor};
 use rustc_hir::{
-    self as hir, BindingAnnotation, Body, BodyId, BorrowKind, Expr, ExprKind, HirId, MatchSource, Mutability, Node,
-    Pat, PatKind, Path, QPath, TyKind, UnOp,
+    self as hir, BindingMode, Body, BodyId, BorrowKind, Expr, ExprKind, HirId, MatchSource, Mutability, Node, Pat,
+    PatKind, Path, QPath, TyKind, UnOp,
 };
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, AutoBorrow, AutoBorrowMutability};
@@ -382,7 +384,7 @@ impl<'tcx> LateLintPass<'tcx> for Dereferencing<'tcx> {
                                         cx,
                                         impl_ty,
                                         trait_id,
-                                        &args[..cx.tcx.generics_of(trait_id).params.len() - 1],
+                                        &args[..cx.tcx.generics_of(trait_id).own_params.len() - 1],
                                     )
                                 {
                                     false
@@ -599,7 +601,7 @@ impl<'tcx> LateLintPass<'tcx> for Dereferencing<'tcx> {
     }
 
     fn check_pat(&mut self, cx: &LateContext<'tcx>, pat: &'tcx Pat<'_>) {
-        if let PatKind::Binding(BindingAnnotation::REF, id, name, _) = pat.kind {
+        if let PatKind::Binding(BindingMode::REF, id, name, _) = pat.kind {
             if let Some(opt_prev_pat) = self.ref_locals.get_mut(&id) {
                 // This binding id has been seen before. Add this pattern to the list of changes.
                 if let Some(prev_pat) = opt_prev_pat {
@@ -641,7 +643,7 @@ impl<'tcx> LateLintPass<'tcx> for Dereferencing<'tcx> {
         }
     }
 
-    fn check_body_post(&mut self, cx: &LateContext<'tcx>, body: &'tcx Body<'_>) {
+    fn check_body_post(&mut self, cx: &LateContext<'tcx>, body: &Body<'_>) {
         if Some(body.id()) == self.current_body {
             for pat in self.ref_locals.drain(..).filter_map(|(_, x)| x) {
                 let replacements = pat.replacements;
@@ -821,6 +823,7 @@ impl TyCoercionStability {
                 | TyKind::Array(..)
                 | TyKind::Ptr(_)
                 | TyKind::BareFn(_)
+                | TyKind::Pat(..)
                 | TyKind::Never
                 | TyKind::Tup(_)
                 | TyKind::Path(_) => Self::Deref,
@@ -869,6 +872,7 @@ impl TyCoercionStability {
                 | ty::Int(_)
                 | ty::Uint(_)
                 | ty::Array(..)
+                | ty::Pat(..)
                 | ty::Float(_)
                 | ty::RawPtr(..)
                 | ty::FnPtr(_)
@@ -1014,9 +1018,18 @@ fn report<'tcx>(
                         },
                         _ => (0, false),
                     };
+                    let is_in_tuple = matches!(
+                        get_parent_expr(cx, data.first_expr),
+                        Some(Expr {
+                            kind: ExprKind::Tup(..),
+                            ..
+                        })
+                    );
+
                     let sugg = if !snip_is_macro
                         && (calls_field || expr.precedence().order() < precedence)
                         && !has_enclosing_paren(&snip)
+                        && !is_in_tuple
                     {
                         format!("({snip})")
                     } else {
@@ -1027,14 +1040,8 @@ fn report<'tcx>(
             );
         },
         State::ExplicitDeref { mutability } => {
-            if matches!(
-                expr.kind,
-                ExprKind::Block(..)
-                    | ExprKind::ConstBlock(_)
-                    | ExprKind::If(..)
-                    | ExprKind::Loop(..)
-                    | ExprKind::Match(..)
-            ) && let ty::Ref(_, ty, _) = data.adjusted_ty.kind()
+            if is_block_like(expr)
+                && let ty::Ref(_, ty, _) = data.adjusted_ty.kind()
                 && ty.is_sized(cx.tcx, cx.param_env)
             {
                 // Rustc bug: auto deref doesn't work on block expression when targeting sized types.

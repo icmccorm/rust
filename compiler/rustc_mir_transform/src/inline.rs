@@ -1,17 +1,17 @@
 //! Inlining pass for MIR functions
 use crate::deref_separator::deref_finder;
 use rustc_attr::InlineAttr;
-use rustc_const_eval::transform::validate::validate_types;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_index::bit_set::BitSet;
 use rustc_index::Idx;
+use rustc_middle::bug;
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs};
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
 use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::{self, Instance, InstanceDef, ParamEnv, Ty, TyCtxt};
-use rustc_session::config::OptLevel;
+use rustc_session::config::{DebugInfo, OptLevel};
 use rustc_span::source_map::Spanned;
 use rustc_span::sym;
 use rustc_target::abi::FieldIdx;
@@ -20,6 +20,7 @@ use rustc_target::spec::abi::Abi;
 use crate::cost_checker::CostChecker;
 use crate::simplify::simplify_cfg;
 use crate::util;
+use crate::validate::validate_types;
 use std::iter;
 use std::ops::{Range, RangeFrom};
 
@@ -224,13 +225,8 @@ impl<'tcx> Inliner<'tcx> {
         // Normally, this shouldn't be required, but trait normalization failure can create a
         // validation ICE.
         let output_type = callee_body.return_ty();
-        if !util::relate_types(
-            self.tcx,
-            self.param_env,
-            ty::Variance::Covariant,
-            output_type,
-            destination_ty,
-        ) {
+        if !util::relate_types(self.tcx, self.param_env, ty::Covariant, output_type, destination_ty)
+        {
             trace!(?output_type, ?destination_ty);
             return Err("failed to normalize return type");
         }
@@ -260,13 +256,8 @@ impl<'tcx> Inliner<'tcx> {
                 self_arg_ty.into_iter().chain(arg_tuple_tys).zip(callee_body.args_iter())
             {
                 let input_type = callee_body.local_decls[input].ty;
-                if !util::relate_types(
-                    self.tcx,
-                    self.param_env,
-                    ty::Variance::Covariant,
-                    input_type,
-                    arg_ty,
-                ) {
+                if !util::relate_types(self.tcx, self.param_env, ty::Covariant, input_type, arg_ty)
+                {
                     trace!(?arg_ty, ?input_type);
                     return Err("failed to normalize tuple argument type");
                 }
@@ -275,13 +266,8 @@ impl<'tcx> Inliner<'tcx> {
             for (arg, input) in args.iter().zip(callee_body.args_iter()) {
                 let input_type = callee_body.local_decls[input].ty;
                 let arg_ty = arg.node.ty(&caller_body.local_decls, self.tcx);
-                if !util::relate_types(
-                    self.tcx,
-                    self.param_env,
-                    ty::Variance::Covariant,
-                    input_type,
-                    arg_ty,
-                ) {
+                if !util::relate_types(self.tcx, self.param_env, ty::Covariant, input_type, arg_ty)
+                {
                     trace!(?arg_ty, ?input_type);
                     return Err("failed to normalize argument type");
                 }
@@ -332,7 +318,8 @@ impl<'tcx> Inliner<'tcx> {
             | InstanceDef::DropGlue(..)
             | InstanceDef::CloneShim(..)
             | InstanceDef::ThreadLocalShim(..)
-            | InstanceDef::FnPtrAddrShim(..) => return Ok(()),
+            | InstanceDef::FnPtrAddrShim(..)
+            | InstanceDef::AsyncDropGlueCtorShim(..) => return Ok(()),
         }
 
         if self.tcx.is_constructor(callee_def_id) {
@@ -699,7 +686,19 @@ impl<'tcx> Inliner<'tcx> {
         // Insert all of the (mapped) parts of the callee body into the caller.
         caller_body.local_decls.extend(callee_body.drain_vars_and_temps());
         caller_body.source_scopes.extend(&mut callee_body.source_scopes.drain(..));
-        caller_body.var_debug_info.append(&mut callee_body.var_debug_info);
+        if self
+            .tcx
+            .sess
+            .opts
+            .unstable_opts
+            .inline_mir_preserve_debug
+            .unwrap_or(self.tcx.sess.opts.debuginfo != DebugInfo::None)
+        {
+            // Note that we need to preserve these in the standard library so that
+            // people working on rust can build with or without debuginfo while
+            // still getting consistent results from the mir-opt tests.
+            caller_body.var_debug_info.append(&mut callee_body.var_debug_info);
+        }
         caller_body.basic_blocks_mut().extend(callee_body.basic_blocks_mut().drain(..));
 
         caller_body[callsite.block].terminator = Some(Terminator {
@@ -707,18 +706,12 @@ impl<'tcx> Inliner<'tcx> {
             kind: TerminatorKind::Goto { target: integrator.map_block(START_BLOCK) },
         });
 
-        // Copy only unevaluated constants from the callee_body into the caller_body.
-        // Although we are only pushing `ConstKind::Unevaluated` consts to
-        // `required_consts`, here we may not only have `ConstKind::Unevaluated`
-        // because we are calling `instantiate_and_normalize_erasing_regions`.
-        caller_body.required_consts.extend(callee_body.required_consts.iter().copied().filter(
-            |&ct| match ct.const_ {
-                Const::Ty(_) => {
-                    bug!("should never encounter ty::UnevaluatedConst in `required_consts`")
-                }
-                Const::Val(..) | Const::Unevaluated(..) => true,
-            },
-        ));
+        // Copy required constants from the callee_body into the caller_body. Although we are only
+        // pushing unevaluated consts to `required_consts`, here they may have been evaluated
+        // because we are calling `instantiate_and_normalize_erasing_regions` -- so we filter again.
+        caller_body.required_consts.extend(
+            callee_body.required_consts.into_iter().filter(|ct| ct.const_.is_required_const()),
+        );
         // Now that we incorporated the callee's `required_consts`, we can remove the callee from
         // `mentioned_items` -- but we have to take their `mentioned_items` in return. This does
         // some extra work here to save the monomorphization collector work later. It helps a lot,
@@ -734,8 +727,9 @@ impl<'tcx> Inliner<'tcx> {
             caller_body.mentioned_items.remove(idx);
             caller_body.mentioned_items.extend(callee_body.mentioned_items);
         } else {
-            // If we can't find the callee, there's no point in adding its items.
-            // Probably it already got removed by being inlined elsewhere in the same function.
+            // If we can't find the callee, there's no point in adding its items. Probably it
+            // already got removed by being inlined elsewhere in the same function, so we already
+            // took its items.
         }
     }
 
@@ -1071,7 +1065,8 @@ fn try_instance_mir<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: InstanceDef<'tcx>,
 ) -> Result<&'tcx Body<'tcx>, &'static str> {
-    if let ty::InstanceDef::DropGlue(_, Some(ty)) = instance
+    if let ty::InstanceDef::DropGlue(_, Some(ty))
+    | ty::InstanceDef::AsyncDropGlueCtorShim(_, Some(ty)) = instance
         && let ty::Adt(def, args) = ty.kind()
     {
         let fields = def.all_fields();

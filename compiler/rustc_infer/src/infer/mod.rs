@@ -2,17 +2,16 @@ pub use at::DefineOpaqueTypes;
 pub use freshen::TypeFreshener;
 pub use lexical_region_resolve::RegionResolutionError;
 pub use relate::combine::CombineFields;
-pub use relate::combine::ObligationEmittingRelation;
+pub use relate::combine::PredicateEmittingRelation;
 pub use relate::StructurallyRelateAliases;
+pub use rustc_macros::{TypeFoldable, TypeVisitable};
 pub use rustc_middle::ty::IntVarValue;
 pub use BoundRegionConversionTime::*;
 pub use RegionVariableOrigin::*;
 pub use SubregionOrigin::*;
-pub use ValuePairs::*;
 
-use crate::traits::{
-    self, ObligationCause, ObligationInspector, PredicateObligations, TraitEngine, TraitEngineExt,
-};
+use crate::infer::relate::{Relate, RelateResult};
+use crate::traits::{self, ObligationCause, ObligationInspector, PredicateObligation, TraitEngine};
 use error_reporting::TypeErrCtxt;
 use free_regions::RegionRelations;
 use lexical_region_resolve::LexicalRegionResolutions;
@@ -20,35 +19,36 @@ use opaque_types::OpaqueTypeStorage;
 use region_constraints::{GenericKind, VarInfos, VerifyBound};
 use region_constraints::{RegionConstraintCollector, RegionConstraintStorage};
 use rustc_data_structures::captures::Captures;
-use rustc_data_structures::fx::FxIndexMap;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_data_structures::sync::Lrc;
 use rustc_data_structures::undo_log::Rollback;
 use rustc_data_structures::unify as ut;
 use rustc_errors::{Diag, DiagCtxt, ErrorGuaranteed};
 use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_macros::extension;
 use rustc_middle::infer::canonical::{Canonical, CanonicalVarValues};
+use rustc_middle::infer::unify_key::ConstVariableOrigin;
 use rustc_middle::infer::unify_key::ConstVariableValue;
 use rustc_middle::infer::unify_key::EffectVarValue;
-use rustc_middle::infer::unify_key::{ConstVariableOrigin, ConstVariableOriginKind, ToType};
 use rustc_middle::infer::unify_key::{ConstVidKey, EffectVidKey};
 use rustc_middle::mir::interpret::{ErrorHandled, EvalToValTreeResult};
 use rustc_middle::mir::ConstraintCategory;
-use rustc_middle::traits::{select, DefiningAnchor};
+use rustc_middle::traits::select;
+use rustc_middle::traits::solve::{Goal, NoSolution};
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::fold::BoundVarReplacerDelegate;
 use rustc_middle::ty::fold::{TypeFoldable, TypeFolder, TypeSuperFoldable};
-use rustc_middle::ty::relate::RelateResult;
 use rustc_middle::ty::visit::TypeVisitableExt;
-use rustc_middle::ty::{self, GenericParamDefKind, InferConst, InferTy, Ty, TyCtxt};
+use rustc_middle::ty::{self, GenericParamDefKind, InferConst, Ty, TyCtxt};
 use rustc_middle::ty::{ConstVid, EffectVid, FloatVid, IntVid, TyVid};
 use rustc_middle::ty::{GenericArg, GenericArgKind, GenericArgs, GenericArgsRef};
+use rustc_middle::{bug, span_bug};
 use rustc_span::symbol::Symbol;
-use rustc_span::Span;
+use rustc_span::{Span, DUMMY_SP};
 use snapshot::undo_log::InferCtxtUndoLogs;
 use std::cell::{Cell, RefCell};
 use std::fmt;
-use type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
+use type_variable::TypeVariableOrigin;
 
 pub mod at;
 pub mod canonical;
@@ -60,7 +60,7 @@ pub mod opaque_types;
 pub mod outlives;
 mod projection;
 pub mod region_constraints;
-mod relate;
+pub mod relate;
 pub mod resolve;
 pub(crate) mod snapshot;
 pub mod type_variable;
@@ -69,7 +69,7 @@ pub mod type_variable;
 #[derive(Debug)]
 pub struct InferOk<'tcx, T> {
     pub value: T,
-    pub obligations: PredicateObligations<'tcx>,
+    pub obligations: Vec<PredicateObligation<'tcx>>,
 }
 pub type InferResult<'tcx, T> = Result<InferOk<'tcx, T>, TypeError<'tcx>>;
 
@@ -243,18 +243,8 @@ impl<'tcx> InferCtxtInner<'tcx> {
 pub struct InferCtxt<'tcx> {
     pub tcx: TyCtxt<'tcx>,
 
-    /// The `DefId` of the item in whose context we are performing inference or typeck.
-    /// It is used to check whether an opaque type use is a defining use.
-    ///
-    /// If it is `DefiningAnchor::Bubble`, we can't resolve opaque types here and need to bubble up
-    /// the obligation. This frequently happens for
-    /// short lived InferCtxt within queries. The opaque type obligations are forwarded
-    /// to the outside until the end up in an `InferCtxt` for typeck or borrowck.
-    ///
-    /// Its default value is `DefiningAnchor::Bind(&[])`, which means no opaque types may be defined.
-    /// This way it is easier to catch errors that
-    /// might come up during inference or typeck.
-    pub defining_use_anchor: DefiningAnchor<'tcx>,
+    /// The `DefIds` of the opaque types that may have their hidden types constrained.
+    defining_opaque_types: &'tcx ty::List<LocalDefId>,
 
     /// Whether this inference context should care about region obligations in
     /// the root universe. Most notably, this is used during hir typeck as region
@@ -362,6 +352,13 @@ impl<'tcx> ty::InferCtxtLike for InferCtxt<'tcx> {
         }
     }
 
+    fn universe_of_lt(&self, lt: ty::RegionVid) -> Option<ty::UniverseIndex> {
+        match self.inner.borrow_mut().unwrap_region_constraints().probe_value(lt) {
+            Err(universe) => Some(universe),
+            Ok(_) => None,
+        }
+    }
+
     fn universe_of_ct(&self, ct: ConstVid) -> Option<ty::UniverseIndex> {
         // Same issue as with `universe_of_ty`
         match self.probe_const_var(ct) {
@@ -370,36 +367,113 @@ impl<'tcx> ty::InferCtxtLike for InferCtxt<'tcx> {
         }
     }
 
-    fn universe_of_lt(&self, lt: ty::RegionVid) -> Option<ty::UniverseIndex> {
-        match self.inner.borrow_mut().unwrap_region_constraints().probe_value(lt) {
-            Err(universe) => Some(universe),
-            Ok(_) => None,
+    fn root_ty_var(&self, var: TyVid) -> TyVid {
+        self.root_var(var)
+    }
+
+    fn root_const_var(&self, var: ConstVid) -> ConstVid {
+        self.root_const_var(var)
+    }
+
+    fn opportunistic_resolve_ty_var(&self, vid: TyVid) -> Ty<'tcx> {
+        match self.probe_ty_var(vid) {
+            Ok(ty) => ty,
+            Err(_) => Ty::new_var(self.tcx, self.root_var(vid)),
         }
     }
 
-    fn root_ty_var(&self, vid: TyVid) -> TyVid {
-        self.root_var(vid)
+    fn opportunistic_resolve_int_var(&self, vid: IntVid) -> Ty<'tcx> {
+        self.opportunistic_resolve_int_var(vid)
     }
 
-    fn probe_ty_var(&self, vid: TyVid) -> Option<Ty<'tcx>> {
-        self.probe_ty_var(vid).ok()
+    fn opportunistic_resolve_float_var(&self, vid: FloatVid) -> Ty<'tcx> {
+        self.opportunistic_resolve_float_var(vid)
     }
 
-    fn opportunistic_resolve_lt_var(&self, vid: ty::RegionVid) -> Option<ty::Region<'tcx>> {
-        let re = self
-            .inner
-            .borrow_mut()
-            .unwrap_region_constraints()
-            .opportunistic_resolve_var(self.tcx, vid);
-        if *re == ty::ReVar(vid) { None } else { Some(re) }
+    fn opportunistic_resolve_ct_var(&self, vid: ConstVid) -> ty::Const<'tcx> {
+        match self.probe_const_var(vid) {
+            Ok(ct) => ct,
+            Err(_) => ty::Const::new_var(self.tcx, self.root_const_var(vid)),
+        }
     }
 
-    fn root_ct_var(&self, vid: ConstVid) -> ConstVid {
-        self.root_const_var(vid)
+    fn opportunistic_resolve_effect_var(&self, vid: EffectVid) -> ty::Const<'tcx> {
+        match self.probe_effect_var(vid) {
+            Some(ct) => ct,
+            None => {
+                ty::Const::new_infer(self.tcx, InferConst::EffectVar(self.root_effect_var(vid)))
+            }
+        }
     }
 
-    fn probe_ct_var(&self, vid: ConstVid) -> Option<ty::Const<'tcx>> {
-        self.probe_const_var(vid).ok()
+    fn opportunistic_resolve_lt_var(&self, vid: ty::RegionVid) -> ty::Region<'tcx> {
+        self.inner.borrow_mut().unwrap_region_constraints().opportunistic_resolve_var(self.tcx, vid)
+    }
+
+    fn defining_opaque_types(&self) -> &'tcx ty::List<LocalDefId> {
+        self.defining_opaque_types
+    }
+
+    fn next_ty_infer(&self) -> Ty<'tcx> {
+        self.next_ty_var(DUMMY_SP)
+    }
+
+    fn next_const_infer(&self) -> ty::Const<'tcx> {
+        self.next_const_var(DUMMY_SP)
+    }
+
+    fn fresh_args_for_item(&self, def_id: DefId) -> ty::GenericArgsRef<'tcx> {
+        self.fresh_args_for_item(DUMMY_SP, def_id)
+    }
+
+    fn instantiate_binder_with_infer<T: TypeFoldable<Self::Interner> + Copy>(
+        &self,
+        value: ty::Binder<'tcx, T>,
+    ) -> T {
+        self.instantiate_binder_with_fresh_vars(
+            DUMMY_SP,
+            BoundRegionConversionTime::HigherRankedType,
+            value,
+        )
+    }
+
+    fn enter_forall<T: TypeFoldable<TyCtxt<'tcx>> + Copy, U>(
+        &self,
+        value: ty::Binder<'tcx, T>,
+        f: impl FnOnce(T) -> U,
+    ) -> U {
+        self.enter_forall(value, f)
+    }
+
+    fn relate<T: Relate<TyCtxt<'tcx>>>(
+        &self,
+        param_env: ty::ParamEnv<'tcx>,
+        lhs: T,
+        variance: ty::Variance,
+        rhs: T,
+    ) -> Result<Vec<Goal<'tcx, ty::Predicate<'tcx>>>, NoSolution> {
+        self.at(&ObligationCause::dummy(), param_env).relate_no_trace(lhs, variance, rhs)
+    }
+
+    fn eq_structurally_relating_aliases<T: Relate<TyCtxt<'tcx>>>(
+        &self,
+        param_env: ty::ParamEnv<'tcx>,
+        lhs: T,
+        rhs: T,
+    ) -> Result<Vec<Goal<'tcx, ty::Predicate<'tcx>>>, NoSolution> {
+        self.at(&ObligationCause::dummy(), param_env)
+            .eq_structurally_relating_aliases_no_trace(lhs, rhs)
+    }
+
+    fn resolve_vars_if_possible<T>(&self, value: T) -> T
+    where
+        T: TypeFoldable<TyCtxt<'tcx>>,
+    {
+        self.resolve_vars_if_possible(value)
+    }
+
+    fn probe<T>(&self, probe: impl FnOnce() -> T) -> T {
+        self.probe(|_| probe())
     }
 }
 
@@ -408,18 +482,19 @@ impl<'tcx> ty::InferCtxtLike for InferCtxt<'tcx> {
 pub enum ValuePairs<'tcx> {
     Regions(ExpectedFound<ty::Region<'tcx>>),
     Terms(ExpectedFound<ty::Term<'tcx>>),
-    Aliases(ExpectedFound<ty::AliasTy<'tcx>>),
-    PolyTraitRefs(ExpectedFound<ty::PolyTraitRef<'tcx>>),
+    Aliases(ExpectedFound<ty::AliasTerm<'tcx>>),
+    TraitRefs(ExpectedFound<ty::TraitRef<'tcx>>),
     PolySigs(ExpectedFound<ty::PolyFnSig<'tcx>>),
     ExistentialTraitRef(ExpectedFound<ty::PolyExistentialTraitRef<'tcx>>),
     ExistentialProjection(ExpectedFound<ty::PolyExistentialProjection<'tcx>>),
+    Dummy,
 }
 
 impl<'tcx> ValuePairs<'tcx> {
     pub fn ty(&self) -> Option<(Ty<'tcx>, Ty<'tcx>)> {
         if let ValuePairs::Terms(ExpectedFound { expected, found }) = self
-            && let Some(expected) = expected.ty()
-            && let Some(found) = found.ty()
+            && let Some(expected) = expected.as_type()
+            && let Some(found) = found.as_type()
         {
             Some((expected, found))
         } else {
@@ -483,8 +558,8 @@ pub enum SubregionOrigin<'tcx> {
 }
 
 // `SubregionOrigin` is used a lot. Make sure it doesn't unintentionally get bigger.
-#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_pointer_width = "64"))]
-static_assert_size!(SubregionOrigin<'_>, 32);
+#[cfg(target_pointer_width = "64")]
+rustc_data_structures::static_assert_size!(SubregionOrigin<'_>, 32);
 
 impl<'tcx> SubregionOrigin<'tcx> {
     pub fn to_constraint_category(&self) -> ConstraintCategory<'tcx> {
@@ -533,8 +608,8 @@ pub enum RegionVariableOrigin {
 
     /// Region variables created as the values for early-bound regions.
     ///
-    /// FIXME(@lcnr): This can also store a `DefId`, similar to
-    /// `TypeVariableOriginKind::TypeParameterDefinition`.
+    /// FIXME(@lcnr): This should also store a `DefId`, similar to
+    /// `TypeVariableOrigin`.
     RegionParameterDefinition(Span, Symbol),
 
     /// Region variables created when instantiating a binder with
@@ -581,6 +656,7 @@ pub enum FixupError {
     UnresolvedFloatTy(FloatVid),
     UnresolvedTy(TyVid),
     UnresolvedConst(ConstVid),
+    UnresolvedEffect(EffectVid),
 }
 
 /// See the `region_obligations` field for more information.
@@ -608,6 +684,7 @@ impl fmt::Display for FixupError {
             ),
             UnresolvedTy(_) => write!(f, "unconstrained type"),
             UnresolvedConst(_) => write!(f, "unconstrained const value"),
+            UnresolvedEffect(_) => write!(f, "unconstrained effect value"),
         }
     }
 }
@@ -615,7 +692,7 @@ impl fmt::Display for FixupError {
 /// Used to configure inference contexts before their creation.
 pub struct InferCtxtBuilder<'tcx> {
     tcx: TyCtxt<'tcx>,
-    defining_use_anchor: DefiningAnchor<'tcx>,
+    defining_opaque_types: &'tcx ty::List<LocalDefId>,
     considering_regions: bool,
     skip_leak_check: bool,
     /// Whether we are in coherence mode.
@@ -630,7 +707,7 @@ impl<'tcx> TyCtxt<'tcx> {
     fn infer_ctxt(self) -> InferCtxtBuilder<'tcx> {
         InferCtxtBuilder {
             tcx: self,
-            defining_use_anchor: DefiningAnchor::Bind(ty::List::empty()),
+            defining_opaque_types: ty::List::empty(),
             considering_regions: true,
             skip_leak_check: false,
             intercrate: false,
@@ -646,8 +723,16 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
     /// It is only meant to be called in two places, for typeck
     /// (via `Inherited::build`) and for the inference context used
     /// in mir borrowck.
-    pub fn with_opaque_type_inference(mut self, defining_use_anchor: DefiningAnchor<'tcx>) -> Self {
-        self.defining_use_anchor = defining_use_anchor;
+    pub fn with_opaque_type_inference(mut self, defining_anchor: LocalDefId) -> Self {
+        self.defining_opaque_types = self.tcx.opaque_types_defined_by(defining_anchor);
+        self
+    }
+
+    pub fn with_defining_opaque_types(
+        mut self,
+        defining_opaque_types: &'tcx ty::List<LocalDefId>,
+    ) -> Self {
+        self.defining_opaque_types = defining_opaque_types;
         self
     }
 
@@ -679,14 +764,14 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
     /// the bound values in `C` to their instantiated values in `V`
     /// (in other words, `S(C) = V`).
     pub fn build_with_canonical<T>(
-        &mut self,
+        self,
         span: Span,
         canonical: &Canonical<'tcx, T>,
     ) -> (InferCtxt<'tcx>, T, CanonicalVarValues<'tcx>)
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        let infcx = self.build();
+        let infcx = self.with_defining_opaque_types(canonical.defining_opaque_types).build();
         let (value, args) = infcx.instantiate_canonical(span, canonical);
         (infcx, value, args)
     }
@@ -694,7 +779,7 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
     pub fn build(&mut self) -> InferCtxt<'tcx> {
         let InferCtxtBuilder {
             tcx,
-            defining_use_anchor,
+            defining_opaque_types,
             considering_regions,
             skip_leak_check,
             intercrate,
@@ -702,7 +787,7 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
         } = *self;
         InferCtxt {
             tcx,
-            defining_use_anchor,
+            defining_opaque_types,
             considering_regions,
             skip_leak_check,
             inner: RefCell::new(InferCtxtInner::new()),
@@ -723,10 +808,10 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
 
 impl<'tcx, T> InferOk<'tcx, T> {
     /// Extracts `value`, registering any obligations into `fulfill_cx`.
-    pub fn into_value_registering_obligations(
+    pub fn into_value_registering_obligations<E: 'tcx>(
         self,
         infcx: &InferCtxt<'tcx>,
-        fulfill_cx: &mut dyn TraitEngine<'tcx>,
+        fulfill_cx: &mut dyn TraitEngine<'tcx, E>,
     ) -> T {
         let InferOk { value, obligations } = self;
         fulfill_cx.register_predicate_obligations(infcx, obligations);
@@ -735,7 +820,7 @@ impl<'tcx, T> InferOk<'tcx, T> {
 }
 
 impl<'tcx> InferOk<'tcx, ()> {
-    pub fn into_obligations(self) -> PredicateObligations<'tcx> {
+    pub fn into_obligations(self) -> Vec<PredicateObligation<'tcx>> {
         self.obligations
     }
 }
@@ -796,14 +881,14 @@ impl<'tcx> InferCtxt<'tcx> {
             .collect();
         vars.extend(
             (0..inner.int_unification_table().len())
-                .map(|i| ty::IntVid::from_u32(i as u32))
-                .filter(|&vid| inner.int_unification_table().probe_value(vid).is_none())
+                .map(|i| ty::IntVid::from_usize(i))
+                .filter(|&vid| inner.int_unification_table().probe_value(vid).is_unknown())
                 .map(|v| Ty::new_int_var(self.tcx, v)),
         );
         vars.extend(
             (0..inner.float_unification_table().len())
-                .map(|i| ty::FloatVid::from_u32(i as u32))
-                .filter(|&vid| inner.float_unification_table().probe_value(vid).is_none())
+                .map(|i| ty::FloatVid::from_usize(i))
+                .filter(|&vid| inner.float_unification_table().probe_value(vid).is_unknown())
                 .map(|v| Ty::new_float_var(self.tcx, v)),
         );
         vars
@@ -816,25 +901,8 @@ impl<'tcx> InferCtxt<'tcx> {
         (0..table.len())
             .map(|i| ty::EffectVid::from_usize(i))
             .filter(|&vid| table.probe_value(vid).is_unknown())
-            .map(|v| {
-                ty::Const::new_infer(self.tcx, ty::InferConst::EffectVar(v), self.tcx.types.bool)
-            })
+            .map(|v| ty::Const::new_infer(self.tcx, ty::InferConst::EffectVar(v)))
             .collect()
-    }
-
-    fn combine_fields<'a>(
-        &'a self,
-        trace: TypeTrace<'tcx>,
-        param_env: ty::ParamEnv<'tcx>,
-        define_opaque_types: DefineOpaqueTypes,
-    ) -> CombineFields<'a, 'tcx> {
-        CombineFields {
-            infcx: self,
-            trace,
-            param_env,
-            obligations: PredicateObligations::new(),
-            define_opaque_types,
-        }
     }
 
     pub fn can_sub<T>(&self, param_env: ty::ParamEnv<'tcx>, expected: T, actual: T) -> bool
@@ -973,48 +1041,52 @@ impl<'tcx> InferCtxt<'tcx> {
         self.inner.borrow_mut().type_variables().num_vars()
     }
 
-    pub fn next_ty_var_id(&self, origin: TypeVariableOrigin) -> TyVid {
-        self.inner.borrow_mut().type_variables().new_var(self.universe(), origin)
+    pub fn next_ty_var(&self, span: Span) -> Ty<'tcx> {
+        self.next_ty_var_with_origin(TypeVariableOrigin { span, param_def_id: None })
     }
 
-    pub fn next_ty_var(&self, origin: TypeVariableOrigin) -> Ty<'tcx> {
-        Ty::new_var(self.tcx, self.next_ty_var_id(origin))
-    }
-
-    pub fn next_ty_var_id_in_universe(
-        &self,
-        origin: TypeVariableOrigin,
-        universe: ty::UniverseIndex,
-    ) -> TyVid {
-        self.inner.borrow_mut().type_variables().new_var(universe, origin)
-    }
-
-    pub fn next_ty_var_in_universe(
-        &self,
-        origin: TypeVariableOrigin,
-        universe: ty::UniverseIndex,
-    ) -> Ty<'tcx> {
-        let vid = self.next_ty_var_id_in_universe(origin, universe);
+    pub fn next_ty_var_with_origin(&self, origin: TypeVariableOrigin) -> Ty<'tcx> {
+        let vid = self.inner.borrow_mut().type_variables().new_var(self.universe(), origin);
         Ty::new_var(self.tcx, vid)
     }
 
-    pub fn next_const_var(&self, ty: Ty<'tcx>, origin: ConstVariableOrigin) -> ty::Const<'tcx> {
-        ty::Const::new_var(self.tcx, self.next_const_var_id(origin), ty)
+    pub fn next_ty_var_id_in_universe(&self, span: Span, universe: ty::UniverseIndex) -> TyVid {
+        let origin = TypeVariableOrigin { span, param_def_id: None };
+        self.inner.borrow_mut().type_variables().new_var(universe, origin)
+    }
+
+    pub fn next_ty_var_in_universe(&self, span: Span, universe: ty::UniverseIndex) -> Ty<'tcx> {
+        let vid = self.next_ty_var_id_in_universe(span, universe);
+        Ty::new_var(self.tcx, vid)
+    }
+
+    pub fn next_const_var(&self, span: Span) -> ty::Const<'tcx> {
+        self.next_const_var_with_origin(ConstVariableOrigin { span, param_def_id: None })
+    }
+
+    pub fn next_const_var_with_origin(&self, origin: ConstVariableOrigin) -> ty::Const<'tcx> {
+        let vid = self
+            .inner
+            .borrow_mut()
+            .const_unification_table()
+            .new_key(ConstVariableValue::Unknown { origin, universe: self.universe() })
+            .vid;
+        ty::Const::new_var(self.tcx, vid)
     }
 
     pub fn next_const_var_in_universe(
         &self,
-        ty: Ty<'tcx>,
-        origin: ConstVariableOrigin,
+        span: Span,
         universe: ty::UniverseIndex,
     ) -> ty::Const<'tcx> {
+        let origin = ConstVariableOrigin { span, param_def_id: None };
         let vid = self
             .inner
             .borrow_mut()
             .const_unification_table()
             .new_key(ConstVariableValue::Unknown { origin, universe })
             .vid;
-        ty::Const::new_var(self.tcx, vid, ty)
+        ty::Const::new_var(self.tcx, vid)
     }
 
     pub fn next_const_var_id(&self, origin: ConstVariableOrigin) -> ConstVid {
@@ -1026,7 +1098,7 @@ impl<'tcx> InferCtxt<'tcx> {
     }
 
     fn next_int_var_id(&self) -> IntVid {
-        self.inner.borrow_mut().int_unification_table().new_key(None)
+        self.inner.borrow_mut().int_unification_table().new_key(ty::IntVarValue::Unknown)
     }
 
     pub fn next_int_var(&self) -> Ty<'tcx> {
@@ -1034,7 +1106,7 @@ impl<'tcx> InferCtxt<'tcx> {
     }
 
     fn next_float_var_id(&self) -> FloatVid {
-        self.inner.borrow_mut().float_unification_table().new_key(None)
+        self.inner.borrow_mut().float_unification_table().new_key(ty::FloatVarValue::Unknown)
     }
 
     pub fn next_float_var(&self) -> Ty<'tcx> {
@@ -1109,13 +1181,7 @@ impl<'tcx> InferCtxt<'tcx> {
                 // as the generic parameters for the default, `(T, U)`.
                 let ty_var_id = self.inner.borrow_mut().type_variables().new_var(
                     self.universe(),
-                    TypeVariableOrigin {
-                        kind: TypeVariableOriginKind::TypeParameterDefinition(
-                            param.name,
-                            param.def_id,
-                        ),
-                        span,
-                    },
+                    TypeVariableOrigin { param_def_id: Some(param.def_id), span },
                 );
 
                 Ty::new_var(self.tcx, ty_var_id).into()
@@ -1124,28 +1190,14 @@ impl<'tcx> InferCtxt<'tcx> {
                 if is_host_effect {
                     return self.var_for_effect(param);
                 }
-                let origin = ConstVariableOrigin {
-                    kind: ConstVariableOriginKind::ConstParameterDefinition(
-                        param.name,
-                        param.def_id,
-                    ),
-                    span,
-                };
+                let origin = ConstVariableOrigin { param_def_id: Some(param.def_id), span };
                 let const_var_id = self
                     .inner
                     .borrow_mut()
                     .const_unification_table()
                     .new_key(ConstVariableValue::Unknown { origin, universe: self.universe() })
                     .vid;
-                ty::Const::new_var(
-                    self.tcx,
-                    const_var_id,
-                    self.tcx
-                        .type_of(param.def_id)
-                        .no_bound_vars()
-                        .expect("const parameter types cannot be generic"),
-                )
-                .into()
+                ty::Const::new_var(self.tcx, const_var_id).into()
             }
         }
     }
@@ -1159,7 +1211,7 @@ impl<'tcx> InferCtxt<'tcx> {
             .no_bound_vars()
             .expect("const parameter types cannot be generic");
         debug_assert_eq!(self.tcx.types.bool, ty);
-        ty::Const::new_infer(self.tcx, ty::InferConst::EffectVar(effect_vid), ty).into()
+        ty::Const::new_infer(self.tcx, ty::InferConst::EffectVar(effect_vid)).into()
     }
 
     /// Given a set of generics defined on a type or impl, returns the generic parameters mapping each
@@ -1230,6 +1282,12 @@ impl<'tcx> InferCtxt<'tcx> {
         self.inner.borrow().opaque_type_storage.opaque_types.clone()
     }
 
+    #[inline(always)]
+    pub fn can_define_opaque_ty(&self, id: impl Into<DefId>) -> bool {
+        let Some(id) = id.into().as_local() else { return false };
+        self.defining_opaque_types.contains(&id)
+    }
+
     pub fn ty_to_string(&self, t: Ty<'tcx>) -> String {
         self.resolve_vars_if_possible(t).to_string()
     }
@@ -1245,19 +1303,75 @@ impl<'tcx> InferCtxt<'tcx> {
         }
     }
 
-    /// Resolve any type variables found in `value` -- but only one
-    /// level. So, if the variable `?X` is bound to some type
-    /// `Foo<?Y>`, then this would return `Foo<?Y>` (but `?Y` may
-    /// itself be bound to a type).
-    ///
-    /// Useful when you only need to inspect the outermost level of
-    /// the type and don't care about nested types (or perhaps you
-    /// will be resolving them as well, e.g. in a loop).
-    pub fn shallow_resolve<T>(&self, value: T) -> T
-    where
-        T: TypeFoldable<TyCtxt<'tcx>>,
-    {
-        value.fold_with(&mut ShallowResolver { infcx: self })
+    pub fn shallow_resolve(&self, ty: Ty<'tcx>) -> Ty<'tcx> {
+        if let ty::Infer(v) = *ty.kind() {
+            match v {
+                ty::TyVar(v) => {
+                    // Not entirely obvious: if `typ` is a type variable,
+                    // it can be resolved to an int/float variable, which
+                    // can then be recursively resolved, hence the
+                    // recursion. Note though that we prevent type
+                    // variables from unifying to other type variables
+                    // directly (though they may be embedded
+                    // structurally), and we prevent cycles in any case,
+                    // so this recursion should always be of very limited
+                    // depth.
+                    //
+                    // Note: if these two lines are combined into one we get
+                    // dynamic borrow errors on `self.inner`.
+                    let known = self.inner.borrow_mut().type_variables().probe(v).known();
+                    known.map_or(ty, |t| self.shallow_resolve(t))
+                }
+
+                ty::IntVar(v) => {
+                    match self.inner.borrow_mut().int_unification_table().probe_value(v) {
+                        ty::IntVarValue::IntType(ty) => Ty::new_int(self.tcx, ty),
+                        ty::IntVarValue::UintType(ty) => Ty::new_uint(self.tcx, ty),
+                        ty::IntVarValue::Unknown => ty,
+                    }
+                }
+
+                ty::FloatVar(v) => {
+                    match self.inner.borrow_mut().float_unification_table().probe_value(v) {
+                        ty::FloatVarValue::Known(ty) => Ty::new_float(self.tcx, ty),
+                        ty::FloatVarValue::Unknown => ty,
+                    }
+                }
+
+                ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_) => ty,
+            }
+        } else {
+            ty
+        }
+    }
+
+    pub fn shallow_resolve_const(&self, ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
+        match ct.kind() {
+            ty::ConstKind::Infer(infer_ct) => match infer_ct {
+                InferConst::Var(vid) => self
+                    .inner
+                    .borrow_mut()
+                    .const_unification_table()
+                    .probe_value(vid)
+                    .known()
+                    .unwrap_or(ct),
+                InferConst::EffectVar(vid) => self
+                    .inner
+                    .borrow_mut()
+                    .effect_unification_table()
+                    .probe_value(vid)
+                    .known()
+                    .unwrap_or(ct),
+                InferConst::Fresh(_) => ct,
+            },
+            ty::ConstKind::Param(_)
+            | ty::ConstKind::Bound(_, _)
+            | ty::ConstKind::Placeholder(_)
+            | ty::ConstKind::Unevaluated(_)
+            | ty::ConstKind::Value(_, _)
+            | ty::ConstKind::Error(_)
+            | ty::ConstKind::Expr(_) => ct,
+        }
     }
 
     pub fn root_var(&self, var: ty::TyVid) -> ty::TyVid {
@@ -1276,10 +1390,13 @@ impl<'tcx> InferCtxt<'tcx> {
     /// or else the root int var in the unification table.
     pub fn opportunistic_resolve_int_var(&self, vid: ty::IntVid) -> Ty<'tcx> {
         let mut inner = self.inner.borrow_mut();
-        if let Some(value) = inner.int_unification_table().probe_value(vid) {
-            value.to_type(self.tcx)
-        } else {
-            Ty::new_int_var(self.tcx, inner.int_unification_table().find(vid))
+        let value = inner.int_unification_table().probe_value(vid);
+        match value {
+            ty::IntVarValue::IntType(ty) => Ty::new_int(self.tcx, ty),
+            ty::IntVarValue::UintType(ty) => Ty::new_uint(self.tcx, ty),
+            ty::IntVarValue::Unknown => {
+                Ty::new_int_var(self.tcx, inner.int_unification_table().find(vid))
+            }
         }
     }
 
@@ -1287,10 +1404,12 @@ impl<'tcx> InferCtxt<'tcx> {
     /// or else the root float var in the unification table.
     pub fn opportunistic_resolve_float_var(&self, vid: ty::FloatVid) -> Ty<'tcx> {
         let mut inner = self.inner.borrow_mut();
-        if let Some(value) = inner.float_unification_table().probe_value(vid) {
-            value.to_type(self.tcx)
-        } else {
-            Ty::new_float_var(self.tcx, inner.float_unification_table().find(vid))
+        let value = inner.float_unification_table().probe_value(vid);
+        match value {
+            ty::FloatVarValue::Known(ty) => Ty::new_float(self.tcx, ty),
+            ty::FloatVarValue::Unknown => {
+                Ty::new_float_var(self.tcx, inner.float_unification_table().find(vid))
+            }
         }
     }
 
@@ -1401,30 +1520,13 @@ impl<'tcx> InferCtxt<'tcx> {
             fn replace_ty(&mut self, bt: ty::BoundTy) -> Ty<'tcx> {
                 self.map
                     .entry(bt.var)
-                    .or_insert_with(|| {
-                        self.infcx
-                            .next_ty_var(TypeVariableOrigin {
-                                kind: TypeVariableOriginKind::MiscVariable,
-                                span: self.span,
-                            })
-                            .into()
-                    })
+                    .or_insert_with(|| self.infcx.next_ty_var(self.span).into())
                     .expect_ty()
             }
-            fn replace_const(&mut self, bv: ty::BoundVar, ty: Ty<'tcx>) -> ty::Const<'tcx> {
+            fn replace_const(&mut self, bv: ty::BoundVar) -> ty::Const<'tcx> {
                 self.map
                     .entry(bv)
-                    .or_insert_with(|| {
-                        self.infcx
-                            .next_const_var(
-                                ty,
-                                ConstVariableOrigin {
-                                    kind: ConstVariableOriginKind::MiscVariable,
-                                    span: self.span,
-                                },
-                            )
-                            .into()
-                    })
+                    .or_insert_with(|| self.infcx.next_const_var(self.span).into())
                     .expect_const()
             }
         }
@@ -1461,15 +1563,6 @@ impl<'tcx> InferCtxt<'tcx> {
         closure_kind_ty.to_opt_closure_kind()
     }
 
-    /// Clears the selection, evaluation, and projection caches. This is useful when
-    /// repeatedly attempting to select an `Obligation` while changing only
-    /// its `ParamEnv`, since `FulfillmentContext` doesn't use probing.
-    pub fn clear_caches(&self) {
-        self.selection_cache.clear();
-        self.evaluation_cache.clear();
-        self.inner.borrow_mut().projection_cache().clear();
-    }
-
     pub fn universe(&self) -> ty::UniverseIndex {
         self.universe.get()
     }
@@ -1487,11 +1580,14 @@ impl<'tcx> InferCtxt<'tcx> {
         &self,
         param_env: ty::ParamEnv<'tcx>,
         unevaluated: ty::UnevaluatedConst<'tcx>,
-        ty: Ty<'tcx>,
         span: Span,
     ) -> Result<ty::Const<'tcx>, ErrorHandled> {
         match self.const_eval_resolve(param_env, unevaluated, span) {
-            Ok(Some(val)) => Ok(ty::Const::new_value(self.tcx, val, ty)),
+            Ok(Some(val)) => Ok(ty::Const::new_value(
+                self.tcx,
+                val,
+                self.tcx.type_of(unevaluated.def).instantiate(self.tcx, unevaluated.args),
+            )),
             Ok(None) => {
                 let tcx = self.tcx;
                 let def_id = unevaluated.def;
@@ -1607,7 +1703,7 @@ impl<'tcx> InferCtxt<'tcx> {
                 // If `inlined_probe_value` returns a value it's always a
                 // `ty::Int(_)` or `ty::UInt(_)`, which never matches a
                 // `ty::Infer(_)`.
-                self.inner.borrow_mut().int_unification_table().inlined_probe_value(v).is_some()
+                self.inner.borrow_mut().int_unification_table().inlined_probe_value(v).is_known()
             }
 
             TyOrConstInferVar::TyFloat(v) => {
@@ -1615,7 +1711,7 @@ impl<'tcx> InferCtxt<'tcx> {
                 // `ty::Float(_)`, which never matches a `ty::Infer(_)`.
                 //
                 // Not `inlined_probe_value(v)` because this call site is colder.
-                self.inner.borrow_mut().float_unification_table().probe_value(v).is_some()
+                self.inner.borrow_mut().float_unification_table().probe_value(v).is_known()
             }
 
             TyOrConstInferVar::Const(v) => {
@@ -1774,89 +1870,6 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for InferenceLiteralEraser<'tcx> {
     }
 }
 
-struct ShallowResolver<'a, 'tcx> {
-    infcx: &'a InferCtxt<'tcx>,
-}
-
-impl<'a, 'tcx> TypeFolder<TyCtxt<'tcx>> for ShallowResolver<'a, 'tcx> {
-    fn interner(&self) -> TyCtxt<'tcx> {
-        self.infcx.tcx
-    }
-
-    /// If `ty` is a type variable of some kind, resolve it one level
-    /// (but do not resolve types found in the result). If `typ` is
-    /// not a type variable, just return it unmodified.
-    #[inline]
-    fn fold_ty(&mut self, ty: Ty<'tcx>) -> Ty<'tcx> {
-        if let ty::Infer(v) = ty.kind() { self.fold_infer_ty(*v).unwrap_or(ty) } else { ty }
-    }
-
-    fn fold_const(&mut self, ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
-        match ct.kind() {
-            ty::ConstKind::Infer(InferConst::Var(vid)) => self
-                .infcx
-                .inner
-                .borrow_mut()
-                .const_unification_table()
-                .probe_value(vid)
-                .known()
-                .unwrap_or(ct),
-            ty::ConstKind::Infer(InferConst::EffectVar(vid)) => self
-                .infcx
-                .inner
-                .borrow_mut()
-                .effect_unification_table()
-                .probe_value(vid)
-                .known()
-                .unwrap_or(ct),
-            _ => ct,
-        }
-    }
-}
-
-impl<'a, 'tcx> ShallowResolver<'a, 'tcx> {
-    // This is separate from `fold_ty` to keep that method small and inlinable.
-    #[inline(never)]
-    fn fold_infer_ty(&mut self, v: InferTy) -> Option<Ty<'tcx>> {
-        match v {
-            ty::TyVar(v) => {
-                // Not entirely obvious: if `typ` is a type variable,
-                // it can be resolved to an int/float variable, which
-                // can then be recursively resolved, hence the
-                // recursion. Note though that we prevent type
-                // variables from unifying to other type variables
-                // directly (though they may be embedded
-                // structurally), and we prevent cycles in any case,
-                // so this recursion should always be of very limited
-                // depth.
-                //
-                // Note: if these two lines are combined into one we get
-                // dynamic borrow errors on `self.inner`.
-                let known = self.infcx.inner.borrow_mut().type_variables().probe(v).known();
-                known.map(|t| self.fold_ty(t))
-            }
-
-            ty::IntVar(v) => self
-                .infcx
-                .inner
-                .borrow_mut()
-                .int_unification_table()
-                .probe_value(v)
-                .map(|v| v.to_type(self.infcx.tcx)),
-
-            ty::FloatVar(v) => self
-                .infcx
-                .inner
-                .borrow_mut()
-                .float_unification_table()
-                .probe_value(v)
-                .map(|v| v.to_type(self.infcx.tcx)),
-
-            ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_) => None,
-        }
-    }
-}
-
 impl<'tcx> TypeTrace<'tcx> {
     pub fn span(&self) -> Span {
         self.cause.span
@@ -1870,19 +1883,19 @@ impl<'tcx> TypeTrace<'tcx> {
     ) -> TypeTrace<'tcx> {
         TypeTrace {
             cause: cause.clone(),
-            values: Terms(ExpectedFound::new(a_is_expected, a.into(), b.into())),
+            values: ValuePairs::Terms(ExpectedFound::new(a_is_expected, a.into(), b.into())),
         }
     }
 
-    pub fn poly_trait_refs(
+    pub fn trait_refs(
         cause: &ObligationCause<'tcx>,
         a_is_expected: bool,
-        a: ty::PolyTraitRef<'tcx>,
-        b: ty::PolyTraitRef<'tcx>,
+        a: ty::TraitRef<'tcx>,
+        b: ty::TraitRef<'tcx>,
     ) -> TypeTrace<'tcx> {
         TypeTrace {
             cause: cause.clone(),
-            values: PolyTraitRefs(ExpectedFound::new(a_is_expected, a, b)),
+            values: ValuePairs::TraitRefs(ExpectedFound::new(a_is_expected, a, b)),
         }
     }
 
@@ -1894,8 +1907,12 @@ impl<'tcx> TypeTrace<'tcx> {
     ) -> TypeTrace<'tcx> {
         TypeTrace {
             cause: cause.clone(),
-            values: Terms(ExpectedFound::new(a_is_expected, a.into(), b.into())),
+            values: ValuePairs::Terms(ExpectedFound::new(a_is_expected, a.into(), b.into())),
         }
+    }
+
+    fn dummy(cause: &ObligationCause<'tcx>) -> TypeTrace<'tcx> {
+        TypeTrace { cause: cause.clone(), values: ValuePairs::Dummy }
     }
 }
 
@@ -1923,7 +1940,7 @@ impl<'tcx> SubregionOrigin<'tcx> {
                 SubregionOrigin::ReferenceOutlivesReferent(ref_type, cause.span)
             }
 
-            traits::ObligationCauseCode::CompareImplItemObligation {
+            traits::ObligationCauseCode::CompareImplItem {
                 impl_item_def_id,
                 trait_item_def_id,
                 kind: _,
@@ -2008,11 +2025,6 @@ fn replace_param_and_infer_args_with_placeholder<'tcx>(
 
         fn fold_const(&mut self, c: ty::Const<'tcx>) -> ty::Const<'tcx> {
             if let ty::ConstKind::Infer(_) = c.kind() {
-                let ty = c.ty();
-                // If the type references param or infer then ICE ICE ICE
-                if ty.has_non_region_param() || ty.has_non_region_infer() {
-                    bug!("const `{c}`'s type should not reference params or types");
-                }
                 ty::Const::new_placeholder(
                     self.tcx,
                     ty::PlaceholderConst {
@@ -2023,7 +2035,6 @@ fn replace_param_and_infer_args_with_placeholder<'tcx>(
                             idx
                         }),
                     },
-                    ty,
                 )
             } else {
                 c.super_fold_with(self)

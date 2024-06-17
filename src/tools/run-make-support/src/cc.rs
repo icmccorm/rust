@@ -1,13 +1,13 @@
-use std::env;
 use std::path::Path;
-use std::process::{Command, Output};
 
-use crate::{bin_name, cygpath_windows, handle_failed_output, is_msvc, is_windows, tmp_dir, uname};
+use crate::command::Command;
+use crate::{bin_name, cygpath_windows, env_var, is_msvc, is_windows, uname};
 
 /// Construct a new platform-specific C compiler invocation.
 ///
 /// WARNING: This means that what flags are accepted by the underlying C compiler is
 /// platform- AND compiler-specific. Consult the relevant docs for `gcc`, `clang` and `mvsc`.
+#[track_caller]
 pub fn cc() -> Cc {
     Cc::new()
 }
@@ -15,21 +15,25 @@ pub fn cc() -> Cc {
 /// A platform-specific C compiler invocation builder. The specific C compiler used is
 /// passed down from compiletest.
 #[derive(Debug)]
+#[must_use]
 pub struct Cc {
     cmd: Command,
 }
+
+crate::impl_common_helpers!(Cc);
 
 impl Cc {
     /// Construct a new platform-specific C compiler invocation.
     ///
     /// WARNING: This means that what flags are accepted by the underlying C compile is
     /// platform- AND compiler-specific. Consult the relevant docs for `gcc`, `clang` and `mvsc`.
+    #[track_caller]
     pub fn new() -> Self {
-        let compiler = env::var("CC").unwrap();
+        let compiler = env_var("CC");
 
         let mut cmd = Command::new(compiler);
 
-        let default_cflags = env::var("CC_DEFAULT_FLAGS").unwrap();
+        let default_cflags = env_var("CC_DEFAULT_FLAGS");
         for flag in default_cflags.split(char::is_whitespace) {
             cmd.arg(flag);
         }
@@ -43,24 +47,15 @@ impl Cc {
         self
     }
 
-    /// Add a *platform-and-compiler-specific* argument. Please consult the docs for the various
-    /// possible C compilers on the various platforms to check which arguments are legal for
-    /// which compiler.
-    pub fn arg(&mut self, flag: &str) -> &mut Self {
-        self.cmd.arg(flag);
+    /// Adds directories to the list that the linker searches for libraries.
+    /// Equivalent to `-L`.
+    pub fn library_search_path<P: AsRef<Path>>(&mut self, path: P) -> &mut Self {
+        self.cmd.arg("-L");
+        self.cmd.arg(path.as_ref());
         self
     }
 
-    /// Add multiple *platform-and-compiler-specific* arguments. Please consult the docs for the
-    /// various possible C compilers on the various platforms to check which arguments are legal
-    /// for which compiler.
-    pub fn args(&mut self, args: &[&str]) -> &mut Self {
-        self.cmd.args(args);
-        self
-    }
-
-    /// Specify `-o` or `-Fe`/`-Fo` depending on platform/compiler. This assumes that the executable
-    /// is under `$TMPDIR`.
+    /// Specify `-o` or `-Fe`/`-Fo` depending on platform/compiler.
     pub fn out_exe(&mut self, name: &str) -> &mut Self {
         // Ref: tools.mk (irrelevant lines omitted):
         //
@@ -74,34 +69,22 @@ impl Cc {
         // ```
 
         if is_msvc() {
-            let fe_path = cygpath_windows(tmp_dir().join(bin_name(name)));
-            let fo_path = cygpath_windows(tmp_dir().join(format!("{name}.obj")));
+            let fe_path = cygpath_windows(bin_name(name));
+            let fo_path = cygpath_windows(format!("{name}.obj"));
             self.cmd.arg(format!("-Fe:{fe_path}"));
             self.cmd.arg(format!("-Fo:{fo_path}"));
         } else {
             self.cmd.arg("-o");
-            self.cmd.arg(tmp_dir().join(name));
+            self.cmd.arg(name);
         }
 
         self
     }
 
-    /// Run the constructed C invocation command and assert that it is successfully run.
-    #[track_caller]
-    pub fn run(&mut self) -> Output {
-        let caller_location = std::panic::Location::caller();
-        let caller_line_number = caller_location.line();
-
-        let output = self.cmd.output().unwrap();
-        if !output.status.success() {
-            handle_failed_output(&format!("{:#?}", self.cmd), output, caller_line_number);
-        }
-        output
-    }
-
-    /// Inspect what the underlying [`Command`] is up to the current construction.
-    pub fn inspect(&mut self, f: impl FnOnce(&Command)) -> &mut Self {
-        f(&self.cmd);
+    /// Specify path of the output binary.
+    pub fn output<P: AsRef<Path>>(&mut self, path: P) -> &mut Self {
+        self.cmd.arg("-o");
+        self.cmd.arg(path.as_ref());
         self
     }
 }
@@ -194,8 +177,9 @@ pub fn extra_cxx_flags() -> Vec<&'static str> {
     if is_windows() {
         if is_msvc() { vec![] } else { vec!["-lstdc++"] }
     } else {
-        match uname() {
-            n if n.contains("Darwin") => vec!["-lc++"],
+        match &uname()[..] {
+            "Darwin" => vec!["-lc++"],
+            "FreeBSD" | "SunOS" | "OpenBSD" => vec![],
             _ => vec!["-lstdc++"],
         }
     }

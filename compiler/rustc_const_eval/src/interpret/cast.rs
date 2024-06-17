@@ -7,16 +7,19 @@ use rustc_middle::mir::CastKind;
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::layout::{IntegerExt, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, FloatTy, Ty};
+use rustc_middle::{bug, span_bug};
 use rustc_target::abi::Integer;
 use rustc_type_ir::TyKind::*;
+use tracing::trace;
 
 use super::{
-    util::ensure_monomorphic_enough, FnVal, ImmTy, Immediate, InterpCx, Machine, OpTy, PlaceTy,
+    err_inval, throw_ub, throw_ub_custom, util::ensure_monomorphic_enough, FnVal, ImmTy, Immediate,
+    InterpCx, Machine, OpTy, PlaceTy,
 };
 
 use crate::fluent_generated as fluent;
 
-impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
+impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     pub fn cast(
         &mut self,
         src: &OpTy<'tcx, M::Provenance>,
@@ -204,7 +207,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         assert!(cast_to.ty.is_unsafe_ptr());
         // Handle casting any ptr to raw ptr (might be a fat ptr).
         if cast_to.size == src.layout.size {
-            // Thin or fat pointer that just hast the ptr kind of target type changed.
+            // Thin or fat pointer that just has the ptr kind of target type changed.
             return Ok(ImmTy::from_immediate(**src, cast_to));
         } else {
             // Casting the metadata away from a fat ptr.
@@ -271,9 +274,13 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         // Let's make sure v is sign-extended *if* it has a signed type.
         let signed = src_layout.abi.is_signed(); // Also asserts that abi is `Scalar`.
 
-        let v = scalar.to_bits(src_layout.size)?;
-        let v = if signed { self.sign_extend(v, src_layout) } else { v };
-        trace!("cast_from_scalar: {}, {} -> {}", v, src_layout.ty, cast_ty);
+        let v = match src_layout.ty.kind() {
+            Uint(_) | RawPtr(..) | FnPtr(..) => scalar.to_uint(src_layout.size)?,
+            Int(_) => scalar.to_int(src_layout.size)? as u128, // we will cast back to `i128` below if the sign matters
+            Bool => scalar.to_bool()?.into(),
+            Char => scalar.to_char()?.into(),
+            _ => span_bug!(self.cur_span(), "invalid int-like cast from {}", src_layout.ty),
+        };
 
         Ok(match *cast_ty.kind() {
             // int -> int
@@ -321,13 +328,12 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         use rustc_type_ir::TyKind::*;
 
         fn adjust_nan<
-            'mir,
-            'tcx: 'mir,
-            M: Machine<'mir, 'tcx>,
+            'tcx,
+            M: Machine<'tcx>,
             F1: rustc_apfloat::Float + FloatConvert<F2>,
             F2: rustc_apfloat::Float,
         >(
-            ecx: &InterpCx<'mir, 'tcx, M>,
+            ecx: &InterpCx<'tcx, M>,
             f1: F1,
             f2: F2,
         ) -> F2 {
@@ -381,7 +387,6 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         match (&src_pointee_ty.kind(), &dest_pointee_ty.kind()) {
             (&ty::Array(_, length), &ty::Slice(_)) => {
                 let ptr = self.read_pointer(src)?;
-                // u64 cast is from usize to u64, which is always good
                 let val = Immediate::new_slice(
                     ptr,
                     length.eval_target_usize(*self.tcx, self.param_env),
@@ -393,15 +398,13 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 let val = self.read_immediate(src)?;
                 if data_a.principal() == data_b.principal() {
                     // A NOP cast that doesn't actually change anything, should be allowed even with mismatching vtables.
+                    // (But currently mismatching vtables violate the validity invariant so UB is triggered anyway.)
                     return self.write_immediate(*val, dest);
                 }
                 let (old_data, old_vptr) = val.to_scalar_pair();
                 let old_data = old_data.to_pointer(self)?;
                 let old_vptr = old_vptr.to_pointer(self)?;
-                let (ty, old_trait) = self.get_ptr_vtable(old_vptr)?;
-                if old_trait != data_a.principal() {
-                    throw_ub_custom!(fluent::const_eval_upcast_mismatch);
-                }
+                let ty = self.get_ptr_vtable_ty(old_vptr, Some(data_a))?;
                 let new_vptr = self.get_vtable_ptr(ty, data_b.principal())?;
                 self.write_immediate(Immediate::new_dyn_trait(old_data, new_vptr, self), dest)
             }

@@ -2,12 +2,14 @@ use crate::lints::{NonFmtPanicBraces, NonFmtPanicUnused};
 use crate::{fluent_generated as fluent, LateContext, LateLintPass, LintContext};
 use rustc_ast as ast;
 use rustc_errors::Applicability;
-use rustc_hir as hir;
+use rustc_hir::{self as hir, LangItem};
 use rustc_infer::infer::TyCtxtInferExt;
+use rustc_middle::bug;
 use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty;
 use rustc_parse_format::{ParseMode, Parser, Piece};
 use rustc_session::lint::FutureIncompatibilityReason;
+use rustc_session::{declare_lint, declare_lint_pass};
 use rustc_span::edition::Edition;
 use rustc_span::{hygiene, sym, symbol::kw, InnerSpan, Span, Symbol};
 use rustc_trait_selection::infer::InferCtxtExt;
@@ -51,9 +53,9 @@ impl<'tcx> LateLintPass<'tcx> for NonPanicFmt {
             if let &ty::FnDef(def_id, _) = cx.typeck_results().expr_ty(f).kind() {
                 let f_diagnostic_name = cx.tcx.get_diagnostic_name(def_id);
 
-                if Some(def_id) == cx.tcx.lang_items().begin_panic_fn()
-                    || Some(def_id) == cx.tcx.lang_items().panic_fn()
-                    || f_diagnostic_name == Some(sym::panic_str)
+                if cx.tcx.is_lang_item(def_id, LangItem::BeginPanic)
+                    || cx.tcx.is_lang_item(def_id, LangItem::Panic)
+                    || f_diagnostic_name == Some(sym::panic_str_2015)
                 {
                     if let Some(id) = f.span.ctxt().outer_expn_data().macro_def_id {
                         if matches!(
@@ -121,7 +123,8 @@ fn check_panic<'tcx>(cx: &LateContext<'tcx>, f: &'tcx hir::Expr<'tcx>, arg: &'tc
     }
 
     #[allow(rustc::diagnostic_outside_of_impl)]
-    cx.span_lint(NON_FMT_PANICS, arg_span, fluent::lint_non_fmt_panic, |lint| {
+    cx.span_lint(NON_FMT_PANICS, arg_span, |lint| {
+        lint.primary_message(fluent::lint_non_fmt_panic);
         lint.arg("name", symbol);
         lint.note(fluent::lint_note);
         lint.note(fluent::lint_more_info_note);
@@ -150,7 +153,7 @@ fn check_panic<'tcx>(cx: &LateContext<'tcx>, f: &'tcx hir::Expr<'tcx>, arg: &'tc
                 ty::Ref(_, r, _) if r.is_str(),
             ) || matches!(
                 ty.ty_adt_def(),
-                Some(ty_def) if Some(ty_def.did()) == cx.tcx.lang_items().string(),
+                Some(ty_def) if cx.tcx.is_lang_item(ty_def.did(), LangItem::String),
             );
 
             let infcx = cx.tcx.infer_ctxt().build();

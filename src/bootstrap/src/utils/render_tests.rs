@@ -215,8 +215,8 @@ impl<'a> Renderer<'a> {
             for bench in &self.benches {
                 rows.push((
                     &bench.name,
-                    format!("{:.2?}/iter", Duration::from_nanos(bench.median)),
-                    format!("+/- {:.2?}", Duration::from_nanos(bench.deviation)),
+                    format!("{:.2?}/iter", bench.median),
+                    format!("+/- {:.2?}", bench.deviation),
                 ));
             }
 
@@ -239,7 +239,7 @@ impl<'a> Renderer<'a> {
             suite.filtered_out,
             time = match suite.exec_time {
                 Some(t) => format!("; finished in {:.2?}", Duration::from_secs_f64(t)),
-                None => format!(""),
+                None => String::new(),
             }
         );
     }
@@ -377,7 +377,7 @@ struct SuiteOutcome {
     measured: usize,
     filtered_out: usize,
     /// The time it took to execute this test suite, or `None` if time measurement was not possible
-    /// (e.g. due to running inside Miri).
+    /// (e.g. due to running on wasm).
     exec_time: Option<f64>,
 }
 
@@ -394,8 +394,8 @@ enum TestMessage {
 #[derive(serde_derive::Deserialize)]
 struct BenchOutcome {
     name: String,
-    median: u64,
-    deviation: u64,
+    median: f64,
+    deviation: f64,
 }
 
 #[derive(serde_derive::Deserialize)]

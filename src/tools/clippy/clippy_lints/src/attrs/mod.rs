@@ -7,8 +7,6 @@ mod deprecated_semver;
 mod duplicated_attributes;
 mod empty_line_after;
 mod inline_always;
-mod maybe_misused_cfg;
-mod mismatched_target_os;
 mod mixed_attributes_style;
 mod non_minimal_cfg;
 mod should_panic_without_expect;
@@ -17,7 +15,7 @@ mod useless_attribute;
 mod utils;
 
 use clippy_config::msrvs::Msrv;
-use rustc_ast::{Attribute, Crate, MetaItemKind, NestedMetaItem};
+use rustc_ast::{Attribute, MetaItemKind, NestedMetaItem};
 use rustc_hir::{ImplItem, Item, ItemKind, TraitItem};
 use rustc_lint::{EarlyContext, EarlyLintPass, LateContext, LateLintPass};
 use rustc_session::{declare_lint_pass, impl_lint_pass};
@@ -61,11 +59,21 @@ declare_clippy_lint! {
     ///
     /// This lint permits lint attributes for lints emitted on the items themself.
     /// For `use` items these lints are:
+    /// * ambiguous_glob_reexports
+    /// * dead_code
     /// * deprecated
+    /// * hidden_glob_reexports
     /// * unreachable_pub
-    /// * unused_imports
+    /// * unused
+    /// * unused_braces
+    /// * unused_import_braces
+    /// * clippy::disallowed_types
     /// * clippy::enum_glob_use
     /// * clippy::macro_use_imports
+    /// * clippy::module_name_repetitions
+    /// * clippy::redundant_pub_crate
+    /// * clippy::single_component_path_imports
+    /// * clippy::unsafe_removed_from_name
     /// * clippy::wildcard_imports
     ///
     /// For `extern crate` items these lints are:
@@ -262,46 +270,13 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for cfg attributes having operating systems used in target family position.
-    ///
-    /// ### Why is this bad?
-    /// The configuration option will not be recognised and the related item will not be included
-    /// by the conditional compilation engine.
-    ///
-    /// ### Example
-    /// ```no_run
-    /// #[cfg(linux)]
-    /// fn conditional() { }
-    /// ```
-    ///
-    /// Use instead:
-    /// ```no_run
-    /// # mod hidden {
-    /// #[cfg(target_os = "linux")]
-    /// fn conditional() { }
-    /// # }
-    ///
-    /// // or
-    ///
-    /// #[cfg(unix)]
-    /// fn conditional() { }
-    /// ```
-    /// Check the [Rust Reference](https://doc.rust-lang.org/reference/conditional-compilation.html#target_os) for more details.
-    #[clippy::version = "1.45.0"]
-    pub MISMATCHED_TARGET_OS,
-    correctness,
-    "usage of `cfg(operating_system)` instead of `cfg(target_os = \"operating_system\")`"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
     /// Checks for attributes that allow lints without a reason.
     ///
     /// (This requires the `lint_reasons` feature)
     ///
-    /// ### Why is this bad?
-    /// Allowing a lint should always have a reason. This reason should be documented to
-    /// ensure that others understand the reasoning
+    /// ### Why restrict this?
+    /// Justifying each `allow` helps readers understand the reasoning,
+    /// and may allow removing `allow` attributes if their purpose is obsolete.
     ///
     /// ### Example
     /// ```no_run
@@ -379,38 +354,6 @@ declare_clippy_lint! {
     pub NON_MINIMAL_CFG,
     style,
     "ensure that all `cfg(any())` and `cfg(all())` have more than one condition"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for `#[cfg(features = "...")]` and suggests to replace it with
-    /// `#[cfg(feature = "...")]`.
-    ///
-    /// It also checks if `cfg(test)` was misspelled.
-    ///
-    /// ### Why is this bad?
-    /// Misspelling `feature` as `features` or `test` as `tests` can be sometimes hard to spot. It
-    /// may cause conditional compilation not work quietly.
-    ///
-    /// ### Example
-    /// ```no_run
-    /// #[cfg(features = "some-feature")]
-    /// fn conditional() { }
-    /// #[cfg(tests)]
-    /// mod tests { }
-    /// ```
-    ///
-    /// Use instead:
-    /// ```no_run
-    /// #[cfg(feature = "some-feature")]
-    /// fn conditional() { }
-    /// #[cfg(test)]
-    /// mod tests { }
-    /// ```
-    #[clippy::version = "1.69.0"]
-    pub MAYBE_MISUSED_CFG,
-    suspicious,
-    "prevent from misusing the wrong attr name"
 }
 
 declare_clippy_lint! {
@@ -520,7 +463,7 @@ declare_clippy_lint! {
     /// #[allow(dead_code)]
     /// fn foo() {}
     /// ```
-    #[clippy::version = "1.78.0"]
+    #[clippy::version = "1.79.0"]
     pub DUPLICATED_ATTRIBUTES,
     suspicious,
     "duplicated attribute"
@@ -534,11 +477,13 @@ declare_lint_pass!(Attributes => [
     BLANKET_CLIPPY_RESTRICTION_LINTS,
     SHOULD_PANIC_WITHOUT_EXPECT,
     MIXED_ATTRIBUTES_STYLE,
+    DUPLICATED_ATTRIBUTES,
 ]);
 
 impl<'tcx> LateLintPass<'tcx> for Attributes {
     fn check_crate(&mut self, cx: &LateContext<'tcx>) {
         blanket_clippy_restriction_lints::check_command_line(cx);
+        duplicated_attributes::check(cx, cx.tcx.hir().krate_attrs());
     }
 
     fn check_attribute(&mut self, cx: &LateContext<'tcx>, attr: &'tcx Attribute) {
@@ -578,6 +523,7 @@ impl<'tcx> LateLintPass<'tcx> for Attributes {
             _ => {},
         }
         mixed_attributes_style::check(cx, item.span, attrs);
+        duplicated_attributes::check(cx, attrs);
     }
 
     fn check_impl_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx ImplItem<'_>) {
@@ -599,32 +545,22 @@ pub struct EarlyAttributes {
 
 impl_lint_pass!(EarlyAttributes => [
     DEPRECATED_CFG_ATTR,
-    MISMATCHED_TARGET_OS,
     EMPTY_LINE_AFTER_OUTER_ATTR,
     EMPTY_LINE_AFTER_DOC_COMMENTS,
     NON_MINIMAL_CFG,
-    MAYBE_MISUSED_CFG,
     DEPRECATED_CLIPPY_CFG_ATTR,
     UNNECESSARY_CLIPPY_CFG,
-    DUPLICATED_ATTRIBUTES,
 ]);
 
 impl EarlyLintPass for EarlyAttributes {
-    fn check_crate(&mut self, cx: &EarlyContext<'_>, krate: &Crate) {
-        duplicated_attributes::check(cx, &krate.attrs);
-    }
-
     fn check_item(&mut self, cx: &EarlyContext<'_>, item: &rustc_ast::Item) {
         empty_line_after::check(cx, item);
-        duplicated_attributes::check(cx, &item.attrs);
     }
 
     fn check_attribute(&mut self, cx: &EarlyContext<'_>, attr: &Attribute) {
         deprecated_cfg_attr::check(cx, attr, &self.msrv);
         deprecated_cfg_attr::check_clippy(cx, attr);
-        mismatched_target_os::check(cx, attr);
         non_minimal_cfg::check(cx, attr);
-        maybe_misused_cfg::check(cx, attr);
     }
 
     extract_msrv_attr!(EarlyContext);

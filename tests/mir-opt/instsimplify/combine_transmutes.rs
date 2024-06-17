@@ -1,12 +1,11 @@
-//@ unit-test: InstSimplify
+//@ test-mir-pass: InstSimplify
 //@ compile-flags: -C panic=abort
 #![crate_type = "lib"]
 #![feature(core_intrinsics)]
 #![feature(custom_mir)]
-#![feature(generic_nonzero)]
 
 use std::intrinsics::mir::*;
-use std::mem::{MaybeUninit, ManuallyDrop, transmute};
+use std::mem::{transmute, ManuallyDrop, MaybeUninit};
 
 // EMIT_MIR combine_transmutes.identity_transmutes.InstSimplify.diff
 pub unsafe fn identity_transmutes() {
@@ -62,4 +61,7 @@ pub unsafe fn adt_transmutes() {
     let _a: ManuallyDrop<String> = transmute(MaybeUninit::<String>::uninit());
 }
 
-pub union Union32 { u32: u32, i32: i32 }
+pub union Union32 {
+    u32: u32,
+    i32: i32,
+}

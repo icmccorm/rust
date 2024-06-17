@@ -25,6 +25,7 @@ pub type GatedCfg = (Symbol, Symbol, GateFn);
 const GATED_CFGS: &[GatedCfg] = &[
     // (name in cfg, feature, function to check if the feature is enabled)
     (sym::overflow_checks, sym::cfg_overflow_checks, cfg_fn!(cfg_overflow_checks)),
+    (sym::ub_checks, sym::cfg_ub_checks, cfg_fn!(cfg_ub_checks)),
     (sym::target_thread_local, sym::cfg_target_thread_local, cfg_fn!(cfg_target_thread_local)),
     (
         sym::target_has_atomic_equal_alignment,
@@ -56,6 +57,16 @@ pub enum AttributeType {
 
     /// Builtin attribute that is only allowed at the crate level
     CrateLevel,
+}
+
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub enum AttributeSafety {
+    /// Normal attribute that does not need `#[unsafe(...)]`
+    Normal,
+
+    /// Unsafe attribute that requires safety obligations
+    /// to be discharged
+    Unsafe,
 }
 
 #[derive(Clone, Copy)]
@@ -171,11 +182,23 @@ macro_rules! template {
 }
 
 macro_rules! ungated {
+    (unsafe $attr:ident, $typ:expr, $tpl:expr, $duplicates:expr, $encode_cross_crate:expr $(,)?) => {
+        BuiltinAttribute {
+            name: sym::$attr,
+            encode_cross_crate: $encode_cross_crate,
+            type_: $typ,
+            safety: AttributeSafety::Unsafe,
+            template: $tpl,
+            gate: Ungated,
+            duplicates: $duplicates,
+        }
+    };
     ($attr:ident, $typ:expr, $tpl:expr, $duplicates:expr, $encode_cross_crate:expr $(,)?) => {
         BuiltinAttribute {
             name: sym::$attr,
             encode_cross_crate: $encode_cross_crate,
             type_: $typ,
+            safety: AttributeSafety::Normal,
             template: $tpl,
             gate: Ungated,
             duplicates: $duplicates,
@@ -184,11 +207,34 @@ macro_rules! ungated {
 }
 
 macro_rules! gated {
+    (unsafe $attr:ident, $typ:expr, $tpl:expr, $duplicates:expr, $encode_cross_crate:expr, $gate:ident, $msg:expr $(,)?) => {
+        BuiltinAttribute {
+            name: sym::$attr,
+            encode_cross_crate: $encode_cross_crate,
+            type_: $typ,
+            safety: AttributeSafety::Unsafe,
+            template: $tpl,
+            duplicates: $duplicates,
+            gate: Gated(Stability::Unstable, sym::$gate, $msg, cfg_fn!($gate)),
+        }
+    };
+    (unsafe $attr:ident, $typ:expr, $tpl:expr, $duplicates:expr, $encode_cross_crate:expr, $msg:expr $(,)?) => {
+        BuiltinAttribute {
+            name: sym::$attr,
+            encode_cross_crate: $encode_cross_crate,
+            type_: $typ,
+            safety: AttributeSafety::Unsafe,
+            template: $tpl,
+            duplicates: $duplicates,
+            gate: Gated(Stability::Unstable, sym::$attr, $msg, cfg_fn!($attr)),
+        }
+    };
     ($attr:ident, $typ:expr, $tpl:expr, $duplicates:expr, $encode_cross_crate:expr, $gate:ident, $msg:expr $(,)?) => {
         BuiltinAttribute {
             name: sym::$attr,
             encode_cross_crate: $encode_cross_crate,
             type_: $typ,
+            safety: AttributeSafety::Normal,
             template: $tpl,
             duplicates: $duplicates,
             gate: Gated(Stability::Unstable, sym::$gate, $msg, cfg_fn!($gate)),
@@ -199,6 +245,7 @@ macro_rules! gated {
             name: sym::$attr,
             encode_cross_crate: $encode_cross_crate,
             type_: $typ,
+            safety: AttributeSafety::Normal,
             template: $tpl,
             duplicates: $duplicates,
             gate: Gated(Stability::Unstable, sym::$attr, $msg, cfg_fn!($attr)),
@@ -227,6 +274,7 @@ macro_rules! rustc_attr {
             name: sym::$attr,
             encode_cross_crate: $encode_cross_crate,
             type_: $typ,
+            safety: AttributeSafety::Normal,
             template: $tpl,
             duplicates: $duplicates,
             gate: Gated(Stability::Unstable, sym::rustc_attrs, $msg, cfg_fn!(rustc_attrs)),
@@ -257,6 +305,7 @@ pub struct BuiltinAttribute {
     /// Otherwise, it can only be used in the local crate.
     pub encode_cross_crate: EncodeCrossCrate,
     pub type_: AttributeType,
+    pub safety: AttributeSafety,
     pub template: AttributeTemplate,
     pub duplicates: AttributeDuplicates,
     pub gate: AttributeGate,
@@ -374,9 +423,9 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     ),
     ungated!(no_link, Normal, template!(Word), WarnFollowing, EncodeCrossCrate::No),
     ungated!(repr, Normal, template!(List: "C"), DuplicatesOk, EncodeCrossCrate::No),
-    ungated!(export_name, Normal, template!(NameValueStr: "name"), FutureWarnPreceding, EncodeCrossCrate::No),
-    ungated!(link_section, Normal, template!(NameValueStr: "name"), FutureWarnPreceding, EncodeCrossCrate::No),
-    ungated!(no_mangle, Normal, template!(Word), WarnFollowing, EncodeCrossCrate::No),
+    ungated!(unsafe export_name, Normal, template!(NameValueStr: "name"), FutureWarnPreceding, EncodeCrossCrate::No),
+    ungated!(unsafe link_section, Normal, template!(NameValueStr: "name"), FutureWarnPreceding, EncodeCrossCrate::No),
+    ungated!(unsafe no_mangle, Normal, template!(Word), WarnFollowing, EncodeCrossCrate::No),
     ungated!(used, Normal, template!(Word, List: "compiler|linker"), WarnFollowing, EncodeCrossCrate::No),
     ungated!(link_ordinal, Normal, template!(List: "ordinal"), ErrorPreceding, EncodeCrossCrate::Yes),
 
@@ -395,10 +444,6 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     ),
 
     // Entry point:
-    gated!(
-        unix_sigpipe, Normal, template!(NameValueStr: "inherit|sig_ign|sig_dfl"), ErrorFollowing,
-        EncodeCrossCrate::Yes, experimental!(unix_sigpipe)
-    ),
     ungated!(start, Normal, template!(Word), WarnFollowing, EncodeCrossCrate::No),
     ungated!(no_start, CrateLevel, template!(Word), WarnFollowing, EncodeCrossCrate::No),
     ungated!(no_main, CrateLevel, template!(Word), WarnFollowing, EncodeCrossCrate::No),
@@ -449,6 +494,9 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         template!(List: r#"natvis_file = "...", gdb_script_file = "...""#),
         DuplicatesOk, EncodeCrossCrate::No
     ),
+    ungated!(collapse_debuginfo, Normal, template!(List: "no|external|yes"), ErrorFollowing,
+        EncodeCrossCrate::Yes
+    ),
 
     // ==========================================================================
     // Unstable attributes:
@@ -486,11 +534,11 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     ),
 
     gated!(
-        ffi_pure, Normal, template!(Word), WarnFollowing,
+        unsafe ffi_pure, Normal, template!(Word), WarnFollowing,
         EncodeCrossCrate::No, experimental!(ffi_pure)
     ),
     gated!(
-        ffi_const, Normal, template!(Word), WarnFollowing,
+        unsafe ffi_const, Normal, template!(Word), WarnFollowing,
         EncodeCrossCrate::No, experimental!(ffi_const)
     ),
     gated!(
@@ -515,22 +563,16 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         EncodeCrossCrate::Yes, experimental!(deprecated_safe),
     ),
 
-    // `#[collapse_debuginfo]`
-    gated!(
-        collapse_debuginfo, Normal, template!(Word, List: "no|external|yes"), ErrorFollowing,
-        EncodeCrossCrate::No, experimental!(collapse_debuginfo)
-    ),
-
-    // RFC 2397
-    gated!(
-        do_not_recommend, Normal, template!(Word), WarnFollowing,
-        EncodeCrossCrate::No, experimental!(do_not_recommend)
-    ),
-
     // `#[cfi_encoding = ""]`
     gated!(
         cfi_encoding, Normal, template!(NameValueStr: "encoding"), ErrorPreceding,
         EncodeCrossCrate::Yes, experimental!(cfi_encoding)
+    ),
+
+    // `#[coroutine]` attribute to be applied to closures to make them coroutines instead
+    gated!(
+        coroutine, Normal, template!(Word), ErrorFollowing,
+        EncodeCrossCrate::No, coroutines, experimental!(coroutines)
     ),
 
     // ==========================================================================
@@ -584,6 +626,12 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         "rustc_allowed_through_unstable_modules special cases accidental stabilizations of stable items \
         through unstable paths"
     ),
+    rustc_attr!(
+        rustc_deprecated_safe_2024, Normal, template!(Word), WarnFollowing,
+        EncodeCrossCrate::Yes,
+        "rustc_deprecated_safe_2024 is supposed to be used in libstd only",
+    ),
+
 
     // ==========================================================================
     // Internal attributes: Type system related:
@@ -797,7 +845,7 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     // ==========================================================================
     gated!(
         lang, Normal, template!(NameValueStr: "name"), DuplicatesOk, EncodeCrossCrate::No, lang_items,
-        "language items are subject to change",
+        "lang items are subject to change",
     ),
     rustc_attr!(
         rustc_pass_by_value, Normal, template!(Word), ErrorFollowing,
@@ -850,6 +898,7 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         // FIXME: This can be `true` once we always use `tcx.is_diagnostic_item`.
         encode_cross_crate: EncodeCrossCrate::Yes,
         type_: Normal,
+        safety: AttributeSafety::Normal,
         template: template!(NameValueStr: "name"),
         duplicates: ErrorFollowing,
         gate: Gated(
@@ -899,10 +948,11 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         "the `#[rustc_main]` attribute is used internally to specify test entry point function",
     ),
     rustc_attr!(
-        rustc_skip_array_during_method_dispatch, Normal, template!(Word),
-        WarnFollowing, EncodeCrossCrate::No,
-        "the `#[rustc_skip_array_during_method_dispatch]` attribute is used to exclude a trait \
-        from method dispatch when the receiver is an array, for compatibility in editions < 2021."
+        rustc_skip_during_method_dispatch, Normal, template!(List: "array, boxed_slice"), WarnFollowing,
+        EncodeCrossCrate::No,
+        "the `#[rustc_skip_during_method_dispatch]` attribute is used to exclude a trait \
+        from method dispatch when the receiver is of the following type, for compatibility in \
+        editions < 2021 (array) or editions < 2024 (boxed_slice)."
     ),
     rustc_attr!(
         rustc_must_implement_one_of, Normal, template!(List: "function1, function2, ..."),
@@ -1081,7 +1131,7 @@ pub fn is_builtin_attr_name(name: Symbol) -> bool {
 /// This means it can be used cross crate.
 pub fn encode_cross_crate(name: Symbol) -> bool {
     if let Some(attr) = BUILTIN_ATTRIBUTE_MAP.get(&name) {
-        if attr.encode_cross_crate == EncodeCrossCrate::Yes { true } else { false }
+        attr.encode_cross_crate == EncodeCrossCrate::Yes
     } else {
         true
     }
@@ -1093,6 +1143,10 @@ pub fn is_valid_for_get_attr(name: Symbol) -> bool {
         | FutureWarnPreceding => true,
         DuplicatesOk | WarnFollowingWordOnly => false,
     })
+}
+
+pub fn is_unsafe_attr(name: Symbol) -> bool {
+    BUILTIN_ATTRIBUTE_MAP.get(&name).is_some_and(|attr| attr.safety == AttributeSafety::Unsafe)
 }
 
 pub static BUILTIN_ATTRIBUTE_MAP: LazyLock<FxHashMap<Symbol, &BuiltinAttribute>> =

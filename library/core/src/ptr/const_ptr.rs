@@ -330,7 +330,7 @@ impl<T: ?Sized> *const T {
     ///
     /// unsafe {
     ///     if let Some(val_back) = ptr.as_ref() {
-    ///         println!("We got back the value: {val_back}!");
+    ///         assert_eq!(val_back, &10);
     ///     }
     /// }
     /// ```
@@ -346,7 +346,7 @@ impl<T: ?Sized> *const T {
     ///
     /// unsafe {
     ///     let val_back = &*ptr;
-    ///     println!("We got back the value: {val_back}!");
+    ///     assert_eq!(val_back, &10);
     /// }
     /// ```
     #[stable(feature = "ptr_as_ref", since = "1.9.0")]
@@ -356,6 +356,54 @@ impl<T: ?Sized> *const T {
         // SAFETY: the caller must guarantee that `self` is valid
         // for a reference if it isn't null.
         if self.is_null() { None } else { unsafe { Some(&*self) } }
+    }
+
+    /// Returns a shared reference to the value behind the pointer.
+    /// If the pointer may be null or the value may be uninitialized, [`as_uninit_ref`] must be used instead.
+    /// If the pointer may be null, but the value is known to have been initialized, [`as_ref`] must be used instead.
+    ///
+    /// [`as_ref`]: #method.as_ref
+    /// [`as_uninit_ref`]: #method.as_uninit_ref
+    ///
+    /// # Safety
+    ///
+    /// When calling this method, you have to ensure that all of the following is true:
+    ///
+    /// * The pointer must be properly aligned.
+    ///
+    /// * It must be "dereferenceable" in the sense defined in [the module documentation].
+    ///
+    /// * The pointer must point to an initialized instance of `T`.
+    ///
+    /// * You must enforce Rust's aliasing rules, since the returned lifetime `'a` is
+    ///   arbitrarily chosen and does not necessarily reflect the actual lifetime of the data.
+    ///   In particular, while this reference exists, the memory the pointer points to must
+    ///   not get mutated (except inside `UnsafeCell`).
+    ///
+    /// This applies even if the result of this method is unused!
+    /// (The part about being initialized is not yet fully decided, but until
+    /// it is, the only safe approach is to ensure that they are indeed initialized.)
+    ///
+    /// [the module documentation]: crate::ptr#safety
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(ptr_as_ref_unchecked)]
+    /// let ptr: *const u8 = &10u8 as *const u8;
+    ///
+    /// unsafe {
+    ///     assert_eq!(ptr.as_ref_unchecked(), &10);
+    /// }
+    /// ```
+    // FIXME: mention it in the docs for `as_ref` and `as_uninit_ref` once stabilized.
+    #[unstable(feature = "ptr_as_ref_unchecked", issue = "122034")]
+    #[rustc_const_unstable(feature = "const_ptr_as_ref", issue = "91822")]
+    #[inline]
+    #[must_use]
+    pub const unsafe fn as_ref_unchecked<'a>(self) -> &'a T {
+        // SAFETY: the caller must guarantee that `self` is valid for a reference
+        unsafe { &*self }
     }
 
     /// Returns `None` if the pointer is null, or else returns a shared reference to
@@ -391,7 +439,7 @@ impl<T: ?Sized> *const T {
     ///
     /// unsafe {
     ///     if let Some(val_back) = ptr.as_uninit_ref() {
-    ///         println!("We got back the value: {}!", val_back.assume_init());
+    ///         assert_eq!(val_back.assume_init(), 10);
     ///     }
     /// }
     /// ```
@@ -417,8 +465,9 @@ impl<T: ?Sized> *const T {
     /// If any of the following conditions are violated, the result is Undefined
     /// Behavior:
     ///
-    /// * Both the starting and resulting pointer must be either in bounds or one
-    ///   byte past the end of the same [allocated object].
+    /// * If the computed offset, **in bytes**, is non-zero, then both the starting and resulting
+    ///   pointer must be either in bounds or at the end of the same [allocated object].
+    ///   (If it is zero, then the function is always well-defined.)
     ///
     /// * The computed offset, **in bytes**, cannot overflow an `isize`.
     ///
@@ -452,8 +501,8 @@ impl<T: ?Sized> *const T {
     /// let ptr: *const u8 = s.as_ptr();
     ///
     /// unsafe {
-    ///     println!("{}", *ptr.offset(1) as char);
-    ///     println!("{}", *ptr.offset(2) as char);
+    ///     assert_eq!(*ptr.offset(1) as char, '2');
+    ///     assert_eq!(*ptr.offset(2) as char, '3');
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -524,19 +573,21 @@ impl<T: ?Sized> *const T {
     /// # Examples
     ///
     /// ```
+    /// # use std::fmt::Write;
     /// // Iterate using a raw pointer in increments of two elements
     /// let data = [1u8, 2, 3, 4, 5];
     /// let mut ptr: *const u8 = data.as_ptr();
     /// let step = 2;
     /// let end_rounded_up = ptr.wrapping_offset(6);
     ///
-    /// // This loop prints "1, 3, 5, "
+    /// let mut out = String::new();
     /// while ptr != end_rounded_up {
     ///     unsafe {
-    ///         print!("{}, ", *ptr);
+    ///         write!(&mut out, "{}, ", *ptr).unwrap();
     ///     }
     ///     ptr = ptr.wrapping_offset(step);
     /// }
+    /// assert_eq!(out.as_str(), "1, 3, 5, ");
     /// ```
     #[stable(feature = "ptr_wrapping_offset", since = "1.16.0")]
     #[must_use = "returns a new pointer rather than modifying its argument"]
@@ -628,11 +679,11 @@ impl<T: ?Sized> *const T {
     /// If any of the following conditions are violated, the result is Undefined
     /// Behavior:
     ///
-    /// * Both `self` and `origin` must be either in bounds or one
-    ///   byte past the end of the same [allocated object].
+    /// * `self` and `origin` must either
     ///
-    /// * Both pointers must be *derived from* a pointer to the same object.
-    ///   (See below for an example.)
+    ///   * both be *derived from* a pointer to the same [allocated object], and the memory range between
+    ///     the two pointers must be either empty or in bounds of that object. (See below for an example.)
+    ///   * or both be derived from an integer literal/constant, and point to the same address.
     ///
     /// * The distance between the pointers, in bytes, must be an exact multiple
     ///   of the size of `T`.
@@ -903,8 +954,9 @@ impl<T: ?Sized> *const T {
     /// If any of the following conditions are violated, the result is Undefined
     /// Behavior:
     ///
-    /// * Both the starting and resulting pointer must be either in bounds or one
-    ///   byte past the end of the same [allocated object].
+    /// * If the computed offset, **in bytes**, is non-zero, then both the starting and resulting
+    ///   pointer must be either in bounds or at the end of the same [allocated object].
+    ///   (If it is zero, then the function is always well-defined.)
     ///
     /// * The computed offset, **in bytes**, cannot overflow an `isize`.
     ///
@@ -938,8 +990,8 @@ impl<T: ?Sized> *const T {
     /// let ptr: *const u8 = s.as_ptr();
     ///
     /// unsafe {
-    ///     println!("{}", *ptr.add(1) as char);
-    ///     println!("{}", *ptr.add(2) as char);
+    ///     assert_eq!(*ptr.add(1), b'2');
+    ///     assert_eq!(*ptr.add(2), b'3');
     /// }
     /// ```
     #[stable(feature = "pointer_methods", since = "1.26.0")]
@@ -987,8 +1039,9 @@ impl<T: ?Sized> *const T {
     /// If any of the following conditions are violated, the result is Undefined
     /// Behavior:
     ///
-    /// * Both the starting and resulting pointer must be either in bounds or one
-    ///   byte past the end of the same [allocated object].
+    /// * If the computed offset, **in bytes**, is non-zero, then both the starting and resulting
+    ///   pointer must be either in bounds or at the end of the same [allocated object].
+    ///   (If it is zero, then the function is always well-defined.)
     ///
     /// * The computed offset cannot exceed `isize::MAX` **bytes**.
     ///
@@ -1022,13 +1075,14 @@ impl<T: ?Sized> *const T {
     ///
     /// unsafe {
     ///     let end: *const u8 = s.as_ptr().add(3);
-    ///     println!("{}", *end.sub(1) as char);
-    ///     println!("{}", *end.sub(2) as char);
+    ///     assert_eq!(*end.sub(1), b'3');
+    ///     assert_eq!(*end.sub(2), b'2');
     /// }
     /// ```
     #[stable(feature = "pointer_methods", since = "1.26.0")]
     #[must_use = "returns a new pointer rather than modifying its argument"]
     #[rustc_const_stable(feature = "const_ptr_offset", since = "1.61.0")]
+    #[rustc_allow_const_fn_unstable(unchecked_neg)]
     #[inline(always)]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     pub const unsafe fn sub(self, count: usize) -> Self
@@ -1042,7 +1096,7 @@ impl<T: ?Sized> *const T {
             // SAFETY: the caller must uphold the safety contract for `offset`.
             // Because the pointee is *not* a ZST, that means that `count` is
             // at most `isize::MAX`, and thus the negation cannot overflow.
-            unsafe { self.offset(intrinsics::unchecked_sub(0, count as isize)) }
+            unsafe { self.offset((count as isize).unchecked_neg()) }
         }
     }
 
@@ -1103,19 +1157,21 @@ impl<T: ?Sized> *const T {
     /// # Examples
     ///
     /// ```
+    /// # use std::fmt::Write;
     /// // Iterate using a raw pointer in increments of two elements
     /// let data = [1u8, 2, 3, 4, 5];
     /// let mut ptr: *const u8 = data.as_ptr();
     /// let step = 2;
     /// let end_rounded_up = ptr.wrapping_add(6);
     ///
-    /// // This loop prints "1, 3, 5, "
+    /// let mut out = String::new();
     /// while ptr != end_rounded_up {
     ///     unsafe {
-    ///         print!("{}, ", *ptr);
+    ///         write!(&mut out, "{}, ", *ptr).unwrap();
     ///     }
     ///     ptr = ptr.wrapping_add(step);
     /// }
+    /// assert_eq!(out, "1, 3, 5, ");
     /// ```
     #[stable(feature = "pointer_methods", since = "1.26.0")]
     #[must_use = "returns a new pointer rather than modifying its argument"]
@@ -1182,19 +1238,21 @@ impl<T: ?Sized> *const T {
     /// # Examples
     ///
     /// ```
+    /// # use std::fmt::Write;
     /// // Iterate using a raw pointer in increments of two elements (backwards)
     /// let data = [1u8, 2, 3, 4, 5];
     /// let mut ptr: *const u8 = data.as_ptr();
     /// let start_rounded_down = ptr.wrapping_sub(2);
     /// ptr = ptr.wrapping_add(4);
     /// let step = 2;
-    /// // This loop prints "5, 3, 1, "
+    /// let mut out = String::new();
     /// while ptr != start_rounded_down {
     ///     unsafe {
-    ///         print!("{}, ", *ptr);
+    ///         write!(&mut out, "{}, ", *ptr).unwrap();
     ///     }
     ///     ptr = ptr.wrapping_sub(step);
     /// }
+    /// assert_eq!(out, "5, 3, 1, ");
     /// ```
     #[stable(feature = "pointer_methods", since = "1.26.0")]
     #[must_use = "returns a new pointer rather than modifying its argument"]
@@ -1496,7 +1554,7 @@ impl<T: ?Sized> *const T {
     /// [tracking issue]: https://github.com/rust-lang/rust/issues/104203
     #[must_use]
     #[inline]
-    #[stable(feature = "pointer_is_aligned", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "pointer_is_aligned", since = "1.79.0")]
     #[rustc_const_unstable(feature = "const_pointer_is_aligned", issue = "104203")]
     pub const fn is_aligned(self) -> bool
     where
@@ -1647,16 +1705,15 @@ impl<T> *const [T] {
     /// # Examples
     ///
     /// ```rust
-    /// #![feature(slice_ptr_len)]
-    ///
     /// use std::ptr;
     ///
     /// let slice: *const [i8] = ptr::slice_from_raw_parts(ptr::null(), 3);
     /// assert_eq!(slice.len(), 3);
     /// ```
     #[inline]
-    #[unstable(feature = "slice_ptr_len", issue = "71146")]
-    #[rustc_const_unstable(feature = "const_slice_ptr_len", issue = "71146")]
+    #[stable(feature = "slice_ptr_len", since = "1.79.0")]
+    #[rustc_const_stable(feature = "const_slice_ptr_len", since = "1.79.0")]
+    #[rustc_allow_const_fn_unstable(ptr_metadata)]
     pub const fn len(self) -> usize {
         metadata(self)
     }
@@ -1666,15 +1723,14 @@ impl<T> *const [T] {
     /// # Examples
     ///
     /// ```
-    /// #![feature(slice_ptr_len)]
     /// use std::ptr;
     ///
     /// let slice: *const [i8] = ptr::slice_from_raw_parts(ptr::null(), 3);
     /// assert!(!slice.is_empty());
     /// ```
     #[inline(always)]
-    #[unstable(feature = "slice_ptr_len", issue = "71146")]
-    #[rustc_const_unstable(feature = "const_slice_ptr_len", issue = "71146")]
+    #[stable(feature = "slice_ptr_len", since = "1.79.0")]
+    #[rustc_const_stable(feature = "const_slice_ptr_len", since = "1.79.0")]
     pub const fn is_empty(self) -> bool {
         self.len() == 0
     }
@@ -1804,7 +1860,7 @@ impl<T, const N: usize> *const [T; N] {
     /// # Examples
     ///
     /// ```
-    /// #![feature(array_ptr_get, slice_ptr_len)]
+    /// #![feature(array_ptr_get)]
     ///
     /// let arr: *const [i32; 3] = &[1, 2, 4] as *const [i32; 3];
     /// let slice: *const [i32] = arr.as_slice();

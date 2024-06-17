@@ -1,5 +1,5 @@
 <!---
-lsp/ext.rs hash: 223f48a89a5126a0
+lsp/ext.rs hash: 1babf76a3c2cef3b
 
 If you need to change the above hash to make the test pass, please check if you
 need to adjust this doc as well and ping this issue:
@@ -377,6 +377,7 @@ rust-analyzer supports only one `kind`, `"cargo"`. The `args` for `"cargo"` look
 ```typescript
 {
     workspaceRoot?: string;
+    cwd?: string;
     cargoArgs: string[];
     cargoExtraArgs: string[];
     executableArgs: string[];
@@ -444,7 +445,7 @@ interface DiscoverTestResults {
     // For each file which its uri is in this list, the response
     // contains all tests that are located in this file, and
     // client should remove old tests not included in the response.
-    scopeFile: lc.TextDocumentIdentifier[] | undefined;    
+    scopeFile: lc.TextDocumentIdentifier[] | undefined;
 }
 ```
 

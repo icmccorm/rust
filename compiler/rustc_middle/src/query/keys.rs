@@ -360,6 +360,14 @@ impl<'tcx> Key for (ty::ParamEnv<'tcx>, ty::TraitRef<'tcx>) {
     }
 }
 
+impl<'tcx> Key for ty::TraitRef<'tcx> {
+    type Cache<V> = DefaultCache<Self, V>;
+
+    fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
+        tcx.def_span(self.def_id)
+    }
+}
+
 impl<'tcx> Key for ty::PolyTraitRef<'tcx> {
     type Cache<V> = DefaultCache<Self, V>;
 
@@ -432,7 +440,7 @@ impl<'tcx> Key for (Ty<'tcx>, Ty<'tcx>) {
     }
 }
 
-impl<'tcx> Key for &'tcx ty::List<ty::Clause<'tcx>> {
+impl<'tcx> Key for ty::Clauses<'tcx> {
     type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
@@ -552,6 +560,19 @@ impl Key for HirId {
     #[inline(always)]
     fn key_as_def_id(&self) -> Option<DefId> {
         None
+    }
+}
+
+impl Key for (LocalDefId, HirId) {
+    type Cache<V> = DefaultCache<Self, V>;
+
+    fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
+        tcx.hir().span(self.1)
+    }
+
+    #[inline(always)]
+    fn key_as_def_id(&self) -> Option<DefId> {
+        Some(self.0.into())
     }
 }
 

@@ -184,12 +184,12 @@ macro_rules! make_mir_visitor {
 
             /// This is called for every constant in the MIR body and every `required_consts`
             /// (i.e., including consts that have been dead-code-eliminated).
-            fn visit_constant(
+            fn visit_const_operand(
                 &mut self,
                 constant: & $($mutability)? ConstOperand<'tcx>,
                 location: Location,
             ) {
-                self.super_constant(constant, location);
+                self.super_const_operand(constant, location);
             }
 
             fn visit_ty_const(
@@ -350,12 +350,14 @@ macro_rules! make_mir_visitor {
                             receiver_by_ref: _,
                         } |
                         ty::InstanceDef::CoroutineKindShim { coroutine_def_id: _def_id } |
+                        ty::InstanceDef::AsyncDropGlueCtorShim(_def_id, None) |
                         ty::InstanceDef::DropGlue(_def_id, None) => {}
 
                         ty::InstanceDef::FnPtrShim(_def_id, ty) |
                         ty::InstanceDef::DropGlue(_def_id, Some(ty)) |
                         ty::InstanceDef::CloneShim(_def_id, ty) |
-                        ty::InstanceDef::FnPtrAddrShim(_def_id, ty) => {
+                        ty::InstanceDef::FnPtrAddrShim(_def_id, ty) |
+                        ty::InstanceDef::AsyncDropGlueCtorShim(_def_id, Some(ty)) => {
                             // FIXME(eddyb) use a better `TyContext` here.
                             self.visit_ty($(& $mutability)? *ty, TyContext::Location(location));
                         }
@@ -595,7 +597,7 @@ macro_rules! make_mir_visitor {
                                 }
                                 InlineAsmOperand::Const { value }
                                 | InlineAsmOperand::SymFn { value } => {
-                                    self.visit_constant(value, location);
+                                    self.visit_const_operand(value, location);
                                 }
                                 InlineAsmOperand::Out { place: None, .. }
                                 | InlineAsmOperand::SymStatic { def_id: _ }
@@ -653,7 +655,7 @@ macro_rules! make_mir_visitor {
                             BorrowKind::Shared => PlaceContext::NonMutatingUse(
                                 NonMutatingUseContext::SharedBorrow
                             ),
-                            BorrowKind::Fake => PlaceContext::NonMutatingUse(
+                            BorrowKind::Fake(_) => PlaceContext::NonMutatingUse(
                                 NonMutatingUseContext::FakeBorrow
                             ),
                             BorrowKind::Mut { .. } =>
@@ -694,8 +696,7 @@ macro_rules! make_mir_visitor {
                         self.visit_ty($(& $mutability)? *ty, TyContext::Location(location));
                     }
 
-                    Rvalue::BinaryOp(_bin_op, box(lhs, rhs))
-                    | Rvalue::CheckedBinaryOp(_bin_op, box(lhs, rhs)) => {
+                    Rvalue::BinaryOp(_bin_op, box(lhs, rhs)) => {
                         self.visit_operand(lhs, location);
                         self.visit_operand(rhs, location);
                     }
@@ -751,6 +752,9 @@ macro_rules! make_mir_visitor {
                             ) => {
                                 self.visit_args(coroutine_closure_args, location);
                             }
+                            AggregateKind::RawPtr(ty, _) => {
+                                self.visit_ty($(& $mutability)? *ty, TyContext::Location(location));
+                            }
                         }
 
                         for operand in operands {
@@ -784,7 +788,7 @@ macro_rules! make_mir_visitor {
                         );
                     }
                     Operand::Constant(constant) => {
-                        self.visit_constant(constant, location);
+                        self.visit_const_operand(constant, location);
                     }
                 }
             }
@@ -863,7 +867,7 @@ macro_rules! make_mir_visitor {
                     }
                 }
                 match value {
-                    VarDebugInfoContents::Const(c) => self.visit_constant(c, location),
+                    VarDebugInfoContents::Const(c) => self.visit_const_operand(c, location),
                     VarDebugInfoContents::Place(place) =>
                         self.visit_place(
                             place,
@@ -878,7 +882,7 @@ macro_rules! make_mir_visitor {
                 _scope: $(& $mutability)? SourceScope
             ) {}
 
-            fn super_constant(
+            fn super_const_operand(
                 &mut self,
                 constant: & $($mutability)? ConstOperand<'tcx>,
                 location: Location
@@ -891,7 +895,7 @@ macro_rules! make_mir_visitor {
 
                 self.visit_span($(& $mutability)? *span);
                 match const_ {
-                    Const::Ty(ct) => self.visit_ty_const($(&$mutability)? *ct, location),
+                    Const::Ty(_, ct) => self.visit_ty_const($(&$mutability)? *ct, location),
                     Const::Val(_, ty) => self.visit_ty($(& $mutability)? *ty, TyContext::Location(location)),
                     Const::Unevaluated(_, ty) => self.visit_ty($(& $mutability)? *ty, TyContext::Location(location)),
                 }
@@ -1053,7 +1057,7 @@ macro_rules! super_body {
 
         for const_ in &$($mutability)? $body.required_consts {
             let location = Location::START;
-            $self.visit_constant(const_, location);
+            $self.visit_const_operand(const_, location);
         }
     }
 }
@@ -1279,6 +1283,8 @@ pub enum NonMutatingUseContext {
     /// Shared borrow.
     SharedBorrow,
     /// A fake borrow.
+    /// FIXME: do we need to distinguish shallow and deep fake borrows? In fact, do we need to
+    /// distinguish fake and normal deep borrows?
     FakeBorrow,
     /// AddressOf for *const pointer.
     AddressOf,

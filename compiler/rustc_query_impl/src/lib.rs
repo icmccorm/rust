@@ -1,18 +1,17 @@
 //! Support for serializing the dep-graph and reloading it.
 
+// tidy-alphabetical-start
+#![allow(internal_features)]
+#![allow(rustc::potential_query_instability, unused_parens)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
-#![feature(rustdoc_internals)]
-#![feature(generic_nonzero)]
 #![feature(min_specialization)]
 #![feature(rustc_attrs)]
-#![allow(rustc::potential_query_instability, unused_parens)]
-#![allow(internal_features)]
-
-#[macro_use]
-extern crate rustc_middle;
+#![feature(rustdoc_internals)]
+// tidy-alphabetical-end
 
 use crate::plumbing::{__rust_begin_short_backtrace, encode_all_query_results, try_mark_green};
+use crate::profiling_support::QueryKeyStringCache;
 use field_offset::offset_of;
 use rustc_data_structures::stable_hasher::HashStable;
 use rustc_data_structures::sync::AtomicU64;
@@ -21,9 +20,7 @@ use rustc_middle::dep_graph::DepNodeIndex;
 use rustc_middle::dep_graph::{self, DepKind, DepKindStruct};
 use rustc_middle::query::erase::{erase, restore, Erase};
 use rustc_middle::query::on_disk_cache::{CacheEncoder, EncodedDepNodeIndex, OnDiskCache};
-use rustc_middle::query::plumbing::{
-    DynamicQuery, QueryKeyStringCache, QuerySystem, QuerySystemFns,
-};
+use rustc_middle::query::plumbing::{DynamicQuery, QuerySystem, QuerySystemFns};
 use rustc_middle::query::AsLocalKey;
 use rustc_middle::query::{
     queries, DynamicQueries, ExternProviders, Providers, QueryCaches, QueryEngine, QueryStates,
@@ -224,4 +221,4 @@ pub fn query_system<'tcx>(
     }
 }
 
-rustc_query_append! { define_queries! }
+rustc_middle::rustc_query_append! { define_queries! }

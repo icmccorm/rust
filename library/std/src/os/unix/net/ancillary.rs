@@ -3,7 +3,7 @@
 use super::{sockaddr_un, SocketAddr};
 use crate::io::{self, IoSlice, IoSliceMut};
 use crate::marker::PhantomData;
-use crate::mem::{size_of, zeroed};
+use crate::mem::zeroed;
 use crate::os::unix::io::RawFd;
 use crate::path::Path;
 use crate::ptr::{eq, read_unaligned};
@@ -20,7 +20,7 @@ use crate::sys::net::Socket;
 ))]
 #[allow(non_camel_case_types)]
 mod libc {
-    pub use libc::c_int;
+    pub use core::ffi::c_int;
     pub struct ucred;
     pub struct cmsghdr;
     pub struct sockcred2;

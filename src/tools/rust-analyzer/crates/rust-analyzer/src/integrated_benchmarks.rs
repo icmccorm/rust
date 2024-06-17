@@ -40,7 +40,7 @@ fn integrated_highlighting_benchmark() {
     };
     let load_cargo_config = LoadCargoConfig {
         load_out_dirs_from_check: true,
-        with_proc_macro_server: ProcMacroServerChoice::None,
+        with_proc_macro_server: ProcMacroServerChoice::Sysroot,
         prefill_caches: false,
     };
 
@@ -100,7 +100,7 @@ fn integrated_completion_benchmark() {
     };
     let load_cargo_config = LoadCargoConfig {
         load_out_dirs_from_check: true,
-        with_proc_macro_server: ProcMacroServerChoice::None,
+        with_proc_macro_server: ProcMacroServerChoice::Sysroot,
         prefill_caches: true,
     };
 
@@ -139,6 +139,7 @@ fn integrated_completion_benchmark() {
             enable_self_on_the_fly: true,
             enable_private_editable: true,
             enable_term_search: true,
+            term_search_fuel: 200,
             full_function_signatures: false,
             callable: Some(CallableSnippets::FillArguments),
             snippet_cap: SnippetCap::new(true),
@@ -149,9 +150,9 @@ fn integrated_completion_benchmark() {
                 group: true,
                 skip_glob_imports: true,
             },
-            snippets: Vec::new(),
             prefer_no_std: false,
             prefer_prelude: true,
+            snippets: Vec::new(),
             limit: None,
         };
         let position =
@@ -183,6 +184,7 @@ fn integrated_completion_benchmark() {
             enable_self_on_the_fly: true,
             enable_private_editable: true,
             enable_term_search: true,
+            term_search_fuel: 200,
             full_function_signatures: false,
             callable: Some(CallableSnippets::FillArguments),
             snippet_cap: SnippetCap::new(true),
@@ -193,9 +195,9 @@ fn integrated_completion_benchmark() {
                 group: true,
                 skip_glob_imports: true,
             },
-            snippets: Vec::new(),
             prefer_no_std: false,
             prefer_prelude: true,
+            snippets: Vec::new(),
             limit: None,
         };
         let position =
@@ -225,6 +227,7 @@ fn integrated_completion_benchmark() {
             enable_self_on_the_fly: true,
             enable_private_editable: true,
             enable_term_search: true,
+            term_search_fuel: 200,
             full_function_signatures: false,
             callable: Some(CallableSnippets::FillArguments),
             snippet_cap: SnippetCap::new(true),
@@ -235,9 +238,9 @@ fn integrated_completion_benchmark() {
                 group: true,
                 skip_glob_imports: true,
             },
-            snippets: Vec::new(),
             prefer_no_std: false,
             prefer_prelude: true,
+            snippets: Vec::new(),
             limit: None,
         };
         let position =
@@ -262,7 +265,7 @@ fn integrated_diagnostics_benchmark() {
     };
     let load_cargo_config = LoadCargoConfig {
         load_out_dirs_from_check: true,
-        with_proc_macro_server: ProcMacroServerChoice::None,
+        with_proc_macro_server: ProcMacroServerChoice::Sysroot,
         prefill_caches: true,
     };
 
@@ -295,12 +298,13 @@ fn integrated_diagnostics_benchmark() {
         },
         prefer_no_std: false,
         prefer_prelude: false,
+        term_search_fuel: 400,
     };
     host.analysis()
         .diagnostics(&diagnostics_config, ide::AssistResolveStrategy::None, file_id)
         .unwrap();
 
-    let _g = crate::tracing::hprof::init("*>1");
+    let _g = crate::tracing::hprof::init("*");
 
     {
         let _it = stdx::timeit("change");

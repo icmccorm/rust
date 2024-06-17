@@ -4,10 +4,10 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
+# tidy-alphabetical-start
 rustc_type_ir = { path = "../rustc_type_ir", default-features = false }
+# tidy-alphabetical-end
 
 [features]
 default = ["nightly"]
-nightly = [
-    "rustc_type_ir/nightly",
-]
+nightly = ["rustc_type_ir/nightly"]

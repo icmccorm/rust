@@ -87,17 +87,13 @@
 //! virtually impossible. Thus, symbol hash generation exclusively relies on
 //! DefPaths which are much more robust in the face of changes to the code base.
 
+// tidy-alphabetical-start
+#![allow(internal_features)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
-#![feature(rustdoc_internals)]
 #![feature(let_chains)]
-#![allow(internal_features)]
-
-#[macro_use]
-extern crate rustc_middle;
-
-#[macro_use]
-extern crate tracing;
+#![feature(rustdoc_internals)]
+// tidy-alphabetical-end
 
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
@@ -107,6 +103,7 @@ use rustc_middle::mir::mono::{InstantiationMode, MonoItem};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{self, Instance, TyCtxt};
 use rustc_session::config::SymbolManglingVersion;
+use tracing::debug;
 
 mod hashed;
 mod legacy;
@@ -114,7 +111,6 @@ mod v0;
 
 pub mod errors;
 pub mod test;
-pub mod typeid;
 
 /// This function computes the symbol name for the given `instance` and the
 /// given instantiating crate. That is, if you know that instance X is

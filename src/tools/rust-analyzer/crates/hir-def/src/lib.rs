@@ -106,6 +106,18 @@ use crate::{
     },
 };
 
+type FxIndexMap<K, V> =
+    indexmap::IndexMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+/// A wrapper around two booleans, [`ImportPathConfig::prefer_no_std`] and [`ImportPathConfig::prefer_prelude`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+pub struct ImportPathConfig {
+    /// If true, prefer to unconditionally use imports of the `core` and `alloc` crate
+    /// over the std.
+    pub prefer_no_std: bool,
+    /// If true, prefer import paths containing a prelude module.
+    pub prefer_prelude: bool,
+}
+
 #[derive(Debug)]
 pub struct ItemLoc<N: ItemTreeNode> {
     pub container: ModuleId,
@@ -422,6 +434,10 @@ impl ModuleId {
         }
     }
 
+    pub fn crate_def_map(self, db: &dyn DefDatabase) -> Arc<DefMap> {
+        db.crate_def_map(self.krate)
+    }
+
     pub fn krate(self) -> CrateId {
         self.krate
     }
@@ -438,6 +454,8 @@ impl ModuleId {
         })
     }
 
+    /// Returns the module containing `self`, either the parent `mod`, or the module (or block) containing
+    /// the block, if `self` corresponds to a block expression.
     pub fn containing_module(self, db: &dyn DefDatabase) -> Option<ModuleId> {
         self.def_map(db).containing_module(self.local_id)
     }
@@ -448,6 +466,26 @@ impl ModuleId {
 
     pub fn is_block_module(self) -> bool {
         self.block.is_some() && self.local_id == DefMap::ROOT
+    }
+
+    pub fn is_within_block(self) -> bool {
+        self.block.is_some()
+    }
+
+    pub fn as_crate_root(&self) -> Option<CrateRootModuleId> {
+        if self.local_id == DefMap::ROOT && self.block.is_none() {
+            Some(CrateRootModuleId { krate: self.krate })
+        } else {
+            None
+        }
+    }
+
+    pub fn derive_crate_root(&self) -> CrateRootModuleId {
+        CrateRootModuleId { krate: self.krate }
+    }
+
+    fn is_crate_root(&self) -> bool {
+        self.local_id == DefMap::ROOT && self.block.is_none()
     }
 }
 
@@ -927,6 +965,18 @@ impl GenericDefId {
             GenericDefId::ImplId(it) => file_id_and_params_of_item_loc(db, it),
             // We won't be using this ID anyway
             GenericDefId::EnumVariantId(_) => (FileId::BOGUS.into(), None),
+        }
+    }
+
+    pub fn assoc_trait_container(self, db: &dyn DefDatabase) -> Option<TraitId> {
+        match match self {
+            GenericDefId::FunctionId(f) => f.lookup(db).container,
+            GenericDefId::TypeAliasId(t) => t.lookup(db).container,
+            GenericDefId::ConstId(c) => c.lookup(db).container,
+            _ => return None,
+        } {
+            ItemContainerId::TraitId(trait_) => Some(trait_),
+            _ => None,
         }
     }
 }

@@ -1,5 +1,11 @@
+//! [Toolstate] checks to keep tools building
+//!
+//! Reachable via `./x.py test` but mostly relevant for CI, since it isn't run locally by default.
+//!
+//! [Toolstate]: https://forge.rust-lang.org/infra/toolstate.html
+
 use crate::core::builder::{Builder, RunConfig, ShouldRun, Step};
-use crate::utils::helpers::t;
+use crate::utils::helpers::{self, t};
 use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -7,7 +13,6 @@ use std::fmt;
 use std::fs;
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time;
 
 // Each cycle is 42 days long (6 weeks); the last week is 35..=42 then.
@@ -96,12 +101,8 @@ fn print_error(tool: &str, submodule: &str) {
 
 fn check_changed_files(toolstates: &HashMap<Box<str>, ToolState>) {
     // Changed files
-    let output = std::process::Command::new("git")
-        .arg("diff")
-        .arg("--name-status")
-        .arg("HEAD")
-        .arg("HEAD^")
-        .output();
+    let output =
+        helpers::git(None).arg("diff").arg("--name-status").arg("HEAD").arg("HEAD^").output();
     let output = match output {
         Ok(o) => o,
         Err(e) => {
@@ -245,8 +246,12 @@ impl Builder<'_> {
                 // Ensure the parent directory always exists
                 t!(std::fs::create_dir_all(parent));
             }
-            let mut file =
-                t!(fs::OpenOptions::new().create(true).write(true).read(true).open(path));
+            let mut file = t!(fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .read(true)
+                .open(path));
 
             serde_json::from_reader(&mut file).unwrap_or_default()
         } else {
@@ -278,8 +283,12 @@ impl Builder<'_> {
                 // Ensure the parent directory always exists
                 t!(std::fs::create_dir_all(parent));
             }
-            let mut file =
-                t!(fs::OpenOptions::new().create(true).read(true).write(true).open(path));
+            let mut file = t!(fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path));
 
             let mut current_toolstates: HashMap<Box<str>, ToolState> =
                 serde_json::from_reader(&mut file).unwrap_or_default();
@@ -310,7 +319,7 @@ fn checkout_toolstate_repo() {
         t!(fs::remove_dir_all(TOOLSTATE_DIR));
     }
 
-    let status = Command::new("git")
+    let status = helpers::git(None)
         .arg("clone")
         .arg("--depth=1")
         .arg(toolstate_repo())
@@ -328,7 +337,7 @@ fn checkout_toolstate_repo() {
 /// Sets up config and authentication for modifying the toolstate repo.
 fn prepare_toolstate_config(token: &str) {
     fn git_config(key: &str, value: &str) {
-        let status = Command::new("git").arg("config").arg("--global").arg(key).arg(value).status();
+        let status = helpers::git(None).arg("config").arg("--global").arg(key).arg(value).status();
         let success = match status {
             Ok(s) => s.success(),
             Err(_) => false,
@@ -392,8 +401,7 @@ fn commit_toolstate_change(current_toolstate: &ToolstateData) {
         publish_test_results(current_toolstate);
 
         // `git commit` failing means nothing to commit.
-        let status = t!(Command::new("git")
-            .current_dir(TOOLSTATE_DIR)
+        let status = t!(helpers::git(Some(Path::new(TOOLSTATE_DIR)))
             .arg("commit")
             .arg("-a")
             .arg("-m")
@@ -404,8 +412,7 @@ fn commit_toolstate_change(current_toolstate: &ToolstateData) {
             break;
         }
 
-        let status = t!(Command::new("git")
-            .current_dir(TOOLSTATE_DIR)
+        let status = t!(helpers::git(Some(Path::new(TOOLSTATE_DIR)))
             .arg("push")
             .arg("origin")
             .arg("master")
@@ -417,15 +424,13 @@ fn commit_toolstate_change(current_toolstate: &ToolstateData) {
         }
         eprintln!("Sleeping for 3 seconds before retrying push");
         std::thread::sleep(std::time::Duration::from_secs(3));
-        let status = t!(Command::new("git")
-            .current_dir(TOOLSTATE_DIR)
+        let status = t!(helpers::git(Some(Path::new(TOOLSTATE_DIR)))
             .arg("fetch")
             .arg("origin")
             .arg("master")
             .status());
         assert!(status.success());
-        let status = t!(Command::new("git")
-            .current_dir(TOOLSTATE_DIR)
+        let status = t!(helpers::git(Some(Path::new(TOOLSTATE_DIR)))
             .arg("reset")
             .arg("--hard")
             .arg("origin/master")
@@ -444,7 +449,7 @@ fn commit_toolstate_change(current_toolstate: &ToolstateData) {
 /// `publish_toolstate.py` script if the PR passes all tests and is merged to
 /// master.
 fn publish_test_results(current_toolstate: &ToolstateData) {
-    let commit = t!(std::process::Command::new("git").arg("rev-parse").arg("HEAD").output());
+    let commit = t!(helpers::git(None).arg("rev-parse").arg("HEAD").output());
     let commit = t!(String::from_utf8(commit.stdout));
 
     let toolstate_serialized = t!(serde_json::to_string(&current_toolstate));

@@ -1,5 +1,5 @@
 use crate::mir::{Operand, Place, Rvalue, StatementKind, UnwindAction, VarDebugInfoContents};
-use crate::ty::{Const, IndexedVal, Ty};
+use crate::ty::{IndexedVal, MirConst, Ty, TyConst};
 use crate::{with, Body, Mutability};
 use fmt::{Display, Formatter};
 use std::fmt::Debug;
@@ -8,7 +8,7 @@ use std::{fmt, io, iter};
 
 use super::{AssertMessage, BinOp, TerminatorKind};
 
-use super::BorrowKind;
+use super::{BorrowKind, FakeBorrowKind};
 
 impl Display for Ty {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -46,7 +46,7 @@ pub(crate) fn function_body<W: Write>(writer: &mut W, body: &Body, name: &str) -
             VarDebugInfoContents::Place(place) => {
                 format!("{place:?}")
             }
-            VarDebugInfoContents::Const(constant) => pretty_const(&constant.const_),
+            VarDebugInfoContents::Const(constant) => pretty_mir_const(&constant.const_),
         };
         writeln!(writer, "    debug {} => {};", info.name, content)
     })?;
@@ -156,7 +156,7 @@ fn pretty_terminator<W: Write>(writer: &mut W, terminator: &TerminatorKind) -> i
 
 fn pretty_terminator_head<W: Write>(writer: &mut W, terminator: &TerminatorKind) -> io::Result<()> {
     use self::TerminatorKind::*;
-    const INDENT: &'static str = "        ";
+    const INDENT: &str = "        ";
     match terminator {
         Goto { .. } => write!(writer, "{INDENT}goto"),
         SwitchInt { discr, .. } => {
@@ -310,12 +310,16 @@ fn pretty_operand(operand: &Operand) -> String {
         Operand::Move(mv) => {
             format!("move {:?}", mv)
         }
-        Operand::Constant(cnst) => pretty_const(&cnst.literal),
+        Operand::Constant(cnst) => pretty_mir_const(&cnst.const_),
     }
 }
 
-fn pretty_const(literal: &Const) -> String {
-    with(|cx| cx.const_pretty(&literal))
+fn pretty_mir_const(literal: &MirConst) -> String {
+    with(|cx| cx.mir_const_pretty(literal))
+}
+
+fn pretty_ty_const(ct: &TyConst) -> String {
+    with(|cx| cx.ty_const_pretty(ct.id))
 }
 
 fn pretty_rvalue<W: Write>(writer: &mut W, rval: &Rvalue) -> io::Result<()> {
@@ -352,13 +356,14 @@ fn pretty_rvalue<W: Write>(writer: &mut W, rval: &Rvalue) -> io::Result<()> {
         Rvalue::Ref(_, borrowkind, place) => {
             let kind = match borrowkind {
                 BorrowKind::Shared => "&",
-                BorrowKind::Fake => "&fake ",
+                BorrowKind::Fake(FakeBorrowKind::Deep) => "&fake ",
+                BorrowKind::Fake(FakeBorrowKind::Shallow) => "&fake shallow ",
                 BorrowKind::Mut { .. } => "&mut ",
             };
             write!(writer, "{kind}{:?}", place)
         }
         Rvalue::Repeat(op, cnst) => {
-            write!(writer, "{} \" \" {}", &pretty_operand(op), cnst.ty())
+            write!(writer, "{} \" \" {}", &pretty_operand(op), &pretty_ty_const(cnst))
         }
         Rvalue::ShallowInitBox(_, _) => Ok(()),
         Rvalue::ThreadLocalRef(item) => {

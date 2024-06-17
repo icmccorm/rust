@@ -7,6 +7,7 @@
 #![feature(never_type)]
 #![feature(rustc_private)]
 #![feature(assert_matches)]
+#![feature(unwrap_infallible)]
 #![recursion_limit = "512"]
 #![cfg_attr(feature = "deny-warnings", deny(warnings))]
 #![allow(
@@ -99,7 +100,7 @@ use rustc_hir::hir_id::{HirIdMap, HirIdSet};
 use rustc_hir::intravisit::{walk_expr, FnKind, Visitor};
 use rustc_hir::LangItem::{OptionNone, OptionSome, ResultErr, ResultOk};
 use rustc_hir::{
-    self as hir, def, Arm, ArrayLen, BindingAnnotation, Block, BlockCheckMode, Body, ByRef, Closure, Destination, Expr,
+    self as hir, def, Arm, ArrayLen, BindingMode, Block, BlockCheckMode, Body, ByRef, Closure, Destination, Expr,
     ExprField, ExprKind, FnDecl, FnRetTy, GenericArgs, HirId, Impl, ImplItem, ImplItemKind, ImplItemRef, Item,
     ItemKind, LangItem, LetStmt, MatchSource, Mutability, Node, OwnerId, Param, Pat, PatKind, Path, PathSegment,
     PrimTy, QPath, Stmt, StmtKind, TraitItem, TraitItemKind, TraitItemRef, TraitRef, TyKind, UnOp,
@@ -125,7 +126,7 @@ use visitors::Visitable;
 use crate::consts::{constant, mir_to_const, Constant};
 use crate::higher::Range;
 use crate::ty::{adt_and_variant_of_res, can_partially_move_ty, expr_sig, is_copy, is_recursively_primitive_type};
-use crate::visitors::for_each_expr;
+use crate::visitors::for_each_expr_without_closures;
 
 use rustc_middle::hir::nested_filter;
 
@@ -184,12 +185,27 @@ pub fn expr_or_init<'a, 'b, 'tcx: 'b>(cx: &LateContext<'tcx>, mut expr: &'a Expr
 /// canonical binding `HirId`.
 pub fn find_binding_init<'tcx>(cx: &LateContext<'tcx>, hir_id: HirId) -> Option<&'tcx Expr<'tcx>> {
     if let Node::Pat(pat) = cx.tcx.hir_node(hir_id)
-        && matches!(pat.kind, PatKind::Binding(BindingAnnotation::NONE, ..))
+        && matches!(pat.kind, PatKind::Binding(BindingMode::NONE, ..))
         && let Node::LetStmt(local) = cx.tcx.parent_hir_node(hir_id)
     {
         return local.init;
     }
     None
+}
+
+/// Checks if the given local has an initializer or is from something other than a `let` statement
+///
+/// e.g. returns true for `x` in `fn f(x: usize) { .. }` and `let x = 1;` but false for `let x;`
+pub fn local_is_initialized(cx: &LateContext<'_>, local: HirId) -> bool {
+    for (_, node) in cx.tcx.hir().parent_iter(local) {
+        match node {
+            Node::Pat(..) | Node::PatField(..) => {},
+            Node::LetStmt(let_stmt) => return let_stmt.init.is_some(),
+            _ => return true,
+        }
+    }
+
+    false
 }
 
 /// Returns `true` if the given `NodeId` is inside a constant context
@@ -303,6 +319,15 @@ pub fn match_trait_method(cx: &LateContext<'_>, expr: &Expr<'_>, path: &[&str]) 
         .type_dependent_def_id(expr.hir_id)
         .and_then(|defid| cx.tcx.trait_of_item(defid))
         .map_or(false, |trt_id| match_def_path(cx, trt_id, path))
+}
+
+/// Checks if the given method call expression calls an inherent method.
+pub fn is_inherent_method_call(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+    if let Some(method_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id) {
+        cx.tcx.trait_of_item(method_id).is_none()
+    } else {
+        false
+    }
 }
 
 /// Checks if a method is defined in an impl of a diagnostic item
@@ -1297,7 +1322,7 @@ pub fn contains_name<'tcx>(name: Symbol, expr: &'tcx Expr<'_>, cx: &LateContext<
 
 /// Returns `true` if `expr` contains a return expression
 pub fn contains_return<'tcx>(expr: impl Visitable<'tcx>) -> bool {
-    for_each_expr(expr, |e| {
+    for_each_expr_without_closures(expr, |e| {
         if matches!(e.kind, ExprKind::Ret(..)) {
             ControlFlow::Break(())
         } else {
@@ -1498,15 +1523,18 @@ pub fn is_else_clause_in_let_else(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> bool {
 }
 
 /// Checks whether the given `Expr` is a range equivalent to a `RangeFull`.
+///
 /// For the lower bound, this means that:
 /// - either there is none
 /// - or it is the smallest value that can be represented by the range's integer type
+///
 /// For the upper bound, this means that:
 /// - either there is none
 /// - or it is the largest value that can be represented by the range's integer type and is
 ///   inclusive
 /// - or it is a call to some container's `len` method and is exclusive, and the range is passed to
 ///   a method call on that same container (e.g. `v.drain(..v.len())`)
+///
 /// If the given `Expr` is not some kind of range, the function returns `false`.
 pub fn is_range_full(cx: &LateContext<'_>, expr: &Expr<'_>, container_path: Option<&Path<'_>>) -> bool {
     let ty = cx.typeck_results().expr_ty(expr);
@@ -1515,7 +1543,7 @@ pub fn is_range_full(cx: &LateContext<'_>, expr: &Expr<'_>, container_path: Opti
             if let rustc_ty::Adt(_, subst) = ty.kind()
                 && let bnd_ty = subst.type_at(0)
                 && let Some(min_val) = bnd_ty.numeric_min_val(cx.tcx)
-                && let Some(min_const) = mir_to_const(cx, Const::from_ty_const(min_val, cx.tcx))
+                && let Some(min_const) = mir_to_const(cx, Const::from_ty_const(min_val, bnd_ty, cx.tcx))
                 && let Some(start_const) = constant(cx, cx.typeck_results(), start)
             {
                 start_const == min_const
@@ -1528,7 +1556,7 @@ pub fn is_range_full(cx: &LateContext<'_>, expr: &Expr<'_>, container_path: Opti
                 if let rustc_ty::Adt(_, subst) = ty.kind()
                     && let bnd_ty = subst.type_at(0)
                     && let Some(max_val) = bnd_ty.numeric_max_val(cx.tcx)
-                    && let Some(max_const) = mir_to_const(cx, Const::from_ty_const(max_val, cx.tcx))
+                    && let Some(max_const) = mir_to_const(cx, Const::from_ty_const(max_val, bnd_ty, cx.tcx))
                     && let Some(end_const) = constant(cx, cx.typeck_results(), end)
                 {
                     end_const == max_const
@@ -2328,10 +2356,10 @@ pub fn is_slice_of_primitives(cx: &LateContext<'_>, expr: &Expr<'_>) -> Option<S
 ///
 /// Given functions `eq` and `hash` such that `eq(a, b) == true`
 /// implies `hash(a) == hash(b)`
-pub fn search_same<T, Hash, Eq>(exprs: &[T], hash: Hash, eq: Eq) -> Vec<(&T, &T)>
+pub fn search_same<T, Hash, Eq>(exprs: &[T], mut hash: Hash, mut eq: Eq) -> Vec<(&T, &T)>
 where
-    Hash: Fn(&T) -> u64,
-    Eq: Fn(&T, &T) -> bool,
+    Hash: FnMut(&T) -> u64,
+    Eq: FnMut(&T, &T) -> bool,
 {
     match exprs {
         [a, b] if eq(a, b) => return vec![(a, b)],
@@ -2505,8 +2533,9 @@ fn with_test_item_names(tcx: TyCtxt<'_>, module: LocalModDefId, f: impl Fn(&[Sym
 /// Note: Add `//@compile-flags: --test` to UI tests with a `#[test]` function
 pub fn is_in_test_function(tcx: TyCtxt<'_>, id: HirId) -> bool {
     with_test_item_names(tcx, tcx.parent_module(id), |names| {
-        tcx.hir()
-            .parent_iter(id)
+        let node = tcx.hir_node(id);
+        once((id, node))
+            .chain(tcx.hir().parent_iter(id))
             // Since you can nest functions we need to collect all until we leave
             // function scope
             .any(|(_id, node)| {
@@ -2545,6 +2574,11 @@ pub fn is_in_cfg_test(tcx: TyCtxt<'_>, id: HirId) -> bool {
     tcx.hir()
         .parent_id_iter(id)
         .any(|parent_id| is_cfg_test(tcx, parent_id))
+}
+
+/// Checks if the node is in a `#[test]` function or has any parent node marked `#[cfg(test)]`
+pub fn is_in_test(tcx: TyCtxt<'_>, hir_id: HirId) -> bool {
+    is_in_test_function(tcx, hir_id) || is_in_cfg_test(tcx, hir_id)
 }
 
 /// Checks if the item of any of its parents has `#[cfg(...)]` attribute applied.
@@ -3285,7 +3319,7 @@ fn maybe_get_relative_path(from: &DefPath, to: &DefPath, max_super: usize) -> St
             Right(r) => Right(r.data),
         });
 
-    // 2. for the remaning segments, construct relative path using only mod names and `super`
+    // 2. for the remaining segments, construct relative path using only mod names and `super`
     let mut go_up_by = 0;
     let mut path = Vec::new();
     for el in unique_parts {
@@ -3344,4 +3378,37 @@ pub fn is_parent_stmt(cx: &LateContext<'_>, id: HirId) -> bool {
         cx.tcx.parent_hir_node(id),
         Node::Stmt(..) | Node::Block(Block { stmts: &[], .. })
     )
+}
+
+/// Returns true if the given `expr` is a block or resembled as a block,
+/// such as `if`, `loop`, `match` expressions etc.
+pub fn is_block_like(expr: &Expr<'_>) -> bool {
+    matches!(
+        expr.kind,
+        ExprKind::Block(..) | ExprKind::ConstBlock(..) | ExprKind::If(..) | ExprKind::Loop(..) | ExprKind::Match(..)
+    )
+}
+
+/// Returns true if the given `expr` is binary expression that needs to be wrapped in parentheses.
+pub fn binary_expr_needs_parentheses(expr: &Expr<'_>) -> bool {
+    fn contains_block(expr: &Expr<'_>, is_operand: bool) -> bool {
+        match expr.kind {
+            ExprKind::Binary(_, lhs, _) => contains_block(lhs, true),
+            _ if is_block_like(expr) => is_operand,
+            _ => false,
+        }
+    }
+
+    contains_block(expr, false)
+}
+
+/// Returns true if the specified expression is in a receiver position.
+pub fn is_receiver_of_method_call(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+    if let Some(parent_expr) = get_parent_expr(cx, expr)
+        && let ExprKind::MethodCall(_, receiver, ..) = parent_expr.kind
+        && receiver.hir_id == expr.hir_id
+    {
+        return true;
+    }
+    false
 }

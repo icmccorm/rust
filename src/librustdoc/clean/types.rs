@@ -23,6 +23,7 @@ use rustc_hir::{BodyId, Mutability};
 use rustc_hir_analysis::check::intrinsic::intrinsic_operation_unsafety;
 use rustc_index::IndexVec;
 use rustc_metadata::rendered_const;
+use rustc_middle::span_bug;
 use rustc_middle::ty::fast_reject::SimplifiedType;
 use rustc_middle::ty::{self, TyCtxt, Visibility};
 use rustc_resolve::rustdoc::{
@@ -266,8 +267,15 @@ impl ExternalCrate {
         let as_primitive = |res: Res<!>| {
             let Res::Def(DefKind::Mod, def_id) = res else { return None };
             tcx.get_attrs(def_id, sym::rustc_doc_primitive).find_map(|attr| {
-                // FIXME: should warn on unknown primitives?
-                Some((def_id, PrimitiveType::from_symbol(attr.value_str()?)?))
+                let attr_value = attr.value_str().expect("syntax should already be validated");
+                let Some(prim) = PrimitiveType::from_symbol(attr_value) else {
+                    span_bug!(
+                        attr.span,
+                        "primitive `{attr_value}` is not a member of `PrimitiveType`"
+                    );
+                };
+
+                Some((def_id, prim))
             })
         };
 
@@ -400,7 +408,7 @@ impl Item {
 
     pub(crate) fn attr_span(&self, tcx: TyCtxt<'_>) -> rustc_span::Span {
         span_of_fragments(&self.attrs.doc_strings)
-            .unwrap_or_else(|| self.span(tcx).map_or(rustc_span::DUMMY_SP, |span| span.inner()))
+            .unwrap_or_else(|| self.span(tcx).map_or(DUMMY_SP, |span| span.inner()))
     }
 
     /// Combine all doc strings into a single value handling indentation and newlines as needed.
@@ -592,13 +600,6 @@ impl Item {
         }
     }
 
-    pub(crate) fn const_stable_since(&self, tcx: TyCtxt<'_>) -> Option<StableSince> {
-        match self.const_stability(tcx)?.level {
-            StabilityLevel::Stable { since, .. } => Some(since),
-            StabilityLevel::Unstable { .. } => None,
-        }
-    }
-
     pub(crate) fn is_non_exhaustive(&self) -> bool {
         self.attrs.other_attrs.iter().any(|a| a.has_name(sym::non_exhaustive))
     }
@@ -626,7 +627,7 @@ impl Item {
         ) -> hir::FnHeader {
             let sig = tcx.fn_sig(def_id).skip_binder();
             let constness =
-                if tcx.is_const_fn(def_id) && is_unstable_const_fn(tcx, def_id).is_none() {
+                if tcx.is_const_fn(def_id) || is_unstable_const_fn(tcx, def_id).is_some() {
                     hir::Constness::Const
                 } else {
                     hir::Constness::NotConst
@@ -635,22 +636,21 @@ impl Item {
                 ty::Asyncness::Yes => hir::IsAsync::Async(DUMMY_SP),
                 ty::Asyncness::No => hir::IsAsync::NotAsync,
             };
-            hir::FnHeader { unsafety: sig.unsafety(), abi: sig.abi(), constness, asyncness }
+            hir::FnHeader { safety: sig.safety(), abi: sig.abi(), constness, asyncness }
         }
         let header = match *self.kind {
             ItemKind::ForeignFunctionItem(_) => {
                 let def_id = self.def_id().unwrap();
                 let abi = tcx.fn_sig(def_id).skip_binder().abi();
                 hir::FnHeader {
-                    unsafety: if abi == Abi::RustIntrinsic {
+                    safety: if abi == Abi::RustIntrinsic {
                         intrinsic_operation_unsafety(tcx, def_id.expect_local())
                     } else {
-                        hir::Unsafety::Unsafe
+                        hir::Safety::Unsafe
                     },
                     abi,
-                    constness: if abi == Abi::RustIntrinsic
-                        && tcx.is_const_fn(def_id)
-                        && is_unstable_const_fn(tcx, def_id).is_none()
+                    constness: if tcx.is_const_fn(def_id)
+                        || is_unstable_const_fn(tcx, def_id).is_some()
                     {
                         hir::Constness::Const
                     } else {
@@ -830,7 +830,6 @@ pub(crate) enum ItemKind {
     TypeAliasItem(Box<TypeAlias>),
     OpaqueTyItem(OpaqueTy),
     StaticItem(Static),
-    ConstantItem(Constant),
     TraitItem(Box<Trait>),
     TraitAliasItem(TraitAlias),
     ImplItem(Box<Impl>),
@@ -853,6 +852,7 @@ pub(crate) enum ItemKind {
     PrimitiveItem(PrimitiveType),
     /// A required associated constant in a trait declaration.
     TyAssocConstItem(Generics, Box<Type>),
+    ConstantItem(Generics, Box<Type>, Constant),
     /// An associated constant in a trait impl or a provided one in a trait declaration.
     AssocConstItem(Generics, Box<Type>, ConstantKind),
     /// A required associated type in a trait declaration.
@@ -888,7 +888,7 @@ impl ItemKind {
             | TypeAliasItem(_)
             | OpaqueTyItem(_)
             | StaticItem(_)
-            | ConstantItem(_)
+            | ConstantItem(_, _, _)
             | TraitAliasItem(_)
             | TyMethodItem(_)
             | MethodItem(_, _)
@@ -922,7 +922,7 @@ impl ItemKind {
                 | TypeAliasItem(_)
                 | OpaqueTyItem(_)
                 | StaticItem(_)
-                | ConstantItem(_)
+                | ConstantItem(_, _, _)
                 | TraitAliasItem(_)
                 | ForeignFunctionItem(_)
                 | ForeignStaticItem(_)
@@ -1447,11 +1447,11 @@ impl Trait {
     pub(crate) fn is_notable_trait(&self, tcx: TyCtxt<'_>) -> bool {
         tcx.is_doc_notable_trait(self.def_id)
     }
-    pub(crate) fn unsafety(&self, tcx: TyCtxt<'_>) -> hir::Unsafety {
-        tcx.trait_def(self.def_id).unsafety
+    pub(crate) fn safety(&self, tcx: TyCtxt<'_>) -> hir::Safety {
+        tcx.trait_def(self.def_id).safety
     }
     pub(crate) fn is_object_safe(&self, tcx: TyCtxt<'_>) -> bool {
-        tcx.check_is_object_safe(self.def_id)
+        tcx.is_object_safe(self.def_id)
     }
 }
 
@@ -1475,7 +1475,9 @@ pub(crate) enum Type {
     ///
     /// This is mostly Rustdoc's version of [`hir::Path`].
     /// It has to be different because Rustdoc's [`PathSegment`] can contain cleaned generics.
-    Path { path: Path },
+    Path {
+        path: Path,
+    },
     /// A `dyn Trait` object: `dyn for<'a> Trait<'a> + Send + 'static`
     DynTrait(Vec<PolyTrait>, Option<Lifetime>),
     /// A type parameter.
@@ -1492,10 +1494,15 @@ pub(crate) enum Type {
     ///
     /// The `String` field is a stringified version of the array's length parameter.
     Array(Box<Type>, Box<str>),
+    Pat(Box<Type>, Box<str>),
     /// A raw pointer type: `*const i32`, `*mut i32`
     RawPointer(Mutability, Box<Type>),
     /// A reference type: `&i32`, `&'a mut Foo`
-    BorrowedRef { lifetime: Option<Lifetime>, mutability: Mutability, type_: Box<Type> },
+    BorrowedRef {
+        lifetime: Option<Lifetime>,
+        mutability: Mutability,
+        type_: Box<Type>,
+    },
 
     /// A qualified path to an associated item: `<Type as Trait>::Name`
     QPath(Box<QPathData>),
@@ -1619,9 +1626,9 @@ impl Type {
         if let Type::ImplTrait(mut v) = self
             && let Some(GenericBound::TraitBound(PolyTrait { mut trait_, .. }, _)) = v.pop()
             && let Some(segment) = trait_.segments.pop()
-            && let GenericArgs::AngleBracketed { mut bindings, .. } = segment.args
-            && let Some(binding) = bindings.pop()
-            && let TypeBindingKind::Equality { term } = binding.kind
+            && let GenericArgs::AngleBracketed { mut constraints, .. } = segment.args
+            && let Some(constraint) = constraints.pop()
+            && let AssocItemConstraintKind::Equality { term } = constraint.kind
             && let Term::Type(ty) = term
         {
             ty
@@ -1692,6 +1699,7 @@ impl Type {
             BareFunction(..) => PrimitiveType::Fn,
             Slice(..) => PrimitiveType::Slice,
             Array(..) => PrimitiveType::Array,
+            Type::Pat(..) => PrimitiveType::Pat,
             RawPointer(..) => PrimitiveType::RawPointer,
             QPath(box QPathData { ref self_type, .. }) => return self_type.inner_def_id(cache),
             Generic(_) | Infer | ImplTrait(_) => return None,
@@ -1745,6 +1753,7 @@ pub(crate) enum PrimitiveType {
     Str,
     Slice,
     Array,
+    Pat,
     Tuple,
     Unit,
     RawPointer,
@@ -1797,8 +1806,10 @@ impl PrimitiveType {
             sym::bool => Some(PrimitiveType::Bool),
             sym::char => Some(PrimitiveType::Char),
             sym::str => Some(PrimitiveType::Str),
+            sym::f16 => Some(PrimitiveType::F16),
             sym::f32 => Some(PrimitiveType::F32),
             sym::f64 => Some(PrimitiveType::F64),
+            sym::f128 => Some(PrimitiveType::F128),
             sym::array => Some(PrimitiveType::Array),
             sym::slice => Some(PrimitiveType::Slice),
             sym::tuple => Some(PrimitiveType::Tuple),
@@ -1831,8 +1842,10 @@ impl PrimitiveType {
                 U32 => single(SimplifiedType::Uint(UintTy::U32)),
                 U64 => single(SimplifiedType::Uint(UintTy::U64)),
                 U128 => single(SimplifiedType::Uint(UintTy::U128)),
+                F16 => single(SimplifiedType::Float(FloatTy::F16)),
                 F32 => single(SimplifiedType::Float(FloatTy::F32)),
                 F64 => single(SimplifiedType::Float(FloatTy::F64)),
+                F128 => single(SimplifiedType::Float(FloatTy::F128)),
                 Str => single(SimplifiedType::Str),
                 Bool => single(SimplifiedType::Bool),
                 Char => single(SimplifiedType::Char),
@@ -1895,6 +1908,7 @@ impl PrimitiveType {
             Bool => sym::bool,
             Char => sym::char,
             Array => sym::array,
+            Pat => sym::pat,
             Slice => sym::slice,
             Tuple => sym::tuple,
             Unit => sym::unit,
@@ -2119,7 +2133,9 @@ impl Discriminant {
     /// Will be `None` in the case of cross-crate reexports, and may be
     /// simplified
     pub(crate) fn expr(&self, tcx: TyCtxt<'_>) -> Option<String> {
-        self.expr.map(|body| rendered_const(tcx, body))
+        self.expr.map(|body| {
+            rendered_const(tcx, tcx.hir().body(body), tcx.hir().body_owner_def_id(body))
+        })
     }
     pub(crate) fn value(&self, tcx: TyCtxt<'_>, with_underscores: bool) -> String {
         print_evaluated_const(tcx, self.value, with_underscores, false).unwrap()
@@ -2244,34 +2260,38 @@ impl GenericArg {
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub(crate) enum GenericArgs {
-    AngleBracketed { args: Box<[GenericArg]>, bindings: ThinVec<TypeBinding> },
+    AngleBracketed { args: Box<[GenericArg]>, constraints: ThinVec<AssocItemConstraint> },
     Parenthesized { inputs: Box<[Type]>, output: Option<Box<Type>> },
 }
 
 impl GenericArgs {
     pub(crate) fn is_empty(&self) -> bool {
         match self {
-            GenericArgs::AngleBracketed { args, bindings } => {
-                args.is_empty() && bindings.is_empty()
+            GenericArgs::AngleBracketed { args, constraints } => {
+                args.is_empty() && constraints.is_empty()
             }
             GenericArgs::Parenthesized { inputs, output } => inputs.is_empty() && output.is_none(),
         }
     }
-    pub(crate) fn bindings<'a>(&'a self) -> Box<dyn Iterator<Item = TypeBinding> + 'a> {
+    pub(crate) fn constraints<'a>(&'a self) -> Box<dyn Iterator<Item = AssocItemConstraint> + 'a> {
         match self {
-            GenericArgs::AngleBracketed { bindings, .. } => Box::new(bindings.iter().cloned()),
+            GenericArgs::AngleBracketed { constraints, .. } => {
+                Box::new(constraints.iter().cloned())
+            }
             GenericArgs::Parenthesized { output, .. } => Box::new(
                 output
                     .as_ref()
-                    .map(|ty| TypeBinding {
+                    .map(|ty| AssocItemConstraint {
                         assoc: PathSegment {
                             name: sym::Output,
                             args: GenericArgs::AngleBracketed {
                                 args: Vec::new().into_boxed_slice(),
-                                bindings: ThinVec::new(),
+                                constraints: ThinVec::new(),
                             },
                         },
-                        kind: TypeBindingKind::Equality { term: Term::Type((**ty).clone()) },
+                        kind: AssocItemConstraintKind::Equality {
+                            term: Term::Type((**ty).clone()),
+                        },
                     })
                     .into_iter(),
             ),
@@ -2329,7 +2349,7 @@ pub(crate) struct OpaqueTy {
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub(crate) struct BareFunctionDecl {
-    pub(crate) unsafety: hir::Unsafety,
+    pub(crate) safety: hir::Safety,
     pub(crate) generic_params: Vec<GenericParamDef>,
     pub(crate) decl: FnDecl,
     pub(crate) abi: Abi,
@@ -2344,8 +2364,6 @@ pub(crate) struct Static {
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Constant {
-    pub(crate) type_: Box<Type>,
-    pub(crate) generics: Generics,
     pub(crate) kind: ConstantKind,
 }
 
@@ -2405,7 +2423,7 @@ impl ConstantKind {
             ConstantKind::TyConst { ref expr } => expr.to_string(),
             ConstantKind::Extern { def_id } => print_inlined_const(tcx, def_id),
             ConstantKind::Local { body, .. } | ConstantKind::Anonymous { body } => {
-                rendered_const(tcx, body)
+                rendered_const(tcx, tcx.hir().body(body), tcx.hir().body_owner_def_id(body))
             }
         }
     }
@@ -2431,7 +2449,7 @@ impl ConstantKind {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Impl {
-    pub(crate) unsafety: hir::Unsafety,
+    pub(crate) safety: hir::Safety,
     pub(crate) generics: Generics,
     pub(crate) trait_: Option<Path>,
     pub(crate) for_: Type,
@@ -2530,22 +2548,31 @@ pub(crate) struct ProcMacro {
     pub(crate) helpers: Vec<Symbol>,
 }
 
-/// An type binding on an associated type (e.g., `A = Bar` in `Foo<A = Bar>` or
-/// `A: Send + Sync` in `Foo<A: Send + Sync>`).
+/// A constraint on an associated item.
+///
+/// ### Examples
+///
+/// * the `A = Ty` and `B = Ty` in `Trait<A = Ty, B = Ty>`
+/// * the `G<Ty> = Ty` in `Trait<G<Ty> = Ty>`
+/// * the `A: Bound` in `Trait<A: Bound>`
+/// * the `RetTy` in `Trait(ArgTy, ArgTy) -> RetTy`
+/// * the `C = { Ct }` in `Trait<C = { Ct }>` (feature `associated_const_equality`)
+/// * the `f(): Bound` in `Trait<f(): Bound>` (feature `return_type_notation`)
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub(crate) struct TypeBinding {
+pub(crate) struct AssocItemConstraint {
     pub(crate) assoc: PathSegment,
-    pub(crate) kind: TypeBindingKind,
+    pub(crate) kind: AssocItemConstraintKind,
 }
 
+/// The kind of [associated item constraint][AssocItemConstraint].
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub(crate) enum TypeBindingKind {
+pub(crate) enum AssocItemConstraintKind {
     Equality { term: Term },
-    Constraint { bounds: Vec<GenericBound> },
+    Bound { bounds: Vec<GenericBound> },
 }
 
 // Some nodes are used a lot. Make sure they don't unintentionally get bigger.
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(target_pointer_width = "64")]
 mod size_asserts {
     use super::*;
     use rustc_data_structures::static_assert_size;

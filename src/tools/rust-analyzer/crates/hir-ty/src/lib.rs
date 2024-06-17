@@ -56,7 +56,6 @@ use base_db::salsa::impl_intern_value_trivial;
 use chalk_ir::{
     fold::{Shift, TypeFoldable},
     interner::HasInterner,
-    visit::{TypeSuperVisitable, TypeVisitable, TypeVisitor},
     NoSolution,
 };
 use either::Either;
@@ -98,7 +97,9 @@ pub use traits::TraitEnvironment;
 pub use utils::{all_super_traits, is_fn_unsafe_to_call};
 
 pub use chalk_ir::{
-    cast::Cast, AdtId, BoundVar, DebruijnIndex, Mutability, Safety, Scalar, TyVariableKind,
+    cast::Cast,
+    visit::{TypeSuperVisitable, TypeVisitable, TypeVisitor},
+    AdtId, BoundVar, DebruijnIndex, Mutability, Safety, Scalar, TyVariableKind,
 };
 
 pub type ForeignDefId = chalk_ir::ForeignDefId<Interner>;
@@ -288,7 +289,7 @@ impl Hash for ConstScalar {
 
 /// Return an index of a parameter in the generic type parameter list by it's id.
 pub fn param_idx(db: &dyn HirDatabase, id: TypeOrConstParamId) -> Option<usize> {
-    generics(db.upcast(), id.parent).param_idx(id)
+    generics(db.upcast(), id.parent).type_or_const_param_idx(id)
 }
 
 pub(crate) fn wrap_empty_binders<T>(value: T) -> Binders<T>
@@ -569,6 +570,10 @@ impl CallableSig {
         }
     }
 
+    pub fn abi(&self) -> FnAbi {
+        self.abi
+    }
+
     pub fn params(&self) -> &[Ty] {
         &self.params_and_return[0..self.params_and_return.len() - 1]
     }
@@ -603,14 +608,14 @@ pub enum ImplTraitId {
 }
 impl_intern_value_trivial!(ImplTraitId);
 
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(PartialEq, Eq, Debug, Hash)]
 pub struct ImplTraits {
     pub(crate) impl_traits: Arena<ImplTrait>,
 }
 
 has_interner!(ImplTraits);
 
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(PartialEq, Eq, Debug, Hash)]
 pub struct ImplTrait {
     pub(crate) bounds: Binders<Vec<QuantifiedWhereClause>>,
 }
@@ -622,7 +627,7 @@ pub fn static_lifetime() -> Lifetime {
 }
 
 pub fn error_lifetime() -> Lifetime {
-    static_lifetime()
+    LifetimeData::Error.intern(Interner)
 }
 
 pub(crate) fn fold_free_vars<T: HasInterner<Interner = Interner> + TypeFoldable<Interner>>(
@@ -861,7 +866,7 @@ where
             if cfg!(debug_assertions) {
                 Err(NoSolution)
             } else {
-                Ok(static_lifetime())
+                Ok(error_lifetime())
             }
         }
 
@@ -873,7 +878,7 @@ where
             if cfg!(debug_assertions) {
                 Err(NoSolution)
             } else {
-                Ok(static_lifetime())
+                Ok(error_lifetime())
             }
         }
     }
@@ -891,20 +896,16 @@ where
     Canonical { value, binders: chalk_ir::CanonicalVarKinds::from_iter(Interner, kinds) }
 }
 
-pub fn callable_sig_from_fnonce(
-    mut self_ty: &Ty,
-    env: Arc<TraitEnvironment>,
+pub fn callable_sig_from_fn_trait(
+    self_ty: &Ty,
+    trait_env: Arc<TraitEnvironment>,
     db: &dyn HirDatabase,
-) -> Option<CallableSig> {
-    if let Some((ty, _, _)) = self_ty.as_reference() {
-        // This will happen when it implements fn or fn mut, since we add a autoborrow adjustment
-        self_ty = ty;
-    }
-    let krate = env.krate;
+) -> Option<(FnTrait, CallableSig)> {
+    let krate = trait_env.krate;
     let fn_once_trait = FnTrait::FnOnce.get_id(db, krate)?;
     let output_assoc_type = db.trait_data(fn_once_trait).associated_type_by_name(&name![Output])?;
 
-    let mut table = InferenceTable::new(db, env);
+    let mut table = InferenceTable::new(db, trait_env.clone());
     let b = TyBuilder::trait_ref(db, fn_once_trait);
     if b.remaining() != 2 {
         return None;
@@ -914,23 +915,56 @@ pub fn callable_sig_from_fnonce(
     // - Self: FnOnce<?args_ty>
     // - <Self as FnOnce<?args_ty>>::Output == ?ret_ty
     let args_ty = table.new_type_var();
-    let trait_ref = b.push(self_ty.clone()).push(args_ty.clone()).build();
+    let mut trait_ref = b.push(self_ty.clone()).push(args_ty.clone()).build();
     let projection = TyBuilder::assoc_type_projection(
         db,
         output_assoc_type,
         Some(trait_ref.substitution.clone()),
     )
     .build();
-    table.register_obligation(trait_ref.cast(Interner));
-    let ret_ty = table.normalize_projection_ty(projection);
 
-    let ret_ty = table.resolve_completely(ret_ty);
-    let args_ty = table.resolve_completely(args_ty);
+    let block = trait_env.block;
+    let trait_env = trait_env.env.clone();
+    let obligation =
+        InEnvironment { goal: trait_ref.clone().cast(Interner), environment: trait_env.clone() };
+    let canonical = table.canonicalize(obligation.clone());
+    if db.trait_solve(krate, block, canonical.cast(Interner)).is_some() {
+        table.register_obligation(obligation.goal);
+        let return_ty = table.normalize_projection_ty(projection);
+        for fn_x in [FnTrait::Fn, FnTrait::FnMut, FnTrait::FnOnce] {
+            let fn_x_trait = fn_x.get_id(db, krate)?;
+            trait_ref.trait_id = to_chalk_trait_id(fn_x_trait);
+            let obligation: chalk_ir::InEnvironment<chalk_ir::Goal<Interner>> = InEnvironment {
+                goal: trait_ref.clone().cast(Interner),
+                environment: trait_env.clone(),
+            };
+            let canonical = table.canonicalize(obligation.clone());
+            if db.trait_solve(krate, block, canonical.cast(Interner)).is_some() {
+                let ret_ty = table.resolve_completely(return_ty);
+                let args_ty = table.resolve_completely(args_ty);
+                let params = args_ty
+                    .as_tuple()?
+                    .iter(Interner)
+                    .map(|it| it.assert_ty_ref(Interner))
+                    .cloned()
+                    .collect();
 
-    let params =
-        args_ty.as_tuple()?.iter(Interner).map(|it| it.assert_ty_ref(Interner)).cloned().collect();
-
-    Some(CallableSig::from_params_and_return(params, ret_ty, false, Safety::Safe, FnAbi::RustCall))
+                return Some((
+                    fn_x,
+                    CallableSig::from_params_and_return(
+                        params,
+                        ret_ty,
+                        false,
+                        Safety::Safe,
+                        FnAbi::RustCall,
+                    ),
+                ));
+            }
+        }
+        unreachable!("It should at least implement FnOnce at this point");
+    } else {
+        None
+    }
 }
 
 struct PlaceholderCollector<'db> {

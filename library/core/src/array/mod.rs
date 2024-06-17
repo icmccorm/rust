@@ -512,7 +512,8 @@ impl<T, const N: usize> [T; N] {
     /// # Examples
     ///
     /// ```
-    /// #![feature(array_try_map, generic_nonzero)]
+    /// #![feature(array_try_map)]
+    ///
     /// let a = ["1", "2", "3"];
     /// let b = a.try_map(|v| v.parse::<u32>()).unwrap().map(|v| v + 1);
     /// assert_eq!(b, [2, 3, 4]);
@@ -522,19 +523,19 @@ impl<T, const N: usize> [T; N] {
     /// assert!(b.is_err());
     ///
     /// use std::num::NonZero;
+    ///
     /// let z = [1, 2, 0, 3, 4];
     /// assert_eq!(z.try_map(NonZero::new), None);
+    ///
     /// let a = [1, 2, 3];
     /// let b = a.try_map(NonZero::new);
     /// let c = b.map(|x| x.map(NonZero::get));
     /// assert_eq!(c, Some(a));
     /// ```
     #[unstable(feature = "array_try_map", issue = "79711")]
-    pub fn try_map<F, R>(self, f: F) -> ChangeOutputType<R, [R::Output; N]>
+    pub fn try_map<R>(self, f: impl FnMut(T) -> R) -> ChangeOutputType<R, [R::Output; N]>
     where
-        F: FnMut(T) -> R,
-        R: Try,
-        R::Residual: Residual<[R::Output; N]>,
+        R: Try<Residual: Residual<[R::Output; N]>>,
     {
         drain_array_with(self, |iter| try_from_trusted_iterator(iter.map(f)))
     }
