@@ -2,7 +2,6 @@
 //! `Machine` trait.
 use inkwell::miri::StackTrace;
 use inkwell::values::GenericValueRef;
-use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::fmt;

@@ -3,27 +3,39 @@ use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalContextExt;
 use crate::shims::llvm::lli::ResolvedRustArgument;
 use crate::shims::llvm::lli::LLI;
 use crate::shims::llvm::logging::LLVMFlag;
-use crate::MiriConfig;
-use crate::MiriInterpCx;
-use crate::Provenance;
-use crate::ThreadId;
+
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::{GenericValue, GenericValueRef};
-use rustc_const_eval::interpret::{InterpResult, OpTy, PlaceTy};
+use rustc_const_eval::interpret::InterpResult;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_span::Symbol;
+use crate::{PlaceTy, OpTy};
+use crate::*;
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
+#[macro_export]
+macro_rules! throw_interop_format {
+    ($($tt:tt)*) => { throw_machine_stop!($crate::TerminationInfo::InteroperationError { msg: format!($($tt)*) }) };
+}
 
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
+#[macro_export]
+macro_rules! err_interop_format {
+    ($($tt:tt)*) => { Err($crate::InterpErrorInfo::MachineStop($crate::TerminationInfo::InteroperationError { msg: format!($($tt)*) })) };
+}
+
+
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
+
+    /// [MiriLLI] Calls an external LLVM function and stores the return value in the destination.
     fn call_external_llvm_fct(
         &mut self,
         link_name: Symbol,
-        dest: &PlaceTy<'tcx, Provenance>,
-        args: &[OpTy<'tcx, Provenance>],
+        dest: &PlaceTy<'tcx>,
+        args: &[OpTy<'tcx>],
     ) -> InterpResult<'tcx, bool> {
         let this = self.eval_context_mut();
-        MiriInterpCx::<'_, '_>::with_lli_opt(|ll| {
+        MiriInterpCx::<'_>::with_lli_opt(|ll| {
             ll.with_module(|module| {
                 let function_opt = module.get_function(link_name.as_str());
                 let result = function_opt.is_some();
@@ -41,23 +53,21 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
     fn perform_opty_conversion<'lli>(
         &mut self,
-        return_place: &PlaceTy<'tcx, Provenance>,
+        return_place: &PlaceTy<'tcx>,
         return_type_opt: Option<BasicTypeEnum<'lli>>,
     ) -> InterpResult<'tcx, GenericValue<'lli>> {
         let this = self.eval_context_mut();
         if let Some(return_type) = return_type_opt {
-            debug!("Preparing GV return value");
             let place_opty = this.place_to_op(return_place)?;
             let place_resolved = ResolvedRustArgument::new(this, place_opty)?;
             place_resolved.to_generic_value(this, Some(return_type))
         } else {
-            debug!("Preparing void return value");
             Ok(GenericValue::new_void())
         }
     }
 
     fn terminate_lli_thread(&self, id: ThreadId) {
-        MiriInterpCx::<'_, '_>::with_lli(|ll| {
+        MiriInterpCx::<'_>::with_lli(|ll| {
             ll.with_engine(|engine| unsafe {
                 engine.as_ref().unwrap().terminate_thread(id.into());
             });
@@ -77,7 +87,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         id: ThreadId,
     ) -> InterpResult<'tcx, Option<GenericValueRef<'static>>> {
         let this = self.eval_context_ref();
-        MiriInterpCx::<'_, '_>::with_lli(|ll| {
+        MiriInterpCx::<'_>::with_lli(|ll| {
             ll.with_engine(|engine| unsafe {
                 let gv_opt = engine.as_ref().unwrap().get_thread_exit_value(id.into());
                 if let Some(info) = this.get_foreign_error() { Err(info) } else { Ok(gv_opt) }
@@ -102,7 +112,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn step_lli_thread(&mut self, id: ThreadId) -> InterpResult<'tcx, bool> {
         let this = self.eval_context_mut();
         let pending_return_opt = this.get_pending_return_value(id)?;
-        MiriInterpCx::<'_, '_>::with_lli(|ll| {
+        MiriInterpCx::<'_>::with_lli(|ll| {
             ll.with_engine(|engine| unsafe {
                 let result = engine.as_ref().unwrap().step_thread(id.into(), pending_return_opt);
                 if let Some(pending_return) = pending_return_opt {

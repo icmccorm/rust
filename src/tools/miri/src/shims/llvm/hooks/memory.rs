@@ -1,54 +1,72 @@
 use crate::eval::ForeignMemoryMode;
-use crate::shims::foreign_items::EvalContextExt as ForeignEvalContextExt;
-use crate::shims::llvm::helpers::EvalContextExt;
-use crate::{MiriInterpCx, MiriMemoryKind};
+use crate::shims::llvm::helpers::EvalContextExt as _;
+use crate::*;
 use inkwell::execution_engine::{MiriInterpCxOpaque, MiriPointer};
+use llvm_sys::miri::MiriProvenance;
 use rustc_const_eval::interpret::InterpResult;
 use rustc_span::Symbol;
-use rustc_target::abi::Align;
-use std::ffi::CString;
-use std::iter::repeat;
-use std::panic::panic_any;
+use rustc_target::abi::{Align, Size};
+use std::{ffi::CString, iter, slice};
+use tracing::debug;
 
-pub fn obtain_ctx_mut(
-    ctx_raw: *mut MiriInterpCxOpaque,
-) -> &'static mut MiriInterpCx<'static, 'static> {
+pub fn obtain_ctx_mut(ctx_raw: *mut MiriInterpCxOpaque) -> &'static mut MiriInterpCx<'static> {
     debug_assert!(!ctx_raw.is_null(), "interpretation context is null");
-    unsafe { (ctx_raw as *mut MiriInterpCx<'_, '_>).as_mut() }.unwrap()
+    unsafe { (ctx_raw as *mut MiriInterpCx<'_>).as_mut() }.unwrap()
+}
+
+fn llvm_malloc_result<'tcx>(
+    ctx: &mut MiriInterpCx<'tcx>,
+    size: u64,
+    alignment: u64,
+    is_static: bool,
+) -> InterpResult<'tcx, MiriPointer> {
+    let this = ctx.eval_context_mut();
+
+    let (kind, zero_init) = if is_static {
+        (MiriMemoryKind::LLVMStatic, is_static)
+    } else {
+        (
+            MiriMemoryKind::LLVMStack,
+            matches!(this.machine.lli_config.memory_mode, ForeignMemoryMode::Zeroed),
+        )
+    };
+    let align = Align::from_bytes(alignment).unwrap();
+    let ptr = this.allocate_ptr(Size::from_bytes(size), align, kind.into())?;
+    if zero_init {
+        // We just allocated this, the access is definitely in-bounds and fits into our address space.
+        this.write_bytes_ptr(ptr.into(), iter::repeat(0u8).take(usize::try_from(size).unwrap()))
+            .unwrap();
+    }
+    if is_static {
+        this.machine.static_roots.push(ptr.provenance.get_alloc_id().unwrap());
+    }
+    Ok(this.pointer_to_lli_wrapped_pointer(ptr.into()))
 }
 
 pub extern "C-unwind" fn llvm_malloc(
     ctx_raw: *mut MiriInterpCxOpaque,
-    bytes: u64,
-    alignment: u64,
+    size: u64,
+    align: u64,
     is_static: bool,
 ) -> MiriPointer {
-    let ctx = obtain_ctx_mut(ctx_raw);
-    let (kind, zero) = if is_static {
-        (MiriMemoryKind::LLVMStatic, is_static)
-    } else {
-        (MiriMemoryKind::LLVMStack, matches!(ctx.machine.lli_config.memory_mode, ForeignMemoryMode::Zeroed))
-    };
-    let allocation = ctx.malloc_align(bytes, Align::from_bytes(alignment).unwrap(), zero, kind);
-    if let Ok(ptr) = allocation {
-        if let Some(crate::Provenance::Concrete { alloc_id, .. }) = ptr.provenance {
-            if is_static {
-                ctx.machine.static_roots.push(alloc_id);
-            }
+    let this = obtain_ctx_mut(ctx_raw);
+    match llvm_malloc_result(this, size, align, is_static) {
+        Ok(ptr) => ptr,
+        Err(e) => {
+            this.set_foreign_error(e);
+            MiriPointer { addr: 0, prov: MiriProvenance { alloc_id: 0, tag: 0 } }
         }
-        ctx.pointer_to_lli_wrapped_pointer(ptr)
-    } else {
-        panic_any("malloc failed");
     }
 }
 
-fn llvm_free_result<'tcx>(
-    ctx: &mut MiriInterpCx<'_, 'tcx>,
-    ptr: MiriPointer,
-) -> InterpResult<'tcx, ()> {
-    let pointer = ctx.lli_wrapped_pointer_to_resolved_pointer(ptr)?;
-    ctx.free(pointer.ptr, MiriMemoryKind::LLVMStack)?;
-    Ok(())
+fn llvm_free_result<'tcx>(ctx: &mut MiriInterpCx<'tcx>, ptr: MiriPointer) -> InterpResult<'tcx> {
+    let this = ctx.eval_context_mut();
+    let resolved = this.lli_wrapped_pointer_to_resolved_pointer(ptr)?;
+    if !this.ptr_is_null(resolved.ptr)? {
+        this.deallocate_ptr(resolved.ptr, None, MiriMemoryKind::LLVMStack.into())
+    } else {
+        Ok(())
+    }
 }
 
 pub extern "C-unwind" fn llvm_free(ctx_raw: *mut MiriInterpCxOpaque, ptr: MiriPointer) -> bool {
@@ -62,14 +80,14 @@ pub extern "C-unwind" fn llvm_free(ctx_raw: *mut MiriInterpCxOpaque, ptr: MiriPo
 }
 
 fn miri_memcpy_result<'tcx>(
-    ctx: &mut MiriInterpCx<'_, 'tcx>,
+    ctx: &mut MiriInterpCx<'tcx>,
     dest: MiriPointer,
     src_ptr: *const u8,
     src_len: u64,
 ) -> InterpResult<'tcx> {
     let dest_pointer = ctx.lli_wrapped_pointer_to_resolved_pointer(dest)?;
-    let slice = unsafe { std::slice::from_raw_parts(src_ptr, usize::try_from(src_len).unwrap()) };
-    ctx.write_bytes_ptr(dest_pointer.ptr, slice.iter().copied())?;
+    let slice = unsafe { slice::from_raw_parts(src_ptr, usize::try_from(src_len).unwrap()) };
+    ctx.write_bytes_ptr(dest_pointer.ptr.into(), slice.iter().copied())?;
     Ok(())
 }
 
@@ -89,13 +107,16 @@ pub extern "C-unwind" fn miri_memcpy(
 }
 
 fn miri_memset_result<'tcx>(
-    ctx: &mut MiriInterpCx<'_, 'tcx>,
+    ctx: &mut MiriInterpCx<'tcx>,
     dest: MiriPointer,
     val: u8,
     len: u64,
 ) -> InterpResult<'tcx, ()> {
     let dest_pointer = ctx.lli_wrapped_pointer_to_resolved_pointer(dest)?;
-    ctx.write_bytes_ptr(dest_pointer.ptr, repeat(val).take(usize::try_from(len).unwrap()))?;
+    ctx.write_bytes_ptr(
+        dest_pointer.ptr.into(),
+        iter::repeat(val).take(usize::try_from(len).unwrap()),
+    )?;
     Ok(())
 }
 
@@ -135,7 +156,7 @@ pub extern "C-unwind" fn miri_register_global(
 }
 
 fn miri_register_global_result<'tcx>(
-    ctx: &mut MiriInterpCx<'_, 'tcx>,
+    ctx: &mut MiriInterpCx<'tcx>,
     name: &str,
     mp: MiriPointer,
 ) -> InterpResult<'tcx, ()> {

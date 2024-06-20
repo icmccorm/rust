@@ -13,9 +13,6 @@ use crate::shims::llvm::convert::to_generic_value::LLVMArgumentConverter;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalContextExt;
 use crate::shims::llvm::logging::LLVMFlag;
 use crate::shims::llvm::threads::link::ThreadLinkDestination;
-use crate::MemoryKind;
-use crate::Provenance;
-use crate::{MiriInterpCx, MiriInterpCxExt};
 use inkwell::attributes::Attribute;
 use inkwell::attributes::AttributeLoc;
 use inkwell::context::Context;
@@ -27,8 +24,6 @@ use inkwell::values::GenericValue;
 use ouroboros::self_referencing;
 use parking_lot::ReentrantMutex;
 use rustc_const_eval::interpret::InterpResult;
-use rustc_const_eval::interpret::OpTy;
-use rustc_const_eval::interpret::PlaceTy;
 use rustc_hash::FxHashSet;
 use rustc_middle::ty::{layout::TyAndLayout, Ty};
 use rustc_target::abi::Abi;
@@ -36,9 +31,11 @@ use rustc_target::abi::Size;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use either::Either;
+use crate::*;
+use tracing::debug;
 
 #[self_referencing]
-pub struct LLI /*<'mir, 'tcx>*/ {
+pub struct LLI {
     pub context: Context,
     #[borrows(context)]
     #[not_covariant]
@@ -55,7 +52,7 @@ pub static LLVM_INTERPRETER: ReentrantMutex<RefCell<Option<LLI>>> =
     ReentrantMutex::new(RefCell::new(None));
 
 impl LLI {
-    pub fn create(miri: &mut MiriInterpCx<'_, '_>, paths: &FxHashSet<PathBuf>) -> Self {
+    pub fn create(miri: &mut MiriInterpCx<'_>, paths: &FxHashSet<PathBuf>) -> Self {
         LLITryBuilder {
             context: Context::create(),
             module_builder: |ctx| {
@@ -86,7 +83,7 @@ impl LLI {
     }
     pub fn initialize_engine<'tcx>(
         &mut self,
-        miri: &mut MiriInterpCx<'_, 'tcx>,
+        miri: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx> {
         let initialization_result = self.with_mut(|n| {
             let engine = match n.module.create_interpreter_execution_engine() {
@@ -113,7 +110,7 @@ impl LLI {
         Ok(initialization_result.map_err(|s| err_unsup_format!("{}", s))?)
     }
 
-    pub fn run_constructors<'tcx>(&self, miri: &mut MiriInterpCx<'_, 'tcx>) -> InterpResult<'tcx> {
+    pub fn run_constructors<'tcx>(&self, miri: &mut MiriInterpCx<'tcx>) -> InterpResult<'tcx> {
         self.with_engine(|engine| {
             miri.active_thread_ref().set_llvm_thread(true);
             let engine = engine.as_ref().unwrap();
@@ -132,7 +129,7 @@ impl LLI {
             result
         })
     }
-    pub fn run_destructors<'tcx>(&self, miri: &mut MiriInterpCx<'_, 'tcx>) -> InterpResult<'tcx> {
+    pub fn run_destructors<'tcx>(&self, miri: &mut MiriInterpCx<'tcx>) -> InterpResult<'tcx> {
         self.with_engine(|engine| {
             miri.active_thread_ref().set_llvm_thread(true);
             let engine = engine.as_ref().unwrap();
@@ -155,10 +152,10 @@ impl LLI {
     #[allow(clippy::arithmetic_side_effects)]
     pub fn call_external_llvm_and_store_return<'lli, 'tcx>(
         &self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        ctx: &mut MiriInterpCx<'tcx>,
         function: FunctionValue<'lli>,
-        args: &[OpTy<'tcx, Provenance>],
-        dest: &PlaceTy<'tcx, Provenance>,
+        args: &[OpTy<'tcx>],
+        dest: &PlaceTy<'tcx>,
     ) -> InterpResult<'tcx> {
         debug!(
             "Calling {:?}: {:?}",
@@ -235,21 +232,21 @@ pub struct ResolvedRustArgument<'tcx> {
     inner: ResolvedRustArgumentInner<'tcx>,
 }
 enum ResolvedRustArgumentInner<'tcx> {
-    Default(OpTy<'tcx, Provenance>),
-    Padded(OpTy<'tcx, Provenance>, Size),
+    Default(OpTy<'tcx>),
+    Padded(OpTy<'tcx>, Size),
 }
 
 impl<'tcx> ResolvedRustArgument<'tcx> {
     pub fn new(
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
-        arg: OpTy<'tcx, Provenance>,
+        ctx: &mut MiriInterpCx<'tcx>,
+        arg: OpTy<'tcx>,
     ) -> InterpResult<'tcx, Self> {
         let arg = ctx.dereference_into_singular_field(arg)?;
         Ok(Self { inner: ResolvedRustArgumentInner::Default(arg) })
     }
     pub fn new_padded(
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
-        arg: OpTy<'tcx, Provenance>,
+        ctx: &mut MiriInterpCx<'tcx>,
+        arg: OpTy<'tcx>,
         padding: Size,
     ) -> InterpResult<'tcx, Self> {
         let arg = ctx.dereference_into_singular_field(arg)?;
@@ -258,7 +255,7 @@ impl<'tcx> ResolvedRustArgument<'tcx> {
 
     pub fn to_generic_value<'lli>(
         self,
-        ctx: &mut MiriInterpCx<'_, 'tcx>,
+        ctx: &mut MiriInterpCx<'tcx>,
         bte: ResolvedLLVMType<'lli>,
     ) -> InterpResult<'tcx, GenericValue<'lli>> {
         let this = ctx.eval_context_mut();
@@ -267,7 +264,7 @@ impl<'tcx> ResolvedRustArgument<'tcx> {
         Ok(value)
     }
 
-    pub fn opty(&self) -> &OpTy<'tcx, Provenance> {
+    pub fn opty(&self) -> &OpTy<'tcx> {
         match &self.inner {
             ResolvedRustArgumentInner::Default(op) => op,
             ResolvedRustArgumentInner::Padded(op, _) => op,

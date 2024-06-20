@@ -1,29 +1,29 @@
 extern crate rustc_abi;
-use crate::{shims::llvm::logging::LLVMFlag, Provenance};
+use crate::shims::llvm::logging::LLVMFlag;
 use rustc_abi::Abi;
-use rustc_const_eval::interpret::{InterpResult, OpTy, Scalar};
+use crate::borrow_tracker::EvalContextExt as _;
+use rustc_const_eval::interpret::InterpResult;
 use rustc_middle::ty::layout::TyAndLayout;
 use std::iter::repeat;
-use crate::alloc_addresses::EvalContextExt as _;
+use crate::*;
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     #![allow(clippy::arithmetic_side_effects)]
     fn scalar_to_bytes(
         &mut self,
-        scalar: Scalar<Provenance>,
+        scalar: Scalar,
         layout: TyAndLayout<'_>,
     ) -> InterpResult<'tcx, Vec<u8>> {
         let this = self.eval_context_mut();
         let scalar_bits = match scalar {
-            Scalar::Int(si) => si.to_bits(si.size()).unwrap(),
+            Scalar::Int(si) => si.to_bits(si.size()),
             Scalar::Ptr(p, _) => {
                 if let crate::Provenance::Concrete { alloc_id, tag } = p.provenance {
                     if let Some(logger) = &mut this.machine.llvm_logger {
                         logger.log_flag(LLVMFlag::ExposedPointerFromRustAtBoundary);
                     }
-                    this.expose_ptr(alloc_id, tag)?
+                    this.expose_tag(alloc_id, tag)?
                 }
                 p.into_parts().1.bits().into()
             }
@@ -41,7 +41,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
     #[allow(clippy::arithmetic_side_effects)]
-    fn op_to_bytes(&mut self, opty: &OpTy<'tcx, Provenance>) -> InterpResult<'tcx, Vec<u8>> {
+    fn op_to_bytes(&mut self, opty: &OpTy<'tcx>) -> InterpResult<'tcx, Vec<u8>> {
         let this = self.eval_context_mut();
         match opty.layout.abi {
             rustc_abi::Abi::Scalar(_) => {

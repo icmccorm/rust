@@ -9,6 +9,7 @@ use std::{
     io::Write,
     path::Path,
 };
+use tracing::debug;
 
 pub struct LLVMLogger {
     bytecode: Option<File>,

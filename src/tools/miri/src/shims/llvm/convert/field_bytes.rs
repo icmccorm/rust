@@ -3,8 +3,8 @@ extern crate rustc_abi;
 use itertools::Itertools;
 use rustc_abi::Endian;
 use rustc_middle::ty::layout::TyAndLayout;
+use crate::*;
 
-use crate::MiriInterpCx;
 
 #[derive(Debug, Copy, Clone)]
 pub struct FieldBytes {
@@ -38,7 +38,7 @@ impl FieldBytes {
     #[allow(clippy::arithmetic_side_effects)]
     pub fn field<'tcx>(
         &self,
-        ctx: &MiriInterpCx<'_, 'tcx>,
+        ctx: &MiriInterpCx<'tcx>,
         parent: TyAndLayout<'tcx>,
         index: usize,
     ) -> Self {

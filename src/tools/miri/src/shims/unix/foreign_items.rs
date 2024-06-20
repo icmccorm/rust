@@ -4,6 +4,7 @@ use std::str;
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_span::Symbol;
 use rustc_target::spec::abi::Abi;
+use rustc_target::abi::{Size, Align};
 
 use crate::shims::alloc::EvalContextExt as _;
 use crate::shims::unix::*;
@@ -379,7 +380,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // Thread-local storage
             "pthread_key_create" => {
                 if this.in_llvm()? {
-                    this.handle_unsupported(format!(
+                    this.handle_unsupported_foreign_item(format!(
                         "can't call foreign function `{link_name}` on OS `{os}`",
                         os = this.tcx.sess.target.os,
                     ))?;
@@ -557,7 +558,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // Threading
             "pthread_create" => {
                 if this.in_llvm()? {
-                    this.handle_unsupported(format!(
+                    this.handle_unsupported_foreign_item(format!(
                         "can't call foreign function `{link_name}` on OS `{os}`",
                         os = this.tcx.sess.target.os,
                     ))?;

@@ -107,6 +107,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         Ok(ptr.into())
     }
 
+
     fn posix_memalign(
         &mut self,
         memptr: &OpTy<'tcx>,

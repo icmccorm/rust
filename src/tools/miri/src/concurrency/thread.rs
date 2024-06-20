@@ -5,8 +5,7 @@ use inkwell::execution_engine::ExecutionEngine;
 use inkwell::types::AsTypeRef;
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::{FunctionValue, GenericValue};
-use std::cell::{Cell, RefCell};
-use std::collections::hash_map::Entry;
+use std::cell::Cell;
 
 use std::mem;
 use std::num::TryFromIntError;
@@ -26,7 +25,7 @@ use rustc_target::spec::abi::Abi;
 use crate::concurrency::data_race;
 use crate::shims::tls;
 use crate::*;
-
+use tracing::debug;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMHelperEvalExt;
 use crate::shims::llvm::threads::link::{ThreadLink, ThreadLinkDestination, ThreadLinkSource};
 use crate::shims::llvm_ffi_support::EvalContextExt as LLIEvalExt;
@@ -240,10 +239,14 @@ pub enum ThreadKind<'tcx> {
     #[default]
     MiriInternal,
 }
+
 /// A thread.
-pub struct Thread<'mir, 'tcx> {
+pub struct Thread<'tcx> {
     state: ThreadState<'tcx>,
+
+    /// Whether the thread is executing LLVM bitcode.
     is_llvm: Cell<bool>,
+
     /// Name of the thread.
     thread_name: Option<Vec<u8>>,
 
@@ -369,8 +372,8 @@ impl<'tcx> Thread<'tcx> {
         Self {
             state: ThreadState::Enabled,
             is_llvm: Cell::new(false),
-            thread_name: name.map(|name| Vec::from(name.as_bytes())),
             thread_kind: Cell::new(ThreadKind::MiriInternal),
+            thread_name: name.map(|name| Vec::from(name.as_bytes())),
             stack: Vec::new(),
             top_user_relevant_frame: None,
             join_status: ThreadJoinStatus::Joinable,
@@ -390,8 +393,8 @@ impl VisitProvenance for Thread<'_> {
             top_user_relevant_frame: _,
             state: _,
             is_llvm: _,
-            thread_name: _,
             thread_kind: _,
+            thread_name: _,
             join_status: _,
             on_stack_empty: _, // we assume the closure captures no GC-relevant state
         } = self;
@@ -485,34 +488,33 @@ pub enum TimeoutAnchor {
     Relative,
     Absolute,
 }
-
 /// A set of threads.
 #[derive(Debug)]
 pub struct ThreadManager<'tcx> {
     /// Identifier of the currently active thread.
     active_thread: ThreadId,
-    /// Threads used in the program.
+    /// Current LLI Thread Group
     lli_thread_group: Cell<Option<ThreadId>>,
+    /// All LLI Thread Groups
+    thread_groups: FxHashMap<ThreadId, ThreadId>,
+    /// Threads used in the program.
+    ///
     /// Note that this vector also contains terminated threads.
     threads: IndexVec<ThreadId, Thread<'tcx>>,
     /// A mapping from a thread-local static to the thread specific allocation.
     thread_local_allocs: FxHashMap<(DefId, ThreadId), StrictPointer>,
     /// A flag that indicates that we should change the active thread.
     yield_active_thread: bool,
-    /// Callbacks that are called once the specified time passes.
-    timeout_callbacks: FxHashMap<ThreadId, TimeoutCallbackInfo<'mir, 'tcx>>,
-    thread_groups: FxHashMap<ThreadId, ThreadId>,
 }
+
 
 impl VisitProvenance for ThreadManager<'_> {
     fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
         let ThreadManager {
             threads,
-            lli_thread_group: _,
-            timeout_callbacks,
-            thread_groups: _,
-            sync,
             thread_local_allocs,
+            lli_thread_group: _,
+            thread_groups: _,
             active_thread: _,
             yield_active_thread: _,
         } = self;
@@ -534,15 +536,14 @@ impl<'tcx> Default for ThreadManager<'tcx> {
         Self {
             active_thread: ThreadId::MAIN_THREAD,
             threads,
-            lli_thread_group: Cell::new(None),
-            sync: SynchronizationState::default(),
-            timeout_callbacks: FxHashMap::default(),
-            thread_groups: FxHashMap::default(),
             thread_local_allocs: Default::default(),
+            lli_thread_group: Cell::new(None),
+            thread_groups: Default::default(),
             yield_active_thread: false,
         }
     }
 }
+
 
 impl<'tcx> ThreadManager<'tcx> {
     pub(crate) fn init(
@@ -605,7 +606,7 @@ impl<'tcx> ThreadManager<'tcx> {
     }
 
     /// Set an active thread and return the id of the thread that was active before.
-    fn set_active_thread_id(&mut self, id: ThreadId) -> ThreadId {
+    pub fn set_active_thread_id(&mut self, id: ThreadId) -> ThreadId {
         assert!(id.index() < self.threads.len());
         info!(
             "---------- Now executing on thread `{}` (previous: `{}`) ----------------------------------------",
@@ -970,7 +971,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             function.get_name().to_string_lossy().to_string()
         );
         let this = self.eval_context_mut();
-        let active_thread_id = this.get_active_thread();
+        let active_thread_id = this.active_thread();
 
         unsafe {
             engine.create_thread(active_thread_id.into(), function, vec![].as_slice());
@@ -1005,7 +1006,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         }
 
         let old_error_place = this.active_thread_mut().last_error.clone();
-        let prev = this.set_active_thread(new_thread_id);
+        let prev = this.machine.threads.set_active_thread_id(new_thread_id);
         let group_id = this.machine.threads.link_to_thread_group(prev, new_thread_id);
 
         if let Some(current_group_id) = this.machine.threads.lli_thread_group.get() {
@@ -1041,7 +1042,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             this.active_thread_mut().thread_kind.set(ThreadKind::LLVM(link));
         }
 
-        let init_thread_id = this.set_active_thread(prev);
+        let init_thread_id = this.machine.threads.set_active_thread_id(prev);
 
         this.join_thread(init_thread_id)?;
         Ok(init_thread_id)
@@ -1051,7 +1052,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn start_callback_thread(
         &mut self,
         inst: Instance<'tcx>,
-        args: &[(OpTy<'tcx, Provenance>, Option<PlaceTy<'tcx, crate::Provenance>>)],
+        args: &[(OpTy<'tcx>, Option<PlaceTy<'tcx>>)],
         dest_layout: TyAndLayout<'tcx>,
         lli_return_type: Option<BasicTypeEnum<'static>>,
     ) -> InterpResult<'tcx, ThreadId> {
@@ -1070,7 +1071,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         // Finally switch to new thread so that we can push the first stackframe.
         // After this all accesses will be treated as occurring in the new thread.
-        let old_thread_id = this.set_active_thread(new_thread_id);
+        let old_thread_id = this.machine.threads.set_active_thread_id(new_thread_id);
         debug!("Switched to callback thread");
 
         this.active_thread_mut().last_error = old_error_place;
@@ -1123,7 +1124,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         this.active_thread_mut().thread_kind.set(ThreadKind::MiriLinked(link));
 
         // Restore the old active thread frame.
-        let new_thread_id = this.set_active_thread(old_thread_id);
+        let new_thread_id = this.machine.threads.set_active_thread_id(old_thread_id);
         this.join_thread(new_thread_id)?;
 
         Ok(new_thread_id)
@@ -1417,7 +1418,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
             match this.machine.threads.schedule(&this.machine.clock)? {
                 SchedulingAction::ExecuteStep => {
-                    let id = this.get_active_thread();
+                    let id = this.active_thread();
                     if this.in_llvm()? {
                         let ready_to_terminate = this.step_lli_thread(id)?;
                         if ready_to_terminate {

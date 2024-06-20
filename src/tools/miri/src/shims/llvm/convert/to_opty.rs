@@ -4,7 +4,6 @@ use super::field_bytes::FieldBytes;
 use crate::alloc_addresses::EvalContextExt as _;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalExt;
 use crate::shims::llvm::logging::LLVMFlag;
-use crate::{MiriInterpCx, Provenance};
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::GenericValueRef;
 use itertools::Itertools;
@@ -13,8 +12,7 @@ use rustc_apfloat::{
     ieee::{Double, Single},
     Float,
 };
-use rustc_const_eval::interpret::{ImmTy, MemoryKind, OpTy, PlaceTy};
-use rustc_const_eval::interpret::{InterpResult, Scalar};
+use rustc_const_eval::interpret::{InterpResult, MemoryKind};
 use rustc_middle::{
     mir::{self, AggregateKind},
     ty::{self, layout::TyAndLayout, AdtKind},
@@ -23,8 +21,10 @@ use rustc_target::abi::FIRST_VARIANT;
 use rustc_target::abi::{FieldIdx, VariantIdx};
 use std::cell::Cell;
 use std::fmt::Formatter;
+use tracing::debug;
+use crate::*;
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
 
 #[derive(Debug, Clone)]
 enum OpTySource<'lli> {
@@ -48,12 +48,12 @@ impl<'lli> std::fmt::Display for OpTySource<'lli> {
     }
 }
 
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn generic_value_to_opty<'lli>(
         &mut self,
         src: GenericValueRef<'lli>,
         rust_layout: TyAndLayout<'tcx>,
-    ) -> InterpResult<'tcx, (OpTy<'tcx, Provenance>, Option<PlaceTy<'tcx, Provenance>>)> {
+    ) -> InterpResult<'tcx, (OpTy<'tcx>, Option<PlaceTy<'tcx>>)> {
         let this = self.eval_context_mut();
         let mut converter = ConversionContext::new(src, rust_layout);
         convert_to_opty(this, &mut converter)
@@ -61,7 +61,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn write_generic_value<'lli>(
         &mut self,
         src: GenericValueRef<'lli>,
-        dest: PlaceTy<'tcx, Provenance>,
+        dest: PlaceTy<'tcx>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let mut converter = ConversionContext::new_to_place(src, dest);
@@ -73,7 +73,7 @@ struct ConversionContext<'tcx, 'lli> {
     pub source: OpTySource<'lli>,
     pub rust_layout: TyAndLayout<'tcx>,
     pub padded_size: Size,
-    destination: Cell<Option<PlaceTy<'tcx, Provenance>>>,
+    destination: Cell<Option<PlaceTy<'tcx>>>,
 }
 
 impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
@@ -86,7 +86,7 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
             destination: Cell::new(None),
         }
     }
-    fn new_to_place(source: GenericValueRef<'lli>, destination: PlaceTy<'tcx, Provenance>) -> Self {
+    fn new_to_place(source: GenericValueRef<'lli>, destination: PlaceTy<'tcx>) -> Self {
         let context = Self::new(source, destination.layout);
         context.destination.set(Some(destination));
         context
@@ -94,9 +94,9 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
 
     fn resolve_fields(
         &self,
-        miri: &mut MiriInterpCx<'_, 'tcx>,
-        destination: PlaceTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, Vec<(PlaceTy<'tcx, Provenance>, Size)>> {
+        miri: &mut MiriInterpCx<'tcx>,
+        destination: PlaceTy<'tcx>,
+    ) -> InterpResult<'tcx, Vec<(PlaceTy<'tcx>, Size)>> {
         let (variant_dest, active_field_index) = if let Some(agk) = self.get_aggregate_kind(miri)? {
             let (variant_index, active_field_index) = match agk {
                 mir::AggregateKind::Adt(_, variant_index, _, _, active_field_index) =>
@@ -122,7 +122,7 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
 
     fn new_from_field(
         source: OpTySource<'lli>,
-        destination: PlaceTy<'tcx, Provenance>,
+        destination: PlaceTy<'tcx>,
         padded_size: Size,
     ) -> Self {
         ConversionContext {
@@ -133,14 +133,14 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
         }
     }
 
-    fn get_destination(&mut self) -> Option<PlaceTy<'tcx, Provenance>> {
+    fn get_destination(&mut self) -> Option<PlaceTy<'tcx>> {
         self.destination.get_mut().clone()
     }
 
     fn get_or_create_destination(
         &mut self,
-        miri: &mut MiriInterpCx<'_, 'tcx>,
-    ) -> InterpResult<'tcx, PlaceTy<'tcx, Provenance>> {
+        miri: &mut MiriInterpCx<'tcx>,
+    ) -> InterpResult<'tcx, PlaceTy<'tcx>> {
         let dest = self.destination.get_mut();
         if let Some(cvp) = dest {
             Ok(cvp.clone())
@@ -155,7 +155,7 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
     }
 
     #[allow(clippy::arithmetic_side_effects)]
-    fn get_discriminant(&self, miri: &MiriInterpCx<'_, 'tcx>) -> InterpResult<'tcx, u32> {
+    fn get_discriminant(&self, miri: &MiriInterpCx<'tcx>) -> InterpResult<'tcx, u32> {
         if self.rust_layout.fields.count() > 0 {
             match &self.source {
                 OpTySource::Generic(gvr) =>
@@ -179,7 +179,7 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
 
     fn get_aggregate_kind(
         &self,
-        miri: &MiriInterpCx<'_, 'tcx>,
+        miri: &MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, Option<AggregateKind<'tcx>>> {
         let rust_type = self.rust_layout.ty;
         let kind = if let ty::Adt(adt_def, sr) = rust_type.kind() {
@@ -211,9 +211,9 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
 }
 
 fn convert_to_opty<'tcx, 'lli>(
-    miri: &mut MiriInterpCx<'_, 'tcx>,
+    miri: &mut MiriInterpCx<'tcx>,
     ctx: &mut ConversionContext<'tcx, 'lli>,
-) -> InterpResult<'tcx, (OpTy<'tcx, Provenance>, Option<PlaceTy<'tcx, Provenance>>)> {
+) -> InterpResult<'tcx, (OpTy<'tcx>, Option<PlaceTy<'tcx>>)> {
     debug!("[GV to Op]: {} to {:?}", ctx.source, ctx.rust_layout.ty);
     match ctx.rust_layout.abi {
         rustc_abi::Abi::Scalar(_) => {
@@ -306,9 +306,9 @@ fn convert_to_opty<'tcx, 'lli>(
 
 #[allow(clippy::arithmetic_side_effects)]
 fn convert_to_immty<'tcx>(
-    miri: &MiriInterpCx<'_, 'tcx>,
+    miri: &MiriInterpCx<'tcx>,
     ctx: &ConversionContext<'tcx, '_>,
-) -> InterpResult<'tcx, ImmTy<'tcx, crate::Provenance>> {
+) -> InterpResult<'tcx, ImmTy<'tcx>> {
     let truncate_to_pointer_size = |v: u128| -> u64 {
         let as_bytes: [u8; 16] = v.to_ne_bytes();
         let pointer_size = miri.tcx.data_layout.pointer_size;
@@ -395,7 +395,7 @@ fn convert_to_immty<'tcx>(
                             wrapped_pointer.addr
                         );
                         let pointer_ty_layout = ctx.rust_layout;
-                        let scalar = Scalar::from_maybe_pointer(mp, miri);
+                        let scalar = Scalar::from_maybe_pointer(mp.into(), miri);
                         let imm = ImmTy::from_scalar(scalar, pointer_ty_layout);
                         return Ok(imm);
                     } else {

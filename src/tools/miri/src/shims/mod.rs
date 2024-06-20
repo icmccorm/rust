@@ -5,11 +5,14 @@ mod backtrace;
 
 #[cfg(target_os = "linux")]
 mod native_lib;
+
 mod unix;
 mod wasi;
 mod windows;
 mod x86;
+
 pub mod llvm;
+#[macro_use]
 pub mod llvm_ffi_support;
 
 pub mod env;
@@ -33,3 +36,4 @@ pub enum EmulateItemResult {
     /// The item is not supported.
     NotSupported,
 }
+

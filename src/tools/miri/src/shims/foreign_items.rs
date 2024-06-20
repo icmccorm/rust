@@ -5,6 +5,8 @@ use std::{
     path::Path,
 };
 
+use crate::shims::llvm::helpers::EvalContextExt as _;
+use crate::shims::llvm_ffi_support::EvalContextExt as _;
 use rustc_apfloat::Float;
 use rustc_ast::expand::allocator::alloc_error_handler_name;
 use rustc_hir::{def::DefKind, def_id::CrateNum};
@@ -16,8 +18,6 @@ use rustc_target::{
     abi::{Align, Size},
     spec::abi::Abi,
 };
-use crate::shims::llvm::helpers::EvalContextExt as _;
-use crate::shims::llvm_ffi_support::EvalContextExt as _;
 
 #[derive(Eq, PartialEq, Copy, Clone, Debug)]
 #[repr(u32)]
@@ -65,7 +65,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx, Option<(&'tcx mir::Body<'tcx>, ty::Instance<'tcx>)>> {
         let this = self.eval_context_mut();
         let tcx = this.tcx.tcx;
-        
+
         // Some shims forward to other MIR bodies.
         match link_name.as_str() {
             // This matches calls to the foreign item `panic_impl`.
@@ -218,87 +218,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             Some(instance) => Ok(Some((this.load_mir(instance.def, None)?, instance))),
         }
     }
-/* 
-    fn malloc(
-        &mut self,
-        size: u64,
-        zero_init: bool,
-        kind: MiriMemoryKind,
-    ) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
-        let this = self.eval_context_mut();
-        this.malloc_align(size, this.min_align(size, kind), zero_init, kind)
-    }
-
-    fn malloc_align(
-        &mut self,
-        size: u64,
-        align: Align,
-        zero_init: bool,
-        kind: MiriMemoryKind,
-    ) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
-        let this = self.eval_context_mut();
-        if size == 0 {
-            Ok(Pointer::null())
-        } else {
-            let ptr = this.allocate_ptr(Size::from_bytes(size), align, kind.into())?;
-            if zero_init {
-                // We just allocated this, the access is definitely in-bounds and fits into our address space.
-                this.write_bytes_ptr(
-                    ptr.into(),
-                    iter::repeat(0u8).take(usize::try_from(size).unwrap()),
-                )
-                .unwrap();
-            }
-            Ok(ptr.into())
-        }
-    }
-
-    fn free(
-        &mut self,
-        ptr: Pointer<Option<Provenance>>,
-        kind: MiriMemoryKind,
-    ) -> InterpResult<'tcx> {
-        let this = self.eval_context_mut();
-        if !this.ptr_is_null(ptr)? {
-            this.deallocate_ptr(ptr, None, kind.into())?;
-        }
-        Ok(())
-    }
-
-    fn realloc(
-        &mut self,
-        old_ptr: Pointer<Option<Provenance>>,
-        new_size: u64,
-        kind: MiriMemoryKind,
-    ) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
-        let this = self.eval_context_mut();
-        let new_align = this.min_align(new_size, kind);
-        if this.ptr_is_null(old_ptr)? {
-            if new_size == 0 {
-                Ok(Pointer::null())
-            } else {
-                let new_ptr =
-                    this.allocate_ptr(Size::from_bytes(new_size), new_align, kind.into())?;
-                Ok(new_ptr.into())
-            }
-        } else {
-            if new_size == 0 {
-                this.deallocate_ptr(old_ptr, None, kind.into())?;
-                Ok(Pointer::null())
-            } else {
-                let new_ptr = this.reallocate_ptr(
-                    old_ptr,
-                    None,
-                    Size::from_bytes(new_size),
-                    new_align,
-                    kind.into(),
-                )?;
-                Ok(new_ptr.into())
-            }
-        }
-    }
 }
-*/
+
 impl<'tcx> EvalContextExtPriv<'tcx> for crate::MiriInterpCx<'tcx> {}
 trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn emulate_foreign_item_inner(
@@ -797,13 +718,11 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let [ptr] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let ptr = this.read_pointer(ptr)?;
                 let (alloc_id, _, _) = this.ptr_get_alloc_id(ptr)?;
-                let base_address = Size::from_bytes(this.addr_from_alloc_id(
-                    alloc_id,
-                )?);
+                let (kind, alloc) = this.memory.alloc_map().get(alloc_id).unwrap();
+                let base_address = Size::from_bytes(this.addr_from_alloc_id(alloc_id, *kind)?);
                 if base_address != ptr.addr() {
                     this.write_scalar(Scalar::from_u64(0), dest)?;
                 } else {
-                    let (_, alloc) = this.memory.alloc_map().get(alloc_id).unwrap();
                     let size = alloc.size().bytes();
                     this.write_scalar(Scalar::from_u64(size), dest)?;
                 };
@@ -1166,7 +1085,11 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     // we would end up with endless stack overflows in cases where a system call is
                     // exposed as an LLVM function, but implemented in terms of itself.
                     if this.has_llvm_interpreter() && !this.in_llvm()? {
-                        if this.call_external_llvm_fct(link_name, &PlaceTy::from(dest.clone()), args)? {
+                        if this.call_external_llvm_fct(
+                            link_name,
+                            &PlaceTy::from(dest.clone()),
+                            args,
+                        )? {
                             return Ok(EmulateItemResult::NeedsReturn);
                         }
                     }
