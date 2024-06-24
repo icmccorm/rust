@@ -1,41 +1,35 @@
 use super::memory::obtain_ctx_mut;
-use crate::concurrency::thread::EvalContextExt as ThreadEvalContextExt;
+use crate::concurrency::thread::EvalContextExt as _;
 use crate::eval::ForeignMemoryMode;
-use crate::helpers::EvalContextExt as HelperEvalContextExt;
-use crate::shims::foreign_items::EvalContextExt as ForeignEvalContextExt;
-use crate::shims::llvm::convert::to_bytes::EvalContextExt as ToBytesEvalContextExt;
-use crate::shims::llvm::convert::to_opty::EvalContextExt as ToOpTyEvalContextExt;
-use crate::shims::llvm::helpers::EvalContextExt as LLVMHelpersEvalContextExt;
-use crate::shims::llvm::hooks::memcpy::eval_memcpy;
-use crate::shims::llvm::hooks::memcpy::MemcpyMode;
-use crate::shims::llvm_ffi_support::EvalContextExt as FFIEvalContextExt;
-use inkwell::types::BasicTypeEnum;
-use inkwell::values::GenericValue;
-use inkwell::values::GenericValueRef;
-use llvm_sys::execution_engine::LLVMGenericValueArrayRef;
-use llvm_sys::miri::MiriInterpCxOpaque;
-use llvm_sys::miri::MiriPointer;
-use llvm_sys::prelude::LLVMTypeRef;
-use rand::Rng;
-use rand::SeedableRng;
+use crate::helpers::EvalContextExt as _;
+use crate::shims::alloc::EvalContextExt as _;
+use crate::shims::foreign_items::EvalContextExt as _;
+use crate::shims::llvm::helpers::EvalContextExt as _;
+use crate::shims::llvm::hooks::{eval_memcpy, MemcpyMode};
+use crate::shims::llvm::EvalContextExt as _;
+use crate::shims::llvm::convert::EvalContextExt as _;
+use inkwell::{
+    types::BasicTypeEnum,
+    values::{GenericValue, GenericValueRef},
+};
+use llvm_sys::{execution_engine::LLVMGenericValueArrayRef, miri::*, prelude::LLVMTypeRef};
+use rand::{Rng, SeedableRng};
 use rustc_const_eval::interpret::{FnVal, InterpResult, MemoryKind};
-use rustc_middle::mir::{UnwindAction, UnwindTerminateReason};
-use rustc_middle::ty;
-use rustc_middle::ty::layout::HasParamEnv;
-use rustc_middle::ty::layout::LayoutOf;
-use rustc_middle::ty::Instance;
-use rustc_middle::ty::Ty;
+use rustc_middle::{
+    mir::{UnwindAction, UnwindTerminateReason},
+    ty::{
+        self,
+        layout::{HasParamEnv, LayoutOf},
+        Instance, Ty,
+    },
+};
 use rustc_span::Symbol;
-use rustc_target::abi::Size;
-use rustc_target::spec::abi::Abi;
-use std::ffi::CStr;
-use std::ffi::CString;
+use rustc_target::{abi::Size, spec::abi::Abi};
+
+use crate::*;
+use std::ffi::{CStr, CString};
 use std::time::SystemTime;
 use tracing::debug;
-use crate::shims::alloc::EvalContextExt as _;
-use crate::PlaceTy;
-use crate::*;
-
 
 fn miri_call_by_instance_result<'tcx>(
     ctx: &mut MiriInterpCx<'tcx>,

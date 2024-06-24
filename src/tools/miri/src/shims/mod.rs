@@ -11,9 +11,8 @@ mod wasi;
 mod windows;
 mod x86;
 
-pub mod llvm;
 #[macro_use]
-pub mod llvm_ffi_support;
+pub mod llvm;
 
 pub mod env;
 pub mod extern_static;

@@ -16,7 +16,7 @@ use shims::unix::linux::foreign_items as linux;
 use shims::unix::macos::foreign_items as macos;
 use shims::unix::solarish::foreign_items as solarish;
 
-use crate::shims::llvm::helpers::EvalContextExt as _;
+use crate::shims::llvm::EvalContextExt as _;
 
 pub fn is_dyn_sym(name: &str, target_os: &str) -> bool {
     match name {

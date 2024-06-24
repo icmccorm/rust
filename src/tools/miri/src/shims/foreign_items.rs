@@ -4,9 +4,7 @@ use std::{
     iter::{self, repeat},
     path::Path,
 };
-
-use crate::shims::llvm::helpers::EvalContextExt as _;
-use crate::shims::llvm_ffi_support::EvalContextExt as _;
+use crate::shims::llvm::EvalContextExt as _;
 use rustc_apfloat::Float;
 use rustc_ast::expand::allocator::alloc_error_handler_name;
 use rustc_hir::{def::DefKind, def_id::CrateNum};

@@ -1,5 +1,5 @@
 //! Implements threads.
-use crate::shims::llvm::logging::LLVMFlag;
+use crate::shims::llvm::LLVMFlag;
 use either::Either;
 use inkwell::execution_engine::ExecutionEngine;
 use inkwell::types::AsTypeRef;
@@ -26,9 +26,9 @@ use crate::concurrency::data_race;
 use crate::shims::tls;
 use crate::*;
 use tracing::debug;
-use crate::shims::llvm::helpers::EvalContextExt as LLVMHelperEvalExt;
-use crate::shims::llvm::threads::link::{ThreadLink, ThreadLinkDestination, ThreadLinkSource};
-use crate::shims::llvm_ffi_support::EvalContextExt as LLIEvalExt;
+use crate::shims::llvm::EvalContextExt as _;
+use crate::shims::llvm::threads::{ThreadLink, ThreadLinkDestination, ThreadLinkSource};
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SchedulingAction {

@@ -4,8 +4,8 @@ use crate::eval::ForeignMemoryMode;
 use crate::machine::MiriInterpCxExt as _;
 use crate::shims::llvm::logging::LLVMFlag;
 use crate::shims::llvm::{
-    helpers::EvalContextExt,
-    hooks::access::{Destination, Source},
+    helpers::EvalContextExt as _,
+    hooks::{Destination, Source},
 };
 use crate::*;
 use rustc_abi::{Align, Size};
@@ -20,12 +20,15 @@ use rustc_const_eval::interpret::{
 #[derive(Debug)]
 pub struct ResolvedPointer {
     pub ptr: Pointer,
-    pub alloc_id: Option<AllocId>,
     pub align: Align,
     pub offset: Size,
 }
 
 impl ResolvedPointer {
+    pub fn alloc_id(&self) -> Option<AllocId> {
+        self.ptr.provenance.map(|p| p.get_alloc_id())?
+    }
+
     pub fn access_alloc<'tcx, 'a>(
         &'a self,
         ctx: &'a MiriInterpCx<'tcx>,
@@ -33,7 +36,10 @@ impl ResolvedPointer {
         align: Align,
     ) -> InterpResult<
         'tcx,
-        (AllocRef<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>, crate::MiriAllocBytes>, AllocRange),
+        (
+            AllocRef<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>, crate::MiriAllocBytes>,
+            AllocRange,
+        ),
     > {
         let this = ctx.eval_context_ref();
         let (size, _align, range) = self.get_access_size_range(this, access_size, align)?;
@@ -53,7 +59,16 @@ impl ResolvedPointer {
         align: Align,
     ) -> InterpResult<
         'tcx,
-        (AllocRefMut<'a, 'tcx, crate::Provenance, crate::AllocExtra<'tcx>, crate::MiriAllocBytes>, AllocRange),
+        (
+            AllocRefMut<
+                'a,
+                'tcx,
+                crate::Provenance,
+                crate::AllocExtra<'tcx>,
+                crate::MiriAllocBytes,
+            >,
+            AllocRange,
+        ),
     > {
         let this = ctx.eval_context_mut();
         let (size, _align, range) = self.get_access_size_range(this, access_size, align)?;
@@ -70,7 +85,6 @@ impl ResolvedPointer {
     pub fn null() -> Self {
         ResolvedPointer {
             ptr: crate::Pointer::null(),
-            alloc_id: None,
             align: Align::ONE,
             offset: Size::from_bytes(0),
         }
@@ -92,7 +106,7 @@ impl ResolvedPointer {
         access_align: Align,
     ) -> InterpResult<'tcx, (Size, Align, AllocRange)> {
         let this = ctx.eval_context_ref();
-        if this.should_check_alignment_in_llvm(self.alloc_id) {
+        if this.should_check_alignment_in_llvm(self.alloc_id()) {
             Ok((access_size, access_align, alloc_range(Size::ZERO, access_size)))
         } else {
             Ok((self.offset + access_size, self.align, alloc_range(self.offset, access_size)))
@@ -107,7 +121,7 @@ impl ResolvedPointer {
         index: u32,
     ) -> InterpResult<'tcx, ResolvedPointer> {
         let this = ctx.eval_context_ref();
-        let (ptr, offset) = if this.should_check_alignment_in_llvm(self.alloc_id) {
+        let (ptr, offset) = if this.should_check_alignment_in_llvm(self.alloc_id()) {
             let ptr = self.ptr.offset(Size::from_bytes(size.bytes() * u64::from(index)), ctx)?;
             (ptr, self.offset)
         } else {
@@ -122,7 +136,7 @@ impl ResolvedPointer {
                 (self.ptr, new_offset)
             }
         };
-        Ok(Self { ptr, alloc_id: self.alloc_id, align: self.align, offset })
+        Ok(Self { ptr, align: self.align, offset })
     }
 }
 

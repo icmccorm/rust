@@ -1,35 +1,38 @@
 extern crate either;
 extern crate rustc_abi;
-use super::values::resolved_ptr::ResolvedPointer;
+use super::values::ResolvedPointer;
 use crate::alloc_addresses::EvalContextExt as _;
-use crate::concurrency::thread::EvalContextExt as _;
 use crate::eval::ForeignAlignmentCheckMode;
 use crate::helpers::EvalContextExt as HelperEvalExt;
 use crate::rustc_const_eval::interpret::AllocMap;
-use crate::rustc_middle::ty::layout::LayoutOf;
 use crate::shims::llvm::logging::LLVMFlag;
-use crate::throw_unsup_llvm_type;
-use crate::throw_unsup_shim_llvm_type;
 use crate::*;
-use either::Either::Right;
-use inkwell::miri::StackTrace;
-use inkwell::types::{AnyTypeEnum, BasicType, BasicTypeEnum};
-use inkwell::values::GenericValueArrayRef;
-use inkwell::values::GenericValueRef;
 use llvm_sys::execution_engine::LLVMGenericValueArrayRef;
-use llvm_sys::miri::{MiriPointer, MiriProvenance};
-use llvm_sys::prelude::LLVMTypeRef;
+
+use inkwell::{
+    miri::StackTrace,
+    types::{AnyTypeEnum, BasicType, BasicTypeEnum},
+    values::{GenericValueArrayRef, GenericValueRef},
+};
+
+use llvm_sys::{
+    miri::{MiriPointer, MiriProvenance},
+    prelude::LLVMTypeRef,
+};
+
+use either::Either::Right;
+
 use rustc_abi::Endian;
 use rustc_const_eval::interpret::{AllocId, CheckInAllocMsg, InterpErrorInfo, InterpResult};
-use rustc_middle::mir::Mutability;
-use rustc_middle::ty::layout::{HasTyCtxt, TyAndLayout};
-use rustc_middle::ty::AdtDef;
-use rustc_middle::ty::GenericArgsRef;
-use rustc_middle::ty::{self, Ty};
-use rustc_span::FileNameDisplayPreference;
-use rustc_target::abi::Align;
-use rustc_target::abi::Size;
-use rustc_target::abi::VariantIdx;
+use rustc_middle::{
+    mir::Mutability,
+    ty::{
+        self,
+        layout::{HasTyCtxt, LayoutOf, TyAndLayout},
+        AdtDef, GenericArgsRef, Ty,
+    },
+};
+use rustc_target::abi::{Align, Size, VariantIdx};
 use std::num::NonZeroU64;
 use tracing::debug;
 
@@ -115,12 +118,15 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 match ty.get_llvm_type_kind() {
                     llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind =>
                         Some(ctx.layout_of(ctx.tcx.types.f64)?),
+
                     llvm_sys::LLVMTypeKind::LLVMFloatTypeKind =>
                         Some(ctx.layout_of(ctx.tcx.types.f32)?),
                     _ => None,
                 },
+
             BasicTypeEnum::IntType(it) =>
                 ctx.get_equivalent_rust_int_from_size(Size::from_bits(it.get_bit_width()))?,
+
             BasicTypeEnum::PointerType(_) => Some(ctx.raw_pointer_to(ctx.tcx.types.u8)?),
             _ => None,
         };
@@ -205,6 +211,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let args = (0..num_arguments_provided)
             .map(|idx| args.get_element_at(idx as u64).unwrap())
             .collect();
+
         Ok((args, ret_ty))
     }
 
@@ -248,26 +255,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         MiriPointer { addr, prov: MiriProvenance { alloc_id, tag } }
     }
 
-    fn get_foreign_error(&self) -> Option<InterpErrorInfo<'tcx>> {
-        let this = self.eval_context_ref();
-        let err_opt = this.machine.foreign_error.take();
-        if err_opt.is_some() {
-            eprintln!("\n\n---- Foreign Error Trace ----");
-            if let Some(trace) = this.machine.foreign_error_trace.take() {
-                eprintln!("{}", trace);
-            }
-            if let Some(call_location) = this.machine.foreign_error_rust_call_location.take() {
-                let span_str = this
-                    .tcx()
-                    .sess
-                    .source_map()
-                    .span_to_string(call_location, FileNameDisplayPreference::Local);
-                eprintln!("{}", span_str);
-            }
-            eprintln!("-----------------------------\n");
-        }
-        err_opt
-    }
+
 
     fn set_pending_return_value(&mut self, id: ThreadId, val_ref: GenericValueRef<'static>) {
         let this = self.eval_context_mut();
@@ -276,15 +264,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         } else {
             this.machine.pending_return_values.try_insert(id, val_ref).unwrap();
         }
-    }
-
-    fn get_pending_return_value(
-        &mut self,
-        id: ThreadId,
-    ) -> InterpResult<'tcx, Option<GenericValueRef<'static>>> {
-        let this = self.eval_context_mut();
-        let pending_return = this.machine.pending_return_values.remove(&id);
-        Ok(pending_return)
     }
 
     fn update_last_rust_call_location(&self) {
@@ -364,7 +343,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             let pointer = if this.should_check_alignment_in_llvm(Some(alloc_id)) {
                 ResolvedPointer {
                     ptr: Pointer::new(Some(provenance), Size::from_bytes(mp.addr)),
-                    alloc_id: Some(alloc_id),
                     align,
                     offset: Size::ZERO,
                 }
@@ -377,7 +355,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let aligned_addr = Size::from_bytes(base_address + aligned_offset);
                 ResolvedPointer {
                     ptr: Pointer::new(Some(provenance), aligned_addr),
-                    alloc_id: Some(alloc_id),
                     align,
                     offset,
                 }
@@ -400,6 +377,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_ref();
         this.layout_of(this.tcx.mk_ty_from_kind(ty::RawPtr(ty, Mutability::Mut)))
     }
+
     #[allow(clippy::arithmetic_side_effects)]
     fn to_vec_endian(&self, bytes: u128, length: usize) -> Vec<u8> {
         let bytes = bytes.to_ne_bytes();
@@ -486,10 +464,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         }
     }
 
-    fn in_llvm(&self) -> InterpResult<'tcx, bool> {
-        let this = self.eval_context_ref();
-        Ok(this.active_thread_ref().is_llvm_thread())
-    }
 
     fn strcmp(
         &mut self,

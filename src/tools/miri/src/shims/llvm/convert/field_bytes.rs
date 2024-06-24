@@ -1,10 +1,9 @@
 extern crate itertools;
 extern crate rustc_abi;
+use crate::*;
 use itertools::Itertools;
 use rustc_abi::Endian;
 use rustc_middle::ty::layout::TyAndLayout;
-use crate::*;
-
 
 #[derive(Debug, Copy, Clone)]
 pub struct FieldBytes {

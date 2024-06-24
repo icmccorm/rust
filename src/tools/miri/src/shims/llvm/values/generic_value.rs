@@ -1,9 +1,9 @@
 use crate::shims::llvm::helpers::EvalContextExt;
-use crate::shims::llvm::hooks::access::{Destination, Source};
+use crate::shims::llvm::hooks::{Destination, Source};
+use crate::*;
 use inkwell::values::GenericValueRef;
 use rustc_const_eval::interpret::InterpResult;
-use rustc_target::abi::{Size, Align};
-use crate::*;
+use rustc_target::abi::{Align, Size};
 
 impl<'lli> Destination<GenericValueRef<'lli>> for GenericValueRef<'lli> {
     fn write_f32<'tcx>(
@@ -68,19 +68,11 @@ impl<'lli> Destination<GenericValueRef<'lli>> for GenericValueRef<'lli> {
 }
 
 impl<'lli> Source<GenericValueRef<'lli>> for GenericValueRef<'lli> {
-    fn read_f32<'tcx>(
-        &self,
-        _ctx: &MiriInterpCx<'tcx>,
-        _align: Align,
-    ) -> InterpResult<'tcx, f32> {
+    fn read_f32<'tcx>(&self, _ctx: &MiriInterpCx<'tcx>, _align: Align) -> InterpResult<'tcx, f32> {
         Ok(self.as_f32())
     }
 
-    fn read_f64<'tcx>(
-        &self,
-        _ctx: &MiriInterpCx<'tcx>,
-        _align: Align,
-    ) -> InterpResult<'tcx, f64> {
+    fn read_f64<'tcx>(&self, _ctx: &MiriInterpCx<'tcx>, _align: Align) -> InterpResult<'tcx, f64> {
         Ok(self.as_f64())
     }
 

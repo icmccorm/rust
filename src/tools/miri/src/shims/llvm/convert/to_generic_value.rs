@@ -1,9 +1,10 @@
 extern crate either;
 extern crate rustc_abi;
-use super::to_bytes::EvalContextExt as ToBytesEvalExt;
+use super::EvalContextExt as _;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalExt;
 use crate::shims::llvm::lli::{ResolvedLLVMType, ResolvedRustArgument};
 use crate::shims::llvm::logging::LLVMFlag;
+use crate::*;
 use either::Either::{Left, Right};
 use inkwell::values::FunctionValue;
 use inkwell::values::GenericValueRef;
@@ -16,21 +17,6 @@ use rustc_target::abi::call::HomogeneousAggregate;
 use rustc_target::abi::FieldsShape;
 use std::iter::repeat;
 use tracing::debug;
-use crate::*;
-
-
-macro_rules! throw_llvm_argument_mismatch {
-    ($function: expr, $rust_args: expr, $llvm_args: expr) => {
-        throw_interop_format!(
-            "argument count mismatch: LLVM function {:?} {} expects {}{} arguments, but Rust provided {}",
-            $function.get_name(),
-            $function.get_type().print_to_string().to_string(),
-            (if $function.get_type().is_var_arg() { "at least " } else { "" }),
-            $llvm_args,
-            $rust_args
-        )
-    };
-}
 
 pub struct LLVMArgumentConverter<'tcx, 'lli> {
     function: FunctionValue<'lli>,
@@ -38,6 +24,7 @@ pub struct LLVMArgumentConverter<'tcx, 'lli> {
     original_argument_counts: (usize, usize),
     llvm_types: Vec<ResolvedLLVMType<'lli>>,
 }
+
 #[allow(dead_code)]
 impl<'tcx, 'lli> LLVMArgumentConverter<'tcx, 'lli> {
     pub fn new(
@@ -255,8 +242,7 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
                         let scalar = if let rustc_abi::Scalar::Union { value } = sc {
                             let mp = arg.opty().assert_mem_place();
                             let ptr = mp.ptr();
-                            let alloc =
-                                ctx.get_ptr_alloc(ptr, value.size(ctx))?;
+                            let alloc = ctx.get_ptr_alloc(ptr, value.size(ctx))?;
                             if let Some(a) = alloc {
                                 a.read_scalar(alloc_range(Size::ZERO, value.size(ctx)), true)?
                             } else {
@@ -377,13 +363,12 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
             match sc.primitive() {
                 rustc_abi::Primitive::Int(_, _) => {
                     let scalar = ctx.read_scalar(arg.opty())?.assert_scalar_int();
-                    let bits = scalar
-                        .to_bits(arg.value_size());
+                    let bits = scalar.to_bits(arg.value_size());
                     debug!("[Op to GV]: Int value: {}", u64::try_from(bits).unwrap());
                     let bytes = ctx.to_vec_endian(bits, arg.value_size().bytes_usize());
                     dest.set_bytes(&bytes);
                 }
-                rustc_abi::Primitive::Float(fl) => {
+                rustc_abi::Primitive::Float(fl) =>
                     match fl {
                         rustc_abi::Float::F32 => {
                             let scalar = ctx.read_scalar(arg.opty())?;
@@ -404,8 +389,7 @@ pub fn convert_opty_to_generic_value<'tcx, 'lli>(
                         _ => {
                             throw_unsup_var_arg!(arg.layout());
                         }
-                    }
-                }
+                    },
                 rustc_abi::Primitive::Pointer(_) => {
                     let ptr = ctx.read_pointer(arg.opty())?;
                     let wrapped_pointer = ctx.pointer_to_lli_wrapped_pointer(ptr.into());

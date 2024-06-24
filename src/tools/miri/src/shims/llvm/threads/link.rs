@@ -1,17 +1,15 @@
-use crate::concurrency::thread::EvalContextExt as ConcurrencyExt;
-use crate::shims::llvm::convert::to_opty::EvalContextExt as ToOpTyExt;
+use crate::concurrency::thread::EvalContextExt as _;
+use crate::shims::llvm::convert::EvalContextExt as _;
 use crate::shims::llvm::helpers::EvalContextExt;
-use crate::shims::llvm_ffi_support::EvalContextExt as FFIEvalContextExt;
-use crate::MiriInterpCx;
-use crate::ThreadId;
-use inkwell::types::BasicTypeEnum;
-use inkwell::values::GenericValue;
-use inkwell::values::GenericValueRef;
-use llvm_sys::prelude::LLVMTypeRef;
-use rustc_const_eval::interpret::InterpResult;
-use rustc_const_eval::interpret::MemoryKind;
-use tracing::debug;
+use crate::shims::llvm::EvalContextExt as _;
 use crate::*;
+use inkwell::{
+    types::BasicTypeEnum,
+    values::{GenericValue, GenericValueRef},
+};
+use llvm_sys::prelude::LLVMTypeRef;
+use rustc_const_eval::interpret::{InterpResult, MemoryKind};
+use tracing::debug;
 
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Debug)]
@@ -115,7 +113,8 @@ impl<'tcx> ThreadLink<'tcx> {
                 if let ThreadLinkSource::FromLLI(gvty_opt) = self.source {
                     if let Some(return_type) = gvty_opt {
                         debug!("[ThreadLink] Writing generic value to Miri destination.");
-                        let prev: ThreadId = this.machine.threads.set_active_thread_id(self.linked_id);
+                        let prev: ThreadId =
+                            this.machine.threads.set_active_thread_id(self.linked_id);
                         let return_ref_opt = this.get_thread_exit_value(self.id)?;
                         if let Some(return_ref) = return_ref_opt {
                             return_ref.set_type_tag(unsafe { &BasicTypeEnum::new(return_type) });

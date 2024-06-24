@@ -7,7 +7,7 @@ use std::task::Poll;
 use std::thread;
 use crate::concurrency::thread::TlsAllocAction;
 use crate::diagnostics::report_leaks;
-use crate::shims::llvm_ffi_support::EvalContextExt;
+use crate::shims::llvm::EvalContextExt as _;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::def::Namespace;
 use rustc_hir::def_id::DefId;
