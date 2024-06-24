@@ -1,9 +1,3 @@
-use std::{
-    collections::hash_map::Entry,
-    io::Write,
-    iter::{self, repeat},
-    path::Path,
-};
 use crate::shims::llvm::EvalContextExt as _;
 use rustc_apfloat::Float;
 use rustc_ast::expand::allocator::alloc_error_handler_name;
@@ -15,6 +9,12 @@ use rustc_span::Symbol;
 use rustc_target::{
     abi::{Align, Size},
     spec::abi::Abi,
+};
+use std::{
+    collections::hash_map::Entry,
+    io::Write,
+    iter::{self, repeat},
+    path::Path,
 };
 
 #[derive(Eq, PartialEq, Copy, Clone, Debug)]
@@ -99,20 +99,26 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         // The rest either implements the logic, or falls back to `lookup_exported_symbol`.
         match this.emulate_foreign_item_inner(link_name, abi, args, dest)? {
-            EmulateItemResult::NeedsReturn => {
-                trace!("{:?}", this.dump_place(&dest.clone().into()));
-                this.return_to_block(ret)?;
-            }
+            EmulateItemResult::NeedsReturn =>
+                if !this.in_llvm()? {
+                    trace!("{:?}", this.dump_place(&dest.clone().into()));
+                    this.return_to_block(ret)?;
+                },
             EmulateItemResult::NeedsUnwind => {
-                // Jump to the unwind block to begin unwinding.
-                this.unwind_to_block(unwind)?;
+                if !this.in_llvm()? {
+                    // Jump to the unwind block to begin unwinding.
+                    this.unwind_to_block(unwind)?;
+                } else {
+                    throw_unsup_format!(
+                        "[MiriLLI]: Unwinding across FFI boundaries is not supported."
+                    );
+                }
             }
             EmulateItemResult::AlreadyJumped => (),
             EmulateItemResult::NotSupported => {
                 if let Some(body) = this.lookup_exported_symbol(link_name)? {
                     return Ok(Some(body));
                 }
-
                 this.handle_unsupported_foreign_item(format!(
                     "can't call foreign function `{link_name}` on OS `{os}`",
                     os = this.tcx.sess.target.os,

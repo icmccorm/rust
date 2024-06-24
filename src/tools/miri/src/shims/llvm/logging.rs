@@ -36,6 +36,7 @@ pub enum LLVMFlag {
     CastPointerFromLLVMAtBoundary,
     AggregateAsBytes,
     VarArgFunction,
+    SizeMismatchInShim
 }
 
 impl std::fmt::Display for LLVMFlag {
@@ -57,6 +58,7 @@ impl std::fmt::Display for LLVMFlag {
             LLVMFlag::VarArgFunction => "VarArgFunction",
             LLVMFlag::EnumOfNonNullablePointer => "EnumOfNonNullablePointer",
             LLVMFlag::ADTAsPointerFromRust => "ADTAsPointerFromRust",
+            LLVMFlag::SizeMismatchInShim => "SizeMismatchInShim",
         };
         write!(f, "{}", string)
     }
