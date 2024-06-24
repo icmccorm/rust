@@ -217,10 +217,7 @@ impl LLI {
     }
 }
 
-pub struct ResolvedRustArgument<'tcx> {
-    inner: ResolvedRustArgumentInner<'tcx>,
-}
-enum ResolvedRustArgumentInner<'tcx> {
+pub enum ResolvedRustArgument<'tcx> {
     Default(OpTy<'tcx>),
     Padded(OpTy<'tcx>, Size),
 }
@@ -228,7 +225,7 @@ enum ResolvedRustArgumentInner<'tcx> {
 impl<'tcx> ResolvedRustArgument<'tcx> {
     pub fn new(ctx: &mut MiriInterpCx<'tcx>, arg: OpTy<'tcx>) -> InterpResult<'tcx, Self> {
         let arg = ctx.dereference_into_singular_field(arg)?;
-        Ok(Self { inner: ResolvedRustArgumentInner::Default(arg) })
+        Ok(ResolvedRustArgument::Default(arg))
     }
     pub fn new_padded(
         ctx: &mut MiriInterpCx<'tcx>,
@@ -236,7 +233,7 @@ impl<'tcx> ResolvedRustArgument<'tcx> {
         padding: Size,
     ) -> InterpResult<'tcx, Self> {
         let arg = ctx.dereference_into_singular_field(arg)?;
-        Ok(Self { inner: ResolvedRustArgumentInner::Padded(arg, padding) })
+        Ok(ResolvedRustArgument::Padded(arg, padding))
     }
 
     pub fn to_generic_value<'lli>(
@@ -251,15 +248,15 @@ impl<'tcx> ResolvedRustArgument<'tcx> {
     }
 
     pub fn opty(&self) -> &OpTy<'tcx> {
-        match &self.inner {
-            ResolvedRustArgumentInner::Default(op) => op,
-            ResolvedRustArgumentInner::Padded(op, _) => op,
+        match self {
+            ResolvedRustArgument::Default(op) => op,
+            ResolvedRustArgument::Padded(op, _) => op,
         }
     }
     pub fn padded_size(&self) -> Size {
-        match self.inner {
-            ResolvedRustArgumentInner::Default(_) => self.value_size(),
-            ResolvedRustArgumentInner::Padded(_, padding) => padding,
+        match self {
+            ResolvedRustArgument::Default(_) => self.value_size(),
+            ResolvedRustArgument::Padded(_, padding) => *padding,
         }
     }
 
