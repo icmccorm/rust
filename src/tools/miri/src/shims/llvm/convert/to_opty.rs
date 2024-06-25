@@ -4,11 +4,10 @@ use super::field_bytes::FieldBytes;
 use crate::alloc_addresses::EvalContextExt as _;
 use crate::shims::llvm::helpers::EvalContextExt as LLVMEvalExt;
 use crate::shims::llvm::logging::LLVMFlag;
-use crate::*;
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::GenericValueRef;
 use itertools::Itertools;
-use rustc_abi::{Endian, Size};
+use rustc_abi::Size;
 use rustc_apfloat::{
     ieee::{Double, Single},
     Float,
@@ -21,29 +20,12 @@ use rustc_middle::{
 use rustc_target::abi::FIRST_VARIANT;
 use rustc_target::abi::{FieldIdx, VariantIdx};
 use std::cell::Cell;
-use std::fmt::Formatter;
-use tracing::debug;
+use crate::*;
 
 #[derive(Debug, Clone)]
 enum OpTySource<'lli> {
     Generic(GenericValueRef<'lli>),
     Bytes(FieldBytes),
-}
-
-impl<'lli> std::fmt::Display for OpTySource<'lli> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OpTySource::Generic(gv) => {
-                let as_string = if let Some(type_tag) = gv.get_type_tag() {
-                    type_tag.print_to_string().to_string()
-                } else {
-                    "None".to_string()
-                };
-                write!(f, "{:?}", as_string)
-            }
-            OpTySource::Bytes(b) => write!(f, "{}", b),
-        }
-    }
 }
 
 pub struct ConversionContext<'tcx, 'lli> {
@@ -192,7 +174,6 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
         &mut self,
         miri: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, (OpTy<'tcx>, Option<PlaceTy<'tcx>>)> {
-        debug!("[GV to Op]: {} to {:?}", self.source, self.rust_layout.ty);
         match self.rust_layout.abi {
             rustc_abi::Abi::Scalar(_) => {
                 let scalar_op = OpTy::from(self.convert_to_immty(miri)?);
@@ -203,13 +184,13 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
             }
             rustc_abi::Abi::ScalarPair(_, _)
             | rustc_abi::Abi::Aggregate { sized: true }
-            | rustc_abi::Abi::Vector { .. } => {
-                let destination = self.get_or_create_destination(miri)?;
-                match &self.source {
+            | rustc_abi::Abi::Vector { .. } =>
+                match &self.source.clone() {
                     OpTySource::Generic(generic) => {
                         let llvm_type = generic.assert_type_tag();
                         match llvm_type {
                             BasicTypeEnum::IntType(_) => {
+                                let destination = self.get_or_create_destination(miri)?;
                                 let field_bytes = generic.as_int().to_ne_bytes();
                                 let field_width: usize =
                                     self.rust_layout.size.bytes().try_into().unwrap();
@@ -220,8 +201,23 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
                                     self.padded_size,
                                 );
                                 new_context.convert_generic_value_to_opty(miri)?;
+                                let operand = miri.place_to_op(&destination)?;
+                                Ok((operand, Some(destination)))
                             }
+                            BasicTypeEnum::PointerType(_) =>
+                                if self.get_destination().is_none() {
+                                    let wrapped_pointer = generic.as_miri_pointer();
+                                    let mp =
+                                        miri.lli_wrapped_pointer_to_maybe_pointer(wrapped_pointer);
+                                    let pointer_ty_layout = self.rust_layout;
+                                    let as_mplace = miri.ptr_to_mplace(mp, pointer_ty_layout);
+                                    let as_place = PlaceTy::from(as_mplace);
+                                    Ok((miri.place_to_op(&as_place)?, None))
+                                } else {
+                                    throw_llvm_type_mismatch!(llvm_type, self.rust_layout.ty);
+                                },
                             _ => {
+                                let destination = self.get_or_create_destination(miri)?;
                                 let mut llvm_fields = generic.assert_fields();
                                 let rust_field_count = self.rust_layout.fields.count();
                                 if rust_field_count == llvm_fields.len() {
@@ -257,12 +253,13 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
                                         self.rust_layout
                                     );
                                 }
+                                let operand = miri.place_to_op(&destination)?;
+                                Ok((operand, Some(destination)))
                             }
                         }
-                        let operand = miri.place_to_op(&destination)?;
-                        return Ok((operand, Some(destination)));
                     }
                     OpTySource::Bytes(fieldbytes) => {
+                        let destination = self.get_or_create_destination(miri)?;
                         let mut rust_fields = self.resolve_fields(miri, destination.clone())?;
                         if u64::try_from(fieldbytes.len()).unwrap() != self.rust_layout.size.bytes()
                         {
@@ -280,11 +277,10 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
                                 new_context.convert_generic_value_to_opty(miri)?;
                             }
                             let operand = miri.place_to_op(&destination)?;
-                            return Ok((operand, Some(destination)));
+                            Ok((operand, Some(destination)))
                         }
                     }
-                }
-            }
+                },
             rustc_abi::Abi::Uninhabited => throw_unsup_abi!("Uninhabited"),
             rustc_abi::Abi::Aggregate { sized: false } => throw_unsup_abi!("unsized Aggregate"),
         }
@@ -292,22 +288,6 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
 
     #[allow(clippy::arithmetic_side_effects)]
     fn convert_to_immty(&self, miri: &MiriInterpCx<'tcx>) -> InterpResult<'tcx, ImmTy<'tcx>> {
-        let truncate_to_pointer_size = |v: u128| -> u64 {
-            let as_bytes: [u8; 16] = v.to_ne_bytes();
-            let pointer_size = miri.tcx.data_layout.pointer_size;
-            match miri.tcx.data_layout.endian {
-                Endian::Little => {
-                    let mut bytes = [0u8; 8];
-                    bytes.copy_from_slice(&as_bytes[..pointer_size.bytes().try_into().unwrap()]);
-                    u64::from_ne_bytes(bytes)
-                }
-                Endian::Big => {
-                    let mut bytes = [0u8; 8];
-                    bytes.copy_from_slice(&as_bytes[8..]);
-                    u64::from_ne_bytes(bytes)
-                }
-            }
-        };
         match &self.source {
             OpTySource::Generic(generic) => {
                 let layouts = &miri.machine.layouts;
@@ -319,7 +299,6 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
                             match rft {
                                 ty::FloatTy::F32 => {
                                     let val = generic.as_f32();
-                                    debug!("[GV to Op]: Float value: {:?}", val);
                                     let imm = ImmTy::from_scalar(
                                         Scalar::from_f32(Single::from_bits(val.to_bits().into())),
                                         layouts.f32,
@@ -328,7 +307,6 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
                                 }
                                 ty::FloatTy::F64 => {
                                     let val = generic.as_f64();
-                                    debug!("[GV to Op]: Float value: {:?}", val);
                                     let imm = ImmTy::from_scalar(
                                         Scalar::from_f64(Double::from_bits(val.to_bits().into())),
                                         layouts.f64,
@@ -342,11 +320,10 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
                         },
                     BasicTypeEnum::IntType(_) => {
                         let converted_int = generic.as_int();
-                        debug!("[GV to Op]: Int value: {:?}", converted_int);
                         let byte_width = Size::from_bytes(u64::from(generic.int_width_bytes()));
                         if miri.is_pointer_convertible(&self.rust_layout) {
                             if byte_width == self.rust_layout.size {
-                                let first_word = truncate_to_pointer_size(converted_int);
+                                let first_word = miri.truncate_to_pointer_size(converted_int);
                                 if let Some(logger) = &miri.machine.llvm_logger {
                                     logger.log_flag(LLVMFlag::CastPointerFromLLVMAtBoundary);
                                 }
@@ -373,12 +350,6 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
                         if miri.is_pointer_convertible(&self.rust_layout) {
                             let wrapped_pointer = generic.as_miri_pointer();
                             let mp = miri.lli_wrapped_pointer_to_maybe_pointer(wrapped_pointer);
-                            debug!(
-                                "[GV to Op]: Provenance: (Tag: {}, AID: {}, Addr: {})",
-                                wrapped_pointer.prov.tag,
-                                wrapped_pointer.prov.alloc_id,
-                                wrapped_pointer.addr
-                            );
                             let pointer_ty_layout = self.rust_layout;
                             let scalar = Scalar::from_maybe_pointer(mp.into(), miri);
                             let imm = ImmTy::from_scalar(scalar, pointer_ty_layout);
@@ -397,7 +368,7 @@ impl<'tcx, 'lli> ConversionContext<'tcx, 'lli> {
                     if let Some(logger) = &miri.machine.llvm_logger {
                         logger.log_flag(LLVMFlag::CastPointerFromLLVMAtBoundary);
                     }
-                    let first_word = truncate_to_pointer_size(value);
+                    let first_word = miri.truncate_to_pointer_size(value);
                     let as_maybe_ptr = miri.ptr_from_addr_cast(first_word)?;
                     match as_maybe_ptr.into_pointer_or_addr() {
                         Ok(ptr) => Scalar::from_pointer(ptr, miri),

@@ -39,6 +39,25 @@ use tracing::debug;
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
 
 pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
+
+    fn truncate_to_pointer_size(&self, v: u128) -> u64 {
+        let this = self.eval_context_ref();
+        let as_bytes: [u8; 16] = v.to_ne_bytes();
+        let pointer_size = this.tcx.data_layout.pointer_size;
+        match this.tcx.data_layout.endian {
+            Endian::Little => {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&as_bytes[..pointer_size.bytes().try_into().unwrap()]);
+                u64::from_ne_bytes(bytes)
+            }
+            Endian::Big => {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&as_bytes[8..]);
+                u64::from_ne_bytes(bytes)
+            }
+        }
+    }
+    
     fn get_equivalent_rust_layout_for_value(
         &self,
         generic_value_ref: &GenericValueRef<'_>,
