@@ -3,8 +3,8 @@ use std::str;
 
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_span::Symbol;
+use rustc_target::abi::{Align, Size};
 use rustc_target::spec::abi::Abi;
-use rustc_target::abi::{Size, Align};
 
 use crate::shims::alloc::EvalContextExt as _;
 use crate::shims::unix::*;
@@ -386,17 +386,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             // Thread-local storage
             "pthread_key_create" => {
-                /* 
-                if this.in_llvm()? {
-                    this.handle_unsupported_foreign_item(format!(
-                        "can't call foreign function `{link_name}` on OS `{os}`",
-                        os = this.tcx.sess.target.os,
-                    ))?;
-                }   */
                 let [key, dtor] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let key_place = this.deref_pointer_as(key, this.libc_ty_layout("pthread_key_t"))?;
                 let dtor = this.read_pointer(dtor)?;
-                info!("pthread_key_create: pthread_key_t: {:?}, key_layout: {:?}", this.libc_ty_layout("pthread_key_t"), key.layout.ty);
+
                 // Extract the function type out of the signature (that seems easier than constructing it ourselves).
                 let dtor = if !this.ptr_is_null(dtor)? {
                     Some(this.get_ptr_fn(dtor)?.as_instance()?)
@@ -404,16 +397,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     None
                 };
 
-                let key_layout = if this.in_llvm()? {
-                    this.libc_ty_layout("pthread_key_t")
-                }else{
-                    let key_type = key_place.layout.ty
-                        .builtin_deref(true)
-                        .ok_or_else(|| err_ub_format!(
-                            "wrong signature used for `pthread_key_create`: first argument must be a raw pointer."
-                        ))?;
-                    this.layout_of(key_type)?
-                };
+                // Figure out how large a pthread TLS key actually is.
+                // To this end, deref the argument type. This is `libc::pthread_key_t`.
+                let key_type = key.layout.ty
+                    .builtin_deref(true)
+                    .ok_or_else(|| err_ub_format!(
+                        "wrong signature used for `pthread_key_create`: first argument must be a raw pointer."
+                    ))?;
+                let key_layout = this.layout_of(key_type)?;
 
                 // Create key and write it into the memory where `key_ptr` wants it.
                 let key = this.machine.tls.create_tls_key(dtor, key_layout.size)?;
