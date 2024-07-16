@@ -977,6 +977,32 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         this.read_bytes_ptr_strip_provenance(ptr, len)
     }
 
+    fn read_c_str_until<'a>(&'a self, ptr: Pointer, max_len: u64) -> InterpResult<'tcx, &'a [u8]>
+    where
+        'tcx: 'a,
+    {
+        let this = self.eval_context_ref();
+        let size1 = Size::from_bytes(1);
+
+        // Step 1: determine the length.
+        let mut len = Size::ZERO;
+        loop {
+            if len.bytes() >= max_len {
+                break;
+            }
+            // FIXME: We are re-getting the allocation each time around the loop.
+            // Would be nice if we could somehow "extend" an existing AllocRange.
+            let alloc = this.get_ptr_alloc(ptr.offset(len, this)?, size1)?.unwrap(); // not a ZST, so we will get a result
+            let byte = alloc.read_integer(alloc_range(Size::ZERO, size1))?.to_u8()?;
+            if byte == 0 {
+                break;
+            } else {
+                len += size1;
+            }
+        }
+        // Step 2: get the bytes.
+        this.read_bytes_ptr_strip_provenance(ptr, len)
+    }
     /// Helper function to write a sequence of bytes with an added null-terminator, which is what
     /// the Unix APIs usually handle. This function returns `Ok((false, length))` without trying
     /// to write if `size` is not large enough to fit the contents of `c_str` plus a null

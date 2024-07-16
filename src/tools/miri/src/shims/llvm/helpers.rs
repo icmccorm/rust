@@ -497,26 +497,22 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // C requires that this must always be a valid pointer (C18 §7.1.4).
         this.ptr_get_alloc_id(left)?;
         this.ptr_get_alloc_id(right)?;
-        let mut left_bytes = this.read_c_str(left)?;
-        let mut right_bytes = this.read_c_str(right)?;
-        if let Some(n) = n {
+
+        let (left, right) = if let Some(n) = n {
             let n = this.read_target_usize(n)?.try_into().unwrap();
-            if n <= left_bytes.len() {
-                left_bytes = &left_bytes[..n];
-            }
-            if n <= right_bytes.len() {
-                right_bytes = &right_bytes[..n];
-            }
-        }
+            (this.read_c_str_until(left, n)?, this.read_c_str_until(right, n)?)
+        }else{
+            (this.read_c_str(left)?, this.read_c_str(right)?)
+        };
         let result = {
-            if left_bytes.len() > right_bytes.len() {
+            if left.len() > right.len() {
                 return Ok(1);
             }
-            if left_bytes.len() < right_bytes.len() {
+            if left.len() < right.len() {
                 return Ok(-1);
             }
             use std::cmp::Ordering::*;
-            match left_bytes.cmp(right_bytes) {
+            match left.cmp(right) {
                 Less => -1i32,
                 Equal => 0,
                 Greater => 1,
