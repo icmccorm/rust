@@ -71,6 +71,7 @@ fn miri_get_element_pointer_result<'tcx>(
     base_ptr: Pointer,
     offset: Size,
 ) -> InterpResult<'tcx, Pointer> {
+    info!("GEP Adding offset {:?}", offset.bytes());
     let this = ctx.eval_context_mut();
     let (ptr_offset, _) = base_ptr.overflowing_offset(offset, this);
 
@@ -90,18 +91,20 @@ fn miri_get_element_pointer_result<'tcx>(
 
     if let Some(Concrete { alloc_id, tag }) = base_ptr.provenance {
         let (size, _, _) = this.get_alloc_info(alloc_id);
-        let base_address = this.addr_from_alloc_id(alloc_id, source_allocation_kind.unwrap())?;
-        let addr_upper_bound = base_address.checked_add(size.bytes());
-        if source_allocation.is_some() {
-            if let Some(addr_upper_bound) = addr_upper_bound {
-                if ptr_offset.addr().bytes() >= addr_upper_bound {
-                    this.expose_ptr(alloc_id, tag)?;
-                    return Ok(Pointer::new(Some(Wildcard), ptr_offset.addr()));
+        if let Some(source_allocation_kind) = source_allocation_kind {
+            let base_address = this.addr_from_alloc_id(alloc_id, source_allocation_kind)?;
+            let addr_upper_bound = base_address.checked_add(size.bytes());
+            if source_allocation.is_some() {
+                if let Some(addr_upper_bound) = addr_upper_bound {
+                    if ptr_offset.addr().bytes() >= addr_upper_bound {
+                        this.expose_ptr(alloc_id, tag)?;
+                        return Ok(Pointer::new(Some(Wildcard), ptr_offset.addr()));
+                    }
                 }
             }
         }
     }
-    debug!(
+    info!(
         "GEP - {:?}({:?}) to {:?}",
         source_allocation_kind, base_ptr.provenance, dest_allocation_kind
     );
