@@ -95,22 +95,21 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
             // Add filename to `miri` arguments.
             config.args.insert(0, tcx.sess.io.input.filestem().to_string());
 
-            // Adjust working directory for interpretation.
-            if let Some(cwd) = env::var_os("MIRI_CWD") {
-                env::set_current_dir(cwd).unwrap();
-            }
             if !config.disable_bc && config.external_bc_files.is_empty() && config.singular_llvm_bc_file.is_none() {
                 let cwd = env::current_dir().unwrap();
                 if cwd.exists() && cwd.is_dir() {
                     config.external_bc_files.extend(collect_llvm_bytecode(cwd));
                 }else{
-                    tcx.dcx().fatal("Unable to resolve CARGO_TARGET_DIR.");
+                    tcx.dcx().fatal("Unable to resolve current working directory.");
                 }
                 if !config.external_bc_files.is_empty() {
                     config.provenance_mode = ProvenanceMode::Permissive;
                 }
             }
-
+            // Adjust working directory for interpretation.
+            if let Some(cwd) = env::var_os("MIRI_CWD") {
+                env::set_current_dir(cwd).unwrap();
+            }
             if tcx.sess.opts.optimize != OptLevel::No {
                 tcx.dcx().warn("Miri does not support optimizations. If you have enabled optimizations \
                     by selecting a Cargo profile (such as --release) which changes other profile settings \
@@ -606,17 +605,20 @@ fn main() {
         } else if arg == "-Zmiri-disable-bc" {
             miri_config.disable_bc = true
         } else if let Some(param) = arg.strip_prefix("-Zmiri-extern-bc-file=") {
-            let filename = param.to_string();
-            if std::path::Path::new(&filename).exists() {
+            let filename_str = param.to_string();
+            let filename_path = std::path::Path::new(&filename_str);
+            let filename_path = fs::canonicalize(filename_path);
+            if let Ok(filename_path) = filename_path {
                 if let Some(other_filename) = miri_config.singular_llvm_bc_file {
                     show_error!(
                         "-Zmiri-extern-bc-file= is already set to {}",
                         other_filename.display()
                     );
+                }else{
+                    miri_config.singular_llvm_bc_file = Some(filename_path);
                 }
-                miri_config.singular_llvm_bc_file = Some(filename.into());
             } else {
-                show_error!("-Zmiri-extern-bc-file `{}` does not exist", filename);
+                show_error!("-Zmiri-extern-bc-file `{}` does not exist", filename_str);
             }
         } else if let Some(param) = arg.strip_prefix("-Zmiri-native-lib=") {
             let filename = param.to_string();
