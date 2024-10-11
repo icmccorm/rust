@@ -32,6 +32,7 @@
 	shallow = true
 [submodule "src/llvm-project"]
 	path = src/llvm-project
+	branch = bsan
 	url = https://github.com/icmccorm/llvm-project
 	shallow = true
 [submodule "src/doc/embedded-book"]
